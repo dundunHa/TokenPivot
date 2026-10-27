@@ -234,8 +234,8 @@ info:
     ## 6.5 版本与跨版本比较
 
     - **同版本**先比较 SHA-256：相同 → `duplicate`；不同 → `conflict`。
-    - **不同版本**不得直接比较摘要。只有当实际留存的列能**无损重建**某个共同版本的全部比较字段时，才重建那个版本的规范化内容再比较。
-    - 若有损升级使共同版本无法重建，必须明确返回永久 `NORMALIZATION_INCOMPATIBLE`，不能误报 `duplicate` 或 `conflict`。
+    - **不同版本**不得直接比较摘要。只有当旧行的留存列**和本次请求**都能**无损形成**某个共同版本的全部比较字段时，才把双方都投影到该版本再比较。
+    - 若任一方（旧行留存列或本次请求）有损而无法形成共同版本，必须明确返回永久 `NORMALIZATION_INCOMPATIBLE`，不能误报 `duplicate` 或 `conflict`。
     - 旧客户端仍走原 v1 路径重传，直至事件超过 180 天窗口；实现升级不得让旧 v1 重传被误判。
     - 未来版本只有在书面说明映射与兼容限制后才能发布；本任务不预建双哈希，也不保存原始报文。
 
@@ -956,7 +956,7 @@ components:
       description: |
         同身份、不同规范化内容，永久拒绝；不覆盖事件、不修正分钟桶。
 
-        跨规范化版本时不直接比较摘要：仅当实际留存列能无损重建某一共同版本时才重建比较；无法重建时返回 `rejected/NORMALIZATION_INCOMPATIBLE`，而不是 `conflict`。
+        跨规范化版本时不直接比较摘要：仅当旧行留存列与本次请求都能无损形成某一共同版本的全部比较字段时，才把双方都投影到该版本再比较；任一方无法形成时返回 `rejected/NORMALIZATION_INCOMPATIBLE`，而不是 `conflict`。
     ItemResultExpired:
       allOf:
         - $ref: '#/components/schemas/ItemResultBase'
@@ -1003,7 +1003,7 @@ components:
         | `PROJECT_INVALID` | 项目非法、跨 workspace 或不可用；不得降级为未归属 |
         | `USAGE_UNSUPPORTED` | 用量组合不合法：known 父项小于 known 子项、三者均 known 但 total 等式不成立、质量词或组合不受支持 |
         | `USAGE_OVERFLOW` | 加法或字段值超出 `2^53-1`；不截断、不转浮点 |
-        | `NORMALIZATION_INCOMPATIBLE` | 跨版本比较时有损升级使共同版本无法重建，不能判 duplicate 或 conflict |
+        | `NORMALIZATION_INCOMPATIBLE` | 跨版本比较时旧行留存列或本次请求任一方无法无损形成共同版本，不能判 duplicate 或 conflict |
 
         永久拒绝不要原样重试。
     ItemResultRetryable:
