@@ -30,7 +30,7 @@ npm --prefix web ci
 
 `bin/` 与 `web/dist/` 都是被忽略提交的构建产物，不随代码发布。组合目标用顺序 recipe/递归 `$(MAKE)` 实现，所以 `make -j build`、`make -j check` 仍然是先 web 后内嵌 Go。任一阶段非零即整体失败；此时可能留有旧的或部分的产物，不承诺原子发布，也不能把旧产物当作本次构建成功。带 `uiembed` 的编译在缺少真实 `web/dist` 时会直接失败，不会生成占位页。
 
-`.env.example` 只是变量清单与安全占位示例，不是可直接启动的有效配置，也不会被自动加载；程序只读进程环境。
+`.env.example` 只是变量清单与安全占位示例，不是可直接启动的有效配置，也不会被自动加载；Go 程序与 Makefile 都只读进程环境。例外是 Vite：`make dev-web` 与 `make build-web` 会读取 `web/.env*`，并把 `VITE_` 前缀变量内联进浏览器产物，所以凭证不得写进 `web/.env*`。
 
 ## 工具链与本地数据库
 
@@ -71,7 +71,7 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 | Vite 开发服务（`make dev-web`） | 只需可选的公开上游地址 `TOKENPIVOT_DEV_API_TARGET`，不接收任何连接信息 |
 | 集成测试（`make test-integration`） | `TOKENPIVOT_TEST_DATABASE_URL` 与 `TOKENPIVOT_TEST_APP_DATABASE_URL` |
 
-完整的变量清单与安全占位见 [.env.example](.env.example)。它是参考，不是可直接启动的配置，也不会被自动加载；变量必须由启动该进程的 shell 或本地凭证工具注入。
+完整的变量清单与安全占位见 [.env.example](.env.example)。它是参考，不是可直接启动的配置，也不会被自动加载；变量必须由启动该进程的 shell 或本地凭证工具注入。Vite 侧的例外同上：它会读 `web/.env*` 并把 `VITE_` 前缀变量内联进产物，那里不得放任何凭证。
 
 非敏感 URL 模板（不含密码，需安全注入凭证）：
 
