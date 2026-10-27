@@ -59,7 +59,7 @@ info:
     [T - 180 × 24h, T]
     ```
 
-    两端**包含**。时钟偏差**为 0 秒**：不接受任何先于 `T` 的未来时间，也不把未来时间截成 `T`，不用 `received_at` 替换 `occurred_at`。
+    两端**包含**。时钟偏差**为 0 秒**：不接受任何**晚于** `T` 的时间，也不把未来时间截成 `T`，不用 `received_at` 替换 `occurred_at`。
 
     | 位置 | 结论 |
     |---|---|
@@ -131,11 +131,11 @@ info:
     1. 字符串为 UTF-8，无 BOM，**无首尾空白，无行尾换行**，任何位置都不出现无意义空白（`:` 与 `,` 后不加空格）。
     2. 字符串转义遵循 RFC 8259 最小转义：`"` → `\"`，`\` → `\\`，U+0000–U+001F 控制字符用 `\b`、`\f`、`\n`、`\r`、`\t` 或 `\u00XX`（十六进制小写）；**不**转义 `/`；**不**把非 ASCII 字符转成 `\uXXXX`，直接写其 UTF-8 字节；不输出代理对转义。因为各字符串字段的入口校验已拒绝控制字符，实际可能出现转义的只剩 `"` 与 `\`。
     3. 数字只写十进制整数：无前导零（`0` 本身除外）、无 `+`、无小数点、无指数、无 `-0`。
-    4. 缺失写 `null` 字面量，不省略。`usage` 对象中**六个指标全部出现**，客户端省略的指标在规范化时显式补成 `{"value":null,"quality":"missing"}`。
+    4. 缺失写 `null` 字面量，不省略。`usage` 对象中**六个指标全部出现**，客户端省略的指标在规范化时显式补成 `{"value":null,"quality":"missing"}`。注意：省略与 `{"value":null,"quality":"missing"}` 在**入口**等价，但 `total_tokens` 的这两种表示都是「total 未提供」，会触发第 6.6 节第 2 条的推导（例如输入 100 known、输出 20 known、total 写 missing 或省略，结果同为 `total=120 known`），**不是**保留为 missing。
     5. `usage` 内的键顺序固定为 `input_tokens`、`output_tokens`、`total_tokens`、`cache_read_tokens`、`cache_write_tokens`、`reasoning_tokens`；每个指标对象内的键顺序固定为 `value`、`quality`。
     6. 摘要 = 对整个规范化文本的 UTF-8 字节做 SHA-256，取 32 字节原始输出。
 
-    ## 6.4 测试向量（四组，均为实算）
+    ## 6.4 测试向量（五组，均为实算）
 
     下面的文本可直接逐字符复制后用 `printf '%s' '<文本>' | shasum -a 256` 复现。这些向量只含 ASCII 可打印字符，因此不涉及“非 ASCII 是否转义”的差异；复现时**不要**带上行尾换行。
 
@@ -156,7 +156,7 @@ info:
     同一个事件的两种 JSON 写法（键顺序不同、`project_id` 大小写不同、`duration_ms` 一次显式写 `null` 一次省略）：
 
     ```
-    {"events":[{"source_event_id":"req-b1","duration_ms":null,"status":"success","usage":{"reasoning_tokens":{"quality":"known","value":50},"cache_read_tokens":{"value":400,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"input_tokens":{"value":1000,"quality":"known"}},"occurred_at":"2026-10-26T23:30:00.123456Z","model":"example-model","provider":"example-provider","project_id":"0199A0B0-0000-7000-8000-00000000000A","source_event_id":"req-b1"}]}
+    {"events":[{"source_event_id":"req-b1","duration_ms":null,"status":"success","usage":{"reasoning_tokens":{"quality":"known","value":50},"cache_read_tokens":{"value":400,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"input_tokens":{"value":1000,"quality":"known"}},"occurred_at":"2026-10-26T23:30:00.123456Z","model":"example-model","provider":"example-provider","project_id":"0199A0B0-0000-7000-8000-00000000000A"}]}
     ```
 
     ```
@@ -205,6 +205,32 @@ info:
 
     D2 SHA-256：`b488e38a6331fcb575c37af32bfbadcbbde4b6d7f037cb81ca4e5d3e5a6a61d4`
 
+    ### 向量 E：total 两种表示等价
+
+    同一个事件（`occurred_at = 2026-10-27T09:15:00Z`、`project_id` 为 `null`、provider/model 为 `example-provider`/`example-model`、输入 100 known、输出 20 known、其余三个指标缺失、`status = "success"`、`duration_ms = 640`）的两种写法 e1 与 e2：
+
+    e1 省略 `total_tokens`：
+
+    ```json
+    {"events":[{"source_event_id":"req-e1","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T09:15:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"status":"success","duration_ms":640}]}
+    ```
+
+    e2 显式写 `total_tokens` 为 `{"value":null,"quality":"missing"}`：
+
+    ```json
+    {"events":[{"source_event_id":"req-e2","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T09:15:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":null,"quality":"missing"}},"status":"success","duration_ms":640}]}
+    ```
+
+    两者按第 6.6 节第 2 条推导出同一个 `total_tokens = {"value":120,"quality":"known"}`（输入与输出均 known），规范化文本完全相同：
+
+    ```
+    ["2026-10-27T09:15:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",640]
+    ```
+
+    SHA-256：`2936ec89e70daa4df0d027f1944d9c887bb2b4a23e866799d0c2c51109b566b8`
+
+    e1 与 e2 的 `source_event_id` 在本向量里不同（`req-e1`/`req-e2`），因为本向量只比较**规范化内容**，而 `source_event_id` 不参与比较；实际提交同一事件重传时身份必须相同，那时两种写法会因内容相同而解析为 `duplicate`。
+
     ## 6.5 版本与跨版本比较
 
     - **同版本**先比较 SHA-256：相同 → `duplicate`；不同 → `conflict`。
@@ -213,12 +239,42 @@ info:
     - 旧客户端仍走原 v1 路径重传，直至事件超过 180 天窗口；实现升级不得让旧 v1 重传被误判。
     - 未来版本只有在书面说明映射与兼容限制后才能发布；本任务不预建双哈希，也不保存原始报文。
 
+    ### 跨版本比较样例（说明性，依据实际留存列）
+
+    样例只描述比较流程，不引入 `x-*` 扩展、不新建算法注册表、不预建双哈希框架。可用的留存列以 T-009 计划 §4.1 为准：`occurred_at`、`project_id`、`provider`、`model`、六个指标的值列与质量列、`status`、`duration_ms`、`normalization_version`、`payload_hash`。选择这两个样例是因为它们分别落在「可无损重建」与「有损、无法重建」两侧。
+
+    **(a) 可无损重建 → 得到 `duplicate` 或 `conflict`**
+
+    设未来发布 `v2`，它新增一个 v1 没有的字段（例如来源侧的请求标识或新的用量分量）。旧事件在 v1 下留存的是 v1 全套比较列，`normalization_version = "tokenpivot-usage-event/v1"`，`payload_hash` 为下面这个真实值：
+
+    - 留存列：`occurred_at = 2026-10-27T14:00:00.000000Z`、`project_id = NULL`、`provider = example-provider`、`model = example-model`、输入 100 known、输出 20 known、total 120 known、`cache_read_tokens`/`cache_write_tokens`/`reasoning_tokens` 缺失、`status = success`、`duration_ms = 1250`、`payload_hash = 66311d0f0854f50184e40db98ea8bc0f086c470b1dd0817eb512fdb17cbdc121`（即向量 A 的摘要）。
+    - 重传：同一身份以 `v2` 重传该事件，请求里带上 `v2` 新增字段。
+
+    比较流程：
+
+    1. 读到旧行的 `normalization_version = v1`，客户端版本为 `v2`，**不比较两者的摘要**（算法不同）。
+    2. 用旧行的留存列重建该事件的 **v1** 规范化内容。参与重建的列就是上面列出的那批；`v2` 新增字段不属于 v1 比较集合，因此**不需要**它。
+    3. 对重建出的 v1 规范化文本算 SHA-256，与留存的 `payload_hash` 比较。
+    4. 相同 → `duplicate`；不同 → `conflict`。两种情况都只对 v1 内容下结论。
+
+    这个样例之所以可无损重建，是因为 T-009 落列时把 v1 比较集合的每个字段都按冻结精度留成了列（时间到微秒、六个指标的值与质量成对、provider/model 为原样字节），所以从列回到 v1 规范化内容不丢信息。`v2` 侧不需要给出摘要：`v2` 的摘要要等两次 `v2` 之间的同版本比较才用得上。
+
+    **(b) 有损变化 → 永久 `NORMALIZATION_INCOMPATIBLE`**
+
+    设未来 `v2` 把 `provider` 与 `model` 合并成单列 `provider_model`（或把 `occurred_at` 精度降到毫秒）。旧事件是按 v1 落列的，留存列中**没有** v1 的 `provider` 与 `model` 原值（或没有微秒部分）：
+
+    - 缺的信息：合并后无法区分 `OpenAI` 与 `openai` 这类原样字节差异，也无法从合并值拆出 v1 的 `provider`、`model` 两个独立元素；降精度后微秒位已不可恢复。
+    - 为什么无法重建：v1 规范化数组的第 2、3 个元素是 provider、model 两个独立字符串（第 0 个元素要求固定 6 位小数秒）。缺其中任一项都无法生成候选文本，算不出可比较的摘要；此时把「算不出」当成「不同」会误报 `conflict`，当成「相同」会误报 `duplicate`。
+    - 预期结果：对该身份的重传返回永久 `rejected` + `NORMALIZATION_INCOMPATIBLE`，不返回 `duplicate`、也不返回 `conflict`。该结果是永久的，客户端不应原样重试。
+
+    实现时的判别顺序是先判「留存列能否覆盖共同版本的全部比较字段」，能才重建；不能就直接给 `NORMALIZATION_INCOMPATIBLE`，不得先比摘要再补救。
+
     ## 6.6 指标归一化五条规则
 
     这五条都是**跨字段**规则，只能由实现执行（JSON Schema 无法表达）：
 
     1. `cache_read_tokens`、`cache_write_tokens` 是输入子集，`reasoning_tokens` 是输出子集，**不另加到 total**。父项与子项均为 known 且子项大于父项时，该项永久拒绝（`USAGE_UNSUPPORTED`）；涉及 estimated 时不因大小关系不成立而拒绝；父项缺失时不据子项反推父项。
-    2. 输入与输出均有数值且省略 total 时，由服务端按两者之和补出 total；两者均 known 时推导质量为 known，否则为 estimated。显式 total 保留其独立值与质量；仅当输入、输出、total 均为 known 时，total 不等于两者之和才拒绝（`USAGE_UNSUPPORTED`）。涉及 estimated 时不因精确等式或质量不同而拒绝。
+    2. 输入与输出均有数值且 **total 未提供**时，由服务端按两者之和补出 total；两者均 known 时推导质量为 known，否则为 estimated。**「total 未提供」= total 被省略，或显式写成 `{"value":null,"quality":"missing"}`**；这两种写法经过完全相同的推导，结果一致。只有 total **显式带数值**（known 或 estimated）时才保留其独立值与质量；此时仅当输入、输出、total 均为 known 时，total 不等于两者之和才拒绝（`USAGE_UNSUPPORTED`）。涉及 estimated 时不因精确等式或质量不同而拒绝。
     3. 输入或输出至少一个缺失时，可保留来源提供且口径可比的 total 及其质量；不能从 total 反推输入/输出，也不能把唯一已知分量当成完整 total。
     4. 加法或字段值超出 `2^53-1 = 9007199254740991` 为永久 `USAGE_OVERFLOW`，不截断、不转浮点。省略 total 时的求和也受此限。
     5. 全部指标缺失仍可接受该事件并计事件数，但所有用量显示不可用；这不是零用量事件。
@@ -228,6 +284,7 @@ info:
     | 情形 | 输入 | 结论 |
     |---|---|---|
     | 输入与输出均 known、省略 total | in=100 known, out=20 known | 合法，total=120 known |
+    | total 显式写 missing、其余同上 | in=100 known, out=20 known, total={"value":null,"quality":"missing"} | 合法，与省略 total 同一结果 total=120 known |
     | 输入 known、输出 estimated、省略 total | in=100 known, out=250 estimated | 合法，total=350 estimated |
     | 显式 total 与推导值一致且三者 known | in=100, out=20, total=120 均 known | 合法 |
     | 三者均 known 但等式不成立 | in=100, out=20, total=130 均 known | 非法，`USAGE_UNSUPPORTED` |
@@ -304,6 +361,12 @@ info:
     10. `Content-Type` 校验（`415`）、请求体字节上限（`413`）、8 秒处理预算与逐项 `DEADLINE_EXCEEDED`。
     11. 认证与身份来源（只认 `Authorization: Bearer`，不回退 Cookie）。
 
+    **`pattern` 的语法口径与 Go 实现改写（T-011 必读）**：本文 schema 里的 `pattern` 按 **ECMA-262** 正则语法书写，例如 `^[^\u0000-\u001F\u007F\u0080-\u009F]+$`。**Go 的 `regexp` 不支持 `\u` 转义**（实测 `regexp.Compile` 报 `invalid escape sequence: \u`），照抄到 Go 里编译不过；实现时必须改写成 RE2 的 `\x{0000}` 这类写法（例如 `^[^\x{0000}-\x{001F}\x{007F}\x{0080}-\x{009F}]+$`）。这一条只讲语法改写，不改变任何字符集的判定范围。
+
+    **`provider`、`model` 的首尾空白口径**：拒绝首尾空白的范围已定为 Unicode `White_Space` 属性，**含** U+00A0（NBSP）与 U+3000（全角空格）。完整字符集是 U+0009–U+000D、U+0020、U+0085、U+00A0、U+1680、U+2000–U+200A、U+2028、U+2029、U+202F、U+205F、U+3000；其中 U+0009–U+000D 与 U+0085 已先被控制字符规则拒绝。**Go 的 `\s` 不匹配 U+00A0 与 U+3000**，实现必须显式列出上表字符集合（不能只写 `\s` 或 `[[:space:]]`）。
+
+    **`status` 的已声明收紧**：本文对 `status` 额外**拒绝控制字符**（`pattern` 拒绝 U+0000–U+001F、U+007F、U+0080–U+009F）。计划 §3.2 只规定「可省略或为 null；非空为 1–64 字节 UTF-8 字符串，首版不透明保存」，并未要求拒绝控制字符，因此这是**相对计划 §3.2 的已声明收紧**（用户已确认保留），不是暗改。理由：不透明状态值没有保留控制字符的用途，且 PostgreSQL 的 `text` 无法存 U+0000。该收紧不改变 1–64 字节与「不透明保存、不做大小写或空白归一化」的口径。
+
     # 12. 示例索引
 
     请求示例与响应示例按**同名**配对，说明它们属于同一次请求：
@@ -315,8 +378,8 @@ info:
     | `missing-zero-estimated` | 缺失、真实零、估算零 |
     | `total-only` | 仅提供 total |
     | `cache-and-reasoning-subset` | 缓存/推理子集合法、求和溢出与 total 等式非法 |
-    | `batch-error-invalid-argument` | 整批错误（400） |
-    | `deadline-exhausted` | 处理期限耗尽的逐项填法 |
+    | `batch-error-invalid-argument` | 整批错误（400）；该组只有响应，没有配对的请求示例 |
+    | `deadline-exhausted` | 处理期限耗尽的逐项填法：请求与响应各 6 项、逐下标对应 |
 
 servers:
   - url: /
@@ -339,6 +402,8 @@ paths:
         **整批阶段（写入前，统一返回整批错误）**：校验 `Content-Type`、凭证与采集权限、请求体字节上限、JSON 可无歧义解析（含重复键）、外壳未知字段、事件条数（1–100）。任一失败时整批无写入。
 
         **逐项阶段（每项独立事务）**：按输入顺序逐项校验格式、项目归属、时间窗口与用量归一化；通过后尝试以 `(workspace_id, source_id, source_event_id)` 唯一性插入。过期判断必须在任何用于 duplicate/conflict 的业务身份查询之前。首次插入成功时在同一事务内写分钟增量；整个事务 Commit 确认成功后才写 `accepted`。身份已存在时按第 6.5 节规则产生 `duplicate` 或 `conflict`，两者都不增加统计、不覆盖事件、不延长保留。
+
+        **分钟增量的归属**：按 `occurred_at` 所落的 **UTC 分钟**桶计入，与 ADR-0003（`docs/decisions/0003-minute-aggregation-and-retention.md`）一致；不是按 `received_at`，也不按来源本地时区或请求到达时间分桶。
 
         批次处理完成（或 8 秒预算耗尽）后一次输出逐项结果，HTTP 一律 200。同一请求内有多条整批错误同时成立时返回哪一条，本文不冻结；但任一情况都不得产生写入。
 
@@ -366,6 +431,8 @@ paths:
                 $ref: '#/components/examples/TotalOnlyRequest'
               cache-and-reasoning-subset:
                 $ref: '#/components/examples/CacheAndReasoningSubsetRequest'
+              deadline-exhausted:
+                $ref: '#/components/examples/DeadlineExhaustedRequest'
       responses:
         '200':
           description: |
@@ -482,7 +549,7 @@ paths:
                             const: INTERNAL
         '503':
           description: |
-            `UNAVAILABLE`：在开始形成任何逐项结果之前的依赖故障（例如数据库不可用）。整批无写入。用原身份原内容重试；不能据此断定没有已提交项。
+            `UNAVAILABLE`：在开始形成任何逐项结果之前的依赖故障（例如数据库不可用）。**不得据此推断没有已提交项**；用原身份、原内容重试，唯一身份会把已提交项解析为 `duplicate`。
           content:
             application/json:
               schema:
@@ -504,7 +571,7 @@ components:
       description: |
         插件接入凭证。令牌形如 `tpk_` + 随机串，由 T-010 签发；随机部分长度由签发方决定，客户端与本文都不硬编码它。
 
-        认证成功即固定 `workspace_id` 与 `source_id`，身份只从认证取得，请求载荷中不得出现它们。令牌只以摘要形式存储，明文只在签发/轮换响应中出现一次；本文不描述签发、轮换、撤销路径。
+        认证成功即固定 `workspace_id` 与 `source_id`，身份只从认证取得，请求载荷中不得出现它们。令牌只以**摘要**形式存储，算法为对完整令牌计算 SHA-256、存 32 字节摘要（与 T-010 计划 `docs/plans/2026-10-27-ingestion-credentials.md` 第 63 行的 `secret_hash` 一致；本文只引用该算法，不重新定义令牌格式）。明文只在签发/轮换响应中出现一次；本文不描述签发、轮换、撤销路径。
 
         请求只接受 `Authorization: Bearer <token>`；不回退 Cookie；没有该头、格式错误、已撤销统一返回 `401 UNAUTHENTICATED`，不泄露具体原因。
 
@@ -574,24 +641,28 @@ components:
           maxLength: 128
           pattern: '^[^\u0000-\u001F\u007F\u0080-\u009F]+$'
           not:
-            pattern: '^\s|\s$'
+            pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]|[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]$'
           description: |
             Provider 名称，必填。
 
             - 1–128 个 **UTF-8 字节**；空值、首尾空白、控制字符均拒绝。
+            - 「首尾空白」按 Unicode `White_Space` 属性判定，**含** U+00A0（NBSP）与 U+3000（全角空格）。完整字符集：U+0009–U+000D、U+0020、U+0085、U+00A0、U+1680、U+2000–U+200A、U+2028、U+2029、U+202F、U+205F、U+3000（其中 U+0009–U+000D 与 U+0085 已先被控制字符规则拒绝）。
+            - 上面 `not.pattern` 就是把这一集合按 ECMA-262 语法写死的形态：首字符或末字符命中集合即拒绝。不用 `\s`，因为 ECMA-262 的 `\s` 比 `White_Space` 多 U+FEFF、少 U+0085（后者已被控制字符规则拒绝）。**实现不能照搬**：Go 的 `regexp` 不支持 `\u` 转义，且 Go 的 `\s` 连 U+00A0 与 U+3000 都不匹配，必须改写为 `\x{...}` 显式列集合，见第 11 节。
             - 保留大小写，**不做**别名合并、trim 或 Unicode 归一化；`OpenAI` 与 `openai` 是两个不同内容。
             - 参与规范化：第 2 个元素，原样字节字符串。
 
-            校验方式：schema（类型、字符长度、无控制字符、无首尾空白）+ 实现（UTF-8 字节长度）。
+            校验方式：schema（类型、字符长度、无控制字符、无首尾空白）+ 实现（UTF-8 字节长度、与该集合等价的 `White_Space` 字符集）。
         model:
           type: string
           minLength: 1
           maxLength: 128
           pattern: '^[^\u0000-\u001F\u007F\u0080-\u009F]+$'
           not:
-            pattern: '^\s|\s$'
+            pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]|[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]$'
           description: |
             模型标识，必填。规则与 `provider` 相同：1–128 UTF-8 字节、拒绝空值与首尾空白与控制字符、保留大小写、不做别名合并或归一化。
+
+            「首尾空白」同样按 Unicode `White_Space` 属性判定并**含** U+00A0 与 U+3000，完整字符集与 Go 实现注意事项见 `provider` 与本文件第 11 节。
 
             参与规范化：第 3 个元素，原样字节字符串。
         occurred_at:
@@ -654,6 +725,8 @@ components:
         | `status` | 否 | UTF-8 字符串 或 `null` | 1–64 字节，拒绝空值/控制字符 | 省略与 `null` 同为“来源不提供” | 是（原样字节或 `null`） |
         | `duration_ms` | 否 | 十进制整数 或 `null` | `[0, 2^53-1]`，`0` 是真实零 | 省略与 `null` 同为“未知” | 是（整数或 `null`） |
 
+        表中 `provider`/`model` 的「首尾空白」按 Unicode `White_Space` 属性判定，**含** U+00A0（NBSP）与 U+3000（全角空格）；完整字符集与 Go 实现注意事项见第 11 节。
+
         所有字符串长度都按 **UTF-8 字节**校验，不是字符数。事件内出现未知字段时，该项永久 `rejected/INVALID_ARGUMENT`，同批其他项照常处理。
 
     UsageObject:
@@ -678,7 +751,7 @@ components:
         六个指标固定为 `input_tokens`、`output_tokens`、`total_tokens`、`cache_read_tokens`、`cache_write_tokens`、`reasoning_tokens`；每个只用 `{value, quality}` 三态之一（known / estimated / missing），其他组合非法，见 `MetricValue`。
 
         - `cache_read_tokens`、`cache_write_tokens` 是 **输入子集**，`reasoning_tokens` 是**输出子集**，都不另加到 total。子集重复累加到总量是错误做法。
-        - 省略某个指标与写 `{"value":null,"quality":"missing"}` 等价。
+        - 省略某个指标与写 `{"value":null,"quality":"missing"}` 等价。但 `total_tokens` 的这两种写法都表示「total 未提供」，会触发第 6.6 节第 2 条的推导，**不是**保留为 missing：例如输入 100 known、输出 20 known 时，省略 total 与显式写 missing 都得到 `total=120 known`。
         - 每指标独立判断质量，禁止用一个全局质量标记覆盖全部字段。
         - 归一化五条规则（子集大小、total 推导与等式、溢出、全缺失仍计事件数）见 `info.description` 第 6.6 节，全部由实现执行，无法用 schema 表达。
 
@@ -1340,12 +1413,93 @@ components:
             error:
               code: USAGE_UNSUPPORTED
               message: known total_tokens does not equal known input_tokens plus output_tokens
+    DeadlineExhaustedRequest:
+      summary: 处理期限耗尽的 6 项批次（与响应示例同名配对）
+      description: |
+        6 项按输入顺序处理，响应示例与之下标逐项对应：
+
+        - 第 0 项：全新合法事件，预期 `accepted`。
+        - 第 1 项：与第 0 项同 `source_event_id`、规范化内容相同（只有字段顺序不同），预期 `duplicate`。
+        - 第 2 项：`input_tokens` 50 known 而 `cache_read_tokens` 60 known，known 子集大于 known 父项，预期 `rejected/USAGE_UNSUPPORTED`。
+        - 第 3–5 项：本身都是合法事件，但在 8 秒预算耗尽时尚未开始，预期 `retryable/DEADLINE_EXCEEDED`。
+
+        请求载荷里不出现 `workspace_id`、`source_id`、凭证 ID 与 `received_at`；身份只从认证取得。第 1 项之所以是 `duplicate` 而不是 `accepted`，是因为它在同批内排在第 0 项之后处理、且内容与第 0 项完全相同——不依赖任何未在请求中体现的外部前提。
+      value:
+        events:
+          - source_event_id: req-dl-01
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T13:58:00Z'
+            usage:
+              input_tokens:
+                value: 100
+                quality: known
+              output_tokens:
+                value: 20
+                quality: known
+            status: success
+            duration_ms: 500
+          - source_event_id: req-dl-01
+            occurred_at: '2026-10-27T13:58:00Z'
+            provider: example-provider
+            model: example-model
+            usage:
+              output_tokens:
+                quality: known
+                value: 20
+              input_tokens:
+                quality: known
+                value: 100
+            duration_ms: 500
+            status: success
+          - source_event_id: req-dl-03
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T13:58:10Z'
+            usage:
+              input_tokens:
+                value: 50
+                quality: known
+              output_tokens:
+                value: 10
+                quality: known
+              cache_read_tokens:
+                value: 60
+                quality: known
+          - source_event_id: req-dl-04
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T13:58:20Z'
+            usage:
+              input_tokens:
+                value: 300
+                quality: known
+              output_tokens:
+                value: 40
+                quality: known
+          - source_event_id: req-dl-05
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T13:58:30Z'
+            usage:
+              total_tokens:
+                value: 900
+                quality: known
+          - source_event_id: req-dl-06
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T13:58:40Z'
+            usage:
+              input_tokens:
+                value: 0
+                quality: known
+            status: success
     DeadlineExhaustedResponse:
       summary: 处理期限耗尽（3 项已定、3 项重试）
       description: |
         8 秒预算到达时仍能写响应：前 3 项已得出确定性结论，给真实状态；后 3 项未开始或结论不确定，全部 `retryable/DEADLINE_EXCEEDED`，不写 `accepted` 凑数。客户端随后用原批次、原身份、原内容重传，已提交项会被解析为 `duplicate`。
 
-        本例是一个 6 项批次的结果形状（请求内容略，按上文规则构造即可）：第 2 项因 known 子集大于 known 父项被永久拒绝，其余 3 项在预算耗尽时尚未开始。**项数与下标必须与真实请求等长**，这里只演示填法。
+        与同名请求示例 `DeadlineExhaustedRequest` 逐下标对应：第 0 项 `accepted`，第 1 项与第 0 项同身份同内容故 `duplicate`，第 2 项因 known 子集大于 known 父项被永久拒绝，第 3–5 项在预算耗尽时尚未开始。**项数与下标必须与真实请求等长**，这里的 6 项即请求示例的 6 项。
       value:
         request_id: 3d4e5f6a-7b8c-4d9e-8f0a-1b2c3d4e5f6a
         results:
