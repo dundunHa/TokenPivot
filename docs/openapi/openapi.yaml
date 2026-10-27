@@ -1,0 +1,1387 @@
+openapi: 3.1.0
+info:
+  title: TokenPivot 用量采集接口
+  version: 'v1'
+  summary: 同步批量提交请求级用量事件的唯一格式依据（外部格式主版本 v1）
+  description: |
+    # 1. 范围与文档边界
+
+    本文冻结 TokenPivot 首版**同步批量采集**接口的格式：方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额，以及供查询任务复用的共同限额。
+
+    - 本文只有一个采集端点。查询接口（筛选、分组、粒度、时区、游标、错误 schema）属 T-023，凭证签发/轮换/撤销属 T-010；两条路径都不在本文。
+    - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
+    - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
+    - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
+
+    # 2. 外部格式版本与规范化版本
+
+    这是两个不同的东西，不要混用：
+
+    - **外部格式主版本**写在 URI 里：`/api/v1/...`。请求体**不放** `format_version`，避免同一个版本出现两个值。不兼容的字段删除、类型或含义变化、必填项增加、规范化语义变化、新增逐项状态，都必须升级主版本；旧主版本只要仍有合法重传就不得直接退役。
+    - **`normalization_version`** 是服务端生成并持久化的比较算法版本，由服务端决定，客户端**不提交**。首版固定为 `"tokenpivot-usage-event/v1"`，与 URI 的 `v1` 相关但不是同一个字段。客户端不需要也不能携带它。
+
+    客户端必须忽略响应中新增的字段；服务端拒绝未知请求字段（详见第 3 节与各 schema）。
+
+    # 3. 意外字段与解析失败的分层
+
+    | 位置 | 首版行为 | 影响范围 |
+    |---|---|---|
+    | 请求载荷中的重复 JSON 键（任何层级） | 整批拒绝，不写入 | 整批 |
+    | JSON 无法无歧义解析（语法错误、非法 UTF-8、尾随内容） | 整批拒绝，不写入 | 整批 |
+    | 外壳（顶层对象）未知字段 | 整批拒绝，不写入 | 整批 |
+    | 事件对象内未知字段 | 该项永久拒绝 `INVALID_ARGUMENT`，同批其他项照常处理 | 单项 |
+    | 用量对象内未知字段 | 同上（该项永久拒绝） | 单项 |
+
+    重复键不能依赖所用 JSON 库“最后一个值覆盖”的偶然行为。**注意**：`additionalProperties: false` 写在 schema 里表达的是“这样的对象是不合法的”，但判定粒度不同——顶层未知字段整批失败，事件内未知字段只让该项失败。因此实现不能只做一次整体 schema 校验，必须按该项粒度归类（见第 11 节的检查分工）。
+
+    # 4. 认证与身份
+
+    - 只接受 `Authorization: Bearer <token>`。令牌由 T-010 签发，形如 `tpk_` + 随机串（随机部分长度由签发方决定，本文不解析其长度）。
+    - 认证成功即确定固定的 `workspace_id` 与 `source_id`。**身份只从认证取得**：`workspace_id`、`source_id`、凭证 ID 一律不得出现在请求载荷中，出现即按未知字段拒绝（顶层整批 `400`，事件内该项 `INVALID_ARGUMENT`），不会因为“值对得上”而放行。
+    - `received_at` 由服务端在首次接受事务内采样，客户端不得提交；出现即按未知字段拒绝。
+    - 插件端点**不回退 Cookie**：即使同时携带有效浏览器 Cookie，也不会把请求改成浏览器用户身份；没有 Bearer、Bearer 无效或已撤销一律 `401 UNAUTHENTICATED`。
+    - 已认证但没有采集权限返回 `403 PERMISSION_DENIED`，不自动重试。
+    - 凭证的签发、轮换、撤销路径不写入本文（属 T-010 的接口文档追加）；轮换不改变 source，因此轮换后用新凭证重传同一请求仍按原身份判定。
+
+    # 5. 时间精度、180 天窗口与采样点
+
+    ## 5.1 精度与表示
+
+    - `occurred_at` 必须带偏移（offset），是最多 6 位小数秒的 RFC 3339 时间字符串。RFC 3339 允许小写 `t`/`z`，本文一视同仁接受，但规范化输出统一写成大写 `T` 与 `Z`。
+    - 解析后统一折算为 **UTC 微秒**（秒后固定 6 位小数）。微秒是格式与存储的共同精度。
+    - 超过 6 位小数秒一律拒绝（`INVALID_ARGUMENT`），**不舍入、不截断**。闰秒（秒值 `60`）拒绝。没有偏移的本地时间拒绝。日历上不存在的日期（如 2 月 30 日）与超出范围的偏移拒绝。
+
+    ## 5.2 有效窗口
+
+    服务端时间记作 `T`（取数据库实际当前时间，不取事务开始时间常量）。有效窗口是
+
+    ```
+    [T - 180 × 24h, T]
+    ```
+
+    两端**包含**。时钟偏差**为 0 秒**：不接受任何先于 `T` 的未来时间，也不把未来时间截成 `T`，不用 `received_at` 替换 `occurred_at`。
+
+    | 位置 | 结论 |
+    |---|---|
+    | `occurred_at < T - 180×24h` | 该项 `expired`（永久拒绝，且**先于**任何查重判断） |
+    | `occurred_at` 恰好等于下界 | 有效 |
+    | `occurred_at` 恰好等于 `T` | 有效 |
+    | `occurred_at > T` | 该项 `rejected` + `FUTURE_EVENT`（不是 `expired`） |
+
+    `expired` 与 `rejected/FUTURE_EVENT` 都是永久项结果：不承诺 `duplicate`/`conflict`，即使原记录仍在也不返回它们。下界之前不保存身份摘要，因此客户端不得靠改时间或复用 ID 绕过窗口。
+
+    ## 5.3 采样点
+
+    不得用批次起点的一次采样覆盖整个长批次。要求：
+
+    1. 每项**首次判断前**采样一次 `T`。
+    2. 在 INSERT 返回后、冲突 SELECT 返回后（含锁等待结束）、分钟增量写入及锁等待结束后、以及 Commit 之前，**重新采样并复核**窗口。
+    3. 复核发现已过期，则按该项当前阶段处理：尚未写入的回滚本项并返回 `expired`；已写入明细与分钟增量的连同事务一起回滚并返回 `expired`。不得因为“开始时有效”就继续提交。
+    4. 复核仍有效才提交并返回 `accepted`。
+
+    ## 5.4 `received_at` 语义
+
+    `received_at` 是首次接受事务中**显式采样**的服务端接收时间，不是精确的 Commit 墙钟时间；重传不更新它，也不延长 180 天明细保留。时钟偏差为 0 时继续满足 `occurred_at <= received_at`。
+
+    ## 5.5 时间边界样例（七组）
+
+    固定样例 `T = 2026-10-27T14:00:00Z`，则下界为 `T - 180×24h = 2026-04-30T14:00:00.000000Z`。
+
+    | # | 场景 | `occurred_at` 输入 | 规范化后的 UTC 微秒 | 结论 |
+    |---|---|---|---|---|
+    | 1 | 下界恰好（用 -07:00 偏移书写等价时刻） | `2026-04-30T07:00:00-07:00` | `2026-04-30T14:00:00.000000Z` | 有效 |
+    | 2 | 下界前 1 微秒 | `2026-04-30T13:59:59.999999Z` | `2026-04-30T13:59:59.999999Z` | `expired` |
+    | 3 | `T` 恰好 | `2026-10-27T14:00:00Z` | `2026-10-27T14:00:00.000000Z` | 有效 |
+    | 4 | `T` 后 1 微秒 | `2026-10-27T14:00:00.000001Z` | `2026-10-27T14:00:00.000001Z` | `rejected` / `FUTURE_EVENT` |
+    | 5 | 不同偏移等价 | `2026-10-27T14:00:00Z` 与 `2026-10-27T07:00:00-07:00` | 两者同为 `2026-10-27T14:00:00.000000Z` | 有效，摘要相同 |
+    | 6 | 超精度 | `2026-10-27T14:00:00.1234567Z` | 不产生 | `rejected` / `INVALID_ARGUMENT` |
+    | 7 | 等待后跨过下界 | 批次起点 `T0 = 2026-10-27T14:00:00Z` 时提交 `2026-04-30T14:00:00.000000Z` | `2026-04-30T14:00:00.000000Z` | 起点判断有效；锁等待后复核时刻 `T1 = 2026-10-27T14:00:00.000001Z`，下界变为 `2026-04-30T14:00:00.000001Z`，该项已过期 → 回滚本项，返回 `expired`，不得提交 |
+
+    第 5 组同时是第 6 节向量 A 的时间依据。第 6 组的七位小数在 `pattern` 层就被拒绝（见 `occurred_at` schema）。
+
+    # 6. 规范化、摘要与跨版本比较
+
+    ## 6.1 规范化版本与摘要形式
+
+    - 首版 `normalization_version = "tokenpivot-usage-event/v1"`。
+    - 摘要 = SHA-256 的**原始 32 字节**（`bytea`），不是十六进制文本，避免大小写等表示歧义。下文向量里的十六进制只供人眼比对，落库比较的是 32 字节。
+    - 首版只实现这一套算法，不建算法注册系统，不预建双哈希，不保存原始报文。
+    - 规范化和落库必须使用**同一份类型化结果**：先解析成类型化事件，再由它同时生成摘要与各列，禁止两处各自序列化。
+
+    ## 6.2 比较集合（固定顺序的规范化 JSON 数组）
+
+    规范化内容是一个 UTF-8 JSON **数组**，元素个数与顺序固定为 7 个：
+
+    | 位置 | 内容 | 说明 |
+    |---|---|---|
+    | 0 | `occurred_at` | JSON 字符串，`YYYY-MM-DDTHH:MM:SS.ffffffZ`，固定 6 位小数秒，始终以 `Z` 结尾（即已折算为 UTC） |
+    | 1 | `project_id` | JSON 字符串（**小写** UUID）或 `null` |
+    | 2 | `provider` | JSON 字符串，原样字节 |
+    | 3 | `model` | JSON 字符串，原样字节 |
+    | 4 | `usage` | JSON 对象，6 个指标**全部出现**，键顺序固定见 6.3 |
+    | 5 | `status` | JSON 字符串（原样字节，不做大小写或空白归一化）或 `null` |
+    | 6 | `duration_ms` | JSON 整数（十进制形式）或 `null` |
+
+    这是对比较集合五组字段的直接展开：第 0 组=occurred_at，第 1 组=project_id，第 2、3 个元素=provider 与 model，第 4 个元素=六个指标，第 5、6 个元素=status 与 duration_ms。
+
+    排除项（不参与比较，重传改变它们不算内容修正）：workspace/source 的认证表示、内部事件 UUID、`source_event_id` 身份本身、`received_at`、凭证、请求下标、JSON 字段顺序、对象空白。身份已由三字段唯一键确定。
+
+    ## 6.3 序列化规则（逐字符可复现）
+
+    1. 字符串为 UTF-8，无 BOM，**无首尾空白，无行尾换行**，任何位置都不出现无意义空白（`:` 与 `,` 后不加空格）。
+    2. 字符串转义遵循 RFC 8259 最小转义：`"` → `\"`，`\` → `\\`，U+0000–U+001F 控制字符用 `\b`、`\f`、`\n`、`\r`、`\t` 或 `\u00XX`（十六进制小写）；**不**转义 `/`；**不**把非 ASCII 字符转成 `\uXXXX`，直接写其 UTF-8 字节；不输出代理对转义。因为各字符串字段的入口校验已拒绝控制字符，实际可能出现转义的只剩 `"` 与 `\`。
+    3. 数字只写十进制整数：无前导零（`0` 本身除外）、无 `+`、无小数点、无指数、无 `-0`。
+    4. 缺失写 `null` 字面量，不省略。`usage` 对象中**六个指标全部出现**，客户端省略的指标在规范化时显式补成 `{"value":null,"quality":"missing"}`。
+    5. `usage` 内的键顺序固定为 `input_tokens`、`output_tokens`、`total_tokens`、`cache_read_tokens`、`cache_write_tokens`、`reasoning_tokens`；每个指标对象内的键顺序固定为 `value`、`quality`。
+    6. 摘要 = 对整个规范化文本的 UTF-8 字节做 SHA-256，取 32 字节原始输出。
+
+    ## 6.4 测试向量（四组，均为实算）
+
+    下面的文本可直接逐字符复制后用 `printf '%s' '<文本>' | shasum -a 256` 复现。这些向量只含 ASCII 可打印字符，因此不涉及“非 ASCII 是否转义”的差异；复现时**不要**带上行尾换行。
+
+    ### 向量 A：偏移等价（不同偏移、同一摘要）
+
+    请求 a1 的 `occurred_at` 写作 `2026-10-27T14:00:00Z`，请求 a2 写作 `2026-10-27T07:00:00-07:00`，其余内容相同，两者规范化文本相同：
+
+    ```
+    ["2026-10-27T14:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",1250]
+    ```
+
+    SHA-256：`66311d0f0854f50184e40db98ea8bc0f086c470b1dd0817eb512fdb17cbdc121`
+
+    该事件省略了 `total_tokens`，输入 100 与输出 20 均 known，故补出 `{"value":120,"quality":"known"}`；省略的三个指标补成 missing（规则见第 6.6 节）。
+
+    ### 向量 B：字段顺序等价与 UUID 大小写等价
+
+    同一个事件的两种 JSON 写法（键顺序不同、`project_id` 大小写不同、`duration_ms` 一次显式写 `null` 一次省略）：
+
+    ```
+    {"events":[{"source_event_id":"req-b1","duration_ms":null,"status":"success","usage":{"reasoning_tokens":{"quality":"known","value":50},"cache_read_tokens":{"value":400,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"input_tokens":{"value":1000,"quality":"known"}},"occurred_at":"2026-10-26T23:30:00.123456Z","model":"example-model","provider":"example-provider","project_id":"0199A0B0-0000-7000-8000-00000000000A","source_event_id":"req-b1"}]}
+    ```
+
+    ```
+    {"events":[{"source_event_id":"req-b1","project_id":"0199a0b0-0000-7000-8000-00000000000a","provider":"example-provider","model":"example-model","occurred_at":"2026-10-26T23:30:00.123456Z","usage":{"input_tokens":{"value":1000,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"cache_read_tokens":{"value":400,"quality":"known"},"reasoning_tokens":{"value":50,"quality":"known"}},"status":"success"}]}
+    ```
+
+    两者规范化文本相同（`total_tokens` 由 1000 known 与 250 estimated 补为 1250 estimated）：
+
+    ```
+    ["2026-10-26T23:30:00.123456Z","0199a0b0-0000-7000-8000-00000000000a","example-provider","example-model",{"input_tokens":{"value":1000,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"total_tokens":{"value":1250,"quality":"estimated"},"cache_read_tokens":{"value":400,"quality":"known"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":50,"quality":"known"}},"success",null]
+    ```
+
+    SHA-256：`538702154d0bc75b274ecb4e70bfc7ec6241a2029d9c07dff6b68e0242ba3e3e`
+
+    ### 向量 C：真实零与缺失不同（C1 与 C2）
+
+    C1 是输入 token 的**真实零**（`{"value":0,"quality":"known"}`），C2 是同一字段**缺失**（省略），两者摘要必须不同：
+
+    ```
+    ["2026-10-27T00:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":0,"quality":"known"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,0]
+    ```
+
+    C1 SHA-256：`fc31a256fba11fc95019164f220e4b47f6673d924c1135c0a57b3117ac841c89`
+
+    ```
+    ["2026-10-27T00:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":null,"quality":"missing"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,0]
+    ```
+
+    C2 SHA-256：`48a0d3828e2b02476e0fb61998b81019821041d605f9f180aea49015a86ce816`
+
+    C2 说明“全部指标缺失”仍是合法事件（计事件数，用量显示不可用），不是零用量事件。C1 与 C2 之外，“估算零”（`{"value":0,"quality":"estimated"}`）与上述两者又都不同。
+
+    ### 向量 D：estimated 与 known 不同（D1 与 D2）
+
+    同一事件的 `cache_read_tokens` 一处为 known、一处为 estimated，值同为 60，摘要必须不同：
+
+    ```
+    ["2026-10-27T12:00:00.500000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"known"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",900]
+    ```
+
+    D1 SHA-256：`033249310b0dcc7b79b675f99fce10e320761e5ba84120a873ddaf9fab1229cf`
+
+    ```
+    ["2026-10-27T12:00:00.500000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"estimated"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",900]
+    ```
+
+    D2 SHA-256：`b488e38a6331fcb575c37af32bfbadcbbde4b6d7f037cb81ca4e5d3e5a6a61d4`
+
+    ## 6.5 版本与跨版本比较
+
+    - **同版本**先比较 SHA-256：相同 → `duplicate`；不同 → `conflict`。
+    - **不同版本**不得直接比较摘要。只有当实际留存的列能**无损重建**某个共同版本的全部比较字段时，才重建那个版本的规范化内容再比较。
+    - 若有损升级使共同版本无法重建，必须明确返回永久 `NORMALIZATION_INCOMPATIBLE`，不能误报 `duplicate` 或 `conflict`。
+    - 旧客户端仍走原 v1 路径重传，直至事件超过 180 天窗口；实现升级不得让旧 v1 重传被误判。
+    - 未来版本只有在书面说明映射与兼容限制后才能发布；本任务不预建双哈希，也不保存原始报文。
+
+    ## 6.6 指标归一化五条规则
+
+    这五条都是**跨字段**规则，只能由实现执行（JSON Schema 无法表达）：
+
+    1. `cache_read_tokens`、`cache_write_tokens` 是输入子集，`reasoning_tokens` 是输出子集，**不另加到 total**。父项与子项均为 known 且子项大于父项时，该项永久拒绝（`USAGE_UNSUPPORTED`）；涉及 estimated 时不因大小关系不成立而拒绝；父项缺失时不据子项反推父项。
+    2. 输入与输出均有数值且省略 total 时，由服务端按两者之和补出 total；两者均 known 时推导质量为 known，否则为 estimated。显式 total 保留其独立值与质量；仅当输入、输出、total 均为 known 时，total 不等于两者之和才拒绝（`USAGE_UNSUPPORTED`）。涉及 estimated 时不因精确等式或质量不同而拒绝。
+    3. 输入或输出至少一个缺失时，可保留来源提供且口径可比的 total 及其质量；不能从 total 反推输入/输出，也不能把唯一已知分量当成完整 total。
+    4. 加法或字段值超出 `2^53-1 = 9007199254740991` 为永久 `USAGE_OVERFLOW`，不截断、不转浮点。省略 total 时的求和也受此限。
+    5. 全部指标缺失仍可接受该事件并计事件数，但所有用量显示不可用；这不是零用量事件。
+
+    合法/非法对照（均为逐项判定，不影响同批其他项）：
+
+    | 情形 | 输入 | 结论 |
+    |---|---|---|
+    | 输入与输出均 known、省略 total | in=100 known, out=20 known | 合法，total=120 known |
+    | 输入 known、输出 estimated、省略 total | in=100 known, out=250 estimated | 合法，total=350 estimated |
+    | 显式 total 与推导值一致且三者 known | in=100, out=20, total=120 均 known | 合法 |
+    | 三者均 known 但等式不成立 | in=100, out=20, total=130 均 known | 非法，`USAGE_UNSUPPORTED` |
+    | 父项 estimated、子项 known 且更大 | in=50 estimated, cache_read=60 known | 合法（涉及 estimated 不比大小） |
+    | 两者均 known 且子项更大 | in=50 known, cache_read=60 known | 非法，`USAGE_UNSUPPORTED` |
+    | 仅提供 total | in 缺失, out 缺失, total=500 known | 合法，保留 total，不反推 in/out |
+    | 求和溢出 | in=9007199254740991 known, out=9007199254740991 known，省略 total | 非法，`USAGE_OVERFLOW` |
+    | 全部缺失 | usage 为空对象 | 合法，用量不可用，不是零用量 |
+    | 真实零不是缺失 | in=0 known | 合法，与 in 缺失不同内容 |
+    | 估算零不是真实零 | in=0 estimated | 合法，与 in=0 known 不同内容 |
+
+    # 7. 逐项响应
+
+    - 已完整解析并处理的批次**一律返回 HTTP 200**，不用 207。`accepted` 表示原始事件与分钟增量已**同步提交**，不是“已入队”。逐项业务拒绝不代表整个 HTTP 请求失败。
+    - 响应含不透明 `request_id` 与 `results`；`results` 与输入 `events` **等长**、按输入顺序排列，`index` 从 0 开始。不能只按 `source_event_id` 组装结果，否则同批重复 ID 会互相覆盖。
+    - 六种逐项状态：
+
+    | 状态 | 含义 | 持久化 / 客户端动作 |
+    |---|---|---|
+    | `accepted` | 本项原始事件与分钟增量均已确认提交 | 不要重发；不增加已提交项的计数以外的动作 |
+    | `duplicate` | 同身份、同规范化内容，没有新增计数 | 首次 `received_at` 不变，不延长保留；不要重发 |
+    | `conflict` | 同身份、不同规范化内容，永久拒绝 | 不覆盖、不修正桶；不要重发 |
+    | `expired` | 超出 180 天下界的永久拒绝，**先于**查重判断 | 即使原记录仍在也不返回 duplicate/conflict；不要重发 |
+    | `rejected` | 其他永久项拒绝，必须带稳定 `error.code` | 修正内容后重新生成身份，不要原样重试 |
+    | `retryable` | 可安全按原身份重试的本项失败 | 原身份原内容重试；Commit 结果不明也只能用它 |
+
+    - `rejected` 的 `error.code` 只能是：`INVALID_ARGUMENT`、`FUTURE_EVENT`、`PROJECT_INVALID`、`USAGE_UNSUPPORTED`、`USAGE_OVERFLOW`、`NORMALIZATION_INCOMPATIBLE`。
+    - `retryable` 的 `error.code` 只能是：`UNAVAILABLE`、`INTERNAL`、`DEADLINE_EXCEEDED`。
+    - `error.message` 只供人读，**不作为分支依据**，且不包含 SQL、堆栈、凭证、事件原文或跨空间资源信息。
+    - 本项永久无效不能影响同批其他项；每项在独立事务内处理，失败只回滚本项。
+
+    # 8. 处理期限耗尽的填法与断连重传
+
+    - 处理预算为**从 handler 开始最多 8 秒**（见第 9 节）。期限到达时若仍能写响应：已得出确定性结论的项给真实状态，**未开始或结论不确定**的项全部给 `retryable` + `DEADLINE_EXCEEDED`。绝不为了凑满结果而写 `accepted`。
+    - 已开始但未确认 Commit 的项同样只能是 `retryable/DEADLINE_EXCEEDED`，不得声称已回滚。
+    - 若连接已断开或响应写入失败：客户端**用原批次、原身份、原内容整批重传**。唯一身份会把已提交项解析为 `duplicate`，未提交项重新处理；已提交的事实不会因为响应失败而改变。
+
+    # 9. 限额
+
+    | 限额 | 值 | 超限动作 |
+    |---|---|---|
+    | 每批事件数 | 1–100 | 0 项或超过 100 项 → 整批 `400 INVALID_ARGUMENT`，无写入 |
+    | 请求体大小 | ≤ 1 MiB（1048576 字节） | `413 BODY_TOO_LARGE`，无写入；拆小批次 |
+    | 单请求处理预算 | 从 handler 开始 ≤ 8 秒 | 按第 8 节逐项填 `DEADLINE_EXCEEDED` |
+    | 每 source 每秒请求数 | 首版不设进程内或分布式限流器 | 无 |
+
+    8 秒小于现有 HTTP 写期限 `internal/server/server.go` 中的 `WriteTimeout = 10 * time.Second`，用于尽量留下写逐项响应的时间；**它不是吞吐保证**。首版没有峰值、并发或吞吐量测，因此本文不写任何性能数字，也不承诺吞吐。
+
+    # 10. 查询侧共同限额（供 T-023 使用）
+
+    T-023 在自己新增的查询路径中必须采用以下数值，不得另定一套：
+
+    - 历史统计最多查 **13 个日历月**，且不得早于实际保留截点。
+    - 统一左闭右开区间 `[start, end)`。带秒的历史范围**明确拒绝**，不静默对齐到整分钟。
+    - 每次趋势查询最多 **1000 个时间桶**。超过时返回稳定错误码 `TOO_MANY_POINTS`，并附允许上限与 T-023 支持的粒度中满足上限的**最细建议粒度**；没有可用粒度时提示缩短范围。**不得服务端静默改粒度。**
+    - 请求明细分页默认 **50**、最大 **200**；明细仍受 180 天实际数据保留限制，不能因为分钟统计可查 13 个月就承诺明细可查 13 个月。
+    - 查询侧不定每秒请求数（RPS）与并发数：PRD 的并发查询量与性能环境尚未确认，未量测前写数字只会形成虚假保证。
+
+    # 11. 检查分工：schema 能表达什么，实现必须补什么
+
+    **JSON Schema（本文 `components/schemas`）能表达，实现必须真的启用**：未知字段拒绝（`additionalProperties: false`，注意第 3 节的判定粒度）、必填项、类型、数值上下界、数组长度上下界、字符串长度上限（按字符计）、正则形态（控制字符、UUID、时间格式）、用量三态 `oneOf`、逐项状态与 `error` 的配对、`error.code` 枚举。
+
+    **只能由实现执行（schema 无法表达）**：
+
+    1. 重复 JSON 键检测（任何层级）。
+    2. 字符串长度按 **UTF-8 字节**计（schema 的 `minLength`/`maxLength` 按字符计；`maxLength: 256` 只挡住码点数超限，不挡住 100 个汉字=300 字节这类情况）。
+    3. JSON 数字**词法**：必须写十进制整数形式；`1.0`、`1e2`、`"100"`、`-0` 一律拒绝。注意 `1.0` 在 JSON Schema 的 `integer` 判定下是合法整数（数学值为整），所以这条只能按原始词法检查。
+    4. 时间解析：日历合法性、偏移范围、闰秒、超过 6 位小数秒。
+    5. 第 6.6 节的五条指标归一化规则（子集大小、total 推导与等式、溢出、全缺失仍计事件数）。
+    6. 项目归属与跨空间校验（`PROJECT_INVALID`），不能降级为 `null`。
+    7. 时间窗口与第 5.3 节采样点、`expired` 先于查重。
+    8. 每项独立事务、提交后才 `accepted`、Commit 结果不明只能 `retryable`。
+    9. 规范化序列化与 SHA-256 摘要、同版本比较、跨版本无损重建与 `NORMALIZATION_INCOMPATIBLE`。
+    10. `Content-Type` 校验（`415`）、请求体字节上限（`413`）、8 秒处理预算与逐项 `DEADLINE_EXCEEDED`。
+    11. 认证与身份来源（只认 `Authorization: Bearer`，不回退 Cookie）。
+
+    # 12. 示例索引
+
+    请求示例与响应示例按**同名**配对，说明它们属于同一次请求：
+
+    | 示例名 | 覆盖内容 |
+    |---|---|
+    | `mixed-batch` | 混合批次：六种逐项状态各一 |
+    | `duplicate-source-event-id` | 同批重复 ID：结果仍等长、下标稳定 |
+    | `missing-zero-estimated` | 缺失、真实零、估算零 |
+    | `total-only` | 仅提供 total |
+    | `cache-and-reasoning-subset` | 缓存/推理子集合法、求和溢出与 total 等式非法 |
+    | `batch-error-invalid-argument` | 整批错误（400） |
+    | `deadline-exhausted` | 处理期限耗尽的逐项填法 |
+
+servers:
+  - url: /
+    description: 同源入口。路径本身已含 `/api`，部署时由入口把 `/api` 路由到服务端，浏览器页面与 API 必须同源。
+
+tags:
+  - name: ingestion
+    description: '插件凭证认证的同步批量采集端点。只接受 `Authorization: Bearer`，不回退 Cookie。'
+
+paths:
+  /api/v1/ingestion/events:
+    post:
+      tags:
+        - ingestion
+      operationId: ingestUsageEvents
+      summary: 同步批量提交请求级用量事件
+      description: |
+        提交一批已经完成的请求事件。URI 的 `v1` 就是外部格式主版本，请求体不放 `format_version`。
+
+        **整批阶段（写入前，统一返回整批错误）**：校验 `Content-Type`、凭证与采集权限、请求体字节上限、JSON 可无歧义解析（含重复键）、外壳未知字段、事件条数（1–100）。任一失败时整批无写入。
+
+        **逐项阶段（每项独立事务）**：按输入顺序逐项校验格式、项目归属、时间窗口与用量归一化；通过后尝试以 `(workspace_id, source_id, source_event_id)` 唯一性插入。过期判断必须在任何用于 duplicate/conflict 的业务身份查询之前。首次插入成功时在同一事务内写分钟增量；整个事务 Commit 确认成功后才写 `accepted`。身份已存在时按第 6.5 节规则产生 `duplicate` 或 `conflict`，两者都不增加统计、不覆盖事件、不延长保留。
+
+        批次处理完成（或 8 秒预算耗尽）后一次输出逐项结果，HTTP 一律 200。同一请求内有多条整批错误同时成立时返回哪一条，本文不冻结；但任一情况都不得产生写入。
+
+        客户端必须忽略响应中新增的字段，服务端必须拒绝未知请求字段。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        description: |
+          请求体为 UTF-8 编码的 `application/json`，顶层只有 `events`。外壳未知字段整批拒绝。
+
+          事件对象的字段语义、范围与是否参与规范化见 `UsageEvent` 的说明；用量三态与归一化规则见 `UsageObject`、`MetricValue` 与 `info.description` 第 6.6 节。
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestionBatchRequest'
+            examples:
+              mixed-batch:
+                $ref: '#/components/examples/MixedBatchRequest'
+              duplicate-source-event-id:
+                $ref: '#/components/examples/DuplicateSourceEventIdRequest'
+              missing-zero-estimated:
+                $ref: '#/components/examples/MissingZeroEstimatedRequest'
+              total-only:
+                $ref: '#/components/examples/TotalOnlyRequest'
+              cache-and-reasoning-subset:
+                $ref: '#/components/examples/CacheAndReasoningSubsetRequest'
+      responses:
+        '200':
+          description: |
+            批次已完整解析并逐项处理。`Content-Type: application/json; charset=utf-8`。
+
+            `results` 与输入 `events` 等长、按输入顺序、`index` 从 0 开始。逐项业务拒绝不影响其他项，也不让整个 HTTP 请求失败。处理期限耗尽（8 秒）时未开始或结论不确定的项一律填 `retryable` + `DEADLINE_EXCEEDED`，不写 `accepted`。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionBatchResponse'
+              examples:
+                mixed-batch:
+                  $ref: '#/components/examples/MixedBatchResponse'
+                duplicate-source-event-id:
+                  $ref: '#/components/examples/DuplicateSourceEventIdResponse'
+                missing-zero-estimated:
+                  $ref: '#/components/examples/MissingZeroEstimatedResponse'
+                total-only:
+                  $ref: '#/components/examples/TotalOnlyResponse'
+                cache-and-reasoning-subset:
+                  $ref: '#/components/examples/CacheAndReasoningSubsetResponse'
+                deadline-exhausted:
+                  $ref: '#/components/examples/DeadlineExhaustedResponse'
+        '400':
+          description: |
+            `INVALID_ARGUMENT`：JSON 无法解析、任何层级出现重复 JSON 键、外壳未知字段、`events` 为空数组、事件条数超过 100，或请求体不是可无歧义解析的 UTF-8 JSON。整批无写入；修正请求后重发，不盲目重试。
+
+            注意：**事件对象内**的未知字段不是整批错误，而是该项 `rejected/INVALID_ARGUMENT`（此时整体仍是 200）。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BatchErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        properties:
+                          code:
+                            const: INVALID_ARGUMENT
+              examples:
+                batch-error-invalid-argument:
+                  $ref: '#/components/examples/BatchErrorInvalidArgument'
+        '401':
+          description: |
+            `UNAUTHENTICATED`：缺少 `Authorization: Bearer`、令牌格式错误、令牌不存在或已撤销。整批无写入。只携带有效浏览器 Cookie 也不能通过（插件端点不回退 Cookie）。按 T-010 更新凭证；不要重试同一令牌。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BatchErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        properties:
+                          code:
+                            const: UNAUTHENTICATED
+        '403':
+          description: |
+            `PERMISSION_DENIED`：已认证但该凭证没有采集权限。整批无写入；不要自动重试，需 owner 侧调整。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BatchErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        properties:
+                          code:
+                            const: PERMISSION_DENIED
+        '413':
+          description: |
+            `BODY_TOO_LARGE`：请求体超过 1 MiB（1048576 字节）。整批无写入；拆小批次后重发。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BatchErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        properties:
+                          code:
+                            const: BODY_TOO_LARGE
+        '415':
+          description: |
+            `UNSUPPORTED_MEDIA_TYPE`：`Content-Type` 不是 `application/json`。整批无写入；修正 `Content-Type` 后重发。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BatchErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        properties:
+                          code:
+                            const: UNSUPPORTED_MEDIA_TYPE
+        '500':
+          description: |
+            `INTERNAL`：在开始形成任何逐项结果之前的服务端故障。此时不能据此断定没有已提交项；用原身份原内容重试，唯一身份会把已提交项解析为 `duplicate`。
+
+            若故障发生在已经开始逐项处理之后，则仍返回 200，把受影响项写成 `retryable/INTERNAL` 或 `retryable/UNAVAILABLE`，不要用整批 500 覆盖已经得出的逐项结论。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BatchErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        properties:
+                          code:
+                            const: INTERNAL
+        '503':
+          description: |
+            `UNAVAILABLE`：在开始形成任何逐项结果之前的依赖故障（例如数据库不可用）。整批无写入。用原身份原内容重试；不能据此断定没有已提交项。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BatchErrorResponse'
+                  - type: object
+                    properties:
+                      error:
+                        properties:
+                          code:
+                            const: UNAVAILABLE
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: tpk_<随机串>
+      description: |
+        插件接入凭证。令牌形如 `tpk_` + 随机串，由 T-010 签发；随机部分长度由签发方决定，客户端与本文都不硬编码它。
+
+        认证成功即固定 `workspace_id` 与 `source_id`，身份只从认证取得，请求载荷中不得出现它们。令牌只以摘要形式存储，明文只在签发/轮换响应中出现一次；本文不描述签发、轮换、撤销路径。
+
+        请求只接受 `Authorization: Bearer <token>`；不回退 Cookie；没有该头、格式错误、已撤销统一返回 `401 UNAUTHENTICATED`，不泄露具体原因。
+
+  schemas:
+    IngestionBatchRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - events
+      properties:
+        events:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: |
+            事件数组，保持输入顺序；响应结果按这里的下标对应。
+
+            长度 1–100（含）。空数组整批拒绝（`400 INVALID_ARGUMENT`），超过 100 项同样整批拒绝——不是只处理前 100 项。同一批内允许出现相同的 `source_event_id`，此时按输入下标分别给出结果，不得合并。
+          items:
+            $ref: '#/components/schemas/UsageEvent'
+      description: |
+        请求外壳：顶层只有 `events`。`workspace_id`、`source_id`、凭证 ID、`received_at`、`format_version` 都不能出现在这里，出现即整批 `400 INVALID_ARGUMENT`。
+
+        任何层级的重复 JSON 键、无法无歧义解析的 JSON 都是整批拒绝（这是实现检查，schema 表达不了）。
+
+    UsageEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - source_event_id
+        - provider
+        - model
+        - occurred_at
+        - usage
+      properties:
+        source_event_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F\u0080-\u009F]+$'
+          description: |
+            来源侧稳定事件 ID，与认证得到的 workspace/source 共同构成事件身份 `(workspace_id, source_id, source_event_id)`。
+
+            - 不透明，**逐字节比较**：不做大小写折叠、不做空白 trim、不做 Unicode 归一化。
+            - 长度 1–256 个 **UTF-8 字节**（不是字符数）。`maxLength: 256` 只按字符挡住超限，字节校验由实现执行；100 个汉字（300 字节）是非法值。
+            - 拒绝 NUL 与控制字符（U+0000–U+001F、U+007F、U+0080–U+009F），见 `pattern`。
+            - 同一稳定 source 内不得复用该 ID。
+            - 不参与规范化比较：身份已由唯一键确定，重传改变它就不是同一个事件。
+
+            校验方式：schema（类型、字符长度、字符集）+ 实现（UTF-8 字节长度）。
+        project_id:
+          type:
+            - string
+            - 'null'
+          pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          description: |
+            未归属项目即省略或写 `null`，两种表示等价，含义都是“未归属”。
+
+            非空时必须是带连字符的 UUID，大小写均可；存储与比较统一为**小写**。非法、跨 workspace 或不可用的项目必须拒绝（`PROJECT_INVALID`），不能降级为 `null`——用未归属掩盖越权是错误的。项目的生成与注册规则属 T-044，本文不定义。
+
+            参与规范化：第 1 个元素，写小写 UUID 或 `null`。
+
+            校验方式：schema（UUID 形态）+ 实现（归属与可用性）。
+        provider:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[^\u0000-\u001F\u007F\u0080-\u009F]+$'
+          not:
+            pattern: '^\s|\s$'
+          description: |
+            Provider 名称，必填。
+
+            - 1–128 个 **UTF-8 字节**；空值、首尾空白、控制字符均拒绝。
+            - 保留大小写，**不做**别名合并、trim 或 Unicode 归一化；`OpenAI` 与 `openai` 是两个不同内容。
+            - 参与规范化：第 2 个元素，原样字节字符串。
+
+            校验方式：schema（类型、字符长度、无控制字符、无首尾空白）+ 实现（UTF-8 字节长度）。
+        model:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[^\u0000-\u001F\u007F\u0080-\u009F]+$'
+          not:
+            pattern: '^\s|\s$'
+          description: |
+            模型标识，必填。规则与 `provider` 相同：1–128 UTF-8 字节、拒绝空值与首尾空白与控制字符、保留大小写、不做别名合并或归一化。
+
+            参与规范化：第 3 个元素，原样字节字符串。
+        occurred_at:
+          type: string
+          format: date-time
+          pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-5][0-9](?:\.[0-9]{1,6})?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})$'
+          description: |
+            请求最终完成的时刻。不得用采集、上传或接收时间替代。
+
+            - 必填 RFC 3339 时间字符串，**必须带偏移**（`Z` 或 `±HH:MM`）。小写 `t`/`z` 按 RFC 3339 接受。
+            - 小数秒最多 6 位；超过 6 位拒绝（不舍入、不截断）。秒值 `60`（闰秒）被 `pattern` 拒绝。没有偏移的本地时间被 `pattern` 拒绝。
+            - 解析后统一折算为 **UTC 微秒**。`2026-10-27T14:00:00Z` 与 `2026-10-27T07:00:00-07:00` 规范化后相同。
+            - 日历上不存在的日期（如 2 月 30 日）与超出范围的偏移由实现拒绝（`INVALID_ARGUMENT`）。
+            - 有效窗口 `[T - 180×24h, T]` 两端包含，时钟偏差 0 秒：下界之前 → `expired`；`T` 之后 → `rejected/FUTURE_EVENT`。完整规则、采样点与七组边界样例见 `info.description` 第 5 节。
+            - 参与规范化：第 0 个元素，写 `YYYY-MM-DDTHH:MM:SS.ffffffZ`（固定 6 位小数秒、始终 `Z`）。
+
+            校验方式：schema（`pattern` 的形态检查；`format` 在 3.1 里默认只是注解，不构成强制断言）+ 实现（解析、日历合法性、偏移范围、窗口判断）。
+        usage:
+          $ref: '#/components/schemas/UsageObject'
+        status:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+          maxLength: 64
+          pattern: '^[^\u0000-\u001F\u007F\u0080-\u009F]+$'
+          description: |
+            请求状态，可省略或为 `null`（含义：来源不提供）。
+
+            非空时为 1–64 个 UTF-8 字节的字符串。首版**不透明保存**：不发明平台状态映射，不做大小写或空白归一化。
+
+            参与规范化：第 5 个元素，原样字节字符串或 `null`；省略等价于 `null`。
+
+            校验方式：schema（类型、字符长度、无控制字符）+ 实现（UTF-8 字节长度）。
+        duration_ms:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+          maximum: 9007199254740991
+          description: |
+            请求耗时（毫秒），可省略或为 `null`（含义：未知）。非空时为 `[0, 2^53-1]` 的十进制整数；**`0` 是真实零，`null` 是未知**，两者不同。
+
+            必须是 JSON number 的十进制整数形式：`1.0`、`1e3`、`"1000"`、`-0` 一律拒绝（这是实现按原始词法检查）。
+
+            参与规范化：第 6 个元素，整数字面量或 `null`；省略等价于 `null`。
+
+            校验方式：schema（类型与数值范围）+ 实现（数字词法）。
+      description: |
+        单个用量事件。必填 5 项：`source_event_id`、`provider`、`model`、`occurred_at`、`usage`；可选 3 项：`project_id`、`status`、`duration_ms`。
+
+        | 字段 | 必填 | 类型与形式 | 范围 | 缺省/空值含义 | 参与规范化 |
+        |---|---|---|---|---|---|
+        | `source_event_id` | 是 | UTF-8 字符串，不透明，逐字节比较 | 1–256 字节，拒绝 NUL 与控制字符 | 无缺省 | 否（它是身份的一部分，不算内容） |
+        | `project_id` | 否 | 带连字符 UUID 字符串 或 `null` | UUID 形态，大小写均可 | 省略与 `null` 同为“未归属” | 是（小写 UUID 或 `null`） |
+        | `provider` | 是 | UTF-8 字符串 | 1–128 字节，拒绝空值/首尾空白/控制字符，保留大小写 | 无缺省 | 是（原样字节） |
+        | `model` | 是 | UTF-8 字符串 | 1–128 字节，拒绝空值/首尾空白/控制字符，保留大小写 | 无缺省 | 是（原样字节） |
+        | `occurred_at` | 是 | RFC 3339 时间字符串，必须带偏移 | 最多 6 位小数秒，拒超精度/闰秒/无偏移 | 无缺省 | 是（UTC、固定 6 位小数、`Z`） |
+        | `usage` | 是 | 对象，六个指标可选 | 见 `UsageObject` | 允许六个指标全缺失 | 是（补全为六指标完整对象） |
+        | `status` | 否 | UTF-8 字符串 或 `null` | 1–64 字节，拒绝空值/控制字符 | 省略与 `null` 同为“来源不提供” | 是（原样字节或 `null`） |
+        | `duration_ms` | 否 | 十进制整数 或 `null` | `[0, 2^53-1]`，`0` 是真实零 | 省略与 `null` 同为“未知” | 是（整数或 `null`） |
+
+        所有字符串长度都按 **UTF-8 字节**校验，不是字符数。事件内出现未知字段时，该项永久 `rejected/INVALID_ARGUMENT`，同批其他项照常处理。
+
+    UsageObject:
+      type: object
+      additionalProperties: false
+      properties:
+        input_tokens:
+          $ref: '#/components/schemas/MetricValue'
+        output_tokens:
+          $ref: '#/components/schemas/MetricValue'
+        total_tokens:
+          $ref: '#/components/schemas/MetricValue'
+        cache_read_tokens:
+          $ref: '#/components/schemas/MetricValue'
+        cache_write_tokens:
+          $ref: '#/components/schemas/MetricValue'
+        reasoning_tokens:
+          $ref: '#/components/schemas/MetricValue'
+      description: |
+        用量对象，必填；六个指标都**可以省略**（因为最终请求仍可能已发生但没有可用用量），但可选不等于可以随便写成别的组合。
+
+        六个指标固定为 `input_tokens`、`output_tokens`、`total_tokens`、`cache_read_tokens`、`cache_write_tokens`、`reasoning_tokens`；每个只用 `{value, quality}` 三态之一（known / estimated / missing），其他组合非法，见 `MetricValue`。
+
+        - `cache_read_tokens`、`cache_write_tokens` 是 **输入子集**，`reasoning_tokens` 是**输出子集**，都不另加到 total。子集重复累加到总量是错误做法。
+        - 省略某个指标与写 `{"value":null,"quality":"missing"}` 等价。
+        - 每指标独立判断质量，禁止用一个全局质量标记覆盖全部字段。
+        - 归一化五条规则（子集大小、total 推导与等式、溢出、全缺失仍计事件数）见 `info.description` 第 6.6 节，全部由实现执行，无法用 schema 表达。
+
+        规范化时本对象固定为第 4 个元素，键顺序固定，六个指标全部出现。
+
+    MetricValue:
+      oneOf:
+        - title: known
+          type: object
+          additionalProperties: false
+          required:
+            - value
+            - quality
+          properties:
+            value:
+              type: integer
+              minimum: 0
+              maximum: 9007199254740991
+              description: 实测或来源确认的真实值，`0` 是**真实零**。必须是十进制整数形式。
+            quality:
+              const: known
+              description: 质量标记，固定为 `known`。
+          description: 实测值：`{"value":N,"quality":"known"}`。
+        - title: estimated
+          type: object
+          additionalProperties: false
+          required:
+            - value
+            - quality
+          properties:
+            value:
+              type: integer
+              minimum: 0
+              maximum: 9007199254740991
+              description: 估算值，必填且非负；**估算零不等于真实零**。必须是十进制整数形式。
+            quality:
+              const: estimated
+              description: 质量标记，固定为 `estimated`。
+          description: 估算值：`{"value":N,"quality":"estimated"}`。
+        - title: missing
+          type: object
+          additionalProperties: false
+          required:
+            - value
+            - quality
+          properties:
+            value:
+              type: 'null'
+              description: 缺失时 `value` 必须是 `null`，不得带任何数值。
+            quality:
+              const: missing
+              description: 质量标记，固定为 `missing`。
+          description: 缺失：`{"value":null,"quality":"missing"}`。
+      description: |
+        单个指标的三种合法形态，仅此三种：
+
+        | 形态 | 含义 | 非法写法 |
+        |---|---|---|
+        | `{"value":N,"quality":"known"}` | 实测值，N 为 `[0, 2^53-1]` 十进制整数，`0` 是真实零 | 缺 `value`、`value` 为 `null`、用其他质量词 |
+        | `{"value":N,"quality":"estimated"}` | 估算值，N 必填且非负 | 同上；估算零不是真实零 |
+        | `{"value":null,"quality":"missing"}` | 缺失；整个指标省略与此写法等价 | 给 missing 带数值、缺 `value` |
+
+        其他组合（未知质量词、known/estimated 缺值、missing 带数值、额外字段）都不合法：schema 的 `oneOf` + `additionalProperties: false` 能挡住结构与质量词，但 **JSON 数字词法**（`1.0`、`1e2`、`"100"`、`-0`）与是否溢出只能由实现检查。
+
+    IngestionBatchResponse:
+      type: object
+      required:
+        - request_id
+        - results
+      properties:
+        request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: 不透明、服务端生成，仅用于日志关联；不用于授权，也不是业务身份。整批错误响应里同样出现。
+        results:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ItemResult'
+          description: |
+            逐项结果。与输入 `events` **等长**、按输入顺序排列，`index` 从 0 开始。
+
+            同一批里出现重复 `source_event_id` 时，每个下标各自给出结果，不得只按 ID 组装（否则会互相覆盖）。不得为了凑长度补 `accepted`。
+      description: |
+        HTTP 200 的逐项响应。批次已完整解析并逐项处理；逐项业务拒绝不代表整个 HTTP 请求失败，因此统一 200，不用 207。
+
+        六种状态与各自可用的 `error.code` 见 `ItemResultAccepted`、`ItemResultDuplicate`、`ItemResultConflict`、`ItemResultExpired`、`ItemResultRejected`、`ItemResultRetryable`。
+
+        响应对象本身允许未来新增字段（客户端必须忽略），因此这里不加 `additionalProperties: false`；`results` 的元素个数必须与输入 `events` 等长，这是实现要保证的跨字段约束，schema 的 `maxItems: 100` 只是数量上限。
+
+    ItemResult:
+      oneOf:
+        - $ref: '#/components/schemas/ItemResultAccepted'
+        - $ref: '#/components/schemas/ItemResultDuplicate'
+        - $ref: '#/components/schemas/ItemResultConflict'
+        - $ref: '#/components/schemas/ItemResultExpired'
+        - $ref: '#/components/schemas/ItemResultRejected'
+        - $ref: '#/components/schemas/ItemResultRetryable'
+      description: |
+        单条逐项结果，六种状态互斥：
+
+        - `accepted`：本项原始事件与分钟增量均已确认提交（不是入队）。
+        - `duplicate`：同身份、同规范化内容，没有新增计数，首次 `received_at` 不变。
+        - `conflict`：同身份、不同规范化内容，永久拒绝，不覆盖。
+        - `expired`：超出 180 天下界，先于查重判断，即使原记录仍在也不返回 duplicate/conflict。
+        - `rejected`：其他永久拒绝，必须带稳定 `error.code`（六选一）。
+        - `retryable`：可按原身份重试的本项失败，必须带 `error.code`（`UNAVAILABLE`、`INTERNAL`、`DEADLINE_EXCEEDED` 三选一）。Commit 结果不明也只能用它，不能写 accepted 或声称已回滚。
+
+        前四种状态**不得**带 `error`；后两种**必须**带 `error`。`error.message` 只供人读，不作为分支依据，不含 SQL、堆栈、凭证、事件原文或跨空间资源信息。
+
+    ItemResultBase:
+      type: object
+      required:
+        - index
+        - status
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          maximum: 99
+          description: 该结果对应输入 `events` 数组的下标，从 0 开始；同一批内不重复。
+        status:
+          type: string
+          description: 逐项状态。具体取值由各状态 schema 用 `const` 固定。
+      description: |
+        逐项结果的公共部分（`index` + `status`），供各状态 schema 组合使用，不在响应中单独出现。
+
+        **响应 schema 一律允许未来新增字段**（客户端必须忽略它们），因此这里不加 `additionalProperties: false`；严格拒绝未知字段只针对**请求**。响应中明确约定不允许出现的字段（例如 `accepted` 带 `error`）用 `not: required` 表达。
+
+    ItemResultAccepted:
+      allOf:
+        - $ref: '#/components/schemas/ItemResultBase'
+        - type: object
+          properties:
+            status:
+              const: accepted
+          not:
+            required:
+              - error
+      description: 本项已确认提交：原始事件与分钟增量在同一事务内提交成功，`accepted` 只在提交之后返回。
+    ItemResultDuplicate:
+      allOf:
+        - $ref: '#/components/schemas/ItemResultBase'
+        - type: object
+          properties:
+            status:
+              const: duplicate
+          not:
+            required:
+              - error
+      description: 同身份、同规范化内容；没有新增计数，首次 `received_at` 不变，不延长保留。
+    ItemResultConflict:
+      allOf:
+        - $ref: '#/components/schemas/ItemResultBase'
+        - type: object
+          properties:
+            status:
+              const: conflict
+          not:
+            required:
+              - error
+      description: |
+        同身份、不同规范化内容，永久拒绝；不覆盖事件、不修正分钟桶。
+
+        跨规范化版本时不直接比较摘要：仅当实际留存列能无损重建某一共同版本时才重建比较；无法重建时返回 `rejected/NORMALIZATION_INCOMPATIBLE`，而不是 `conflict`。
+    ItemResultExpired:
+      allOf:
+        - $ref: '#/components/schemas/ItemResultBase'
+        - type: object
+          properties:
+            status:
+              const: expired
+          not:
+            required:
+              - error
+      description: |
+        `occurred_at < T - 180×24h` 的永久拒绝，**先于**任何查重判断。即使原记录仍在也不返回 duplicate/conflict。下界之前不保存身份摘要。
+
+        被改过时间或复用 ID 的内容不承诺识别。
+    ItemResultRejected:
+      allOf:
+        - $ref: '#/components/schemas/ItemResultBase'
+        - type: object
+          required:
+            - error
+          properties:
+            status:
+              const: rejected
+            error:
+              allOf:
+                - $ref: '#/components/schemas/ItemError'
+                - type: object
+                  properties:
+                    code:
+                      enum:
+                        - INVALID_ARGUMENT
+                        - FUTURE_EVENT
+                        - PROJECT_INVALID
+                        - USAGE_UNSUPPORTED
+                        - USAGE_OVERFLOW
+                        - NORMALIZATION_INCOMPATIBLE
+      description: |
+        其他永久项错误，必须带稳定 `error.code`，取值含义：
+
+        | `error.code` | 含义 |
+        |---|---|
+        | `INVALID_ARGUMENT` | 该项格式不合法：未知字段、字节长度超限、数字不是十进制整数词法、时间形态或日历非法、超精度小数秒 |
+        | `FUTURE_EVENT` | `occurred_at > T`（时钟偏差 0 秒，不截断到 `T`） |
+        | `PROJECT_INVALID` | 项目非法、跨 workspace 或不可用；不得降级为未归属 |
+        | `USAGE_UNSUPPORTED` | 用量组合不合法：known 父项小于 known 子项、三者均 known 但 total 等式不成立、质量词或组合不受支持 |
+        | `USAGE_OVERFLOW` | 加法或字段值超出 `2^53-1`；不截断、不转浮点 |
+        | `NORMALIZATION_INCOMPATIBLE` | 跨版本比较时有损升级使共同版本无法重建，不能判 duplicate 或 conflict |
+
+        永久拒绝不要原样重试。
+    ItemResultRetryable:
+      allOf:
+        - $ref: '#/components/schemas/ItemResultBase'
+        - type: object
+          required:
+            - error
+          properties:
+            status:
+              const: retryable
+            error:
+              allOf:
+                - $ref: '#/components/schemas/ItemError'
+                - type: object
+                  properties:
+                    code:
+                      enum:
+                        - UNAVAILABLE
+                        - INTERNAL
+                        - DEADLINE_EXCEEDED
+      description: |
+        可按原身份、原内容重试的本项失败，必须带 `error.code`，取值仅三种：
+
+        | `error.code` | 含义 |
+        |---|---|
+        | `UNAVAILABLE` | 依赖暂时不可用（例如数据库或分钟增量写入失败） |
+        | `INTERNAL` | 其他服务端失败，含 Commit 结果不明；不得声称已回滚 |
+        | `DEADLINE_EXCEEDED` | 8 秒处理预算到达时该项未开始或结论不确定 |
+
+        重试使用同一 `source_event_id` 与同一内容；已提交过的项会被解析为 `duplicate`。
+    ItemError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: 稳定错误码。具体枚举按所属逐项状态限定，见 `ItemResultRejected` 与 `ItemResultRetryable`。
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: 只供人读的说明；**不作为分支依据**，不含 SQL、堆栈、凭证、事件原文或跨空间资源信息。
+      description: 逐项错误。`code` 供程序判断，`message` 只供人读。
+
+    BatchErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          $ref: '#/components/schemas/BatchError'
+      description: |
+        整批错误信封，形状为 `error` 对象内包含 `code`、`message`、`request_id` 与可选的 `details`。
+
+        响应对象允许未来新增字段（客户端必须忽略），因此这里不加 `additionalProperties: false`。
+
+    BatchError:
+      type: object
+      required:
+        - code
+        - message
+        - request_id
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_ARGUMENT
+            - UNAUTHENTICATED
+            - PERMISSION_DENIED
+            - BODY_TOO_LARGE
+            - UNSUPPORTED_MEDIA_TYPE
+            - INTERNAL
+            - UNAVAILABLE
+          description: |
+            整批错误码。对应的 HTTP 状态见各响应；本文档只用到七种：
+
+            | HTTP | `code` | 情况 |
+            |---|---|---|
+            | 400 | `INVALID_ARGUMENT` | JSON 无法解析、重复键、外壳字段/空数组/条数错误 |
+            | 401 | `UNAUTHENTICATED` | 凭证缺失或无效 |
+            | 403 | `PERMISSION_DENIED` | 已认证但无采集权限 |
+            | 413 | `BODY_TOO_LARGE` | 请求体超过 1 MiB |
+            | 415 | `UNSUPPORTED_MEDIA_TYPE` | 非 `application/json` |
+            | 500 | `INTERNAL` | 形成任何逐项结果之前的服务端故障 |
+            | 503 | `UNAVAILABLE` | 形成任何逐项结果之前的依赖故障 |
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: 只供人读；不含 SQL、堆栈、凭证、事件原文或跨空间资源信息。程序分支请用 `code`。
+        request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: 不透明、服务端生成，用于日志关联；整批被拒时也提供，便于对账。
+        details:
+          type: array
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/BatchErrorDetail'
+          description: 仅用于安全的字段/原因列表；没有可用信息时省略。不是错误原文，不含跨空间资源信息。
+      description: 整批错误体。整批错误意味着**没有写入任何事件**（500/503 除外：无法断定没有已提交项，须按原身份重试）。
+
+    BatchErrorDetail:
+      type: object
+      required:
+        - field
+        - reason
+      properties:
+        field:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: 出错的字段位置，用 JSON Pointer（RFC 6901）书写，例如 `/events/0/provider`、`/events`。
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: 安全的短原因标记，例如 `unknown_field`、`body_not_json`、`too_many_events`、`empty_events`；不包含 SQL 或堆栈。
+      description: 单条字段/原因说明。仅供定位与展示，程序分支请用整批 `error.code`。
+
+  examples:
+    MixedBatchRequest:
+      summary: 混合批次（六项，对应六种逐项状态）
+      description: |
+        示例时间基准固定为 `T = 2026-10-27T14:00:00Z`，因此 180 天下界为 `2026-04-30T14:00:00.000000Z`；真实请求按服务端当时的 `T` 判断。本示例符合 schema，其中第 4 项的 `1.0` 是刻意展示“schema 判为整数、实现必须拒绝”的数字词法案例（`rejected/INVALID_ARGUMENT` 属逐项结果，不影响整体 200）。
+
+        - 第 0 项：全新合法事件，预期 `accepted`。
+        - 第 1 项：与第 0 项同 `source_event_id`、规范化内容相同但键顺序不同，预期 `duplicate`。
+        - 第 2 项：服务端此前已有同身份、不同内容的事件（请求本身不携带该前提），预期 `conflict`。
+        - 第 3 项：`occurred_at` 早于下界，预期 `expired`。
+        - 第 4 项：`total_tokens.value` 写作 `1.0`，预期 `rejected/INVALID_ARGUMENT`。
+        - 第 5 项：合法内容，但处理时遇到依赖超时，预期 `retryable/UNAVAILABLE`。
+      value:
+        events:
+          - source_event_id: req-0001
+            project_id: 0199a0b0-0000-7000-8000-00000000000a
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T06:59:30.250000-07:00'
+            usage:
+              input_tokens:
+                value: 1200
+                quality: known
+              output_tokens:
+                value: 300
+                quality: known
+              cache_read_tokens:
+                value: 400
+                quality: known
+              reasoning_tokens:
+                value: 120
+                quality: known
+            status: success
+            duration_ms: 2400
+          - source_event_id: req-0001
+            model: example-model
+            provider: example-provider
+            occurred_at: '2026-10-27T13:59:30.250000Z'
+            status: success
+            duration_ms: 2400
+            project_id: 0199A0B0-0000-7000-8000-00000000000A
+            usage:
+              input_tokens:
+                quality: known
+                value: 1200
+              output_tokens:
+                quality: known
+                value: 300
+              reasoning_tokens:
+                quality: known
+                value: 120
+              cache_read_tokens:
+                quality: known
+                value: 400
+          - source_event_id: req-0003
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T04:00:00Z'
+            usage:
+              input_tokens:
+                value: 800
+                quality: known
+              output_tokens:
+                value: 90
+                quality: estimated
+            status: success
+            duration_ms: 700
+          - source_event_id: req-0004
+            project_id: null
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-04-29T13:59:59.999999Z'
+            usage:
+              input_tokens:
+                value: 10
+                quality: known
+            status: success
+            duration_ms: 0
+          - source_event_id: req-0005
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T13:00:00Z'
+            usage:
+              total_tokens:
+                value: 1.0
+                quality: known
+          - source_event_id: req-0006
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T13:59:59.500000Z'
+            usage:
+              input_tokens:
+                value: 42
+                quality: known
+            status: success
+    MixedBatchResponse:
+      summary: 混合批次的逐项结果（与请求示例同名配对）
+      description: 六项结果与请求示例逐下标对应：`accepted`、`duplicate`、`conflict`、`expired`、`rejected/INVALID_ARGUMENT`、`retryable/UNAVAILABLE`。
+      value:
+        request_id: 6a0f0c3e-8f4a-4d7e-9b1a-2c5d3e4f5a60
+        results:
+          - index: 0
+            status: accepted
+          - index: 1
+            status: duplicate
+          - index: 2
+            status: conflict
+          - index: 3
+            status: expired
+          - index: 4
+            status: rejected
+            error:
+              code: INVALID_ARGUMENT
+              message: numeric value must be written as a decimal integer
+          - index: 5
+            status: retryable
+            error:
+              code: UNAVAILABLE
+              message: temporarily unavailable
+    DuplicateSourceEventIdRequest:
+      summary: 同批重复 ID（内容相同，键顺序不同）
+      description: |
+        两项使用同一个 `source_event_id` 且规范化内容相同（只有字段顺序不同）。响应必须仍是两项、下标 0 与 1 各一条，不能只按 ID 组装而互相覆盖。第 0 项首次提交为 `accepted`，第 1 项因同身份同内容为 `duplicate`。
+      value:
+        events:
+          - source_event_id: req-dup-01
+            project_id: 0199a0b0-0000-7000-8000-00000000000b
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T05:00:00-07:00'
+            usage:
+              input_tokens:
+                value: 300
+                quality: known
+              output_tokens:
+                value: 60
+                quality: known
+            status: success
+            duration_ms: 800
+          - source_event_id: req-dup-01
+            occurred_at: '2026-10-27T12:00:00Z'
+            provider: example-provider
+            model: example-model
+            project_id: 0199A0B0-0000-7000-8000-00000000000B
+            duration_ms: 800
+            status: success
+            usage:
+              output_tokens:
+                quality: known
+                value: 60
+              input_tokens:
+                quality: known
+                value: 300
+    DuplicateSourceEventIdResponse:
+      summary: 同批重复 ID 的逐项结果
+      description: 响应与输入等长（2 项），`index` 稳定；重复 ID 没有合并成一条。
+      value:
+        request_id: 0b7d1e5a-3c9f-4a8b-9e2d-5f6a7b8c9d01
+        results:
+          - index: 0
+            status: accepted
+          - index: 1
+            status: duplicate
+    MissingZeroEstimatedRequest:
+      summary: 缺失、真实零、估算零
+      description: |
+        三项分别展示“输入 token 是真实零”“输入 token 是估算零且输出缺失”“六个指标全部省略”。三者都合法且互不相同：真实零与估算零的摘要不同，估算零与缺失也不同。
+      value:
+        events:
+          - source_event_id: req-zero-01
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T00:00:00Z'
+            usage:
+              input_tokens:
+                value: 0
+                quality: known
+            duration_ms: 0
+          - source_event_id: req-zero-02
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T00:00:00Z'
+            usage:
+              input_tokens:
+                value: 0
+                quality: estimated
+            duration_ms: 0
+          - source_event_id: req-zero-03
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T00:00:00Z'
+            usage: {}
+    MissingZeroEstimatedResponse:
+      summary: 三项均合法接受（用量可用性不同）
+      description: 第 2 项全部指标缺失仍然接受并计事件数，但用量显示不可用；它不是零用量事件。
+      value:
+        request_id: 9c1b2d3e-4f5a-4b6c-8d9e-0f1a2b3c4d5e
+        results:
+          - index: 0
+            status: accepted
+          - index: 1
+            status: accepted
+          - index: 2
+            status: accepted
+    TotalOnlyRequest:
+      summary: 仅提供 total
+      description: |
+        输入与输出都缺失，只提供 `total_tokens`。合法：保留来源的 total 及其质量，不反推输入/输出，也不把唯一已知分量当成完整 total。
+      value:
+        events:
+          - source_event_id: req-total-01
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T02:30:00Z'
+            usage:
+              total_tokens:
+                value: 500
+                quality: known
+            status: success
+    TotalOnlyResponse:
+      summary: 仅提供 total 的结果
+      value:
+        request_id: 1f2e3d4c-5b6a-4978-8a7b-6c5d4e3f2a1b
+        results:
+          - index: 0
+            status: accepted
+    CacheAndReasoningSubsetRequest:
+      summary: 缓存/推理子集与 total 推导：一项合法、三项跨字段非法
+      description: |
+        第 0 项：`cache_read_tokens` 400 是 `input_tokens` 1000 的 known 子集，`reasoning_tokens` 80 是 `output_tokens` 200 的 known 子集，子集不另加到 total；省略 total，由 1000 + 200 补为 1200 known。合法。
+
+        第 1 项：输入与输出都是 `2^53-1 = 9007199254740991` 且省略 total，按规则应补出的 total 超出上限，因此该项永久 `USAGE_OVERFLOW`（不截断、不转浮点）。
+
+        第 2 项：`input_tokens` 50 known 而 `cache_read_tokens` 60 known，known 子集大于 known 父项，永久 `USAGE_UNSUPPORTED`。（若父项是 estimated 则不比大小，属合法。）
+
+        第 3 项：输入 100、输出 20、total 130 **三者均为 known**，等式不成立，永久 `USAGE_UNSUPPORTED`。若 total 是 estimated，或输入/输出有任一非 known，则不因等式不成立而拒绝。
+
+        后三项的每个字段单独看都在 `maximum` 之内，所以都是**跨字段**非法：schema 通过，实现拒绝。这一组同时是“子集不重复累加”“total 推导与等式检查”的正反例。
+      value:
+        events:
+          - source_event_id: req-subset-01
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T03:00:00Z'
+            usage:
+              input_tokens:
+                value: 1000
+                quality: known
+              output_tokens:
+                value: 200
+                quality: known
+              cache_read_tokens:
+                value: 400
+                quality: known
+              cache_write_tokens:
+                value: 100
+                quality: known
+              reasoning_tokens:
+                value: 80
+                quality: known
+            status: success
+            duration_ms: 1500
+          - source_event_id: req-subset-02
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T03:00:01Z'
+            usage:
+              input_tokens:
+                value: 9007199254740991
+                quality: known
+              output_tokens:
+                value: 9007199254740991
+                quality: known
+          - source_event_id: req-subset-03
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T03:00:02Z'
+            usage:
+              input_tokens:
+                value: 50
+                quality: known
+              output_tokens:
+                value: 10
+                quality: known
+              cache_read_tokens:
+                value: 60
+                quality: known
+          - source_event_id: req-subset-04
+            provider: example-provider
+            model: example-model
+            occurred_at: '2026-10-27T03:00:03Z'
+            usage:
+              input_tokens:
+                value: 100
+                quality: known
+              output_tokens:
+                value: 20
+                quality: known
+              total_tokens:
+                value: 130
+                quality: known
+    CacheAndReasoningSubsetResponse:
+      summary: 子集与 total 推导示例的结果（一项接受、三项跨字段拒绝）
+      value:
+        request_id: 7a8b9c0d-1e2f-4a3b-9c4d-5e6f7a8b9c0d
+        results:
+          - index: 0
+            status: accepted
+          - index: 1
+            status: rejected
+            error:
+              code: USAGE_OVERFLOW
+              message: derived total_tokens exceeds 2^53-1
+          - index: 2
+            status: rejected
+            error:
+              code: USAGE_UNSUPPORTED
+              message: known cache_read_tokens exceeds known input_tokens
+          - index: 3
+            status: rejected
+            error:
+              code: USAGE_UNSUPPORTED
+              message: known total_tokens does not equal known input_tokens plus output_tokens
+    DeadlineExhaustedResponse:
+      summary: 处理期限耗尽（3 项已定、3 项重试）
+      description: |
+        8 秒预算到达时仍能写响应：前 3 项已得出确定性结论，给真实状态；后 3 项未开始或结论不确定，全部 `retryable/DEADLINE_EXCEEDED`，不写 `accepted` 凑数。客户端随后用原批次、原身份、原内容重传，已提交项会被解析为 `duplicate`。
+
+        本例是一个 6 项批次的结果形状（请求内容略，按上文规则构造即可）：第 2 项因 known 子集大于 known 父项被永久拒绝，其余 3 项在预算耗尽时尚未开始。**项数与下标必须与真实请求等长**，这里只演示填法。
+      value:
+        request_id: 3d4e5f6a-7b8c-4d9e-8f0a-1b2c3d4e5f6a
+        results:
+          - index: 0
+            status: accepted
+          - index: 1
+            status: duplicate
+          - index: 2
+            status: rejected
+            error:
+              code: USAGE_UNSUPPORTED
+              message: known cache_read_tokens exceeds known input_tokens
+          - index: 3
+            status: retryable
+            error:
+              code: DEADLINE_EXCEEDED
+              message: processing budget exhausted before this item started
+          - index: 4
+            status: retryable
+            error:
+              code: DEADLINE_EXCEEDED
+              message: processing budget exhausted before this item started
+          - index: 5
+            status: retryable
+            error:
+              code: DEADLINE_EXCEEDED
+              message: processing budget exhausted before this item started
+    BatchErrorInvalidArgument:
+      summary: 整批错误 400（外壳出现越权字段）
+      description: |
+        触发请求在顶层夹带 `workspace_id`（身份只能从认证取得）。整批无写入；修正后重发，不盲目重试。`details` 只给安全的字段与原因，不含 SQL、堆栈、凭证或事件原文。
+      value:
+        error:
+          code: INVALID_ARGUMENT
+          message: request body contains unexpected fields
+          request_id: 5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b
+          details:
+            - field: /workspace_id
+              reason: unknown_field
