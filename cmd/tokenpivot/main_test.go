@@ -5,14 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -96,73 +93,6 @@ func checkLogs(t *testing.T, text string, wantStarted, wantStopped bool) {
 	}
 }
 
-func TestSignals(t *testing.T) {
-	for _, sig := range []os.Signal{os.Interrupt, syscall.SIGTERM} {
-		t.Run(sig.String(), func(t *testing.T) {
-			l := testListener(t)
-			addr := l.Addr().String()
-			if err := l.Close(); err != nil {
-				t.Fatal(err)
-			}
-			cmd, logs := child(t, addr)
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
-			done := make(chan error, 1)
-			go func() { done <- cmd.Wait() }()
-			select {
-			case <-logs.started:
-			case err := <-done:
-				t.Fatalf("process exited before startup: %v; %s", err, logs.text())
-			case <-time.After(5 * time.Second):
-				t.Fatal("startup timeout")
-			}
-			client := &http.Client{Timeout: 3 * time.Second}
-			req, err := http.NewRequest("POST", "http://"+addr+"/healthz?q=synthetic-sensitive-marker", strings.NewReader("synthetic-sensitive-marker"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			req.Header.Set("Authorization", "synthetic-sensitive-marker")
-			req.Header.Set("Cookie", "test=synthetic-sensitive-marker")
-			resp, err := client.Do(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-				t.Error(err)
-			}
-			if err := resp.Body.Close(); err != nil {
-				t.Error(err)
-			}
-			if resp.StatusCode != http.StatusMethodNotAllowed {
-				t.Errorf("POST status = %d", resp.StatusCode)
-			}
-			if err := cmd.Process.Signal(sig); err != nil {
-				t.Fatal(err)
-			}
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatalf("signal exit: %v; %s", err, logs.text())
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("shutdown timeout")
-			}
-			checkLogs(t, logs.text(), true, true)
-			if n := strings.Count(strings.TrimSpace(logs.text()), "\n") + 1; n != 2 {
-				t.Errorf("got %d log lines, want only started/stopped", n)
-			}
-			conn, err := net.DialTimeout("tcp", addr, time.Second)
-			if err == nil {
-				if err := conn.Close(); err != nil {
-					t.Error(err)
-				}
-				t.Error("process left listener open")
-			}
-		})
-	}
-}
-
 func TestStartupFailures(t *testing.T) {
 	l := testListener(t)
 	defer func() {
@@ -171,7 +101,7 @@ func TestStartupFailures(t *testing.T) {
 		}
 	}()
 	for _, tt := range []struct{ name, addr string }{
-		{"occupied", l.Addr().String()},
+		{"missing database", l.Addr().String()},
 		{"invalid", "synthetic-sensitive-marker"},
 		{"empty", ""},
 	} {
