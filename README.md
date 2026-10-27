@@ -4,7 +4,7 @@ Go HTTP 服务和独立 PostgreSQL 迁移入口。当前没有业务表或业务
 
 ## 工具前提、首次安装与根命令入口
 
-工具前提（不自动安装、不自动切换版本）：Go **1.27.3**（`gofmt` 必须来自同一安装）、Node **24.22.1**、npm **11.19.1**、`make`、POSIX shell；`make check` 还要求 race 检测可用的本地 C 编译工具链。把这些工具的 `bin` 放进当前 shell 的 PATH；Go 命令统一由 Makefile 以 `GOTOOLCHAIN=local` 执行，版本不匹配就直接失败，不会下载另一套工具链。
+工具前提（不自动安装、不自动切换版本）：Go **1.26.4**（`gofmt` 必须来自同一安装；这是 `go.mod` 里的最低要求，新机器用 1.26.10 也满足，但不把 1.26.10 当作目标）、Node **26**、npm **随 Node 26 分发（本机 11.20.0）**、`make`、POSIX shell；`make check` 还要求 race 检测可用的本地 C 编译工具链。把这些工具的 `bin` 放进当前 shell 的 PATH；Go 命令统一由 Makefile 以 `GOTOOLCHAIN=local` 执行，版本不匹配就直接失败，不会下载另一套工具链，因此本机不再依赖模块缓存里的 1.27.3。
 
 首次安装（在仓库根执行）。`npm ci` 要求已有锁文件、会替换 `web/node_modules`，且不改写 `web/package.json` / `web/package-lock.json`；锁文件与包定义不一致时它会失败，不要用 `npm install`、force 或 legacy-peer-deps 掩盖：
 
@@ -34,7 +34,9 @@ npm --prefix web ci
 
 ## 工具链与本地数据库
 
-固定 Go **1.27.3**、pgx **v5.11.0**、goose **v3.29.0**；本地验收 PostgreSQL **18.6**。将独立安装的工具 `bin` 放入当前 shell 的 PATH，不修改全局配置，使用 `GOTOOLCHAIN=local`。
+固定 Go **1.26.4**、pgx **v5.11.0**、goose **v3.29.0**；本地验收 PostgreSQL **18.4**。将独立安装的工具 `bin` 放入当前 shell 的 PATH，不修改全局配置，使用 `GOTOOLCHAIN=local`。
+
+PG 18.4 这一项只有客户端/开发库证据（本机 `psql --version` 与 `pg_config --version` 均为 18.4），**未核实实际运行服务端**；本次只是改声明，不连接、不升级、不降级任何实例。版本口径来源见 [T-052 工具链版本基线计划](docs/plans/2026-10-27-toolchain-baseline.md)。
 
 只在专用本地实例执行以下准备，不连接或改动已有开发数据库。管理员通过交互式 `psql` 执行，角色/数据库创建不属于迁移：
 
@@ -184,7 +186,7 @@ make test-integration
 
 ## 前端开发与内嵌构建
 
-前端工程位于 [web](web/README.md)，使用 Node **24.22.1** 与 npm **11.19.1**，先确认版本。开发时先完成上述数据库准备、独立迁移并安全注入 `TOKENPIVOT_DATABASE_URL`，再按前面的最短双终端启动分别运行 `make dev-go` 与 `make dev-web`（Vite 那端用 `TOKENPIVOT_DEV_API_TARGET` 指定上游地址）。
+前端工程位于 [web](web/README.md)，使用 Node **26** 与随 Node 26 分发的 npm（本机 11.20.0），先确认版本。开发时先完成上述数据库准备、独立迁移并安全注入 `TOKENPIVOT_DATABASE_URL`，再按前面的最短双终端启动分别运行 `make dev-go` 与 `make dev-web`（Vite 那端用 `TOKENPIVOT_DEV_API_TARGET` 指定上游地址）。
 
 页面为 `http://127.0.0.1:5173`，仅 `/api` 及其子路径经 Vite 转发到 `http://127.0.0.1:8080`；开发覆盖变量 `TOKENPIVOT_DEV_API_TARGET` 只在 Vite 服务端读取。`/healthz` 与 `/readyz` 直接访问 Go。代理保留 Host/Origin/Cookie，不代表认证或 Origin 校验已经实现。
 
