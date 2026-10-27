@@ -1,0 +1,39 @@
+{
+  "name": "tokenpivot-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "npm@11.19.1",
+  "engines": {
+    "node": ">=24.22.1 <25"
+  },
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "clsx": "2.1.1",
+    "tailwind-merge": "3.7.0"
+  },
+  "devDependencies": {
+    "vite": "8.3.5",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "5.9.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/node": "24.19.2",
+    "tailwindcss": "4.3.3",
+    "@tailwindcss/vite": "4.3.3",
+    "eslint": "10.13.0",
+    "typescript-eslint": "8.72.1",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.7",
+    "prettier": "3.9.10"
+  }
+}
