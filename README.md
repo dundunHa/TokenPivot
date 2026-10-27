@@ -2,6 +2,36 @@
 
 Go HTTP 服务和独立 PostgreSQL 迁移入口。当前没有业务表或业务 API；数据库连接可用不代表业务已可用。服务启动必须连接数据库，**不会自动迁移**。 可选内嵌前端工程占位页仅在构建时需要 Node，运行不依赖 Node 或磁盘前端文件。
 
+## 工具前提、首次安装与根命令入口
+
+工具前提（不自动安装、不自动切换版本）：Go **1.27.3**（`gofmt` 必须来自同一安装）、Node **24.22.1**、npm **11.19.1**、`make`、POSIX shell；`make check` 还要求 race 检测可用的本地 C 编译工具链。把这些工具的 `bin` 放进当前 shell 的 PATH；Go 命令统一由 Makefile 以 `GOTOOLCHAIN=local` 执行，版本不匹配就直接失败，不会下载另一套工具链。
+
+首次安装（在仓库根执行）。`npm ci` 要求已有锁文件、会替换 `web/node_modules`，且不改写 `web/package.json` / `web/package-lock.json`；锁文件与包定义不一致时它会失败，不要用 `npm install`、force 或 legacy-peer-deps 掩盖：
+
+```sh
+GOTOOLCHAIN=local go mod download
+GOTOOLCHAIN=local go mod verify
+npm --prefix web ci
+```
+
+根 [Makefile](Makefile) 只组合既有的 go/npm 命令，不安装依赖、不迁移、不加载 `.env`、不管理后台进程。默认目标 `make` 等同 `make help`，只打印清单：
+
+| 命令 | 行为 | 输出 |
+|---|---|---|
+| `make help` | 打印命令清单 | 仅标准输出 |
+| `make dev-go` | `GOTOOLCHAIN=local go run -mod=readonly ./cmd/tokenpivot`，继承当前进程环境，不迁移 | 前台进程 |
+| `make dev-web` | `npm --prefix web run dev`，固定 `127.0.0.1:5173` | 前台进程 |
+| `make build-go` | 分别构建两个命令，**不加** `uiembed`，不需要 Node 或 dist | `bin/tokenpivot-api`、`bin/tokenpivot-migrate` |
+| `make build-web` | 先 `tsc --noEmit`，再 `vite build` | `web/dist/` |
+| `make build` | 顺序执行 build-web，再构建 `-tags=uiembed` 的服务，再构建迁移二进制 | `bin/tokenpivot`（内嵌前端）、`bin/tokenpivot-migrate` |
+| `make format-check` | `gofmt -l cmd internal db web/*.go` 列出文件即退出 1，再跑前端 `prettier --check` | 失败时列出文件，从不改写 |
+| `make check` | 见下节「验证」 | 失败即非零 |
+| `make test-integration` | 先 build-web，再跑 `uiembed,integration` 联合标签测试 | 需要专用 PG |
+
+`bin/` 与 `web/dist/` 都是被忽略提交的构建产物，不随代码发布。组合目标用顺序 recipe/递归 `$(MAKE)` 实现，所以 `make -j build`、`make -j check` 仍然是先 web 后内嵌 Go。任一阶段非零即整体失败；此时可能留有旧的或部分的产物，不承诺原子发布，也不能把旧产物当作本次构建成功。带 `uiembed` 的编译在缺少真实 `web/dist` 时会直接失败，不会生成占位页。
+
+`.env.example` 只是变量清单与安全占位示例，不是可直接启动的有效配置，也不会被自动加载；程序只读进程环境。
+
 ## 工具链与本地数据库
 
 固定 Go **1.27.3**、pgx **v5.11.0**、goose **v3.29.0**；本地验收 PostgreSQL **18.6**。将独立安装的工具 `bin` 放入当前 shell 的 PATH，不修改全局配置，使用 `GOTOOLCHAIN=local`。
@@ -32,6 +62,17 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 | `TOKENPIVOT_DATABASE_URL` | 服务必填，PostgreSQL URL，明确 host、database、user、sslmode |
 | `TOKENPIVOT_MIGRATION_DATABASE_URL` | 独立迁移账号，必填；不会回退到服务 URL |
 
+哪个进程需要哪些变量（各变量之间没有回退关系）：
+
+| 进程 | 需要的变量 |
+|---|---|
+| Go 服务（`make dev-go`、`bin/tokenpivot-api`、`bin/tokenpivot`） | 服务连接 `TOKENPIVOT_DATABASE_URL`，可选监听地址 `TOKENPIVOT_HTTP_ADDR` |
+| 独立迁移（`bin/tokenpivot-migrate`） | 只需 `TOKENPIVOT_MIGRATION_DATABASE_URL`；不要同时向服务进程注入迁移账号 |
+| Vite 开发服务（`make dev-web`） | 只需可选的公开上游地址 `TOKENPIVOT_DEV_API_TARGET`，不接收任何连接信息 |
+| 集成测试（`make test-integration`） | `TOKENPIVOT_TEST_DATABASE_URL` 与 `TOKENPIVOT_TEST_APP_DATABASE_URL` |
+
+完整的变量清单与安全占位见 [.env.example](.env.example)。它是参考，不是可直接启动的配置，也不会被自动加载；变量必须由启动该进程的 shell 或本地凭证工具注入。
+
 非敏感 URL 模板（不含密码，需安全注入凭证）：
 
 ```text
@@ -43,19 +84,33 @@ postgres://tokenpivot_owner@127.0.0.1:5432/tokenpivot_local?sslmode=disable&sear
 
 配置只加载一次，不读取 `.env`/YAML，不支持热加载。支持 IPv4、主机名、方括号 IPv6、空 host；`:8080` 表示明确监听所有接口，默认回环监听不是生产安全方案。地址占用失败，不自动换端口或重试。
 
+最短双终端启动（**先独立迁移成功，再启动服务**）。迁移是一次性的前置步骤，之后两个终端分别跑 Go 与 Vite；每个会话只注入自己需要的变量，连接值不出现在命令参数里：
+
 ```sh
-GOTOOLCHAIN=local go version
-GOTOOLCHAIN=local go build -o /tmp/tokenpivot-t050 ./cmd/tokenpivot
-GOTOOLCHAIN=local go build -o /tmp/tokenpivot-migrate-t050 ./cmd/tokenpivot-migrate
+# 前置（一次性）：先 make build-go 生成 bin/tokenpivot-migrate，本会话只注入 TOKENPIVOT_MIGRATION_DATABASE_URL
+# 仅对已准备的本地开发库执行；需要看当前版本时先跑 status（注意它可能创建历史表）
+./bin/tokenpivot-migrate up
+```
+
+```sh
+# 终端一：只注入 TOKENPIVOT_DATABASE_URL（最小权限的服务角色）
+TOKENPIVOT_HTTP_ADDR=127.0.0.1:8080 make dev-go
+```
+
+```sh
+# 终端二：只给 Vite 公开上游地址；首次运行前先 npm --prefix web ci
+TOKENPIVOT_DEV_API_TARGET=http://127.0.0.1:8080 make dev-web
+```
+
+页面在 `http://127.0.0.1:5173`，两个探针直接访问 Go 的 `http://127.0.0.1:8080`。启动顺序是配置、可选前端初始化、建池并 Ping、监听——缺连接或连不上库时服务不监听；Go 未监听时 Vite 的 `/api` 请求失败，不会回退页面。
+
+撤销演练是独立的人工步骤，不属于最短启动，也不在任何默认目标里。只有在确认为本地/测试库、并核对过当前版本后才执行：
+
+```sh
 # 先安全注入 TOKENPIVOT_MIGRATION_DATABASE_URL
-/tmp/tokenpivot-migrate-t050 status
-/tmp/tokenpivot-migrate-t050 up
-/tmp/tokenpivot-migrate-t050 up
-# 仅在确认的本地/测试库演练撤销一条
-/tmp/tokenpivot-migrate-t050 down-one
-/tmp/tokenpivot-migrate-t050 up
-# 再安全注入最小权限的 TOKENPIVOT_DATABASE_URL
-TOKENPIVOT_HTTP_ADDR=127.0.0.1:18080 /tmp/tokenpivot-t050
+./bin/tokenpivot-migrate status
+./bin/tokenpivot-migrate down-one
+./bin/tokenpivot-migrate up
 ```
 
 发布顺序：**独立迁移成功 → 启动/发布服务**。迁移命令只支持 `status`、`up`、`down-one`，SQL 内嵌，不依赖工作目录；首次 `status` 可能创建历史表，并非绝对只读。重复 `up` 成功并记录 `no change`。第一条 bootstrap 的 Up/Down 仅 `SELECT 1`，不是业务 schema；唯一持久结构为 goose 管理的 `goose_db_version`，down 不删除历史表。后续文件从 00002 编号，已在共享环境执行的文件不能改写。
@@ -89,18 +144,21 @@ stderr 输出 slog JSON；数据库错误只包含安全阶段/类别，不输�
 
 ## 验证
 
-不连接 PG 的检查：
+普通检查不需要 PostgreSQL、连接变量、业务表或登录，用根入口一条命令：
 
 ```sh
-GOTOOLCHAIN=local go test ./...
-GOTOOLCHAIN=local go test -race ./...
-GOTOOLCHAIN=local go vet ./...
-GOTOOLCHAIN=local go build -o /tmp/tokenpivot-t050 ./cmd/tokenpivot
-GOTOOLCHAIN=local go build -o /tmp/tokenpivot-migrate-t050 ./cmd/tokenpivot-migrate
-gofmt -l cmd/tokenpivot/*.go cmd/tokenpivot-migrate/*.go internal/config/*.go internal/database/*.go internal/server/*.go db/migrations/*.go
+make check
 ```
 
-`gofmt -l` 应无输出，race 需要本机 C 编译工具链。真实 PG 集成测试必须单独准备专用库（数据库名以 `_test` 结尾），可在专用实例复用上述两种角色；管理员执行：
+它按顺序执行：`make format-check`（Go `gofmt -l cmd internal db web/*.go` 有文件即失败、不改写，再跑前端 `prettier --check`）→ 普通 `go vet` → 前端 `eslint` → 普通 `go test -race -count=1` → 前端 `node:test` → `make build-go` → `make build`（含前端 `tsc --noEmit`）→ `uiembed` 的 `go test -race -count=1` → `uiembed` 的 `go vet`。任一阶段非零即整体失败，日志里的 `==> [n/9]` 标明执行阶段。构建已经包含前端类型检查，所以没有单独的 typecheck 步骤；需要单独跑时仍可用 `npm --prefix web run typecheck`。
+
+Go 命令在 Makefile 中一律带 `GOTOOLCHAIN=local` 和 `-mod=readonly`。`-mod=readonly` 会在需要改 `go.mod` 时失败，但它不是“`go.sum` 绝不会变化”的承诺；干净环境请对照依赖文件：
+
+```sh
+git diff --exit-code -- go.mod go.sum web/package.json web/package-lock.json
+```
+
+`web/test/proxy.test.mjs` 会临时启动回环 Vite 与真实上游验证代理语义，不是 UI 自动化，也不是完整产品测试。race 需要本机 C 编译工具链。真实 PG 集成测试必须单独准备专用库（数据库名以 `_test` 结尾），可在专用实例复用上述两种角色；管理员执行：
 
 ```sql
 CREATE DATABASE tokenpivot_test;
@@ -111,45 +169,40 @@ GRANT CONNECT ON DATABASE tokenpivot_test TO tokenpivot_app;
 
 测试服务角色必须使用密码认证（推荐 `scram-sha-256`），不能命中 `trust`；在专用实例的 `pg_hba.conf` 中，将精确测试库/服务角色/回环地址规则放在通配规则之前，reload 后验证正确密码可连接。测试会用同一真实角色的错误密码断言 SQLSTATE `28P01`，并验证服务退出和日志脱敏。
 
-安全注入 `TOKENPIVOT_TEST_DATABASE_URL`（迁移 owner）和 `TOKENPIVOT_TEST_APP_DATABASE_URL`（服务角色）。URL 必须明确回环 **IP**（例如 127.0.0.1）、同一 host/端口和 `_test` 数据库、不同用户及 sslmode；查询参数仅接受 sslmode/search_path。测试验证角色身份及权限，缺变量直接失败，不 skip。测试清除 PG 默认环境并隔离默认凭证文件；只使用明确注入的两个测试 URL。每个用例新建随机 schema、设置 search_path，记录非敏感归属，关闭本次连接/进程后仅清理本次 schema；失败保留并报告 schema 名，不删除数据库、不扫描清空旧对象。
+安全注入 `TOKENPIVOT_TEST_DATABASE_URL`（迁移 owner）和 `TOKENPIVOT_TEST_APP_DATABASE_URL`（服务角色）。URL 必须明确回环 **IP**（例如 127.0.0.1）、同一 host/端口和 `_test` 数据库、不同用户及 sslmode；查询参数仅接受 sslmode/search_path。测试验证角色身份及权限，缺变量直接失败，不 skip。测试清除 PG 默认环境并隔离默认凭证文件；只使用明确注入的两个测试 URL。每个用例新建随机 `t050_` 前缀 schema、设置 search_path，记录非敏感归属，关闭本次连接/进程后仅清理本次 schema。清理**通常仍会执行**；只有在归属检查失败、清理本身失败等情形才会保留该 schema、报出 schema 名并使测试失败，供人工核对——这不是“失败一律保留”，也不代表测试从不清理。不删除数据库、不扫描清空旧对象。
 
 先结束手工验收进程，独占运行；**禁止同库并行多套测试或手工迁移**：
 
 ```sh
-GOTOOLCHAIN=local go test -tags=integration -count=1 -p 1 -v ./...
+make test-integration
 ```
+
+该目标先构建前端（联合标签需要真实 `web/dist`），再执行 `GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -count=1 -p 1 -v ./...`。`-count=1` 避免测试缓存掩盖本次库状态，`-p 1` 保持包级串行；它是有数据库写入的显式操作，**不包含在 `make check` 里**。缺变量时会看到 `explicit integration database variables required` 并非零，此刻不会接触数据库。
 
 覆盖单连接初始化/重复迁移/撤销重上、同连接锁与 SQL、事务回滚、争锁/取消/杀进程恢复、最小权限、服务信号退出和真实 TCP 断连恢复。测试专用 TCP 转发器阻断服务连接，不停止数据库、不终止未知会话。Unix 子进程信号测试不覆盖 Windows 服务管理。
 
 
 ## 前端开发与内嵌构建
 
-前端工程位于 [web](web/README.md)，使用 Node **24.22.1** 与 npm **11.19.1**，先确认版本。开发时先完成上述数据库准备、独立迁移并安全注入 `TOKENPIVOT_DATABASE_URL`，再分别启动 Go 与 Vite：
-
-```sh
-GOTOOLCHAIN=local go run ./cmd/tokenpivot
-# 另一终端
-npm --prefix web ci
-npm --prefix web run dev
-```
+前端工程位于 [web](web/README.md)，使用 Node **24.22.1** 与 npm **11.19.1**，先确认版本。开发时先完成上述数据库准备、独立迁移并安全注入 `TOKENPIVOT_DATABASE_URL`，再按前面的最短双终端启动分别运行 `make dev-go` 与 `make dev-web`（Vite 那端用 `TOKENPIVOT_DEV_API_TARGET` 指定上游地址）。
 
 页面为 `http://127.0.0.1:5173`，仅 `/api` 及其子路径经 Vite 转发到 `http://127.0.0.1:8080`；开发覆盖变量 `TOKENPIVOT_DEV_API_TARGET` 只在 Vite 服务端读取。`/healthz` 与 `/readyz` 直接访问 Go。代理保留 Host/Origin/Cookie，不代表认证或 Origin 校验已经实现。
 
-无 `uiembed` 标签时保持纯后端行为，缺少前端产物不影响 Go 测试或构建。发布内嵌页面：
+无 `uiembed` 标签时保持纯后端行为，缺少前端产物不影响 Go 测试或构建。发布内嵌页面用 `make build`（先 web 后内嵌 Go），等价的手工序列：
 
 ```sh
 npm --prefix web ci
 npm --prefix web run build
 GOTOOLCHAIN=local go test -tags uiembed ./...
-GOTOOLCHAIN=local go test -race -tags uiembed ./...
+GOTOOLCHAIN=local go test -race -count=1 -tags uiembed ./...
 GOTOOLCHAIN=local go vet -tags uiembed ./...
-GOTOOLCHAIN=local go build -tags uiembed -o /tmp/tokenpivot-t031-ui ./cmd/tokenpivot
+GOTOOLCHAIN=local go build -mod=readonly -tags uiembed -o /tmp/tokenpivot-t031-ui ./cmd/tokenpivot
 # 先独立迁移并安全注入 TOKENPIVOT_DATABASE_URL
 TOKENPIVOT_HTTP_ADDR=127.0.0.1:18080 /tmp/tokenpivot-t031-ui
 ```
 
 带标签缺少 dist 时编译失败；缺少可读普通 index.html 时初始化失败，不会启动成假成功。构建后可将二进制放到不含仓库的目录运行。页面与 API 必须同源，生产 TLS 由外层入口提供。所有静态成功响应 `Cache-Control: no-cache`；不存在的资源不返回 HTML，只有显式接受 HTML 的无扩展名导航可回退入口。带哈希资源不承诺升级后旧页面永远可用。
 
-当前不含业务表、业务 API、认证授权、TLS、请求 ID、指标追踪、后台任务、Redis/队列；占位页不是产品视觉或业务页面。也不建设 Makefile、CI、Docker 或统一 lint 平台。公网部署前须独立完成入口与业务安全设计。
+当前不含业务表、业务 API、认证授权、TLS、请求 ID、指标追踪、后台任务、Redis/队列；占位页不是产品视觉或业务页面。根 [Makefile](Makefile) 只是薄命令入口，不建设 CI、Docker、统一 lint 平台或热重载/后台进程管理。公网部署前须独立完成入口与业务安全设计。
 
-前端和数据库联合验收：完成前端构建并安全注入上述两个测试 URL 后，独占测试库执行 `GOTOOLCHAIN=local go test -tags=uiembed,integration -count=1 -p 1 -v ./...`；不能用分别编译两个标签代替联合验收。
+前端和数据库联合验收：完成前端构建并安全注入上述两个测试 URL 后，独占测试库执行 `make test-integration`（即 `GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -count=1 -p 1 -v ./...`）；不能用分别编译两个标签代替联合验收。

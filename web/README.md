@@ -2,6 +2,10 @@
 
 T-031 只提供工程占位页与同源接入，不提供业务 API、认证、登录、统计数据或产品视觉。
 
+> 仓库根的统一入口在 [根 README](../README.md) 与 [Makefile](../Makefile)：根说明有完整的工具前提、首次安装、命令表与最短双终端启动，Makefile 提供 `make build-web`、`make dev-web` 等组合目标。本页只保留前端专项细节，不重复第二套安装步骤。
+>
+> 开发前的前置条件在根一侧：先按根 README 准备专用本地 PostgreSQL、独立执行迁移并安全注入 `TOKENPIVOT_DATABASE_URL`，Go 服务才能监听；Go 未启动时 Vite 的 `/api` 请求会失败，不会回退页面。
+
 ## 工具与命令
 
 使用 Node **24.22.1**（engines: `>=24.22.1 <25`）、随包 npm **11.19.1**、Go **1.27.3**。不自动切换工具链；如使用隔离安装，把对应 bin 放入当前进程 PATH，不修改全局配置。
@@ -19,6 +23,8 @@ npm --prefix web run format:check
 npm --prefix web test
 npm --prefix web run build
 ```
+
+这些 npm 脚本保持独立可用；根 Makefile 只是把它们组合成 `make build-web`（等同 `npm --prefix web run build`）等目标，不改变脚本语义。
 
 首次更新锁文件使用正常 `npm --prefix web install`；直接依赖固定版本，不使用 force 或 legacy-peer-deps 隐藏冲突。TypeScript strict 覆盖 src 与 Vite 配置，ESLint 负责 JS/TS 规则，Prettier 负责前端格式，Go 文件仅用 gofmt。测试使用 Node 原生 node:test 与真实 Vite/HTTP 上游，不使用 UI 自动化。
 
