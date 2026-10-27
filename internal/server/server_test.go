@@ -13,7 +13,7 @@ import (
 )
 
 func TestHandler(t *testing.T) {
-	srv := httptest.NewServer(NewHandler())
+	srv := httptest.NewServer(NewHandler(nil))
 	defer srv.Close()
 	client := srv.Client()
 	client.Timeout = 3 * time.Second
@@ -54,6 +54,41 @@ func TestHandler(t *testing.T) {
 				t.Errorf("Content-Type = %q", got)
 			}
 		})
+	}
+}
+
+func TestFrontendDispatch(t *testing.T) {
+	frontend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Frontend", "yes")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	h := NewHandler(frontend)
+	for _, method := range []string{"GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"} {
+		for _, path := range []string{"/api", "/api/", "/api/not-implemented", "/api?x=1", "/healthz", "/healthz/", "/healthz/unknown", "/readyz", "/readyz/", "/readyz/unknown"} {
+			t.Run(method+path, func(t *testing.T) {
+				r := httptest.NewRequest(method, path, nil)
+				r.Header.Set("Accept", "text/html")
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, r)
+				want := http.StatusNotFound
+				if path == "/healthz" {
+					want = http.StatusMethodNotAllowed
+					if method == "GET" || method == "HEAD" {
+						want = http.StatusOK
+					}
+				}
+				if w.Code != want || w.Header().Get("X-Frontend") != "" {
+					t.Fatalf("status/frontend = %d %q, want %d backend", w.Code, w.Header().Get("X-Frontend"), want)
+				}
+			})
+		}
+		for _, path := range []string{"/", "/route", "/apix", "/healthzx", "/readyzx"} {
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(method, path, nil))
+			if w.Code != http.StatusNoContent || w.Header().Get("X-Frontend") != "yes" {
+				t.Errorf("%s %s did not reach frontend", method, path)
+			}
+		}
 	}
 }
 
@@ -104,7 +139,7 @@ func assertNotListening(t *testing.T, addr string) {
 
 func TestRunCancellation(t *testing.T) {
 	l := listen(t)
-	srv := &http.Server{Handler: NewHandler()}
+	srv := &http.Server{Handler: NewHandler(nil)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -223,7 +258,7 @@ func TestRunServeFailure(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	err := Run(context.Background(), &http.Server{Handler: NewHandler()}, l, time.Second)
+	err := Run(context.Background(), &http.Server{Handler: NewHandler(nil)}, l, time.Second)
 	if !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Run error = %v, want closed listener", err)
 	}
@@ -231,7 +266,7 @@ func TestRunServeFailure(t *testing.T) {
 
 func TestRunExpectedServerClosed(t *testing.T) {
 	l := listen(t)
-	srv := &http.Server{Handler: NewHandler()}
+	srv := &http.Server{Handler: NewHandler(nil)}
 	if err := srv.Close(); err != nil {
 		t.Fatal(err)
 	}

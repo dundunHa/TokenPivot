@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -19,8 +20,8 @@ const (
 	ShutdownTimeout   = 10 * time.Second
 )
 
-// NewHandler returns a private mux exposing only the liveness probe.
-func NewHandler() http.Handler {
+// NewHandler keeps API and probe paths on the backend and optionally serves a frontend.
+func NewHandler(frontend http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -29,7 +30,18 @@ func NewHandler() http.Handler {
 			return
 		}
 	})
-	return mux
+	if frontend == nil {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, prefix := range []string{"/api", "/healthz", "/readyz"} {
+			if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, prefix+"/") {
+				mux.ServeHTTP(w, r)
+				return
+			}
+		}
+		frontend.ServeHTTP(w, r)
+	})
 }
 
 // Run serves listener until cancellation or a serving error. Cancellation drains
