@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/dundunHa/TokenPivot/db/migrations"
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // usageMetric is one metric column pair: a nullable value and its NOT NULL quality.
@@ -464,7 +466,8 @@ func TestUsageEvents(t *testing.T) {
 	})
 
 	// 6. Concurrent commit: the blocked do-nothing insert returns zero rows, yet the
-	// following SELECT in the same transaction sees the committed row.
+	// following SELECT in the same read committed transaction B sees the row A committed
+	// after B started waiting on the identity key.
 	t.Run("concurrent commit", func(t *testing.T) {
 		row := syntheticUsageEvent(t)
 		connA := connectTestConn(t, ctx, appURL, "A")
@@ -483,9 +486,21 @@ func TestUsageEvents(t *testing.T) {
 			t.Fatal(database.SafeError("insert A", err))
 		}
 		pidB := backendPID(t, ctx, connB, "pid B")
-		blockCtx, stopBlock := context.WithTimeout(context.Background(), 20*time.Second)
-		defer stopBlock()
-		done := startBlockedInsert(blockCtx, connB, row)
+		txB, err := connB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(database.SafeError("begin B", err))
+		}
+		// Registered before the blocked insert starts, so the cleanup that cancels and
+		// joins that goroutine runs first, and connB is only closed after txB is done.
+		// Cancelling a blocked Exec closes its connection, so a closed connection here
+		// means the server already discarded the transaction; only unexpected errors fail.
+		t.Cleanup(func() {
+			err := txB.Rollback(context.Background())
+			if err != nil && !errors.Is(err, pgx.ErrTxClosed) && !errors.Is(err, pgconn.ErrConnClosed) {
+				t.Error("rollback B failed")
+			}
+		})
+		done := startBlockedInsert(t, ctx, txB, row)
 		waitForBlockedLock(t, ctx, db, pidB)
 		if err := txA.Commit(ctx); err != nil {
 			t.Fatal(database.SafeError("commit A", err))
@@ -494,11 +509,14 @@ func TestUsageEvents(t *testing.T) {
 			t.Fatal("blocked insert reported an inserted row after the first commit")
 		}
 		var idB string
-		if err := connB.QueryRow(ctx, "SELECT id FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", row.workspaceID, row.sourceID, row.sourceEventID).Scan(&idB); err != nil {
+		if err := txB.QueryRow(ctx, "SELECT id FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", row.workspaceID, row.sourceID, row.sourceEventID).Scan(&idB); err != nil {
 			t.Fatal(database.SafeError("read after conflict", err))
 		}
 		if idB != idA {
 			t.Fatalf("follow-up read id=%s want=%s", idB, idA)
+		}
+		if err := txB.Commit(ctx); err != nil {
+			t.Fatal(database.SafeError("commit B", err))
 		}
 		if count := usageEventCount(t, ctx, app, row); count != 1 {
 			t.Fatalf("rows=%d want=1", count)
@@ -515,6 +533,11 @@ func TestUsageEvents(t *testing.T) {
 		if err != nil {
 			t.Fatal(database.SafeError("begin A", err))
 		}
+		defer func() {
+			if err := txA.Rollback(context.Background()); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+				t.Error("rollback A failed")
+			}
+		}()
 		if _, err := txA.Exec(ctx, insertUsageEventSQL, usageEventArgs(row)...); err != nil {
 			t.Fatal(database.SafeError("insert A", err))
 		}
@@ -522,9 +545,7 @@ func TestUsageEvents(t *testing.T) {
 		rowB := row
 		rowB.payloadHash = bytes.Repeat([]byte{0x44}, 32)
 		rowB.provider = "synthetic-rollback-provider"
-		blockCtx, stopBlock := context.WithTimeout(context.Background(), 20*time.Second)
-		defer stopBlock()
-		done := startBlockedInsert(blockCtx, connB, rowB)
+		done := startBlockedInsert(t, ctx, connB, rowB)
 		waitForBlockedLock(t, ctx, db, pidB)
 		if err := txA.Rollback(ctx); err != nil {
 			t.Fatal(database.SafeError("rollback A", err))
@@ -564,10 +585,18 @@ func TestUsageEvents(t *testing.T) {
 		}
 		results := make(chan outcome, contenders)
 		release := make(chan struct{})
-		contendCtx, stopContend := context.WithTimeout(context.Background(), 30*time.Second)
-		defer stopContend()
+		contendCtx, stopContend := context.WithTimeout(ctx, 30*time.Second)
+		// Registered after the connections, so on every path this cancel-and-join cleanup
+		// runs before the contenders' connections are closed.
+		var wg sync.WaitGroup
+		t.Cleanup(func() {
+			stopContend()
+			wg.Wait()
+		})
+		wg.Add(contenders)
 		for i, conn := range conns {
 			go func(i int, conn *pgx.Conn) {
+				defer wg.Done()
 				<-release
 				tag, err := conn.Exec(contendCtx, insertUsageEventSQL, usageEventArgs(rows[i])...)
 				if err != nil {
@@ -748,13 +777,30 @@ type blockedInsertOutcome struct {
 	err      error
 }
 
+// usageEventInserter is the Exec subset shared by *pgx.Conn and pgx.Tx, so the blocked
+// insert can run either in an explicit transaction or in autocommit.
+type usageEventInserter interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
 // startBlockedInsert runs the do-nothing insert in a goroutine so it can wait on the
-// identity lock while the test finishes the other transaction. The channel is
-// buffered, so the goroutine can always deliver its outcome and exit.
-func startBlockedInsert(ctx context.Context, conn *pgx.Conn, row usageEventRow) <-chan blockedInsertOutcome {
+// identity lock while the test finishes the other transaction. The channel is buffered,
+// so the goroutine can always deliver its outcome and exit. Cleanups run last in first
+// out, so the registration below cancels the insert and joins its goroutine before any
+// connection opened earlier by the caller is closed.
+func startBlockedInsert(t *testing.T, parent context.Context, inserter usageEventInserter, row usageEventRow) <-chan blockedInsertOutcome {
+	t.Helper()
+	ctx, stopBlock := context.WithTimeout(parent, 20*time.Second)
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		stopBlock()
+		wg.Wait()
+	})
 	done := make(chan blockedInsertOutcome, 1)
+	wg.Add(1)
 	go func() {
-		tag, err := conn.Exec(ctx, insertUsageEventSQL, usageEventArgs(row)...)
+		defer wg.Done()
+		tag, err := inserter.Exec(ctx, insertUsageEventSQL, usageEventArgs(row)...)
 		if err != nil {
 			done <- blockedInsertOutcome{err: err}
 			return
