@@ -126,11 +126,9 @@ func integrationSchema(t *testing.T) (string, string) {
 		_ = app.Close(ctx)
 		t.Fatal(database.SafeError("create owned schema", err))
 	}
-	if _, err := owner.Exec(ctx, "GRANT USAGE ON SCHEMA "+quoted+" TO "+pgx.Identifier{appRole}.Sanitize()); err != nil {
-		_ = app.Close(ctx)
-		t.Fatal(database.SafeError("grant usage", err))
-	}
-	t.Logf("owned schema=%s database=%s migrator=%s app=%s", schema, db, role, appRole)
+	// Register the cleanup right after CREATE SCHEMA succeeds: any later t.Fatal
+	// leaves the schema behind otherwise. The closure below only depends on
+	// owner, schema, quoted and role, which are all in scope by now.
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -144,6 +142,11 @@ func integrationSchema(t *testing.T) (string, string) {
 			t.Errorf("preserving schema %s: cleanup failed", schema)
 		}
 	})
+	if _, err := owner.Exec(ctx, "GRANT USAGE ON SCHEMA "+quoted+" TO "+pgx.Identifier{appRole}.Sanitize()); err != nil {
+		_ = app.Close(ctx)
+		t.Fatal(database.SafeError("grant usage", err))
+	}
+	t.Logf("owned schema=%s database=%s migrator=%s app=%s", schema, db, role, appRole)
 	if err := app.Close(context.Background()); err != nil {
 		t.Error(database.SafeError("app close", err))
 	}
@@ -357,16 +360,28 @@ func TestListIsolationAgainstPostgres(t *testing.T) {
 	}{
 		{"other workspace", workspaceB, sourceA},
 		{"other source", workspaceA, sourceB},
+		{"missing source", workspaceA, testID(0x7f)},
 	} {
 		crossList, err := service.List(ctx, scope.workspaceID, scope.sourceID)
-		if err != nil {
-			t.Fatalf("%s list error=%v", scope.name, err)
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s list error=%v want ErrNotFound", scope.name, err)
 		}
-		if len(crossList) != 0 {
+		if crossList != nil {
 			t.Fatalf("%s list returned %d credentials", scope.name, len(crossList))
 		}
 	}
-	t.Logf("listed=%d cross-space lists empty", len(list))
+
+	// A source of this workspace without any credential is an existing source:
+	// an empty list plus a nil error, never ErrNotFound.
+	emptySource := insertSource(t, ctx, pool, workspaceA)
+	empty, err := service.List(ctx, workspaceA, emptySource)
+	if err != nil {
+		t.Fatalf("existing empty source list error=%v want nil", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("existing empty source list returned %d credentials", len(empty))
+	}
+	t.Logf("listed=%d cross-space lists returned not_found", len(list))
 }
 
 func TestCrossWorkspaceRotateRevokeAgainstPostgres(t *testing.T) {
@@ -461,6 +476,162 @@ func TestConcurrentRevokeAgainstPostgres(t *testing.T) {
 		t.Fatalf("revoked token error=%v want ErrUnauthenticated", err)
 	}
 	t.Logf("concurrent workers=%d all succeeded with one revoked_at", workers)
+}
+
+func TestConcurrentIssueCreatesIndependentCredentials(t *testing.T) {
+	_, appURL := integrationSchema(t)
+	pool := newPool(t, appURL)
+	service := New(NewPostgres(pool))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	workspaceID := insertWorkspace(t, ctx, pool, "synthetic-concurrent-issue")
+	sourceID := insertSource(t, ctx, pool, workspaceID)
+
+	countRows := func() int {
+		var total int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM ingest_credentials WHERE workspace_id=$1", workspaceID).Scan(&total); err != nil {
+			t.Fatal(database.SafeError("count credentials", err))
+		}
+		return total
+	}
+	before := countRows()
+
+	// Every worker blocks on start and then issues at the same time; no prior
+	// lookup is involved, so the independent rows come from the inserts alone.
+	const workers = 8
+	start := make(chan struct{})
+	issued := make([]IssuedCredential, workers)
+	failures := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			<-start
+			credential, err := service.Issue(ctx, workspaceID, sourceID)
+			issued[slot] = credential
+			failures[slot] = err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	ids := make(map[[16]byte]bool, workers)
+	tokens := make(map[string]bool, workers)
+	for slot, err := range failures {
+		if err != nil {
+			t.Fatalf("concurrent issue %d error=%v", slot, err)
+		}
+		credential := issued[slot]
+		if credential.WorkspaceID.Bytes != workspaceID.Bytes || credential.SourceID.Bytes != sourceID.Bytes {
+			t.Fatalf("concurrent issue %d returned foreign ownership", slot)
+		}
+		if credential.RevokedAt != nil {
+			t.Fatalf("concurrent issue %d returned a revoked credential", slot)
+		}
+		if ids[credential.ID.Bytes] {
+			t.Fatalf("concurrent issue %d reused a credential id", slot)
+		}
+		if tokens[credential.Token] {
+			t.Fatalf("concurrent issue %d reused a token", slot)
+		}
+		ids[credential.ID.Bytes] = true
+		tokens[credential.Token] = true
+	}
+	if len(ids) != workers || len(tokens) != workers {
+		t.Fatalf("distinct ids=%d tokens=%d want=%d", len(ids), len(tokens), workers)
+	}
+	if added := countRows() - before; added != workers {
+		t.Fatalf("credential rows added=%d want=%d", added, workers)
+	}
+	for _, credential := range issued {
+		if _, err := service.Authenticate(ctx, credential.Token); err != nil {
+			t.Fatalf("concurrently issued token error=%v want nil", err)
+		}
+	}
+	t.Logf("concurrent issues=%d distinct ids=%d tokens=%d rows added=%d", workers, len(ids), len(tokens), countRows()-before)
+}
+
+func TestConcurrentRotateCreatesIndependentCredentials(t *testing.T) {
+	_, appURL := integrationSchema(t)
+	pool := newPool(t, appURL)
+	service := New(NewPostgres(pool))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	workspaceID := insertWorkspace(t, ctx, pool, "synthetic-concurrent-rotate")
+	sourceID := insertSource(t, ctx, pool, workspaceID)
+	old, err := service.Issue(ctx, workspaceID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := loadRow(t, ctx, pool, old.ID)
+
+	// The same old credential is rotated concurrently: each worker must get its
+	// own new row while the old row stays byte-identical.
+	const workers = 8
+	start := make(chan struct{})
+	rotated := make([]IssuedCredential, workers)
+	failures := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			<-start
+			credential, err := service.Rotate(ctx, workspaceID, old.ID)
+			rotated[slot] = credential
+			failures[slot] = err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	ids := make(map[[16]byte]bool, workers)
+	tokens := make(map[string]bool, workers)
+	for slot, err := range failures {
+		if err != nil {
+			t.Fatalf("concurrent rotate %d error=%v", slot, err)
+		}
+		credential := rotated[slot]
+		if credential.ID.Bytes == old.ID.Bytes {
+			t.Fatalf("concurrent rotate %d reused the old credential id", slot)
+		}
+		if credential.WorkspaceID.Bytes != before.WorkspaceID.Bytes || credential.SourceID.Bytes != before.SourceID.Bytes {
+			t.Fatalf("concurrent rotate %d moved the fixed ownership", slot)
+		}
+		if credential.RevokedAt != nil {
+			t.Fatalf("concurrent rotate %d returned a revoked credential", slot)
+		}
+		if ids[credential.ID.Bytes] || tokens[credential.Token] {
+			t.Fatalf("concurrent rotate %d reused an id or token", slot)
+		}
+		ids[credential.ID.Bytes] = true
+		tokens[credential.Token] = true
+	}
+	if len(ids) != workers || len(tokens) != workers {
+		t.Fatalf("distinct rotated ids=%d tokens=%d want=%d", len(ids), len(tokens), workers)
+	}
+	after := loadRow(t, ctx, pool, old.ID)
+	if after.WorkspaceID.Bytes != before.WorkspaceID.Bytes || after.SourceID.Bytes != before.SourceID.Bytes {
+		t.Fatal("concurrent rotate changed the old ownership")
+	}
+	if before.RevokedAt == nil && after.RevokedAt != nil {
+		t.Fatal("concurrent rotate revoked the old credential")
+	}
+	if before.RevokedAt != nil && (after.RevokedAt == nil || !after.RevokedAt.Equal(*before.RevokedAt)) {
+		t.Fatal("concurrent rotate changed the old revoked_at")
+	}
+	if _, err := service.Authenticate(ctx, old.Token); err != nil {
+		t.Fatalf("old token error=%v want nil: rotate must not revoke it", err)
+	}
+	var total int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ingest_credentials WHERE workspace_id=$1 AND source_id=$2", workspaceID, sourceID).Scan(&total); err != nil {
+		t.Fatal(database.SafeError("count credentials", err))
+	}
+	if total != workers+1 {
+		t.Fatalf("credential rows=%d want=%d", total, workers+1)
+	}
+	t.Logf("concurrent rotations=%d distinct ids=%d old row untouched rows=%d", workers, len(ids), total)
 }
 
 func TestRevokeRotateCommitOrdersAgainstPostgres(t *testing.T) {

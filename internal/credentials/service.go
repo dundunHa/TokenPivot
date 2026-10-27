@@ -110,8 +110,17 @@ func (s *Service) Authenticate(ctx context.Context, token string) (Credential, e
 }
 
 // List returns the metadata of every credential of the given workspace and
-// source, including revoked ones. It never returns tokens or digests.
+// source, including revoked ones. It never returns tokens or digests. A source
+// outside the workspace yields ErrNotFound, so an empty list always means the
+// source exists and simply has no credentials yet.
 func (s *Service) List(ctx context.Context, workspaceID, sourceID ID) ([]Credential, error) {
+	exists, err := s.store.SourceExists(ctx, workspaceID, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
 	return s.store.List(ctx, workspaceID, sourceID)
 }
 

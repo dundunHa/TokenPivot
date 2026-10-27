@@ -428,6 +428,134 @@ func TestLostIssueResponseRevokesByListedID(t *testing.T) {
 	}
 }
 
+func TestListEmptyForExistingSourceWithoutCredentials(t *testing.T) {
+	service, _, workspaceID, sourceID := newTestService(t)
+	list, err := service.List(context.Background(), workspaceID, sourceID)
+	if err != nil {
+		t.Fatalf("error=%v want nil for an existing source", err)
+	}
+	if list == nil {
+		t.Fatal("list returned a nil slice instead of an empty one")
+	}
+	if len(list) != 0 {
+		t.Fatalf("listed credentials=%d want=0", len(list))
+	}
+}
+
+func TestListRejectsForeignOrMissingSource(t *testing.T) {
+	service, fake, workspaceID, sourceID := newTestService(t)
+	ctx := context.Background()
+	if _, err := service.Issue(ctx, workspaceID, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	foreignWorkspace := testID(0x71)
+	fake.addSource(foreignWorkspace, testID(0x72))
+	for name, scope := range map[string]struct {
+		workspaceID ID
+		sourceID    ID
+	}{
+		"missing source":       {workspaceID, testID(0x73)},
+		"foreign source":       {workspaceID, testID(0x72)},
+		"foreign workspace":    {foreignWorkspace, sourceID},
+		"foreign both missing": {foreignWorkspace, testID(0x74)},
+	} {
+		list, err := service.List(ctx, scope.workspaceID, scope.sourceID)
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s list error=%v want ErrNotFound", name, err)
+		}
+		if list != nil {
+			t.Fatalf("%s list returned %d credentials alongside ErrNotFound", name, len(list))
+		}
+	}
+}
+
+func TestListPropagatesSourceCheckError(t *testing.T) {
+	service, fake, workspaceID, sourceID := newTestService(t)
+	failure := errors.New("synthetic source lookup failure")
+	fake.errSource = failure
+	list, err := service.List(context.Background(), workspaceID, sourceID)
+	if !errors.Is(err, failure) {
+		t.Fatalf("error=%v want the store failure", err)
+	}
+	if list != nil {
+		t.Fatal("failed list still returned credentials")
+	}
+}
+
+func TestLostRotateResponseRevokesByListedID(t *testing.T) {
+	service, _, workspaceID, sourceID := newTestService(t)
+	ctx := context.Background()
+	// A is the credential the owner wants to keep; rotating it loses the
+	// response, so the only trace of B is the extra row in the list.
+	kept, err := service.Issue(ctx, workspaceID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lost, err := service.Rotate(ctx, workspaceID, kept.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lost.ID.Bytes == kept.ID.Bytes {
+		t.Fatal("rotation reused the kept credential id")
+	}
+	list, err := service.List(ctx, workspaceID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("listed credentials=%d want=2", len(list))
+	}
+	var strays []Credential
+	for _, credential := range list {
+		if credential.ID.Bytes != kept.ID.Bytes {
+			strays = append(strays, credential)
+		}
+		if credential.RevokedAt != nil {
+			t.Fatal("an active credential was listed as revoked")
+		}
+	}
+	if len(strays) != 1 {
+		t.Fatalf("unexpected credentials beyond the kept one=%d want=1", len(strays))
+	}
+	if strays[0].ID.Bytes != lost.ID.Bytes {
+		t.Fatal("the only extra credential is not the lost rotation result")
+	}
+	if err := service.Revoke(ctx, strays[0].WorkspaceID, strays[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Authenticate(ctx, lost.Token); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("lost rotation token error=%v want ErrUnauthenticated", err)
+	}
+	if _, err := service.Authenticate(ctx, kept.Token); err != nil {
+		t.Fatalf("kept credential stopped working: %v", err)
+	}
+	after, err := service.List(ctx, workspaceID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 2 {
+		t.Fatalf("listed credentials=%d want=2 after revoke", len(after))
+	}
+	revokedSeen, activeSeen := 0, 0
+	for _, credential := range after {
+		switch credential.ID.Bytes {
+		case lost.ID.Bytes:
+			if credential.RevokedAt == nil {
+				t.Fatal("list does not show the revoked state of the lost rotation")
+			}
+			revokedSeen++
+		case kept.ID.Bytes:
+			if credential.RevokedAt != nil {
+				t.Fatal("revoking the lost rotation also revoked the kept credential")
+			}
+			activeSeen++
+		}
+	}
+	if revokedSeen != 1 || activeSeen != 1 {
+		t.Fatalf("revoked=%d active=%d want 1/1", revokedSeen, activeSeen)
+	}
+}
+
 func TestRepeatedRevokeKeepsFirstTime(t *testing.T) {
 	service, fake, workspaceID, sourceID := newTestService(t)
 	ctx := context.Background()
@@ -471,6 +599,8 @@ func TestStoreErrorsArePropagated(t *testing.T) {
 			},
 		},
 		{
+			// The source exists, so List passes the ownership check and the
+			// store list failure below is the error that must surface.
 			name:  "list",
 			setup: func(f *fakeStore) { f.errList = failure },
 			call: func(s *Service, workspaceID, sourceID ID) error {
