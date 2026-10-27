@@ -6,11 +6,13 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 )
 
-// Config contains the HTTP listener address.
+// Config contains startup settings; DatabaseURL must never be logged.
 type Config struct {
-	HTTPAddr string
+	HTTPAddr    string
+	DatabaseURL string
 }
 
 // Load reads TOKENPIVOT_HTTP_ADDR once and validates its host:port format.
@@ -31,5 +33,22 @@ func Load() (Config, error) {
 	if err != nil || !validPort || portErr != nil || n < 1 || n > 65535 {
 		return Config{}, errors.New("TOKENPIVOT_HTTP_ADDR must be host:port with a numeric port from 1 to 65535")
 	}
-	return Config{HTTPAddr: addr}, nil
+	databaseURL := os.Getenv("TOKENPIVOT_DATABASE_URL")
+	if strings.TrimSpace(databaseURL) == "" {
+		return Config{}, errors.New("TOKENPIVOT_DATABASE_URL is required")
+	}
+	return Config{HTTPAddr: addr, DatabaseURL: databaseURL}, nil
+}
+
+// MigrationConfig contains only the independent migration connection setting.
+// It must never be logged.
+type MigrationConfig struct{ DatabaseURL string }
+
+// LoadMigration never falls back to the service credentials or reads HTTP settings.
+func LoadMigration() (MigrationConfig, error) {
+	value := os.Getenv("TOKENPIVOT_MIGRATION_DATABASE_URL")
+	if strings.TrimSpace(value) == "" {
+		return MigrationConfig{}, errors.New("TOKENPIVOT_MIGRATION_DATABASE_URL is required")
+	}
+	return MigrationConfig{DatabaseURL: value}, nil
 }

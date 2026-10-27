@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/dundunHa/TokenPivot/internal/config"
+	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/dundunHa/TokenPivot/internal/server"
 	"github.com/dundunHa/TokenPivot/web"
 )
@@ -34,8 +35,12 @@ func run(logger *slog.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	pool, err := database.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
 	srv := &http.Server{
-		Handler:           server.NewHandler(frontend),
+		Handler:           server.NewHandler(pool.Ping, frontend),
 		ReadHeaderTimeout: server.ReadHeaderTimeout,
 		ReadTimeout:       server.ReadTimeout,
 		WriteTimeout:      server.WriteTimeout,
@@ -44,10 +49,13 @@ func run(logger *slog.Logger) error {
 	}
 	listener, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
+		pool.Close()
 		return fmt.Errorf("listen: %w", err)
 	}
 	logger.Info("started", "stage", "http", "addr", listener.Addr().String())
-	if err := server.Run(ctx, srv, listener, server.ShutdownTimeout); err != nil {
+	err = server.Run(ctx, srv, listener, server.ShutdownTimeout)
+	pool.Close()
+	if err != nil {
 		return err
 	}
 	logger.Info("stopped", "stage", "http")

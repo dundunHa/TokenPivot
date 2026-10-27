@@ -13,7 +13,7 @@ import (
 )
 
 func TestHandler(t *testing.T) {
-	srv := httptest.NewServer(NewHandler(nil))
+	srv := httptest.NewServer(NewHandler(func(context.Context) error { return nil }, nil))
 	defer srv.Close()
 	client := srv.Client()
 	client.Timeout = 3 * time.Second
@@ -28,7 +28,10 @@ func TestHandler(t *testing.T) {
 		{"PUT", "/healthz", 405, "Method Not Allowed\n"},
 		{"GET", "/", 404, "404 page not found\n"},
 		{"GET", "/api/example", 404, "404 page not found\n"},
-		{"GET", "/readyz", 404, "404 page not found\n"},
+		{"GET", "/readyz", 200, "ok\n"},
+		{"HEAD", "/readyz", 200, ""},
+		{"POST", "/readyz", 405, "Method Not Allowed\n"},
+		{"GET", "/readyz/", 404, "404 page not found\n"},
 		{"GET", "/healthz/", 404, "404 page not found\n"},
 	} {
 		t.Run(tt.method+tt.path, func(t *testing.T) {
@@ -62,7 +65,7 @@ func TestFrontendDispatch(t *testing.T) {
 		w.Header().Set("X-Frontend", "yes")
 		w.WriteHeader(http.StatusNoContent)
 	})
-	h := NewHandler(frontend)
+	h := NewHandler(func(context.Context) error { return nil }, frontend)
 	for _, method := range []string{"GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"} {
 		for _, path := range []string{"/api", "/api/", "/api/not-implemented", "/api?x=1", "/healthz", "/healthz/", "/healthz/unknown", "/readyz", "/readyz/", "/readyz/unknown"} {
 			t.Run(method+path, func(t *testing.T) {
@@ -71,7 +74,7 @@ func TestFrontendDispatch(t *testing.T) {
 				w := httptest.NewRecorder()
 				h.ServeHTTP(w, r)
 				want := http.StatusNotFound
-				if path == "/healthz" {
+				if path == "/healthz" || path == "/readyz" {
 					want = http.StatusMethodNotAllowed
 					if method == "GET" || method == "HEAD" {
 						want = http.StatusOK
@@ -139,7 +142,7 @@ func assertNotListening(t *testing.T, addr string) {
 
 func TestRunCancellation(t *testing.T) {
 	l := listen(t)
-	srv := &http.Server{Handler: NewHandler(nil)}
+	srv := &http.Server{Handler: NewHandler(func(context.Context) error { return nil }, nil)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -258,7 +261,7 @@ func TestRunServeFailure(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	err := Run(context.Background(), &http.Server{Handler: NewHandler(nil)}, l, time.Second)
+	err := Run(context.Background(), &http.Server{Handler: NewHandler(func(context.Context) error { return nil }, nil)}, l, time.Second)
 	if !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Run error = %v, want closed listener", err)
 	}
@@ -266,7 +269,7 @@ func TestRunServeFailure(t *testing.T) {
 
 func TestRunExpectedServerClosed(t *testing.T) {
 	l := listen(t)
-	srv := &http.Server{Handler: NewHandler(nil)}
+	srv := &http.Server{Handler: NewHandler(func(context.Context) error { return nil }, nil)}
 	if err := srv.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -274,4 +277,38 @@ func TestRunExpectedServerClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNotListening(t, l.Addr().String())
+}
+
+func TestReadinessFailures(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		calls := 0
+		h := NewHandler(func(ctx context.Context) error {
+			calls++
+			if timeout {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return errors.New("synthetic-sensitive-marker")
+		}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		for _, method := range []string{"GET", "HEAD"} {
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(method, "/readyz", nil))
+			want := "not ready\n"
+			if method == "HEAD" {
+				want = ""
+			}
+			if w.Code != 503 || w.Body.String() != want {
+				t.Fatalf("unsafe readiness response: %d", w.Code)
+			}
+		}
+		for _, path := range []string{"/healthz", "/readyz/"} {
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", path, nil))
+		}
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/readyz", nil))
+		if calls != 2 {
+			t.Fatalf("unexpected checks: %d", calls)
+		}
+	}
 }

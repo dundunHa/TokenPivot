@@ -18,16 +18,33 @@ const (
 	WriteTimeout      = 10 * time.Second
 	IdleTimeout       = 60 * time.Second
 	ShutdownTimeout   = 10 * time.Second
+	ReadyTimeout      = time.Second
 )
 
-// NewHandler keeps API and probe paths on the backend and optionally serves a frontend.
-func NewHandler(frontend http.Handler) http.Handler {
+// NewHandler exposes liveness and bounded, uncached readiness, keeping API and
+// probe paths on the backend while optionally serving a frontend.
+func NewHandler(checkReady func(context.Context) error, frontend http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		// A write failure means the peer disconnected; no request data is logged.
 		if _, err := w.Write([]byte("ok\n")); err != nil {
 			return
+		}
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		ctx, cancel := context.WithTimeout(r.Context(), ReadyTimeout)
+		defer cancel()
+		status, body := http.StatusOK, "ok\n"
+		if err := checkReady(ctx); err != nil {
+			status, body = http.StatusServiceUnavailable, "not ready\n"
+		}
+		w.WriteHeader(status)
+		if r.Method != http.MethodHead {
+			if _, err := w.Write([]byte(body)); err != nil {
+				return
+			}
 		}
 	})
 	if frontend == nil {
