@@ -467,24 +467,8 @@ func TestUsageEvents(t *testing.T) {
 	// following SELECT in the same transaction sees the committed row.
 	t.Run("concurrent commit", func(t *testing.T) {
 		row := syntheticUsageEvent(t)
-		connA, err := pgx.Connect(ctx, appURL)
-		if err != nil {
-			t.Fatal(database.SafeError("connect A", err))
-		}
-		defer func() {
-			if err := connA.Close(context.Background()); err != nil {
-				t.Error("close A failed")
-			}
-		}()
-		connB, err := pgx.Connect(ctx, appURL)
-		if err != nil {
-			t.Fatal(database.SafeError("connect B", err))
-		}
-		defer func() {
-			if err := connB.Close(context.Background()); err != nil {
-				t.Error("close B failed")
-			}
-		}()
+		connA := connectTestConn(t, ctx, appURL, "A")
+		connB := connectTestConn(t, ctx, appURL, "B")
 		txA, err := connA.Begin(ctx)
 		if err != nil {
 			t.Fatal(database.SafeError("begin A", err))
@@ -498,34 +482,15 @@ func TestUsageEvents(t *testing.T) {
 		if err := txA.QueryRow(ctx, insertUsageEventSQL, usageEventArgs(row)...).Scan(&idA); err != nil {
 			t.Fatal(database.SafeError("insert A", err))
 		}
-		var pidB int
-		if err := connB.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidB); err != nil {
-			t.Fatal(database.SafeError("pid B", err))
-		}
-		type outcome struct {
-			inserted bool
-			err      error
-		}
-		done := make(chan outcome, 1)
+		pidB := backendPID(t, ctx, connB, "pid B")
 		blockCtx, stopBlock := context.WithTimeout(context.Background(), 20*time.Second)
 		defer stopBlock()
-		go func() {
-			tag, err := connB.Exec(blockCtx, insertUsageEventSQL, usageEventArgs(row)...)
-			if err != nil {
-				done <- outcome{err: err}
-				return
-			}
-			done <- outcome{inserted: tag.RowsAffected() == 1}
-		}()
+		done := startBlockedInsert(blockCtx, connB, row)
 		waitForBlockedLock(t, ctx, db, pidB)
 		if err := txA.Commit(ctx); err != nil {
 			t.Fatal(database.SafeError("commit A", err))
 		}
-		result := <-done
-		if result.err != nil {
-			t.Fatal(database.SafeError("blocked insert", result.err))
-		}
-		if result.inserted {
+		if awaitBlockedInsert(t, done) {
 			t.Fatal("blocked insert reported an inserted row after the first commit")
 		}
 		var idB string
@@ -544,24 +509,8 @@ func TestUsageEvents(t *testing.T) {
 	// succeeds and its own content is the stored row.
 	t.Run("concurrent rollback", func(t *testing.T) {
 		row := syntheticUsageEvent(t)
-		connA, err := pgx.Connect(ctx, appURL)
-		if err != nil {
-			t.Fatal(database.SafeError("connect A", err))
-		}
-		defer func() {
-			if err := connA.Close(context.Background()); err != nil {
-				t.Error("close A failed")
-			}
-		}()
-		connB, err := pgx.Connect(ctx, appURL)
-		if err != nil {
-			t.Fatal(database.SafeError("connect B", err))
-		}
-		defer func() {
-			if err := connB.Close(context.Background()); err != nil {
-				t.Error("close B failed")
-			}
-		}()
+		connA := connectTestConn(t, ctx, appURL, "A")
+		connB := connectTestConn(t, ctx, appURL, "B")
 		txA, err := connA.Begin(ctx)
 		if err != nil {
 			t.Fatal(database.SafeError("begin A", err))
@@ -569,37 +518,18 @@ func TestUsageEvents(t *testing.T) {
 		if _, err := txA.Exec(ctx, insertUsageEventSQL, usageEventArgs(row)...); err != nil {
 			t.Fatal(database.SafeError("insert A", err))
 		}
-		var pidB int
-		if err := connB.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidB); err != nil {
-			t.Fatal(database.SafeError("pid B", err))
-		}
+		pidB := backendPID(t, ctx, connB, "pid B")
 		rowB := row
 		rowB.payloadHash = bytes.Repeat([]byte{0x44}, 32)
 		rowB.provider = "synthetic-rollback-provider"
-		type outcome struct {
-			inserted bool
-			err      error
-		}
-		done := make(chan outcome, 1)
 		blockCtx, stopBlock := context.WithTimeout(context.Background(), 20*time.Second)
 		defer stopBlock()
-		go func() {
-			tag, err := connB.Exec(blockCtx, insertUsageEventSQL, usageEventArgs(rowB)...)
-			if err != nil {
-				done <- outcome{err: err}
-				return
-			}
-			done <- outcome{inserted: tag.RowsAffected() == 1}
-		}()
+		done := startBlockedInsert(blockCtx, connB, rowB)
 		waitForBlockedLock(t, ctx, db, pidB)
 		if err := txA.Rollback(ctx); err != nil {
 			t.Fatal(database.SafeError("rollback A", err))
 		}
-		result := <-done
-		if result.err != nil {
-			t.Fatal(database.SafeError("blocked insert", result.err))
-		}
-		if !result.inserted {
+		if !awaitBlockedInsert(t, done) {
 			t.Fatal("insert after rollback was not inserted")
 		}
 		var provider string
@@ -625,16 +555,7 @@ func TestUsageEvents(t *testing.T) {
 			rows[i] = base
 			rows[i].payloadHash = bytes.Repeat([]byte{byte(0x50 + i)}, 32)
 			rows[i].provider = fmt.Sprintf("synthetic-contender-%d", i)
-			conn, err := pgx.Connect(ctx, appURL)
-			if err != nil {
-				t.Fatal(database.SafeError("connect contender", err))
-			}
-			conns[i] = conn
-			defer func() {
-				if err := conn.Close(context.Background()); err != nil {
-					t.Error("close contender failed")
-				}
-			}()
+			conns[i] = connectTestConn(t, ctx, appURL, "contender")
 		}
 		type outcome struct {
 			index    int
@@ -795,6 +716,62 @@ func TestUsageEvents(t *testing.T) {
 		}
 		t.Logf("samples=%d at 256 byte identity", len(samples))
 	})
+}
+
+// connectTestConn opens a dedicated connection and closes it when the subtest ends;
+// name labels the connect and close failures.
+func connectTestConn(t *testing.T, ctx context.Context, url, name string) *pgx.Conn {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(database.SafeError("connect "+name, err))
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Error("close " + name + " failed")
+		}
+	})
+	return conn
+}
+
+func backendPID(t *testing.T, ctx context.Context, conn *pgx.Conn, op string) int {
+	t.Helper()
+	var pid int
+	if err := conn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
+		t.Fatal(database.SafeError(op, err))
+	}
+	return pid
+}
+
+type blockedInsertOutcome struct {
+	inserted bool
+	err      error
+}
+
+// startBlockedInsert runs the do-nothing insert in a goroutine so it can wait on the
+// identity lock while the test finishes the other transaction. The channel is
+// buffered, so the goroutine can always deliver its outcome and exit.
+func startBlockedInsert(ctx context.Context, conn *pgx.Conn, row usageEventRow) <-chan blockedInsertOutcome {
+	done := make(chan blockedInsertOutcome, 1)
+	go func() {
+		tag, err := conn.Exec(ctx, insertUsageEventSQL, usageEventArgs(row)...)
+		if err != nil {
+			done <- blockedInsertOutcome{err: err}
+			return
+		}
+		done <- blockedInsertOutcome{inserted: tag.RowsAffected() == 1}
+	}()
+	return done
+}
+
+// awaitBlockedInsert waits for startBlockedInsert and reports whether it inserted a row.
+func awaitBlockedInsert(t *testing.T, done <-chan blockedInsertOutcome) bool {
+	t.Helper()
+	result := <-done
+	if result.err != nil {
+		t.Fatal(database.SafeError("blocked insert", result.err))
+	}
+	return result.inserted
 }
 
 // waitForBlockedLock polls the wait-side backend pid until pg_locks reports a lock it
