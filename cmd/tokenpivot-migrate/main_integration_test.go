@@ -91,9 +91,19 @@ func integrationSchema(t *testing.T) (string, string) {
 	var appRole string
 	var unsafe bool
 	err = app.QueryRow(ctx, "SELECT current_user, rolsuper OR rolcreaterole OR rolcreatedb OR has_database_privilege(current_user,current_database(),'CREATE') FROM pg_roles WHERE rolname=current_user").Scan(&appRole, &unsafe)
-	closeErr := app.Close(ctx)
-	if err != nil || closeErr != nil || unsafe || appRole != urls[1].User.Username() {
+	if err != nil || unsafe || appRole != urls[1].User.Username() {
+		if closeErr := app.Close(ctx); closeErr != nil {
+			t.Error("close app failed")
+		}
 		t.Fatal("unsafe test service role")
+	}
+	// Migrations grant table privileges to the fixed tokenpivot_app role, so the
+	// service test account must be that role or inherit it without SET ROLE.
+	var appPrivileges bool
+	err = app.QueryRow(ctx, "SELECT pg_has_role(current_user, 'tokenpivot_app', 'USAGE')").Scan(&appPrivileges)
+	closeErr := app.Close(ctx)
+	if err != nil || closeErr != nil || !appPrivileges {
+		t.Fatal("test service role must have tokenpivot_app privileges")
 	}
 	schema := "t050_" + fmt.Sprintf("%x", rand.Text()[:12])
 	quoted := pgx.Identifier{schema}.Sanitize()
@@ -154,6 +164,14 @@ func TestSingleConnectionMatrix(t *testing.T) {
 		t.Run(first, func(t *testing.T) {
 			value, appURL := integrationSchema(t)
 			p, db := testProvider(t, value, migrations.Files)
+			// Derive the expectations from the embedded migrations so later
+			// migrations do not need to edit this test again.
+			sources := p.ListSources()
+			if len(sources) < 2 {
+				t.Fatal("fewer than two migration sources")
+			}
+			latest := sources[len(sources)-1].Version
+			previous := sources[len(sources)-2].Version
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			var before, after int
@@ -171,9 +189,12 @@ func TestSingleConnectionMatrix(t *testing.T) {
 				if err != nil {
 					t.Fatal(database.SafeError("version", err))
 				}
-				want := int64(1)
-				if command == "status" || command == "down-one" {
+				want := latest
+				switch command {
+				case "status":
 					want = 0
+				case "down-one":
+					want = previous
 				}
 				if version != want {
 					t.Fatalf("version=%d want=%d", version, want)
@@ -191,10 +212,6 @@ func TestSingleConnectionMatrix(t *testing.T) {
 				t.Fatal("operation borrowed another connection or waited")
 			}
 			t.Logf("backend_pid=%d open=%d idle=%d wait_count=%d", after, stats.OpenConnections, stats.Idle, stats.WaitCount)
-			var tables int
-			if err := db.QueryRowContext(ctx, "SELECT count(*) FROM pg_tables WHERE schemaname=current_schema() AND tablename <> 'goose_db_version'").Scan(&tables); err != nil || tables != 0 {
-				t.Fatal("unexpected business tables")
-			}
 			app, err := pgx.Connect(ctx, appURL)
 			if err != nil {
 				t.Fatal(database.SafeError("app", err))

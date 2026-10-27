@@ -1,6 +1,6 @@
 # TokenPivot 数据模型设计
 
-> T-001 技术设计草案；核心边界已确认，字段与索引须经接口样例及压测后定稿。尚无迁移，不是数据库已实现的说明。
+> T-001 技术设计草案；核心边界已确认，字段与索引须经接口样例及压测后定稿。`workspaces`、`projects`、`sources`、`ingest_credentials` 四张基础表已由迁移 00002 实现，其余表仍只是设计，不是数据库已实现的说明。
 
 ## 1. 关系
 
@@ -20,22 +20,24 @@ erDiagram
 
 ## 2. 公共约定
 
-ID 逻辑上为 UUID，具体生成版本待实现时确认；时间为 timestamptz，存 UTC。Token 和计数用 bigint，禁止浮点存用量。业务字符串用 text；必填默认 NOT NULL，可空字段逐项说明理由。数值范围、负数、溢出、引用与状态由应用层验证。字段名是设计建议，不是已发布接口。
+ID 用 UUID v7，由数据库默认值 `uuidv7()` 生成，写入后用 `RETURNING id` 取回，因此服务端最低版本为 **PostgreSQL 18**（该函数自 18 起内置）。机器标识列（`project_key`、`platform`、`instance_key`）使用 `COLLATE "C"`，按字节排序和判等，不随数据库 locale 与系统排序库版本变化；`name` 一类展示用列沿用数据库默认排序规则。时间为 timestamptz，存 UTC。Token 和计数用 bigint，禁止浮点存用量。业务字符串用 text；摘要值等二进制值用 bytea。必填默认 NOT NULL，可空字段逐项说明理由。数值范围、负数、溢出、引用与状态由应用层验证。索引命名规则：唯一索引 `uk_<表>_<列>`，普通索引 `idx_<表>_<列>`，主键索引用数据库默认名 `<表>_pkey`。字段名是设计建议，不是已发布接口。
 
 ## 3. 核心实体与访问路径
 
 | 实体 | 核心字段/类型 | 唯一性与读写路径 |
 |---|---|---|
 | users | id uuid；email text；password_hash text；email_verified_at timestamptz 可空（未验证） | 规范化 email 唯一；按 ID/邮箱登录查询，验证和重置更新 |
-| workspaces | id uuid；name text；created_at timestamptz | 主键；成员列表关联查询 |
+| workspaces | id uuid（默认 `uuidv7()`）；name text；created_at timestamptz（默认 `now()`） | 只有主键；name 不唯一，非空与长度由应用校验；成员列表按 workspace 关联查询 |
 | workspace_memberships | workspace_id/user_id uuid；role text；joined_at timestamptz | `(workspace_id,user_id)` 唯一；另支持 user_id 查空间；role=owner/member |
-| projects | id/workspace_id uuid；project_key/name text；archived_at timestamptz 可空 | `(workspace_id,project_key)` 唯一；按空间列举。归档不删除历史身份 |
-| sources | id/workspace_id uuid；platform/instance_key text；last_received_at timestamptz 可空 | `(workspace_id,platform,instance_key)` 唯一；代表稳定插件实例，不代表一次凭证；实例标识生成待插件核验 |
-| ingest_credentials | id/workspace_id/source_id uuid；secret_hash text；revoked_at timestamptz 可空 | 按凭证公开 ID 定位并验证摘要；source_id 索引；轮换创建新凭证但 source 不变 |
+| projects | id/workspace_id uuid；project_key text（`COLLATE "C"`）；name text；archived_at timestamptz 可空；created_at timestamptz（默认 `now()`） | `uk_projects_workspace_id_project_key` UNIQUE `(workspace_id,project_key)`；唯一索引以 workspace_id 开头，兼作 workspace_id 引用索引并支持按空间列举。归档后 key 仍被占用（不用部分唯一索引）；归档不删除历史身份 |
+| sources | id/workspace_id uuid；platform、instance_key text（均 `COLLATE "C"`）；last_received_at timestamptz 可空；created_at timestamptz（默认 `now()`） | `uk_sources_workspace_id_platform_instance_key` UNIQUE `(workspace_id,platform,instance_key)`；代表稳定插件实例，不代表一次凭证；实例标识生成待插件核验 |
+| ingest_credentials | id/workspace_id/source_id uuid；secret_hash bytea；revoked_at timestamptz 可空；created_at timestamptz（默认 `now()`） | `uk_ingest_credentials_secret_hash` UNIQUE `(secret_hash)`：认证按完整令牌的 SHA-256 摘要等值查找，一个摘要只对应一条凭证；`idx_ingest_credentials_workspace_id_source_id` `(workspace_id,source_id)` 支持按空间或空间+source 列举；轮换创建新凭证但 source 不变，所以 source_id 不唯一 |
 | sessions | id/user_id uuid；token_hash text；expires_at timestamptz | token_hash 唯一；user_id 索引用于撤销；expires_at 支持清理 |
 | auth_actions | id/user_id uuid；purpose/token_hash text；expires_at/consumed_at timestamptz（consumed 可空）；目标邮箱、邀请 workspace 按用途可空 | token_hash 唯一；一次性邮箱验证/重置/邀请；邀请场景 user_id 可空，按用途校验字段完整性；最终字段拆分待认证流程确认 |
 
-状态流转：凭证 active→revoked；会话 active→expired/revoked；一次性操作 pending→consumed/expired。消费采用条件更新，避免并发复用。成员变更需保护最后一个 owner。项目归档不回写旧事件，不做级联删除。source 归档或凭证撤销不清除防重记录。
+已在迁移 00002 实现的四张表（workspaces、projects、sources、ingest_credentials）另有以下约定：服务角色 `tokenpivot_app` 在这四张表上只有 SELECT、INSERT、UPDATE 权限，不授予 DELETE、TRUNCATE、REFERENCES、TRIGGER，归档与撤销都用 UPDATE 完成；除 `archived_at`、`last_received_at`、`revoked_at` 三列可空外全部 NOT NULL；`created_at` 用于管理页排序与凭证签发时间审计；`secret_hash` 存 32 字节摘要原始字节，长度由应用保证，迁移不加 CHECK；表级 COMMENT 写英文，字段含义以本文件为准。这些都与早期设计草案有差异：新增 `created_at`、凭证索引改为 `(workspace_id, source_id)` 组合索引、ID 生成版本定为 UUID v7 的数据库默认值、`secret_hash` 由 text 改为 bytea 并加唯一索引（认证从“按公开 ID 定位”改为“按摘要查找”）。
+
+状态流转：凭证 active→revoked；会话 active→expired/revoked；一次性操作 pending→consumed/expired。消费采用条件更新，避免并发复用。成员变更需保护最后一个 owner。项目归档不回写旧事件，不做级联删除。凭证撤销或项目归档不清除防重记录。当前 `sources` 没有 `archived_at`，source 生命周期字段要等出现真实需求时由管理任务另起迁移新增，不在 00002 预留。
 
 ## 4. usage_events：不可变最终事件
 

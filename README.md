@@ -1,6 +1,6 @@
 # TokenPivot
 
-Go HTTP 服务和独立 PostgreSQL 迁移入口。当前没有业务表或业务 API；数据库连接可用不代表业务已可用。服务启动必须连接数据库，**不会自动迁移**。 可选内嵌前端工程占位页仅在构建时需要 Node，运行不依赖 Node 或磁盘前端文件。
+Go HTTP 服务和独立 PostgreSQL 迁移入口。迁移 00002 已建立四张基础业务表（`workspaces`、`projects`、`sources`、`ingest_credentials`），但还没有业务 API；数据库连接可用不代表业务已可用。服务启动必须连接数据库，**不会自动迁移**。 可选内嵌前端工程占位页仅在构建时需要 Node，运行不依赖 Node 或磁盘前端文件。
 
 ## 工具前提、首次安装与根命令入口
 
@@ -36,7 +36,7 @@ npm --prefix web ci
 
 Go 最低要求 **1.26.4**（新机器用 1.26.10 也满足，但不把它当作目标）；固定 pgx **v5.11.0**、goose **v3.29.0**；本地验收 PostgreSQL **18.4**。将独立安装的工具 `bin` 放入当前 shell 的 PATH，不修改全局配置，使用 `GOTOOLCHAIN=local`。
 
-PG 18.4 这一项只有客户端/开发库证据（本机 `psql --version` 与 `pg_config --version` 均为 18.4），**未核实实际运行服务端**；本次只是改声明，不连接、不升级、不降级任何实例。版本口径来源见 [T-052 工具链版本基线计划](docs/plans/2026-10-27-toolchain-baseline.md)。
+PG 18.4 这一项只有客户端/开发库证据（本机 `psql --version` 与 `pg_config --version` 均为 18.4），**未核实实际运行服务端**；本次只是改声明，不连接、不升级、不降级任何实例。迁移 00002 用 `uuidv7()` 作 id 默认值，因此**服务端最低版本是 PostgreSQL 18**（低于 18 时迁移失败）。版本口径来源见 [T-052 工具链版本基线计划](docs/plans/2026-10-27-toolchain-baseline.md)。
 
 只在专用本地实例执行以下准备，不连接或改动已有开发数据库。管理员通过交互式 `psql` 执行，角色/数据库创建不属于迁移：
 
@@ -54,7 +54,7 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 \password tokenpivot_app
 ```
 
-密码用 `\password` 交互设置，再由本地凭证管理工具安全注入；不要把真实密码/URL 写进仓库、日志、命令参数或 shell 历史。服务只有 CONNECT/USAGE，不是 schema owner，不能写迁移历史；业务表授权由后续迁移确定，不预授未来所有表权限。
+密码用 `\password` 交互设置，再由本地凭证管理工具安全注入；不要把真实密码/URL 写进仓库、日志、命令参数或 shell 历史。服务只有 CONNECT/USAGE，不是 schema owner，不能写迁移历史。业务表权限不预授予未来所有表，而是随建表迁移逐条 `GRANT SELECT, INSERT, UPDATE` 给固定角色 `tokenpivot_app`（不授予 DELETE、TRUNCATE 等），所以**执行 `up` 之前这个角色必须已存在**；不存在时整个迁移文件回滚、命令以非零码退出。部署用的登录名如果不是 `tokenpivot_app`，就另建一个 NOLOGIN 的 `tokenpivot_app` 角色并对该表授权，再把 `tokenpivot_app` 授予实际登录角色，由登录角色继承权限；不要改迁移里的角色名。逐表授权清单以迁移文件和 [数据模型](docs/data-model.md) 为准，这里不重复列出。
 
 ## 配置与启动
 
@@ -115,7 +115,18 @@ TOKENPIVOT_DEV_API_TARGET=http://127.0.0.1:8080 make dev-web
 ./bin/tokenpivot-migrate up
 ```
 
-发布顺序：**独立迁移成功 → 启动/发布服务**。迁移命令只支持 `status`、`up`、`down-one`，SQL 内嵌，不依赖工作目录；首次 `status` 可能创建历史表，并非绝对只读。重复 `up` 成功并记录 `no change`。第一条 bootstrap 的 Up/Down 仅 `SELECT 1`，不是业务 schema；唯一持久结构为 goose 管理的 `goose_db_version`，down 不删除历史表。后续文件从 00002 编号，已在共享环境执行的文件不能改写。
+发布顺序：**独立迁移成功 → 启动/发布服务**。迁移命令只支持 `status`、`up`、`down-one`，SQL 内嵌，不依赖工作目录；首次 `status` 可能创建历史表，并非绝对只读。重复 `up` 成功并记录 `no change`。第一条 bootstrap 的 Up/Down 仅 `SELECT 1`，不建业务对象；00002 起才有业务表（四张基础表），`goose_db_version` 始终由 goose 管理、down 不删除。后续文件从 00003 编号，已在共享环境执行的文件不能改写。
+
+第一次在有业务表的库上执行 `up` 之前，按顺序自查（管理员在 `psql` 里执行）：
+
+```sql
+SHOW server_version;                                   -- 必须 >= 18：id 默认值用 uuidv7()
+SELECT 1 FROM pg_roles WHERE rolname = 'tokenpivot_app'; -- 必须有结果：迁移向这个固定角色授权
+SELECT to_regclass('workspaces'), to_regclass('projects'),
+       to_regclass('sources'), to_regclass('ingest_credentials'); -- 00002 尚未执行时全为 NULL
+```
+
+**迁移命令失败时输出里没有原因**：错误细节（含 SQLSTATE）在入口被脱敏丢弃，只会看到 `up or unlock: database operation failed` 这类固定文本。所以排查只能靠上面的自查加数据库服务端日志——服务端低于 18（`uuidv7()` 不存在）、`tokenpivot_app` 不存在、对象已存在，这三种情况的提示完全相同。这个脱敏是有意设计，不是缺陷。
 
 迁移直连 PG，不可经过事务池化 PgBouncer。固定 session advisory lock 在同一数据库不同 schema 也可能争用；争用短暂等待后失败，不重试 SQL。逐文件事务保证失败文件的对象及历史一起回滚，之前成功文件保留。SQL 失败先核对状态和对象，再修复尚未发布文件或新增前向修复；不手工标记成功、不 reset/force。进程被杀或提交失联可能已提交，必须核对后再重跑。生产优先前向修复，不自动 down。
 
@@ -169,7 +180,7 @@ GRANT CONNECT, CREATE ON DATABASE tokenpivot_test TO tokenpivot_owner;
 GRANT CONNECT ON DATABASE tokenpivot_test TO tokenpivot_app;
 ```
 
-测试服务角色必须使用密码认证（推荐 `scram-sha-256`），不能命中 `trust`；在专用实例的 `pg_hba.conf` 中，将精确测试库/服务角色/回环地址规则放在通配规则之前，reload 后验证正确密码可连接。测试会用同一真实角色的错误密码断言 SQLSTATE `28P01`，并验证服务退出和日志脱敏。
+测试服务角色必须使用密码认证（推荐 `scram-sha-256`），不能命中 `trust`；在专用实例的 `pg_hba.conf` 中，将精确测试库/服务角色/回环地址规则放在通配规则之前，reload 后验证正确密码可连接。测试会用同一真实角色的错误密码断言 SQLSTATE `28P01`，并验证服务退出和日志脱敏。服务测试账号还必须就是 `tokenpivot_app`，或者无需 `SET ROLE` 就能直接使用它的权限（例如把 `tokenpivot_app` 授予该账号）；每轮集成测试开头都会用 `pg_has_role` 检查这一点，不满足就以 `test service role must have tokenpivot_app privileges` 失败，因为迁移只向这个固定角色授权。
 
 安全注入 `TOKENPIVOT_TEST_DATABASE_URL`（迁移 owner）和 `TOKENPIVOT_TEST_APP_DATABASE_URL`（服务角色）。URL 必须明确回环 **IP**（例如 127.0.0.1）、同一 host/端口和 `_test` 数据库、不同用户及 sslmode；查询参数仅接受 sslmode/search_path。测试验证角色身份及权限，缺变量直接失败，不 skip。测试清除 PG 默认环境并隔离默认凭证文件；只使用明确注入的两个测试 URL。每个用例新建随机 `t050_` 前缀 schema、设置 search_path，记录非敏感归属，关闭本次连接/进程后仅清理本次 schema。清理**通常仍会执行**；只有在归属检查失败、清理本身失败等情形才会保留该 schema、报出 schema 名并使测试失败，供人工核对——这不是“失败一律保留”，也不代表测试从不清理。不删除数据库、不扫描清空旧对象。
 
@@ -181,7 +192,7 @@ make test-integration
 
 该目标先构建前端（联合标签需要真实 `web/dist`），再执行 `GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -count=1 -p 1 -v ./...`。`-count=1` 避免测试缓存掩盖本次库状态，`-p 1` 保持包级串行；它是有数据库写入的显式操作，**不包含在 `make check` 里**。缺变量时会看到 `explicit integration database variables required` 并非零，此刻不会接触数据库。
 
-覆盖单连接初始化/重复迁移/撤销重上、同连接锁与 SQL、事务回滚、争锁/取消/杀进程恢复、最小权限、服务信号退出和真实 TCP 断连恢复。测试专用 TCP 转发器阻断服务连接，不停止数据库、不终止未知会话。Unix 子进程信号测试不覆盖 Windows 服务管理。
+覆盖单连接初始化/重复迁移/撤销重上、同连接锁与 SQL、事务回滚、争锁/取消/杀进程恢复、最小权限、服务信号退出和真实 TCP 断连恢复，以及 00002 四张基础表的列与默认值、索引、无外键/CHECK/触发器/RLS、`tokenpivot_app` 只有 SELECT/INSERT/UPDATE 权限、唯一性范围（含归档后 key 仍被占用、大小写按字节判等）、同 source 多凭证轮换与撤销、`UpTo(2)`/`DownTo(1)` 回退重上。测试专用 TCP 转发器阻断服务连接，不停止数据库、不终止未知会话。Unix 子进程信号测试不覆盖 Windows 服务管理。
 
 
 ## 前端开发与内嵌构建
@@ -205,6 +216,6 @@ TOKENPIVOT_HTTP_ADDR=127.0.0.1:18080 /tmp/tokenpivot-t031-ui
 
 带标签缺少 dist 时编译失败；缺少可读普通 index.html 时初始化失败，不会启动成假成功。构建后可将二进制放到不含仓库的目录运行。页面与 API 必须同源，生产 TLS 由外层入口提供。所有静态成功响应 `Cache-Control: no-cache`；不存在的资源不返回 HTML，只有显式接受 HTML 的无扩展名导航可回退入口。带哈希资源不承诺升级后旧页面永远可用。
 
-当前不含业务表、业务 API、认证授权、TLS、请求 ID、指标追踪、后台任务、Redis/队列；占位页不是产品视觉或业务页面。根 [Makefile](Makefile) 只是薄命令入口，不建设 CI、Docker、统一 lint 平台或热重载/后台进程管理。公网部署前须独立完成入口与业务安全设计。
+当前除迁移 00002 的四张基础表外没有其他业务表，也没有业务 API、认证授权、TLS、请求 ID、指标追踪、后台任务、Redis/队列；占位页不是产品视觉或业务页面。根 [Makefile](Makefile) 只是薄命令入口，不建设 CI、Docker、统一 lint 平台或热重载/后台进程管理。公网部署前须独立完成入口与业务安全设计。
 
 前端和数据库联合验收：完成前端构建并安全注入上述两个测试 URL 后，独占测试库执行 `make test-integration`（即 `GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -count=1 -p 1 -v ./...`）；不能用分别编译两个标签代替联合验收。
