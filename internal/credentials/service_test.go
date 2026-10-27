@@ -217,7 +217,7 @@ func TestIssueTokenPrefixAndUniqueness(t *testing.T) {
 			t.Fatalf("stored digest %d length=%d want=%d", i, len(digest), sha256.Size)
 		}
 	}
-	if bytes.Equal(fake.digests[0], []byte(first.Token)) || bytes.Contains(fake.digests[0], []byte(first.Token)) {
+	if bytes.Contains(fake.digests[0], []byte(first.Token)) {
 		t.Fatal("stored digest contains the plaintext token")
 	}
 	if !bytes.Equal(fake.digests[1], tokenDigest(second.Token)) {
@@ -334,7 +334,7 @@ func TestIssueRejectsForeignSource(t *testing.T) {
 }
 
 func TestRotateAndRevokeRejectForeignWorkspace(t *testing.T) {
-	service, _, workspaceID, sourceID := newTestService(t)
+	service, fake, workspaceID, sourceID := newTestService(t)
 	ctx := context.Background()
 	issued, err := service.Issue(ctx, workspaceID, sourceID)
 	if err != nil {
@@ -347,7 +347,7 @@ func TestRotateAndRevokeRejectForeignWorkspace(t *testing.T) {
 	if err := service.Revoke(ctx, foreignWorkspace, issued.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("revoke error=%v want ErrNotFound", err)
 	}
-	target := service.store.(*fakeStore).stored(t, issued.ID)
+	target := fake.stored(t, issued.ID)
 	if target.credential.RevokedAt != nil {
 		t.Fatal("foreign workspace revoke changed the credential")
 	}

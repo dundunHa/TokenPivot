@@ -39,7 +39,7 @@ func (p *Postgres) List(ctx context.Context, workspaceID, sourceID ID) ([]Creden
 		return nil, database.SafeError("credentials list", err)
 	}
 	defer rows.Close()
-	credentials := make([]Credential, 0, 4)
+	credentials := []Credential{}
 	for rows.Next() {
 		credential, err := scanCredential(rows)
 		if err != nil {
