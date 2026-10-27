@@ -1,0 +1,927 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenPivot · D-B 大屏指挥中心（荧光绿）</title>
+<style>
+  :root{
+    --bg:#070a08;
+    --panel:rgba(10,15,12,.86);
+    --panel-2:rgba(10,15,12,.9);
+    --line:rgba(53,244,155,.15);
+    --line-2:rgba(53,244,155,.08);
+    --cyan:#35f49b;
+    --blue:#1f9e68;
+    --violet:#a3ffce;
+    --amber:#ffd166;
+    --green:#35f49b;
+    --red:#ff7b72;
+    --t1:#dff5e8;
+    --t2:#9cb5a7;
+    --dim:#5f7a6c;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#070a08}
+  body{font-family:var(--sans);color:var(--t1);-webkit-font-smoothing:antialiased}
+
+  .viewport{position:fixed;inset:0;display:grid;place-items:center;
+    background:
+      radial-gradient(1200px 620px at 50% -10%,rgba(53,244,155,.13),transparent 70%),
+      radial-gradient(900px 500px at 100% 100%,rgba(163,255,206,.10),transparent 72%),
+      #070a08;
+  }
+  .viewport::before{
+    content:"";position:absolute;inset:0;pointer-events:none;opacity:.5;
+    background-image:
+      repeating-linear-gradient(0deg,rgba(53,244,155,.05) 0 1px,transparent 1px 44px),
+      repeating-linear-gradient(90deg,rgba(53,244,155,.05) 0 1px,transparent 1px 44px);
+    mask-image:radial-gradient(circle at 50% 40%,#000 30%,transparent 78%);
+  }
+
+  .stage{
+    width:1920px;height:1080px;transform-origin:center center;
+    display:flex;flex-direction:column;gap:12px;padding:16px 22px 18px;position:relative;
+  }
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+  /* ---------- header ---------- */
+  .top{display:flex;align-items:center;gap:18px;height:58px;flex:0 0 58px}
+  .logo{width:30px;height:30px;border-radius:7px;
+    background:conic-gradient(from 200deg,#35f49b,#a3ffce,#35f49b);
+    box-shadow:0 0 22px rgba(53,244,155,.5)}
+  .ttl{font-size:22px;font-weight:600;letter-spacing:.04em;line-height:1.15}
+  .ttl small{display:block;font-size:10.5px;letter-spacing:.28em;color:var(--dim);font-weight:400;margin-top:2px}
+  .ws{display:flex;align-items:center;gap:8px;padding:6px 12px;margin-left:10px;
+    border:1px solid var(--line);border-radius:5px;background:rgba(10,15,12,.8);font-size:12px;color:var(--t2)}
+  .ws b{color:var(--t1);font-weight:500}
+  .ws .dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
+  .hsp{flex:1}
+  .clock{text-align:right}
+  .clock .t{font-family:var(--mono);font-size:26px;letter-spacing:.02em;line-height:1;color:#dff5e8}
+  .clock .d{font-size:10.5px;letter-spacing:.14em;color:var(--dim);margin-top:4px}
+  .wall{padding:5px 10px;border-radius:4px;border:1px solid rgba(53,244,155,.35);
+    background:rgba(53,244,155,.08);font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;color:#7cffc6}
+  .live{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10.5px;color:var(--dim);letter-spacing:.08em}
+  .live i{width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:blink 2.2s infinite}
+  @keyframes blink{0%,60%{opacity:1;box-shadow:0 0 10px var(--cyan)}61%,100%{opacity:.2;box-shadow:none}}
+
+  /* ---------- ticker ---------- */
+  .ticker{height:26px;flex:0 0 26px;border-top:1px solid var(--line-2);border-bottom:1px solid var(--line-2);
+    overflow:hidden;position:relative;display:flex;align-items:center;
+    background:linear-gradient(90deg,rgba(53,244,155,.06),transparent 30%,transparent 70%,rgba(163,255,206,.06))}
+  .ticker .run{display:flex;gap:44px;white-space:nowrap;font-family:var(--mono);font-size:11px;
+    letter-spacing:.06em;color:#5f7a6c;animation:slide 46s linear infinite}
+  .ticker .run b{color:#7cffc6;font-weight:500}
+  .ticker .run em{font-style:normal;color:var(--amber)}
+  @keyframes slide{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+
+  /* ---------- kpi ---------- */
+  .kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;flex:0 0 88px}
+  .kpi{position:relative;padding:8px 12px;border:1px solid var(--line);border-radius:6px;
+    background:linear-gradient(160deg,rgba(10,15,12,.92),rgba(10,15,12,.92));overflow:hidden}
+  .kpi::before{content:"";position:absolute;left:0;top:0;width:2px;height:100%;
+    background:linear-gradient(180deg,var(--cyan),transparent)}
+  .kpi .l{font-size:10.5px;letter-spacing:.16em;color:var(--dim)}
+  .kpi .v{font-family:var(--mono);font-size:28px;font-weight:600;letter-spacing:-.02em;margin-top:2px;line-height:1.05}
+  .kpi .v u{text-decoration:none;font-size:13px;color:var(--t2);margin-left:3px;font-weight:400}
+  .kpi .m{font-family:var(--mono);font-size:10px;color:var(--dim);margin-top:3px;display:flex;gap:8px}
+  .kpi .m .up{color:var(--green)}.kpi .m .dn{color:var(--red)}
+  .kpi svg{position:absolute;right:10px;top:6px;opacity:.65}
+  .kpi.alt::before{background:linear-gradient(180deg,var(--violet),transparent)}
+
+  /* ---------- grid ---------- */
+  .mid{flex:1 1 auto;display:grid;grid-template-columns:352px minmax(0,1fr) 352px;gap:12px;min-height:0}
+  .col{display:flex;flex-direction:column;gap:12px;min-height:0}
+  .low{flex:0 0 236px;display:grid;grid-template-columns:minmax(0,1.06fr) minmax(0,1.35fr) minmax(0,1fr);gap:12px}
+
+  .card{
+    position:relative;border:1px solid var(--line);border-radius:6px;overflow:hidden;
+    background:linear-gradient(165deg,rgba(10,15,12,.94),rgba(10,15,12,.94));
+    display:flex;flex-direction:column;min-height:0;
+  }
+  .card::before,.card::after{content:"";position:absolute;width:12px;height:12px;pointer-events:none;opacity:.75}
+  .card::before{left:4px;top:4px;border-left:1px solid rgba(53,244,155,.6);border-top:1px solid rgba(53,244,155,.6)}
+  .card::after{right:4px;bottom:4px;border-right:1px solid rgba(163,255,206,.55);border-bottom:1px solid rgba(163,255,206,.55)}
+  .ch{display:flex;align-items:center;gap:8px;padding:9px 13px 7px;flex:0 0 auto}
+  .ch h3{margin:0;font-size:12.5px;font-weight:500;letter-spacing:.12em;color:#7cffc6;display:flex;align-items:center;gap:8px}
+  .ch h3::before{content:"";width:3px;height:11px;border-radius:1px;
+    background:linear-gradient(180deg,var(--cyan),rgba(53,244,155,.15));box-shadow:0 0 8px rgba(53,244,155,.6)}
+  .ch .cm{font-family:var(--mono);font-size:9.5px;color:var(--dim);letter-spacing:.06em}
+  .ch .g{flex:1}
+  .cbody{flex:1;min-height:0;padding:0 12px 10px;display:flex;flex-direction:column}
+
+  /* gauge */
+  .gaugewrap{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;position:relative}
+  .gaugeval{position:absolute;left:50%;top:52%;transform:translate(-50%,-30%);text-align:center;pointer-events:none}
+  .gaugeval .n{font-family:var(--mono);font-size:34px;font-weight:600;letter-spacing:-.02em;line-height:1}
+  .gaugeval .n u{text-decoration:none;font-size:12px;color:var(--t2);margin-left:2px;font-weight:400}
+  .gaugeval .c{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.1em;margin-top:3px}
+  .gaugesub{display:flex;justify-content:space-around;width:100%;padding:2px 4px 0}
+  .gaugesub div{text-align:center}
+  .gaugesub .k{font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--dim)}
+  .gaugesub .v{font-family:var(--mono);font-size:14px;color:var(--t1)}
+
+  /* trend */
+  .lgb{display:flex;gap:14px;font-family:var(--mono);font-size:10px;color:var(--dim);align-items:center}
+  .lgb i{width:16px;height:3px;display:inline-block;margin-right:5px;vertical-align:middle;border-radius:2px}
+  .chartarea{position:relative;flex:1;min-height:0}
+  svg.wide{display:block;width:100%;height:100%;overflow:visible}
+  .axl{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:#31443a;padding:2px 0 0}
+
+  /* 趋势图：平滑曲线 + 渐变面 + 端点脉冲 */
+  .tr-line{fill:none;stroke-linejoin:round;stroke-linecap:round;
+    stroke-dasharray:3200;stroke-dashoffset:3200;animation:draw 1.5s cubic-bezier(.2,.7,.3,1) forwards}
+  .tr-line.l-out{stroke:var(--cyan);stroke-width:2}
+  .tr-line.l-in{stroke:var(--blue);stroke-width:1.3;opacity:.95}
+  .tr-line.l-cache{stroke:var(--violet);stroke-width:1.1;opacity:.9}
+  @keyframes draw{to{stroke-dashoffset:0}}
+  .tr-area{stroke:none}
+  .dotg{fill:var(--cyan);opacity:.15}
+  .so-out{stop-color:var(--cyan);stop-opacity:.34}
+  .so-in{stop-color:var(--blue);stop-opacity:.2}
+  .so-cache{stop-color:var(--violet);stop-opacity:.5}
+  .tr-end .halo{fill:none;stroke:var(--cyan);stroke-width:1.1}
+  .tr-end .edot{fill:var(--cyan);filter:drop-shadow(0 0 6px var(--cyan))}
+  .endlab rect{fill:var(--panel);stroke:var(--cyan);stroke-opacity:.4}
+  .endlab text{fill:var(--cyan);font:10px var(--mono)}
+  .pkline{stroke:var(--amber);stroke-opacity:.35;stroke-dasharray:2 5}
+  .pkdot{fill:var(--bg);stroke:var(--amber);stroke-width:1.6}
+  .tip{position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-115%);
+    background:rgba(10,15,12,.97);border:1px solid rgba(53,244,155,.35);border-radius:4px;
+    padding:6px 9px;font-family:var(--mono);font-size:10px;color:var(--t2);white-space:nowrap;z-index:8;
+    box-shadow:0 8px 28px rgba(0,0,0,.6)}
+  .tip b{color:#c9ffe6;font-weight:600}
+
+  /* heatmap */
+  .heat{display:grid;grid-template-columns:repeat(24,1fr);grid-template-rows:repeat(6,1fr);grid-auto-flow:column;gap:3px;flex:1;min-height:0}
+  .heat i{border-radius:1.5px;background:rgba(53,244,155,.06)}
+  .heatlbl{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:#31443a;margin-top:5px}
+  .legendbar{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:9px;color:var(--dim)}
+  .legendbar .sw{width:64px;height:5px;border-radius:2px;
+    background:linear-gradient(90deg,rgba(53,244,155,.1),rgba(53,244,155,.55),#35f49b,#a3ffce,#ffd166)}
+
+  /* donut + radar + bullets */
+  .split{display:flex;gap:10px;align-items:center;flex:1;min-height:0}
+  .dlist{flex:1;display:flex;flex-direction:column;gap:6px;font-size:11px}
+  .dlist .r{display:flex;align-items:center;gap:7px;color:var(--t2)}
+  .dlist .r i{width:7px;height:7px;border-radius:1.5px;flex:0 0 7px}
+  .dlist .r .v{margin-left:auto;font-family:var(--mono);font-size:11.5px;color:var(--t1)}
+  .dlist .r .p{font-family:var(--mono);font-size:10px;color:var(--dim);width:42px;text-align:right}
+
+  .blt{display:flex;flex-direction:column;gap:7px;flex:1;justify-content:center}
+  .blt .b{display:grid;grid-template-columns:86px 1fr 52px;gap:8px;align-items:center;font-family:var(--mono);font-size:10px;color:var(--t2)}
+  .blt .track{height:9px;background:rgba(53,244,155,.09);position:relative;border-radius:1px}
+  .blt .track b{position:absolute;left:0;top:0;height:9px;border-radius:1px;
+    background:linear-gradient(90deg,rgba(53,244,155,.55),#35f49b)}
+  .blt .track s{position:absolute;top:-2px;width:1px;height:13px;background:#ffd166}
+  .blt .v{text-align:right;color:var(--t1)}
+
+  /* projects */
+  .proj{display:flex;flex-direction:column;gap:9px;flex:1;justify-content:center}
+  .proj .p{display:grid;grid-template-columns:104px 1fr 54px 40px;gap:9px;align-items:center;font-size:11.5px}
+  .proj .nm{color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .proj .tr{height:12px;background:rgba(53,244,155,.08);position:relative;border-radius:2px;overflow:hidden}
+  .proj .tr b{position:absolute;left:0;top:0;height:100%;
+    background:linear-gradient(90deg,rgba(31,158,104,.5),#35f49b);border-radius:2px}
+  .proj .tr b.v2{background:linear-gradient(90deg,rgba(163,255,206,.45),#a3ffce)}
+  .proj .val{font-family:var(--mono);font-size:11px;color:var(--t1);text-align:right}
+  .proj .pc{font-family:var(--mono);font-size:10px;color:var(--dim);text-align:right}
+
+  /* req stream */
+  .req{display:flex;flex-direction:column;gap:2px;flex:1;font-family:var(--mono);font-size:10.5px}
+  .req .h,.req .r{display:grid;grid-template-columns:56px 34px 1fr 64px 60px;gap:8px;padding:4px 2px}
+  .req .h{color:#31443a;font-size:9px;letter-spacing:.1em;border-bottom:1px solid var(--line-2);padding-bottom:5px}
+  .req .r{color:#9cb5a7;border-bottom:1px solid rgba(53,244,155,.06)}
+  .req .r:last-child{border-bottom:0}
+  .req .r .n{color:#9cb5a7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .req .r .ok{color:var(--green)}
+  .req .r .wn{color:var(--amber)}
+  .req .r .num{text-align:right;color:var(--t1)}
+  .req .r.fresh{background:linear-gradient(90deg,rgba(53,244,155,.12),transparent 70%)}
+
+  /* sources */
+  .srcs{display:flex;gap:14px;flex:1;align-items:center}
+  .ring{position:relative;width:92px;height:92px;flex:0 0 92px}
+  .ring .t{position:absolute;inset:0;display:grid;place-items:center;text-align:center}
+  .ring .t b{font-family:var(--mono);font-size:15px;display:block;line-height:1}
+  .ring .t i{font-style:normal;font-family:var(--mono);font-size:8.5px;color:var(--dim);display:block;margin-top:3px}
+  .srcinfo{display:flex;flex-direction:column;gap:6px;font-family:var(--mono);font-size:10px;color:var(--t2);flex:1}
+  .srcinfo .row{display:flex;gap:6px;align-items:center}
+  .srcinfo .row i{width:5px;height:5px;border-radius:50%;background:var(--green)}
+  .srcinfo .row i.w{background:var(--amber)}
+  .srcinfo .row .g{margin-left:auto;color:var(--dim)}
+
+  .foot{flex:0 0 16px;display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:9.5px;color:#31443a;letter-spacing:.06em}
+  .foot b{color:#5f7a6c;font-weight:500}
+
+  @media (prefers-reduced-motion:reduce){
+    .ticker .run{animation:none}
+    .live i{animation:none}
+    *{transition:none!important}
+  }
+</style>
+</head>
+<body>
+<div class="viewport">
+  <div class="stage" id="stage">
+
+    <div class="top">
+      <div class="logo"></div>
+      <div class="ttl">TOKEN 用量指挥中心<small>TOKENPIVOT · WALL / TERMINAL</small></div>
+      <div class="ws"><span class="dot"></span><b>Acme Studio</b><span>团队工作空间 · 4 成员</span></div>
+      <div class="hsp"></div>
+      <div class="live"><i></i>最近接收 12s</div>
+      <div class="wall">1920 × 1080</div>
+      <div class="clock">
+        <div class="t mono" id="clock">--:--:--</div>
+        <div class="d">2026-10-27 · ASIA/SHANGHAI</div>
+      </div>
+    </div>
+
+    <div class="ticker">
+      <div class="run" id="ticker"></div>
+    </div>
+
+    <div class="kpis" id="kpis"></div>
+
+    <div class="mid">
+      <!-- ============ 左列 ============ -->
+      <div class="col">
+        <div class="card" style="flex:0 0 246px">
+          <div class="ch">
+            <h3>消耗速率</h3><span class="cm">TOKENS / MIN</span><span class="g"></span>
+            <span class="cm">60s 滚动</span>
+          </div>
+          <div class="cbody">
+            <div class="gaugewrap">
+              <svg id="gauge" width="300" height="168" viewBox="0 0 300 168" role="img" aria-label="速率仪表盘"></svg>
+              <div class="gaugeval">
+                <div class="n">18.4<u>K</u></div>
+                <div class="c">当前速率</div>
+              </div>
+            </div>
+            <div class="gaugesub">
+              <div><div class="k">1M AVG</div><div class="v">17.1K</div></div>
+              <div><div class="k">5M AVG</div><div class="v">16.4K</div></div>
+              <div><div class="k">15M AVG</div><div class="v">14.9K</div></div>
+              <div><div class="k">PEAK</div><div class="v" style="color:#ffd166">52.6K</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="flex:1 1 auto">
+          <div class="ch">
+            <h3>分钟请求量</h3><span class="cm">LAST 60M</span><span class="g"></span>
+            <span class="cm">均值 <b style="color:#9cb5a7">268</b></span>
+          </div>
+          <div class="cbody">
+            <div class="chartarea">
+              <svg class="wide" id="minbars" viewBox="0 0 320 210" preserveAspectRatio="none" role="img"
+                   aria-label="近 60 分钟请求量"></svg>
+              <div class="axl"><span>-60m</span><span>-45m</span><span>-30m</span><span>-15m</span><span>现在</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 中列 ============ -->
+      <div class="col">
+        <div class="card" style="flex:1 1 auto">
+          <div class="ch">
+            <h3>用量趋势</h3><span class="cm" id="trendMeta">60 分钟 · 每 1 分钟</span>
+            <span class="g"></span>
+            <div class="lgb">
+              <span><i style="background:#35f49b"></i>输出</span>
+              <span><i style="background:#1f9e68"></i>输入</span>
+              <span><i style="background:#a3ffce"></i>缓存命中</span>
+              <span><i style="background:#ffd166"></i>峰值</span>
+            </div>
+          </div>
+          <div class="cbody">
+            <div class="chartarea" id="trendBox">
+              <svg class="wide" id="trend" viewBox="0 0 1000 300" preserveAspectRatio="none" role="img"
+                   aria-label="用量趋势（示例）"></svg>
+              <div class="axl" id="trendAx"></div>
+              <div class="tip" id="trendTip"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="flex:0 0 200px">
+          <div class="ch">
+            <h3>24 小时热度</h3><span class="cm">每格 10 分钟</span><span class="g"></span>
+            <div class="legendbar"><span>低</span><span class="sw"></span><span>高</span></div>
+          </div>
+          <div class="cbody">
+            <div class="heat" id="heat"></div>
+            <div class="heatlbl"><span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>23</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 右列 ============ -->
+      <div class="col">
+        <div class="card" style="flex:0 0 188px">
+          <div class="ch"><h3>供应商构成</h3><span class="cm">BY PROVIDER</span><span class="g"></span><span class="cm">12.85M</span></div>
+          <div class="cbody">
+            <div class="split">
+              <svg width="150" height="150" viewBox="0 0 150 150" role="img" aria-label="供应商构成环形图" id="donut"></svg>
+              <div class="dlist" id="donutList"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="flex:0 0 200px">
+          <div class="ch"><h3>模型能力雷达</h3><span class="cm">五维归一化</span><span class="g"></span></div>
+          <div class="cbody">
+            <div class="split">
+              <svg width="196" height="170" viewBox="0 0 196 170" role="img" aria-label="模型能力雷达" id="radar"></svg>
+              <div class="dlist" id="radarList"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="flex:1 1 auto">
+          <div class="ch"><h3>模型用量</h3><span class="cm">目标线 = 预算</span><span class="g"></span></div>
+          <div class="cbody">
+            <div class="blt" id="bullets"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 底部 ============ -->
+    <div class="low">
+      <div class="card">
+        <div class="ch"><h3>项目排行</h3><span class="cm">TOKENS</span><span class="g"></span><span class="cm">占比</span></div>
+        <div class="cbody"><div class="proj" id="projects"></div></div>
+      </div>
+
+      <div class="card">
+        <div class="ch"><h3>请求流</h3><span class="cm">按完成时间倒序</span><span class="g"></span><span class="cm">示例数据</span></div>
+        <div class="cbody">
+          <div class="req">
+            <div class="h"><span>时间</span><span>源</span><span>供应商 / 模型</span><span>TOKENS</span><span>状态</span></div>
+            <div id="reqrows"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="ch"><h3>采集健康</h3><span class="cm">INGEST</span><span class="g"></span><span class="cm">2 / 2 源</span></div>
+        <div class="cbody">
+          <div class="srcs">
+            <div class="ring">
+              <svg width="92" height="92" viewBox="0 0 92 92" aria-hidden="true">
+                <circle cx="46" cy="46" r="38" fill="none" stroke="rgba(53,244,155,.1)" stroke-width="7"/>
+                <circle cx="46" cy="46" r="38" fill="none" stroke="#35f49b" stroke-width="7"
+                        stroke-linecap="round" stroke-dasharray="236.6 238.8" transform="rotate(-90 46 46)"/>
+              </svg>
+              <div class="t"><b>99.1%</b><i>成功率</i></div>
+            </div>
+            <div class="ring">
+              <svg width="92" height="92" viewBox="0 0 92 92" aria-hidden="true">
+                <circle cx="46" cy="46" r="38" fill="none" stroke="rgba(53,244,155,.1)" stroke-width="7"/>
+                <circle cx="46" cy="46" r="38" fill="none" stroke="#ffd166" stroke-width="7"
+                        stroke-linecap="round" stroke-dasharray="220.2 238.8" transform="rotate(-90 46 46)"/>
+              </svg>
+              <div class="t"><b style="color:#ffd166">92.2%</b><i>已归属</i></div>
+            </div>
+            <div class="srcinfo">
+              <div class="row"><i></i><span>DSH · v0.4.1</span><span class="g">12s</span></div>
+              <div class="row"><i></i><span>PI · v0.3.7</span><span class="g">43s</span></div>
+              <div class="row"><i class="w"></i><span>未归属项目</span><span class="g">1.00M</span></div>
+              <div class="row"><i class="w"></i><span>补报回填</span><span class="g">3 次</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="foot">
+      <b>设计预览 D-B 大屏 · 荧光绿</b><span>|</span>
+      <span>全部数字为示例数据，未连接采集接口</span><span>|</span>
+      <span>比较对象为 A/B/C 桌面工作台版</span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var round = Math.round;
+
+  /* ---------- 自适应缩放 ---------- */
+  var stage = document.getElementById("stage");
+  function fit() {
+    var s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    stage.style.transform = "scale(" + s + ")";
+  }
+  window.addEventListener("resize", fit);
+  fit();
+
+  /* ---------- 时钟 ---------- */
+  function clock() {
+    var now = new Date();
+    var parts = new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai", hour12: false,
+      hour: "2-digit", minute: "2-digit", second: "2-digit"
+    }).format(now);
+    document.getElementById("clock").textContent = parts;
+  }
+  clock(); setInterval(clock, 1000);
+
+  /* ---------- 示例序列 ---------- */
+  function series(group) {
+    var len = group === "minute" ? 60 : group === "hour" ? 24 : 7;
+    var inp = [], out = [], cache = [];
+    for (var i = 0; i < len; i++) {
+      var w = Math.sin((i / len) * Math.PI * 2.1 - 1.2) * 0.34 + 1;
+      var spike = i === round(len * 0.68) ? 1.85 : 1;
+      var base = group === "day" ? 1.7e6 : group === "hour" ? 4.1e5 : 2.6e5;
+      inp.push(round(base * w * spike * 1.0));
+      out.push(round(base * w * spike * 0.38 + (i % 5) * 1600));
+      cache.push(round(base * w * spike * 0.26));
+    }
+    return { inp: inp, out: out, cache: cache, len: len };
+  }
+
+  /* ---------- KPI ---------- */
+  var KPI = [
+    { l: "今日总量", v: "12.85", u: "M", m: '<span class="up">▲ 8.4%</span><span>较昨日</span>' },
+    { l: "输入", v: "9.21", u: "M", m: '<span>71.7%</span><span>含缓存 1.42M</span>' },
+    { l: "输出", v: "3.64", u: "M", m: '<span>28.3%</span><span>推理计入</span>' },
+    { l: "请求数", v: "8,412", u: "", m: '<span class="up">▲ 412</span><span>成功 99.1%</span>' },
+    { l: "60 秒速率", v: "18.4", u: "K", m: '<span class="up">▲ 3.2%</span><span>tok/min</span>' },
+    { l: "峰值速率", v: "52.6", u: "K", m: '<span style="color:#ffd166">22:14</span><span>tok/min</span>' }
+  ];
+
+  function spark(vals, color) {
+    var w = 74, h = 24, max = Math.max.apply(null, vals), min = Math.min.apply(null, vals);
+    var d = "";
+    vals.forEach(function (v, i) {
+      var x = (w * i) / (vals.length - 1);
+      var y = h - ((v - min) / Math.max(1, max - min)) * h;
+      d += (i ? " L" : "M") + x.toFixed(1) + " " + y.toFixed(1);
+    });
+    return '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + " " + h +
+      '"><path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.3" opacity=".8"/></svg>';
+  }
+
+  var sKpi = series("minute");
+  document.getElementById("kpis").innerHTML = KPI.map(function (k, i) {
+    var vals = [];
+    for (var j = 0; j < 14; j++) vals.push(sKpi.out[(i * 4 + j) % 60] + (j % 3) * 4000);
+    var color = i % 3 === 2 ? "#a3ffce" : "#35f49b";
+    return '<div class="kpi' + (i % 3 === 2 ? " alt" : "") + '">' +
+      '<div class="l">' + k.l + '</div>' +
+      '<div class="v">' + k.v + (k.u ? "<u>" + k.u + "</u>" : "") + '</div>' +
+      '<div class="m">' + k.m + '</div>' + spark(vals, color) + '</div>';
+  }).join("");
+
+  /* ---------- 滚动播报 ---------- */
+  var TICKS = [
+    "今日累计 <b>12.85M</b> tokens",
+    "请求 <b>8,412</b> 次 · 成功 <b>99.1%</b>",
+    "60 秒速率 <b>18.4K</b> tok/min",
+    "峰值 <em>52.6K</em> tok/min @ 22:14",
+    "DSH 最近接收 <b>12s</b> · PI <b>43s</b>",
+    "未归属项目 <em>1.00M</em> tokens",
+    "格式告警 <em>2</em> 条 · 补报回填 <b>3</b> 次",
+    "采集口径：用量计入请求完成时刻"
+  ];
+  var one = TICKS.map(function (t) { return "<span>" + t + "</span>"; }).join("");
+  document.getElementById("ticker").innerHTML = one + one;
+
+  /* ---------- 速率仪表盘 ---------- */
+  (function gauge() {
+    var svg = document.getElementById("gauge");
+    var cx = 150, cy = 148, r = 118, START = 180, SWEEP = 240;
+    var MAX = 40; // K tok/min
+    var val = 18.4;
+    var ratio = Math.min(1, val / MAX);
+
+    function polar(deg, rr) {
+      var rad = (deg * Math.PI) / 180;
+      return [cx + rr * Math.cos(rad), cy + rr * Math.sin(rad)];
+    }
+    function arc(a0, a1, rr) {
+      var p0 = polar(a0, rr), p1 = polar(a1, rr);
+      var large = Math.abs(a1 - a0) > 180 ? 1 : 0;
+      return "M" + p0[0].toFixed(1) + " " + p0[1].toFixed(1) +
+        " A" + rr + " " + rr + " 0 " + large + " 1 " + p1[0].toFixed(1) + " " + p1[1].toFixed(1);
+    }
+
+    var ticks = "";
+    for (var i = 0; i <= 8; i++) {
+      var t = START + (SWEEP * i) / 8;
+      var p0 = polar(t, r - 12), p1 = polar(t, r);
+      ticks += '<line x1="' + p0[0].toFixed(1) + '" y1="' + p0[1].toFixed(1) +
+        '" x2="' + p1[0].toFixed(1) + '" y2="' + p1[1].toFixed(1) +
+        '" stroke="rgba(53,244,155,' + (i % 2 ? ".25" : ".5") + ')" stroke-width="1"/>';
+      if (i % 2 === 0) {
+        var lp = polar(t, r - 26);
+        ticks += '<text x="' + lp[0].toFixed(1) + '" y="' + (lp[1] + 3).toFixed(1) +
+          '" text-anchor="middle" font-family="ui-monospace,Menlo" font-size="8.5" fill="#5f7a6c">' +
+          round((MAX * i) / 8) + "K</text>";
+      }
+    }
+
+    var ang = START + SWEEP * ratio;
+    var hand = polar(ang, r - 30);
+    svg.innerHTML =
+      '<defs>' +
+      '<linearGradient id="gg" x1="0" y1="0" x2="1" y2="0">' +
+      '<stop offset="0" stop-color="#1f9e68"/><stop offset=".55" stop-color="#35f49b"/>' +
+      '<stop offset="1" stop-color="#a3ffce"/></linearGradient>' +
+      '<radialGradient id="glow" cx="50%" cy="80%" r="60%">' +
+      '<stop offset="0" stop-color="rgba(53,244,155,.25)"/><stop offset="1" stop-color="transparent"/>' +
+      '</radialGradient>' +
+      '</defs>' +
+      '<circle cx="' + cx + '" cy="' + cy + '" r="86" fill="url(#glow)"/>' +
+      '<path d="' + arc(START, START + SWEEP, r) + '" fill="none" stroke="rgba(53,244,155,.12)" stroke-width="13"/>' +
+      '<path d="' + arc(START, ang, r) + '" fill="none" stroke="url(#gg)" stroke-width="13" stroke-linecap="round"/>' +
+      ticks +
+      '<line x1="' + cx + '" y1="' + cy + '" x2="' + hand[0].toFixed(1) + '" y2="' + hand[1].toFixed(1) +
+      '" stroke="#dff5e8" stroke-width="1.6" stroke-linecap="round"/>' +
+      '<circle cx="' + cx + '" cy="' + cy + '" r="4.5" fill="#070a08" stroke="#35f49b" stroke-width="1.6"/>' +
+      '<circle cx="' + cx + '" cy="' + cy + '" r="1.8" fill="#35f49b"/>';
+  })();
+
+  /* ---------- 分钟柱 ---------- */
+  (function bars() {
+    var svg = document.getElementById("minbars");
+    var W = 320, H = 210, PADB = 18, PADT = 12;
+    var vals = [];
+    for (var i = 0; i < 60; i++) {
+      var w = Math.sin((i / 60) * Math.PI * 2.2 - 1.4) * 0.35 + 1;
+      var spike = i === 41 ? 1.9 : 1;
+      vals.push(round(190 * w * spike + (i % 4) * 22));
+    }
+    var max = Math.max.apply(null, vals);
+    var bw = W / 60, avg = 268;
+    var bars = "";
+    vals.forEach(function (v, i) {
+      var h = (v / max) * (H - PADB - PADT);
+      var x = i * bw + 1.5;
+      var hot = v > max * 0.82;
+      bars += '<rect x="' + x.toFixed(1) + '" y="' + (H - PADB - h).toFixed(1) +
+        '" width="' + (bw - 3).toFixed(1) + '" height="' + h.toFixed(1) +
+        '" rx="1" fill="' + (hot ? "#ffd166" : "rgba(53,244,155,.62)") + '"/>';
+    });
+    var avgY = H - PADB - (avg / max) * (H - PADB - PADT);
+    svg.innerHTML = bars +
+      '<line x1="0" y1="' + avgY.toFixed(1) + '" x2="' + W + '" y2="' + avgY.toFixed(1) +
+      '" stroke="rgba(163,255,206,.65)" stroke-width="1" stroke-dasharray="4 4"/>' +
+      '<line x1="0" y1="' + (H - PADB) + '" x2="' + W + '" y2="' + (H - PADB) +
+      '" stroke="rgba(53,244,155,.25)" stroke-width="1"/>';
+  })();
+
+  /* ---------- 主趋势（堆叠面积） ---------- */
+  var trendBox = document.getElementById("trendBox");
+  var trendSvg = document.getElementById("trend");
+  var trendTip = document.getElementById("trendTip");
+  var TW = 1000, TH = 300, TP = { t: 16, r: 8, b: 14, l: 8 };
+  var cur = null, curGroup = "minute";
+  var GROUP_META = { minute: "60 分钟 · 每 1 分钟", hour: "24 小时 · 每 1 小时", day: "7 天 · 每 1 天" };
+
+  function lineOf(len, max, key) {
+    var iw = TW - TP.l - TP.r, ih = TH - TP.t - TP.b, d = "";
+    for (var i = 0; i < len; i++) {
+      var yv = key(i);
+      var x = TP.l + (iw * i) / (len - 1);
+      var y = TP.t + ih - (yv / max) * ih;
+      d += (i ? " L" : "M") + x.toFixed(1) + " " + y.toFixed(1);
+    }
+    return d;
+  }
+
+  function axisLabels(group, len) {
+    var out = [], step = Math.max(1, round(len / 6));
+    for (var i = 0; i < len; i += step) {
+      if (group === "minute") out.push("-" + (len - i) + "m");
+      else if (group === "hour") out.push(String((i + 14) % 24).padStart(2, "0") + ":00");
+      else out.push(["10/21", "10/22", "10/23", "10/24", "10/25", "10/26", "10/27"][i] || "");
+    }
+    out.push("现在");
+    return out;
+  }
+
+  function drawTrend() {
+    var s = series(curGroup), len = s.len;
+    var total = [];
+    for (var i = 0; i < len; i++) total.push(s.inp[i] + s.out[i] + s.cache[i]);
+    var max = Math.max.apply(null, total) * 1.06;
+    cur = { s: s, len: len, max: max, total: total };
+
+    var iw = TW - TP.l - TP.r, ih = TH - TP.t - TP.b;
+    function xs(i) { return TP.l + (iw * i) / (len - 1); }
+    function ys(v) { return TP.t + ih - (v / max) * ih; }
+
+    /* 单调三次插值：曲线平滑且不会冲出数据范围 */
+    function smooth(points) {
+      var n = points.length;
+      if (n < 3) {
+        return "M" + points.map(function (p) { return p[0].toFixed(1) + " " + p[1].toFixed(1); }).join(" L");
+      }
+      var d = [], m = [], k;
+      for (k = 0; k < n - 1; k++) d.push(points[k + 1][1] - points[k][1]);
+      m[0] = d[0];
+      m[n - 1] = d[n - 2];
+      for (k = 1; k < n - 1; k++) {
+        if (d[k - 1] * d[k] <= 0) { m[k] = 0; }
+        else {
+          var w1 = 2 * d[k] + d[k - 1], w2 = d[k] + 2 * d[k - 1];
+          m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k]);
+        }
+      }
+      var out = "M" + points[0][0].toFixed(1) + " " + points[0][1].toFixed(1);
+      for (k = 0; k < n - 1; k++) {
+        var p1 = points[k], p2 = points[k + 1], dx = (p2[0] - p1[0]) / 3;
+        out += " C" + (p1[0] + dx).toFixed(1) + " " + (p1[1] + m[k] * dx).toFixed(1) +
+          " " + (p2[0] - dx).toFixed(1) + " " + (p2[1] - m[k + 1] * dx).toFixed(1) +
+          " " + p2[0].toFixed(1) + " " + p2[1].toFixed(1);
+      }
+      return out;
+    }
+
+    function area(base, add) {
+      var top = [], bot = [];
+      for (var i = 0; i < len; i++) {
+        top.push([xs(i), ys(base[i] + add[i])]);
+        bot.push([xs(i), ys(base[i])]);
+      }
+      return smooth(top) + " L" + bot.reverse().map(function (p) {
+        return p[0].toFixed(1) + " " + p[1].toFixed(1);
+      }).join(" L") + " Z";
+    }
+
+    function lineOf(len2, key) {
+      var pts = [];
+      for (var i = 0; i < len2; i++) pts.push([xs(i), ys(key(i))]);
+      return smooth(pts);
+    }
+
+    var grid = "";
+    for (var g = 0; g <= 4; g++) {
+      var y = TP.t + (ih * g) / 4;
+      grid += '<line x1="0" y1="' + y.toFixed(1) + '" x2="' + TW + '" y2="' + y.toFixed(1) +
+        '" stroke="var(--cyan)" stroke-opacity="' + (g === 4 ? ".18" : ".09") +
+        '" stroke-width="1"' + (g === 4 ? "" : ' stroke-dasharray="3 7"') + '/>';
+    }
+
+    var peakIdx = 0;
+    for (var k2 = 1; k2 < len; k2++) if (total[k2] > total[peakIdx]) peakIdx = k2;
+    var peakX = xs(peakIdx), peakY = ys(total[peakIdx]);
+
+    var endIdx = len - 1, ex = xs(endIdx), ey = ys(total[endIdx]);
+    var labY = ey > 46 ? ey - 30 : ey + 12;
+
+    trendSvg.innerHTML =
+      '<defs>' +
+      '<linearGradient id="gOut" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop class="so-out" offset="0"/><stop class="so-out" offset="1" stop-opacity=".03"/></linearGradient>' +
+      '<linearGradient id="gIn" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop class="so-in" offset="0"/><stop class="so-in" offset="1" stop-opacity=".03"/></linearGradient>' +
+      '<linearGradient id="gCache" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop class="so-cache" offset="0"/><stop class="so-cache" offset="1" stop-opacity=".12"/></linearGradient>' +
+      '<pattern id="dotgrid" width="16" height="16" patternUnits="userSpaceOnUse">' +
+      '<circle class="dotg" cx="1" cy="1" r=".9"/></pattern>' +
+      '</defs>' +
+      '<rect x="0" y="0" width="' + TW + '" height="' + TH + '" fill="url(#dotgrid)"/>' +
+      grid +
+      '<path class="tr-area" d="' + area(s.cache, s.inp) + '" fill="url(#gIn)"/>' +
+      '<path class="tr-area" d="' + area(s.inp.map(function (v, i2) { return v + s.cache[i2]; }), s.out) + '" fill="url(#gOut)"/>' +
+      '<path class="tr-area" d="' + area(s.cache, s.cache) + '" fill="url(#gCache)"/>' +
+      '<path class="tr-line l-cache" d="' + lineOf(len, function (i3) { return s.cache[i3]; }) + '"/>' +
+      '<path class="tr-line l-in" d="' + lineOf(len, function (i4) { return s.inp[i4] + s.cache[i4]; }) + '"/>' +
+      '<path class="tr-line l-out" d="' + lineOf(len, function (i5) { return total[i5]; }) + '"/>' +
+      '<line class="pkline" x1="' + peakX.toFixed(1) + '" y1="' + peakY.toFixed(1) +
+      '" x2="' + peakX.toFixed(1) + '" y2="' + (TH - TP.b) + '"/>' +
+      '<circle class="pkdot" cx="' + peakX.toFixed(1) + '" cy="' + peakY.toFixed(1) + '" r="3.2"/>' +
+      '<line id="tcross" x1="0" x2="0" y1="0" y2="' + TH + '" stroke="var(--cyan)" stroke-opacity=".5" opacity="0"/>' +
+      '<circle id="tdot" r="3" fill="var(--bg)" stroke="var(--cyan)" stroke-width="1.8" opacity="0"/>' +
+      '<g class="tr-end">' +
+      '<circle class="halo" cx="' + ex.toFixed(1) + '" cy="' + ey.toFixed(1) + '" r="4">' +
+      '<animate attributeName="r" values="4;20" dur="2.8s" repeatCount="indefinite"/>' +
+      '<animate attributeName="opacity" values=".85;0" dur="2.8s" repeatCount="indefinite"/></circle>' +
+      '<circle class="halo" cx="' + ex.toFixed(1) + '" cy="' + ey.toFixed(1) + '" r="4">' +
+      '<animate attributeName="r" values="4;20" dur="2.8s" begin="1.4s" repeatCount="indefinite"/>' +
+      '<animate attributeName="opacity" values=".55;0" dur="2.8s" begin="1.4s" repeatCount="indefinite"/></circle>' +
+      '<circle class="edot" cx="' + ex.toFixed(1) + '" cy="' + ey.toFixed(1) + '" r="3.6"/>' +
+      '</g>' +
+      '<g class="endlab"><rect x="' + (ex - 92).toFixed(1) + '" y="' + (labY - 11).toFixed(1) +
+      '" width="84" height="19" rx="4"/>' +
+      '<text x="' + (ex - 50).toFixed(1) + '" y="' + (labY + 2).toFixed(1) + '" text-anchor="middle">' +
+      (total[endIdx] / 1000).toFixed(1) + 'K · 现在</text></g>';
+
+    document.getElementById("trendAx").innerHTML = axisLabels(curGroup, len)
+      .map(function (t) { return "<span>" + t + "</span>"; }).join("");
+    document.getElementById("trendMeta").textContent = GROUP_META[curGroup];
+  }
+
+  function bucketLabel(idx) {
+    if (curGroup === "minute") return (cur.len - idx) + " 分钟前";
+    if (curGroup === "hour") return "10/27 " + String((idx + 14) % 24).padStart(2, "0") + ":00";
+    return ["10/21", "10/22", "10/23", "10/24", "10/25", "10/26", "10/27"][idx] || "";
+  }
+
+  function fmt(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+    return String(n);
+  }
+
+  trendBox.addEventListener("mousemove", function (e) {
+    if (!cur) return;
+    var r = trendSvg.getBoundingClientRect();
+    var p = Math.min(0.999, Math.max(0.001, (e.clientX - r.left) / r.width));
+    var idx = round(p * (cur.len - 1));
+    var iw = TW - TP.l - TP.r, ih = TH - TP.t - TP.b;
+    var x = TP.l + (iw * idx) / (cur.len - 1);
+    var y = TP.t + ih - (cur.total[idx] / cur.max) * ih;
+
+    document.getElementById("tcross").setAttribute("x1", x);
+    document.getElementById("tcross").setAttribute("x2", x);
+    document.getElementById("tcross").setAttribute("opacity", ".7");
+    var d = document.getElementById("tdot");
+    d.setAttribute("cx", x); d.setAttribute("cy", y); d.setAttribute("opacity", "1");
+
+    trendTip.style.left = ((x / TW) * r.width) + "px";
+    trendTip.style.top = ((y / TH) * r.height) + "px";
+    trendTip.style.opacity = "1";
+    trendTip.innerHTML = bucketLabel(idx) +
+      "<br>输出 <b>" + fmt(cur.s.out[idx]) + "</b>" +
+      "<br>输入 <b>" + fmt(cur.s.inp[idx]) + "</b>" +
+      "<br>缓存 <b>" + fmt(cur.s.cache[idx]) + "</b>";
+  });
+  trendBox.addEventListener("mouseleave", function () {
+    trendTip.style.opacity = "0";
+    document.getElementById("tcross").setAttribute("opacity", "0");
+    document.getElementById("tdot").setAttribute("opacity", "0");
+  });
+  drawTrend();
+
+  /* ---------- 24 小时热度 ---------- */
+  (function heat() {
+    var box = document.getElementById("heat");
+    var cells = "";
+    for (var h = 0; h < 24; h++) {
+      for (var m = 0; m < 6; m++) {
+        var shape = Math.sin(((h * 6 + m) / 144) * Math.PI * 2.4 - 1.1) * 0.26 + 0.62;
+        var evening = h >= 20 && h <= 22 ? 1.28 : 1;
+        var night = h <= 5 ? 0.42 : 1;
+        var v = Math.min(1, Math.max(0.04, shape * evening * night + (m % 3) * 0.03));
+        var a = (0.06 + v * 0.8).toFixed(2);
+        var bg = v > 0.86
+          ? "rgba(255,209,102,.92)"
+          : v > 0.62
+            ? "rgba(163,255,206," + a + ")"
+            : "rgba(53,244,155," + a + ")";
+        cells += '<i style="background:' + bg + '" title="' + h + ":" + (m * 10) + '"></i>';
+      }
+    }
+    box.innerHTML = cells;
+  })();
+
+  /* ---------- 供应商环形 ---------- */
+  (function donut() {
+    var svg = document.getElementById("donut");
+    var cx = 75, cy = 75, r = 54, C = 2 * Math.PI * r;
+    var DATA = [
+      { n: "OpenAI", v: 542, c: "#35f49b" },
+      { n: "Anthropic", v: 398, c: "#1f9e68" },
+      { n: "DeepSeek", v: 221, c: "#a3ffce" },
+      { n: "Google", v: 124, c: "#ffd166" }
+    ];
+    var total = DATA.reduce(function (a, d) { return a + d.v; }, 0);
+    var acc = 0, segs = "";
+    DATA.forEach(function (d) {
+      var len = (d.v / total) * C;
+      segs += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none" stroke="' + d.c +
+        '" stroke-width="15" stroke-dasharray="' + (len - 2).toFixed(1) + " " + (C - len + 2).toFixed(1) +
+        '" stroke-dashoffset="' + (-acc).toFixed(1) + '" transform="rotate(-90 ' + cx + " " + cy + ')"/>';
+      acc += len;
+    });
+    svg.innerHTML = '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none" stroke="rgba(53,244,155,.07)" stroke-width="15"/>' +
+      segs +
+      '<text x="' + cx + '" y="' + (cy - 2) + '" text-anchor="middle" font-family="ui-monospace,Menlo" font-size="16" fill="#dff5e8">12.85M</text>' +
+      '<text x="' + cx + '" y="' + (cy + 12) + '" text-anchor="middle" font-family="ui-monospace,Menlo" font-size="9" fill="#5f7a6c">TOTAL</text>';
+
+    document.getElementById("donutList").innerHTML = DATA.map(function (d) {
+      return '<div class="r"><i style="background:' + d.c + '"></i>' + d.n +
+        '<span class="v">' + (d.v / 10).toFixed(2) + 'M</span>' +
+        '<span class="p">' + ((d.v / total) * 100).toFixed(1) + '%</span></div>';
+    }).join("");
+  })();
+
+  /* ---------- 模型雷达 ---------- */
+  (function radar() {
+    var svg = document.getElementById("radar");
+    var cx = 98, cy = 86, R = 62;
+    var AXES = ["用量", "请求", "延迟", "成本效率", "缓存命中"];
+    var SETS = [
+      { n: "gpt-6-astra", c: "#35f49b", v: [0.92, 0.74, 0.66, 0.48, 0.81] },
+      { n: "claude-opus-4", c: "#a3ffce", v: [0.71, 0.62, 0.82, 0.35, 0.58] }
+    ];
+    function pt(i, ratio) {
+      var a = (-90 + i * 72) * Math.PI / 180;
+      return [cx + R * ratio * Math.cos(a), cy + R * ratio * Math.sin(a)];
+    }
+    var grid = "";
+    [1, 0.66, 0.33].forEach(function (ratio) {
+      var d = "";
+      for (var i = 0; i < 5; i++) {
+        var p = pt(i, ratio);
+        d += (i ? " L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1);
+      }
+      grid += '<path d="' + d + ' Z" fill="none" stroke="rgba(53,244,155,' + (ratio === 1 ? ".28" : ".13") + ')" stroke-width="1"/>';
+    });
+    for (var i = 0; i < 5; i++) {
+      var e = pt(i, 1);
+      grid += '<line x1="' + cx + '" y1="' + cy + '" x2="' + e[0].toFixed(1) + '" y2="' + e[1].toFixed(1) +
+        '" stroke="rgba(53,244,155,.14)" stroke-width="1"/>';
+      var lb = pt(i, 1.28);
+      grid += '<text x="' + lb[0].toFixed(1) + '" y="' + (lb[1] + 3).toFixed(1) +
+        '" text-anchor="middle" font-size="8.5" fill="#5f7a6c" font-family="-apple-system,PingFang SC">' +
+        AXES[i] + "</text>";
+    }
+    var shape = SETS.map(function (s) {
+      var d = "";
+      for (var i = 0; i < 5; i++) {
+        var p = pt(i, s.v[i]);
+        d += (i ? " L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1);
+      }
+      return '<path d="' + d + ' Z" fill="' + s.c + '" fill-opacity=".14" stroke="' + s.c + '" stroke-width="1.5"/>';
+    }).join("");
+    svg.innerHTML = grid + shape;
+
+    document.getElementById("radarList").innerHTML = SETS.map(function (s) {
+      return '<div class="r"><i style="background:' + s.c + '"></i>' + s.n + '</div>';
+    }).join("") + '<div class="r" style="color:var(--dim);font-size:9.5px;line-height:1.5;display:block">' +
+      '五维均已归一化，<br>用于横向比较，<br>不代表绝对性能。</div>';
+  })();
+
+  /* ---------- 模型子弹图 ---------- */
+  (function bullets() {
+    var DATA = [
+      { n: "gpt-6-astra", v: 5.42, budget: 6.0, max: 7 },
+      { n: "claude-opus-4", v: 3.98, budget: 4.4, max: 7 },
+      { n: "deepseek-v4.1", v: 2.21, budget: 3.0, max: 7 },
+      { n: "gemini-3-pro", v: 1.24, budget: 2.0, max: 7 }
+    ];
+    document.getElementById("bullets").innerHTML = DATA.map(function (d) {
+      var w = (d.v / d.max) * 100, t = (d.budget / d.max) * 100;
+      var over = d.v > d.budget;
+      return '<div class="b"><span>' + d.n + '</span><span class="track">' +
+        '<b style="width:' + w.toFixed(1) + '%;background:' +
+        (over ? "linear-gradient(90deg,rgba(255,209,102,.4),#ffd166)" : "linear-gradient(90deg,rgba(53,244,155,.45),#35f49b)") +
+        '"></b><s style="left:' + t.toFixed(1) + '%"></s></span>' +
+        '<span class="v">' + d.v.toFixed(2) + 'M</span></div>';
+    }).join("");
+  })();
+
+  /* ---------- 项目排行 ---------- */
+  (function projects() {
+    var DATA = [
+      { n: "TokenPivot", v: 4.82, c: "" },
+      { n: "hermes-core", v: 3.61, c: "" },
+      { n: "docs-site", v: 2.14, c: "v2" },
+      { n: "infra-tools", v: 1.28, c: "v2" },
+      { n: "未归属", v: 1.00, c: "v2" }
+    ];
+    var total = DATA.reduce(function (a, d) { return a + d.v; }, 0);
+    var top = DATA[0].v;
+    document.getElementById("projects").innerHTML = DATA.map(function (d) {
+      return '<div class="p"><span class="nm">' + d.n + '</span>' +
+        '<span class="tr"><b class="' + d.c + '" style="width:' + ((d.v / top) * 100).toFixed(1) + '%"></b></span>' +
+        '<span class="val">' + d.v.toFixed(2) + 'M</span>' +
+        '<span class="pc">' + ((d.v / total) * 100).toFixed(1) + '%</span></div>';
+    }).join("");
+  })();
+
+  /* ---------- 请求流 ---------- */
+  (function reqs() {
+    var DATA = [
+      ["10:42:07", "DSH", "openai / gpt-6-astra", "15.5K", "ok"],
+      ["10:41:52", "PI", "anthropic / claude-opus-4", "39.0K", "ok"],
+      ["10:41:33", "DSH", "openai / gpt-6-astra", "6.1K", "ok"],
+      ["10:41:10", "PI", "deepseek / deepseek-v4.1", "28.4K", "wn"],
+      ["10:40:58", "DSH", "anthropic / claude-opus-4", "10.4K", "ok"],
+      ["10:40:41", "PI", "google / gemini-3-pro", "8.2K", "ok"]
+    ];
+    document.getElementById("reqrows").innerHTML = DATA.map(function (r, i) {
+      return '<div class="r' + (i === 0 ? " fresh" : "") + '">' +
+        '<span>' + r[0] + '</span><span>' + r[1] + '</span>' +
+        '<span class="n">' + r[2] + '</span>' +
+        '<span class="num">' + r[3] + '</span>' +
+        '<span class="' + r[4] + '">' + (r[4] === "ok" ? "200" : "重试") + '</span></div>';
+    }).join("");
+  })();
+})();
+</script>
+</body>
+</html>

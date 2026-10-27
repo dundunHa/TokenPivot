@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenPivot · E 大屏（即刻风格）</title>
+<style>
+  :root{
+    --bg:#0a0a0b;
+    --ink:#f4f1ea;
+    --ink-2:#a9a49a;
+    --dim:#6e6a62;
+    --line:rgba(244,241,234,.12);
+    --line-soft:rgba(244,241,234,.06);
+    --amber:#e0a64b;
+    --amber-2:#f0c07a;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg)}
+  body{font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased}
+
+  .viewport{position:fixed;inset:0;display:grid;place-items:center;background:var(--bg)}
+  .stage{width:1920px;height:1080px;padding:40px 60px 26px;display:flex;flex-direction:column;
+    transform-origin:center center;position:relative}
+  .stage::before{
+    content:"";position:absolute;inset:0;pointer-events:none;
+    background:radial-gradient(900px 520px at 22% -8%,rgba(224,166,75,.09),transparent 70%);
+  }
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+  /* ── 顶栏：只有字，没有框 ─────────────────── */
+  .top{display:flex;align-items:baseline;gap:14px;flex:0 0 auto}
+  .brand{font-size:15px;letter-spacing:.01em;display:flex;align-items:center;gap:9px}
+  .brand i{width:8px;height:8px;border-radius:50%;background:var(--amber);
+    box-shadow:0 0 14px rgba(224,166,75,.7);display:inline-block}
+  .brand b{font-weight:600}
+  .brand .sep{color:var(--dim);font-weight:300}
+  .brand .ws{color:var(--ink-2);font-size:14px}
+  .top .grow{flex:1}
+  .top .meta{font-family:var(--mono);font-size:11.5px;color:var(--dim);letter-spacing:.06em;
+    display:flex;align-items:center;gap:16px}
+  .live{display:flex;align-items:center;gap:7px;color:var(--ink-2)}
+  .live i{width:5px;height:5px;border-radius:50%;background:var(--amber);animation:blink 2.4s infinite}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+
+  /* ── 主网格 ─────────────────────────────── */
+  main{flex:1 1 auto;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));
+    gap:22px 34px;margin-top:22px;min-height:0}
+  .eyebrow{font-size:12px;color:var(--dim);letter-spacing:.18em;font-family:var(--mono)}
+
+  /* 主数字：这一屏的主角 */
+  .hero{grid-column:1/9;grid-row:1;display:flex;flex-direction:column;min-width:0}
+  .big{display:flex;align-items:flex-start;gap:14px;margin-top:10px}
+  .big .n{font-family:var(--mono);font-size:104px;line-height:.92;letter-spacing:-.035em;font-weight:500}
+  .big .u{font-family:var(--mono);font-size:26px;color:var(--ink-2);margin-top:14px;letter-spacing:.02em}
+  .big .d{margin-top:16px;font-family:var(--mono);font-size:12.5px;color:var(--amber);
+    border:1px solid rgba(224,166,75,.4);border-radius:999px;padding:3px 10px;white-space:nowrap}
+  .lede{margin-top:12px;font-size:13px;color:var(--ink-2);line-height:1.6}
+  .lede b{color:var(--ink);font-weight:500}
+  .lede .m{color:var(--dim)}
+
+  .chartwrap{position:relative;margin-top:14px;flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+  .chartwrap svg{width:100%;flex:1 1 auto;min-height:0;display:block}
+  .axl{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10.5px;
+    color:var(--dim);letter-spacing:.08em;padding:8px 0 0}
+
+  /* ── 右侧数字栏：细线分隔，不套卡片 ───────── */
+  .rail{grid-column:9/13;grid-row:1;display:flex;flex-direction:column;min-width:0}
+  .stat{padding:14px 0;border-top:1px solid var(--line-soft)}
+  .stat:first-child{border-top:0;padding-top:2px}
+  .stat .k{font-size:11.5px;color:var(--dim);letter-spacing:.16em;text-transform:uppercase}
+  .stat .v{font-family:var(--mono);font-size:34px;letter-spacing:-.02em;margin-top:6px;line-height:1.05}
+  .stat .v em{font-style:normal;font-size:16px;color:var(--ink-2);margin-left:2px}
+  .stat .v small{font-size:12px;color:var(--dim);margin-left:5px;letter-spacing:.02em}
+  .stat .n{font-size:11.5px;color:var(--dim);margin-top:5px}
+  .stat.hot{background:linear-gradient(135deg,#f2c98a,#e0a64b);color:#141414;
+    border-radius:16px;padding:16px 20px;border-top:0;margin-bottom:6px}
+  .stat.hot .k{color:rgba(20,20,20,.62)}
+  .stat.hot .v em,.stat.hot .v small,.stat.hot .n{color:rgba(20,20,20,.66)}
+  .stat.hot svg{display:block;width:100%;height:38px;margin-top:6px}
+
+  /* ── 底部三块 ───────────────────────────── */
+  .blk{grid-row:2;min-width:0;display:flex;flex-direction:column}
+  .blk h4{margin:0 0 12px;font-size:11.5px;font-weight:500;color:var(--dim);
+    letter-spacing:.18em;text-transform:uppercase;display:flex;align-items:baseline;gap:8px}
+  .blk h4 span{font-family:var(--mono);font-size:10.5px;color:var(--dim);letter-spacing:.04em;text-transform:none}
+
+  .prov{grid-column:1/5}
+  .stack{display:flex;height:10px;border-radius:999px;overflow:hidden;gap:2px;margin-top:2px}
+  .stack i{display:block;height:100%;transition:width .8s cubic-bezier(.2,.7,.3,1)}
+  .plist{display:flex;flex-direction:column;gap:9px;margin-top:16px}
+  .plist .row{display:flex;align-items:baseline;gap:9px;font-size:12.5px;color:var(--ink-2)}
+  .plist .row i{width:8px;height:8px;border-radius:3px;flex:0 0 8px;transform:translateY(-1px)}
+  .plist .row .v{margin-left:auto;font-family:var(--mono);font-size:12.5px;color:var(--ink)}
+  .plist .row .p{font-family:var(--mono);font-size:10.5px;color:var(--dim);width:46px;text-align:right}
+
+  .models{grid-column:5/9}
+  .mlist{display:flex;flex-direction:column;gap:10px}
+  .mlist .row{display:grid;grid-template-columns:1fr 76px 46px;align-items:center;gap:10px}
+  .mlist .nm{font-size:13px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .mlist .nm small{color:var(--dim);font-size:10.5px;margin-left:6px;letter-spacing:.04em}
+  .mlist .bar{height:3px;border-radius:2px;background:var(--line-soft);position:relative;overflow:hidden}
+  .mlist .bar b{position:absolute;left:0;top:0;height:100%;background:var(--amber);border-radius:2px;
+    width:0;transition:width .9s cubic-bezier(.2,.7,.3,1)}
+  .mlist .v{font-family:var(--mono);font-size:12px;color:var(--ink);text-align:right}
+
+  .proj{grid-column:9/13}
+  .jlist{display:flex;flex-direction:column;gap:12px}
+  .jlist .row{display:flex;align-items:center;gap:12px;font-size:12.5px}
+  .jlist .nm{color:var(--ink-2);width:96px;flex:0 0 96px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .jlist .bar{flex:1;height:3px;background:var(--line-soft);border-radius:2px;overflow:hidden}
+  .jlist .bar b{display:block;height:100%;background:linear-gradient(90deg,rgba(224,166,75,.5),var(--amber));
+    width:0;transition:width .9s cubic-bezier(.2,.7,.3,1)}
+  .jlist .v{font-family:var(--mono);font-size:11.5px;color:var(--ink);width:52px;text-align:right}
+
+  /* ── 页脚：热度条 + 播报 ─────────────────── */
+  .foot{flex:0 0 auto;margin-top:16px;display:flex;align-items:flex-end;gap:26px}
+  .heatbox{display:flex;flex-direction:column;gap:6px}
+  .heatbox .lab{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.14em}
+  #heat{display:block;width:560px;height:64px}
+  .tickerbox{flex:1;min-width:0;overflow:hidden;position:relative;
+    mask-image:linear-gradient(90deg,transparent,#000 4%,#000 96%,transparent)}
+  .run{display:flex;white-space:nowrap;gap:34px;font-family:var(--mono);font-size:11px;color:var(--dim);
+    animation:slide 34s linear infinite}
+  .run b{color:var(--ink-2);font-weight:400}
+  .run i{color:var(--amber);font-style:normal}
+  @keyframes slide{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+
+  /* 端点脉冲 */
+  .halo{fill:none;stroke:var(--amber);stroke-width:1.1}
+  .edot{fill:var(--amber);filter:drop-shadow(0 0 8px rgba(224,166,75,.9))}
+  .endlab rect{fill:#111113;stroke:rgba(224,166,75,.45)}
+  .endlab text{fill:var(--amber-2);font:10.5px var(--mono)}
+
+  @media (prefers-reduced-motion:reduce){
+    .run,.live i{animation:none}
+    *{transition:none!important}
+  }
+</style>
+</head>
+<body>
+<div class="viewport">
+  <div class="stage" id="stage">
+
+    <div class="top">
+      <div class="brand"><i></i><b>TokenPivot</b><span class="sep">/</span><span class="ws">Acme Studio</span></div>
+      <div class="grow"></div>
+      <div class="meta">
+        <span class="live"><i></i>实时</span>
+        <span id="clock">10:42:07</span>
+        <span>2026-10-27 · CST</span>
+      </div>
+    </div>
+
+    <main>
+      <section class="hero">
+        <div class="eyebrow">本周 · 10/21 – 10/27</div>
+        <div class="big">
+          <span class="n mono" id="bigtotal">0.00</span>
+          <span class="u">M tokens</span>
+          <span class="d">↑ 8.4% 比上周</span>
+        </div>
+        <p class="lede">
+          <b>输入 4.88M</b> · <b>输出 2.83M</b> · <b>缓存 5.14M</b><span class="m">　缓存占 40%，比上周多 3 个点</span>
+        </p>
+        <div class="chartwrap">
+          <svg id="hero" viewBox="0 0 1080 320" preserveAspectRatio="none" role="img" aria-label="Token 用量趋势"></svg>
+          <div class="axl" id="axl"></div>
+        </div>
+      </section>
+
+      <aside class="rail">
+        <div class="stat hot">
+          <div class="k">当前速率</div>
+          <div class="v">18.4<em>K</em><small>tokens / 分钟</small></div>
+          <svg id="spark" viewBox="0 0 300 38" preserveAspectRatio="none"></svg>
+          <div class="n">过去 60 秒滚动 · 峰值 52.6K</div>
+        </div>
+        <div class="stat">
+          <div class="k">今日</div>
+          <div class="v">1.92<em>M</em></div>
+          <div class="n">比昨天多 6.2% · 剩 4 小时</div>
+        </div>
+        <div class="stat">
+          <div class="k">请求</div>
+          <div class="v">42.1<em>K</em></div>
+          <div class="n">平均 1.7K tokens / 次 · 成功率 99.1%</div>
+        </div>
+        <div class="stat">
+          <div class="k">预算</div>
+          <div class="v">62<em>%</em></div>
+          <div class="n">已花 $1,284 / $2,000 · 按当前速率 11/3 用完</div>
+        </div>
+      </aside>
+
+      <section class="blk prov">
+        <h4>供应商 <span>按 tokens</span></h4>
+        <div class="stack" id="provbar"></div>
+        <div class="plist" id="provlist"></div>
+      </section>
+
+      <section class="blk models">
+        <h4>模型 Top 5 <span>本周</span></h4>
+        <div class="mlist" id="mods"></div>
+      </section>
+
+      <section class="blk proj">
+        <h4>项目 <span>本周</span></h4>
+        <div class="jlist" id="projs"></div>
+      </section>
+    </main>
+
+    <div class="foot">
+      <div class="heatbox">
+        <div class="lab">过去 24 小时 · 每分钟</div>
+        <svg id="heat"></svg>
+      </div>
+      <div class="tickerbox">
+        <div class="run" id="run"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var round = Math.round;
+  var clockEl = document.getElementById("clock");
+
+  /* ── 缩放：整屏等比，布局不动 ───────────── */
+  function fit() {
+    var s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    document.getElementById("stage").style.transform = "scale(" + s + ")";
+  }
+  fit();
+  window.addEventListener("resize", fit);
+
+  (function tick() {
+    var d = new Date();
+    var p = function (n) { return String(n).padStart(2, "0"); };
+    clockEl.textContent = p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+    setTimeout(tick, 1000);
+  })();
+
+  /* ── 数字滚动到目标值 ─────────────────── */
+  function countUp(el, to, dur) {
+    var start = performance.now();
+    (function step(now) {
+      var t = Math.min(1, (now - start) / dur);
+      var e = 1 - Math.pow(1 - t, 3);
+      el.textContent = (to * e).toFixed(2);
+      if (t < 1) requestAnimationFrame(step);
+    })(start);
+  }
+  countUp(document.getElementById("bigtotal"), 12.85, 1200);
+
+  /* ── 主趋势：平滑曲线 + 渐变面 + 端点脉冲 ── */
+  (function hero() {
+    var W = 1080, H = 320, T = 22, R = 10, B = 18, L = 10;
+    var iw = W - L - R, ih = H - T - B;
+    var n = 84, out = [], inp = [], cache = [], total = [];
+    for (var i = 0; i < n; i++) {
+      var wave = Math.sin(i / 9.2) * 0.26 + Math.sin(i / 3.1) * 0.1 + 0.62;
+      var ramp = 0.55 + (i / n) * 0.6;
+      var spike = i > 62 && i < 70 ? 0.32 : 1;
+      var t = wave * ramp * spike;
+      out.push(120 + t * 210);
+      inp.push(80 + t * 130);
+      cache.push(60 + t * 90);
+    }
+    for (i = 0; i < n; i++) total.push(out[i] + inp[i] + cache[i]);
+    var max = Math.max.apply(null, total) * 1.08;
+
+    function xs(i) { return L + (iw * i) / (n - 1); }
+    function ys(v) { return T + ih - (v / max) * ih; }
+
+    function smooth(pts) {
+      var k, d = [], m = [], len = pts.length;
+      for (k = 0; k < len - 1; k++) d.push(pts[k + 1][1] - pts[k][1]);
+      m[0] = d[0]; m[len - 1] = d[len - 2];
+      for (k = 1; k < len - 1; k++) {
+        if (d[k - 1] * d[k] <= 0) { m[k] = 0; }
+        else {
+          var w1 = 2 * d[k] + d[k - 1], w2 = d[k] + 2 * d[k - 1];
+          m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k]);
+        }
+      }
+      var s = "M" + pts[0][0].toFixed(1) + " " + pts[0][1].toFixed(1);
+      for (k = 0; k < len - 1; k++) {
+        var p1 = pts[k], p2 = pts[k + 1], dx = (p2[0] - p1[0]) / 3;
+        s += " C" + (p1[0] + dx).toFixed(1) + " " + (p1[1] + m[k] * dx).toFixed(1) +
+          " " + (p2[0] - dx).toFixed(1) + " " + (p2[1] - m[k + 1] * dx).toFixed(1) +
+          " " + p2[0].toFixed(1) + " " + p2[1].toFixed(1);
+      }
+      return s;
+    }
+    function band(base, add) {
+      var top = [], bot = [];
+      for (var k = 0; k < n; k++) {
+        top.push([xs(k), ys(base[k] + add[k])]);
+        bot.push([xs(k), ys(base[k])]);
+      }
+      return smooth(top) + " L" + bot.reverse().map(function (p) {
+        return p[0].toFixed(1) + " " + p[1].toFixed(1);
+      }).join(" L") + " Z";
+    }
+    function curve(key) {
+      var pts = [];
+      for (var k = 0; k < n; k++) pts.push([xs(k), ys(key(k))]);
+      return smooth(pts);
+    }
+
+    var ex = xs(n - 1), ey = ys(total[n - 1]);
+    var svg = document.getElementById("hero");
+    svg.innerHTML =
+      '<defs>' +
+      '<linearGradient id="e1" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0" stop-color="#e0a64b" stop-opacity=".38"/>' +
+      '<stop offset="1" stop-color="#e0a64b" stop-opacity="0"/></linearGradient>' +
+      '<linearGradient id="e2" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0" stop-color="#f4f1ea" stop-opacity=".10"/>' +
+      '<stop offset="1" stop-color="#f4f1ea" stop-opacity="0"/></linearGradient>' +
+      '<pattern id="dots" width="18" height="18" patternUnits="userSpaceOnUse">' +
+      '<circle cx="1" cy="1" r=".9" fill="#e0a64b" opacity=".14"/></pattern>' +
+      '</defs>' +
+      '<rect width="' + W + '" height="' + H + '" fill="url(#dots)"/>' +
+      '<path d="' + band(cache, inp) + '" fill="url(#e2)"/>' +
+      '<path d="' + band(inp.map(function (v, k) { return v + cache[k]; }), out) + '" fill="url(#e1)"/>' +
+      '<path d="' + curve(function (k) { return cache[k]; }) + '" fill="none" stroke="#6e6a62" stroke-width="1.1" opacity=".8"/>' +
+      '<path d="' + curve(function (k) { return inp[k] + cache[k]; }) + '" fill="none" stroke="#a9a49a" stroke-width="1.1" opacity=".75"/>' +
+      '<path class="mainline" d="' + curve(function (k) { return total[k]; }) +
+      '" fill="none" stroke="#e0a64b" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>' +
+      '<g class="tr-end">' +
+      '<circle class="halo" cx="' + ex.toFixed(1) + '" cy="' + ey.toFixed(1) + '" r="4">' +
+      '<animate attributeName="r" values="4;22" dur="2.8s" repeatCount="indefinite"/>' +
+      '<animate attributeName="opacity" values=".85;0" dur="2.8s" repeatCount="indefinite"/></circle>' +
+      '<circle class="halo" cx="' + ex.toFixed(1) + '" cy="' + ey.toFixed(1) + '" r="4">' +
+      '<animate attributeName="r" values="4;22" dur="2.8s" begin="1.4s" repeatCount="indefinite"/>' +
+      '<animate attributeName="opacity" values=".55;0" dur="2.8s" begin="1.4s" repeatCount="indefinite"/></circle>' +
+      '<circle class="edot" cx="' + ex.toFixed(1) + '" cy="' + ey.toFixed(1) + '" r="4"/>' +
+      '</g>' +
+      '<g class="endlab">' +
+      '<rect x="' + (ex - 118) + '" y="' + (ey - 32) + '" width="104" height="20" rx="5"/>' +
+      '<text x="' + (ex - 66) + '" y="' + (ey - 17.5) + '" text-anchor="middle">1.41K · 现在</text></g>';
+
+    var line = svg.querySelector(".mainline");
+    var len = line.getTotalLength();
+    line.style.strokeDasharray = len;
+    line.style.strokeDashoffset = len;
+    line.style.transition = "stroke-dashoffset 1.6s cubic-bezier(.2,.7,.3,1)";
+    requestAnimationFrame(function () { line.style.strokeDashoffset = 0; });
+
+    document.getElementById("axl").innerHTML =
+      ["10/21", "10/22", "10/23", "10/24", "10/25", "10/26", "今天"]
+        .map(function (t) { return "<span>" + t + "</span>"; }).join("");
+  })();
+
+  /* ── 速率迷你线（亮色块上用深色） ───────── */
+  (function spark() {
+    var W = 300, H = 38, n = 46, v = [], d = "";
+    for (var i = 0; i < n; i++) v.push(10 + Math.sin(i / 3.4) * 6 + Math.sin(i / 1.7) * 3 + i * .22);
+    var max = Math.max.apply(null, v), min = Math.min.apply(null, v);
+    v.forEach(function (y, i) {
+      var x = (W * i) / (n - 1);
+      var py = H - 4 - ((y - min) / (max - min || 1)) * (H - 8);
+      d += (i ? " L" : "M") + x.toFixed(1) + " " + py.toFixed(1);
+    });
+    document.getElementById("spark").innerHTML =
+      '<path d="' + d + '" fill="none" stroke="rgba(20,20,20,.55)" stroke-width="1.6" stroke-linejoin="round"/>' +
+      '<circle cx="' + W + '" cy="' + (H - 4 - ((v[n - 1] - min) / (max - min || 1)) * (H - 8)).toFixed(1) +
+      '" r="2.6" fill="#141414"/>';
+  })();
+
+  /* ── 供应商：一条堆叠条 + 清单 ───────────── */
+  (function prov() {
+    var DATA = [
+      { n: "OpenAI", v: 5.42, c: "#e0a64b" },
+      { n: "Anthropic", v: 3.98, c: "#f4f1ea" },
+      { n: "DeepSeek", v: 2.21, c: "#a9a49a" },
+      { n: "Google", v: 1.24, c: "#6e6a62" }
+    ];
+    var total = DATA.reduce(function (a, d) { return a + d.v; }, 0);
+    document.getElementById("provbar").innerHTML = DATA.map(function (d) {
+      return '<i style="background:' + d.c + ';width:0" data-w="' + ((d.v / total) * 100).toFixed(2) + '"></i>';
+    }).join("");
+    document.getElementById("provlist").innerHTML = DATA.map(function (d) {
+      return '<div class="row"><i style="background:' + d.c + '"></i>' + d.n +
+        '<span class="v">' + d.v.toFixed(2) + 'M</span>' +
+        '<span class="p">' + ((d.v / total) * 100).toFixed(1) + '%</span></div>';
+    }).join("");
+  })();
+
+  /* ── 模型 Top 5 ──────────────────────────── */
+  (function mods() {
+    var DATA = [
+      ["gpt-6-astra", "OpenAI", 4.62, 36],
+      ["claude-opus-4", "Anthropic", 3.18, 25],
+      ["gemini-3-pro", "Google", 2.41, 19],
+      ["deepseek-v4.1", "DeepSeek", 1.72, 13],
+      ["gpt-6-mini", "OpenAI", 0.92, 7]
+    ];
+    var max = DATA[0][2];
+    document.getElementById("mods").innerHTML = DATA.map(function (d) {
+      return '<div class="row"><div class="nm">' + d[0] + '<small>' + d[1] + '</small></div>' +
+        '<div class="bar"><b data-w="' + ((d[2] / max) * 100).toFixed(1) + '"></b></div>' +
+        '<div class="v">' + d[2].toFixed(2) + 'M</div></div>';
+    }).join("");
+  })();
+
+  /* ── 项目 ────────────────────────────────── */
+  (function projs() {
+    var DATA = [
+      ["tokenpivot", 4.86], ["dsh-plugin", 3.42], ["pi-bridge", 2.18],
+      ["website", 1.24], ["未归属", 1.15]
+    ];
+    var max = DATA[0][1];
+    document.getElementById("projs").innerHTML = DATA.map(function (d) {
+      return '<div class="row"><span class="nm">' + d[0] + '</span>' +
+        '<div class="bar"><b data-w="' + ((d[1] / max) * 100).toFixed(1) + '"></b></div>' +
+        '<span class="v">' + d[1].toFixed(2) + 'M</span></div>';
+    }).join("");
+  })();
+
+  /* ── 24 小时热度：一条细柱阵列 ───────────── */
+  (function heat() {
+    var W = 560, H = 64, cols = 144, gap = 2, w = (W - gap * (cols - 1)) / cols;
+    var parts = "";
+    for (var i = 0; i < cols; i++) {
+      var hour = i / 6;
+      var shape = Math.sin((i / cols) * Math.PI * 1.7 - .6) * .3 + .55;
+      var night = hour < 5 ? .45 : 1;
+      var v = Math.max(.05, Math.min(1, shape * night + (i % 4) * .02));
+      var h = 8 + v * (H - 8);
+      parts += '<rect x="' + (i * (w + gap)).toFixed(1) + '" y="' + (H - h).toFixed(1) +
+        '" width="' + w.toFixed(1) + '" height="' + h.toFixed(1) + '" rx="1" fill="#e0a64b" opacity="' +
+        (.18 + v * .62).toFixed(2) + '"/>';
+    }
+    document.getElementById("heat").innerHTML = parts;
+  })();
+
+  /* ── 播报 ────────────────────────────────── */
+  (function ticker() {
+    var ITEMS = [
+      "gpt-6-astra 刚用了 <i>15.5K</i> tokens",
+      "claude-opus-4 缓存命中 <i>78%</i>",
+      "项目 tokenpivot 本周第一",
+      "采集成功率 <i>99.1%</i>",
+      "未归属请求 <i>1.15M</i>，建议补项目标识"
+    ];
+    var one = ITEMS.map(function (t) { return "<span>" + t + "</span>"; }).join("");
+    document.getElementById("run").innerHTML = one + one;
+  })();
+
+  /* ── 进场：条状元素从 0 展开 ─────────────── */
+  requestAnimationFrame(function () {
+    document.querySelectorAll("#provbar i, .mlist .bar b, .jlist .bar b").forEach(function (el) {
+      el.style.width = el.getAttribute("data-w") + "%";
+    });
+  });
+})();
+</script>
+</body>
+</html>

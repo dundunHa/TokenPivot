@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenPivot · B 开发者终端</title>
+<style>
+  :root{
+    --bg:#070a08;
+    --panel:#0a0f0c;
+    --panel-2:#0c1210;
+    --line:#1a2620;
+    --line-2:#141d18;
+    --text:#dff5e8;
+    --text-2:#9cb5a7;
+    --dim:#5f7a6c;
+    --accent:#35f49b;
+    --accent-dim:rgba(53,244,155,.16);
+    --warn:#ffd166;
+    --bad:#ff7b72;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12.5px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;min-height:100vh;
+  }
+  body::after{
+    content:"";position:fixed;inset:0;pointer-events:none;z-index:9;
+    background:repeating-linear-gradient(180deg,rgba(53,244,155,.035) 0 1px,transparent 1px 3px);
+    mix-blend-mode:screen;opacity:.5;
+  }
+  .m{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+  /* shell */
+  .shell{display:flex;flex-direction:column;min-height:100vh;position:relative;z-index:1}
+
+  /* top strip */
+  .cmd{
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 18px;
+    border-bottom:1px solid var(--line);background:linear-gradient(180deg,#0a0f0c,#070a08);
+  }
+  .glyph{display:flex;gap:3px;align-items:center}
+  .glyph span{width:6px;height:6px;background:#1e2b24;border-radius:1px}
+  .glyph span:first-child{background:var(--accent);box-shadow:0 0 8px rgba(53,244,155,.7)}
+  .crumb{font-family:var(--mono);font-size:11.5px;color:var(--dim);letter-spacing:.02em}
+  .crumb b{color:var(--text)}
+  .crumb i{color:#31443a;font-style:normal;padding:0 5px}
+  .cmd .grow{flex:1}
+  .stat-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent);
+    animation:blink 2.6s steps(1,end) infinite}
+  @keyframes blink{0%,70%{opacity:1}71%,100%{opacity:.25}}
+  .livecode{font-family:var(--mono);font-size:10.5px;color:var(--dim);letter-spacing:.08em}
+  .livecode b{color:var(--accent)}
+
+  .seg{display:inline-flex;border:1px solid var(--line);background:#08100c}
+  .seg button{border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);
+    font-family:var(--mono);font-size:10.5px;padding:4px 9px;cursor:pointer;letter-spacing:.04em}
+  .seg button:last-child{border-right:0}
+  .seg button:hover{color:var(--text-2);background:#0c1611}
+  .seg button[aria-pressed="true"]{background:rgba(53,244,155,.12);color:#9bffd0}
+  .btn{background:#08100c;border:1px solid var(--line);color:var(--text-2);font-family:var(--mono);
+    font-size:10.5px;padding:4px 9px;cursor:pointer;letter-spacing:.05em}
+  .btn:hover{border-color:#2b4034;color:var(--text)}
+
+  /* registers */
+  .regs{display:grid;grid-template-columns:repeat(6,1fr);border-bottom:1px solid var(--line)}
+  .reg{padding:12px 18px 13px;border-right:1px solid var(--line-2)}
+  .reg:last-child{border-right:0}
+  .reg .lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;color:#4e6759;display:flex;justify-content:space-between}
+  .reg .val{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:21px;font-weight:600;
+    letter-spacing:-.02em;margin-top:4px;color:#e9fff2}
+  .reg .val u{text-decoration:none;font-size:11px;color:var(--dim);margin-left:2px}
+  .reg .sub{font-family:var(--mono);font-size:9.5px;color:#4e6759;margin-top:3px}
+  .reg.hero .val{color:var(--accent);text-shadow:0 0 18px rgba(53,244,155,.28)}
+
+  /* filters */
+  .filt{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 18px;border-bottom:1px solid var(--line);
+    background:#080d0a}
+  .filt .k{font-family:var(--mono);font-size:9.5px;letter-spacing:.14em;color:#4a6154}
+  .chip{background:transparent;border:1px solid var(--line);color:var(--text-2);font-family:var(--mono);
+    font-size:10.5px;padding:2px 8px;cursor:pointer;letter-spacing:.02em}
+  .chip:hover{border-color:#2b4034;color:var(--text)}
+  .chip[aria-pressed="true"]{background:var(--accent-dim);border-color:rgba(53,244,155,.4);color:#a8ffd6}
+  .sep-v{width:1px;height:14px;background:var(--line)}
+  .filt .tail{margin-left:auto;font-family:var(--mono);font-size:9.5px;color:#456054;display:flex;gap:12px;flex-wrap:wrap}
+
+  /* body grid */
+  .body{display:grid;grid-template-columns:minmax(0,1fr) 292px;flex:1}
+  .pane{padding:14px 18px 16px;min-width:0}
+  .pane.r{border-left:1px solid var(--line);background:#080d0a}
+
+  .head{display:flex;align-items:baseline;gap:10px;margin-bottom:9px}
+  .head h2{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;color:#7b9a8a;margin:0;font-weight:500}
+  .head .s{font-family:var(--mono);font-size:9.5px;color:#3f5749}
+  .head .grow{flex:1}
+
+  /* meter */
+  .meter{display:flex;align-items:flex-end;gap:2px;height:34px;padding:6px 8px;border:1px solid var(--line);
+    background:#070c09;margin-bottom:10px}
+  .meter i{flex:1;background:#16241d;border-radius:1px 1px 0 0;min-height:2px;transition:height .2s}
+  .meter i.on{background:linear-gradient(180deg,#5cffb6,#1f8a5c)}
+  .meter i.peak{background:linear-gradient(180deg,#ffd166,#a67b1d)}
+
+  /* chart */
+  .cbox{border:1px solid var(--line);background:#070c09;position:relative;padding:8px 8px 2px}
+  .cbox .ctop{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:#3f5749;padding:0 2px 6px}
+  svg{display:block;width:100%;height:196px;overflow:visible}
+  .xrow{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:#33483d;padding:3px 2px 5px}
+  .tip{position:absolute;pointer-events:none;opacity:0;background:#0b1410;border:1px solid #26382e;
+    padding:5px 8px;font-family:var(--mono);font-size:9.5px;color:var(--text-2);white-space:nowrap;
+    transform:translate(-50%,-130%);z-index:5}
+  .tip b{color:#a8ffd6}
+
+  /* table */
+  .tblwrap{border:1px solid var(--line);margin-top:14px}
+  table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10.5px}
+  thead th{text-align:left;font-weight:500;font-size:9px;letter-spacing:.1em;color:#46604f;
+    padding:6px 9px;border-bottom:1px solid var(--line);background:#080e0b;white-space:nowrap}
+  thead th.r,tbody td.r{text-align:right}
+  tbody td{padding:5px 9px;border-bottom:1px solid #0f1814;color:#9cb5a7;white-space:nowrap}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr:hover td{background:#0b1511;color:#d4f3e2}
+  td.hi{color:#dff5e8}
+  .ok{color:var(--accent)}
+  .warn{color:var(--warn)}
+  .bad{color:var(--bad)}
+  .dash{color:#2f4438}
+
+  /* right side */
+  .srow{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #101a15;font-family:var(--mono);font-size:10.5px}
+  .srow:last-child{border-bottom:0}
+  .srow .nm{color:var(--text-2);flex:1;overflow:hidden;text-overflow:ellipsis}
+  .srow .ag{color:#3f5749}
+  .bar{height:4px;background:#101a15;width:100%;margin-top:4px}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,#166b47,#35f49b)}
+  .blk{margin-bottom:16px}
+  .blk .cap{font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;color:#46604f;margin-bottom:4px;display:flex;justify-content:space-between}
+  .prov{padding:8px 9px;border:1px solid var(--line);margin-bottom:6px;background:#080e0b}
+  .prov .top{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10.5px}
+  .prov .top b{color:var(--text)}
+  .prov .top span{margin-left:auto;color:#46604f;font-size:9.5px}
+  .prov .row2{display:flex;gap:10px;font-family:var(--mono);font-size:9.5px;color:#5b7566;margin-top:4px}
+  .prov .row2 u{text-decoration:none;color:#9cb5a7}
+
+  .foot{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:8px 18px 14px;
+    font-family:var(--mono);font-size:9.5px;color:#3f5749}
+  .foot b{color:#6d8a7a}
+
+  @media (max-width:1180px){
+    .body{grid-template-columns:1fr}
+    .pane.r{border-left:0;border-top:1px solid var(--line)}
+    .regs{grid-template-columns:repeat(3,1fr)}
+  }
+  @media (max-width:760px){
+    .regs{grid-template-columns:repeat(2,1fr)}
+    .filt .tail{margin-left:0}
+  }
+  @media (prefers-reduced-motion:reduce){.stat-dot{animation:none}*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <div class="cmd">
+    <div class="glyph"><span></span><span></span><span></span></div>
+    <div class="crumb"><b>TOKENPIVOT</b><i>›</i>acme-studio<i>›</i>overview</div>
+    <div class="grow"></div>
+    <div class="seg" role="group" aria-label="时间范围">
+      <button type="button" aria-pressed="true">24H</button>
+      <button type="button" aria-pressed="false">1H</button>
+      <button type="button" aria-pressed="false">7D</button>
+      <button type="button" aria-pressed="false">CUSTOM</button>
+    </div>
+    <div class="seg" role="group" aria-label="粒度" id="gran">
+      <button type="button" data-g="minute" aria-pressed="true">MIN</button>
+      <button type="button" data-g="hour" aria-pressed="false">HOUR</button>
+      <button type="button" data-g="day" aria-pressed="false">DAY</button>
+    </div>
+    <span class="seg" style="border:0;background:none">
+      <button class="btn" type="button">export.csv</button>
+    </span>
+    <div class="livecode"><b>●</b> last_poll <span class="stat-dot" style="display:inline-block;vertical-align:middle"></span> 12s</div>
+  </div>
+
+  <div class="regs" aria-label="关键指标">
+    <div class="reg hero">
+      <div class="lbl"><span>TOTAL_TOKENS</span><span>D</span></div>
+      <div class="val">12.85<u>M</u></div>
+      <div class="sub">+8.4% vs 昨日</div>
+    </div>
+    <div class="reg">
+      <div class="lbl"><span>INPUT</span><span>71.7%</span></div>
+      <div class="val">9.21<u>M</u></div>
+      <div class="sub">cache_hit 1.42M</div>
+    </div>
+    <div class="reg">
+      <div class="lbl"><span>OUTPUT</span><span>28.3%</span></div>
+      <div class="val">3.64<u>M</u></div>
+      <div class="sub">reasoning 内含</div>
+    </div>
+    <div class="reg">
+      <div class="lbl"><span>REQUESTS</span><span>OK 99.1%</span></div>
+      <div class="val">8,412</div>
+      <div class="sub">retry 74 · fail 12</div>
+    </div>
+    <div class="reg">
+      <div class="lbl"><span>RATE_60S</span><span>tok/min</span></div>
+      <div class="val">18.4<u>K</u></div>
+      <div class="sub">+3.2% vs prev</div>
+    </div>
+    <div class="reg">
+      <div class="lbl"><span>SOURCES</span><span>2/2</span></div>
+      <div class="val">DSH<i>·</i>PI</div>
+      <div class="sub">dsh 12s · pi 43s</div>
+    </div>
+  </div>
+
+  <div class="filt">
+    <span class="k">WHERE</span>
+    <button class="chip" aria-pressed="true" type="button">provider=openai</button>
+    <button class="chip" aria-pressed="true" type="button">provider=anthropic</button>
+    <button class="chip" aria-pressed="false" type="button">provider=deepseek</button>
+    <span class="sep-v"></span>
+    <button class="chip" aria-pressed="false" type="button">model=gpt-6-astra</button>
+    <button class="chip" aria-pressed="false" type="button">model=claude-opus-4</button>
+    <span class="sep-v"></span>
+    <button class="chip" aria-pressed="false" type="button">project=TokenPivot</button>
+    <button class="chip" aria-pressed="false" type="button">project=hermes-core</button>
+    <button class="chip" aria-pressed="false" type="button">project=unassigned</button>
+    <span class="tail">
+      <span>tz=Asia/Shanghai</span><span>bucket=complete_time</span><span>partial=last_bucket</span>
+    </span>
+  </div>
+
+  <div class="body">
+    <div class="pane">
+      <div class="head">
+        <h2>THROUGHPUT</h2>
+        <span class="s" id="cmeta">60 MIN · 1 MIN BUCKET</span>
+        <span class="grow"></span>
+        <span class="s">IN <span style="color:#6f8f7f">───</span> OUT <span style="color:#35f49b">───</span></span>
+      </div>
+
+      <div class="meter" id="meter" aria-hidden="true"></div>
+
+      <div class="cbox" id="cbox">
+        <div class="ctop"><span id="ymax">y: 0 — 620K</span><span>hover 查看单分钟</span></div>
+        <svg id="chart" viewBox="0 0 900 196" preserveAspectRatio="none" role="img" aria-label="示例吞吐趋势"></svg>
+        <div class="xrow" id="xrow"></div>
+        <div class="tip" id="tip"></div>
+      </div>
+
+      <div class="head" style="margin:16px 0 8px">
+        <h2>REQUEST_TAIL</h2>
+        <span class="s">最近 5 条 · 示例数据</span>
+        <span class="grow"></span>
+        <span class="s">按完成时间倒序</span>
+      </div>
+      <div class="tblwrap">
+        <table>
+          <thead>
+            <tr>
+              <th>TIME</th><th>SRC</th><th>PROVIDER</th><th>MODEL</th><th>PROJECT</th>
+              <th>IN</th><th>OUT</th><th class="r">MS</th><th class="r">ST</th>
+            </tr>
+          </thead>
+          <tbody id="reqs"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="pane r">
+      <div class="blk">
+        <div class="cap" title="点击切换 项目 / 模型 / 供应商" style="cursor:pointer"><span>TOP_PROJECT</span><span>share ↻</span></div>
+        <div id="rank"></div>
+      </div>
+
+      <div class="blk">
+        <div class="cap"><span>BY_PROVIDER</span><span>tokens</span></div>
+        <div class="prov">
+          <div class="top"><span class="ok">●</span><b>openai</b><span>42.2%</span></div>
+          <div class="row2"><span>5.42M</span><span>gpt-6-astra</span><u>1.9K req</u></div>
+        </div>
+        <div class="prov">
+          <div class="top"><span class="ok">●</span><b>anthropic</b><span>31.0%</span></div>
+          <div class="row2"><span>3.98M</span><span>claude-opus-4</span><u>1.4K req</u></div>
+        </div>
+        <div class="prov">
+          <div class="top"><span class="ok">●</span><b>deepseek</b><span>17.2%</span></div>
+          <div class="row2"><span>2.21M</span><span>deepseek-v4.1</span><u>860 req</u></div>
+        </div>
+        <div class="prov">
+          <div class="top"><span class="warn">●</span><b>google</b><span>9.6%</span></div>
+          <div class="row2"><span>1.24M</span><span>gemini-3-pro</span><u class="warn">延迟 8m</u></div>
+        </div>
+      </div>
+
+      <div class="blk">
+        <div class="cap"><span>INGEST_HEALTH</span><span>status</span></div>
+        <div class="srow"><span class="ok">●</span><span class="nm">dsh › plugin v0.4.1</span><span class="ag">12s</span></div>
+        <div class="srow"><span class="ok">●</span><span class="nm">pi › plugin v0.3.7</span><span class="ag">43s</span></div>
+        <div class="srow"><span class="dash">○</span><span class="nm">未归属项目</span><span class="ag">1.0M</span></div>
+        <div class="srow"><span class="warn">●</span><span class="nm">格式告警</span><span class="ag">2 条</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>设计预览 B · 开发者终端</b><span>·</span>
+    <span>全部数字为示例数据，未连接采集接口。</span><span>·</span>
+    <span>“最近接收”不是“实时在线”的证明。</span>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var round = Math.round;
+
+  function fmt(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+    return String(n);
+  }
+
+  function series(group) {
+    var len = group === "minute" ? 60 : group === "hour" ? 24 : 7;
+    var out = [], inp = [];
+    for (var i = 0; i < len; i++) {
+      var w = Math.sin((i / len) * Math.PI * 2.1 - 1.2) * 0.34 + 1;
+      var spike = i === Math.round(len * 0.68) ? 1.85 : 1;
+      var base = group === "day" ? 1.7e6 : group === "hour" ? 4.1e5 : 2.6e5;
+      inp.push(round(base * w * spike * 1.15));
+      out.push(round(base * w * spike * 0.42 + (i % 5) * 1800));
+    }
+    return { inp: inp, out: out, len: len };
+  }
+
+  document.querySelectorAll(".chip").forEach(function (c) {
+    c.addEventListener("click", function () {
+      c.setAttribute("aria-pressed", c.getAttribute("aria-pressed") === "true" ? "false" : "true");
+    });
+  });
+
+  var W = 900, H = 196, PAD = { t: 8, r: 6, b: 6, l: 6 };
+  var svg = document.getElementById("chart");
+  var tip = document.getElementById("tip");
+  var cbox = document.getElementById("cbox");
+  var cur = null, curGroup = "minute";
+  var meta = { minute: "60 MIN · 1 MIN BUCKET", hour: "24 HOUR · 1 HOUR BUCKET", day: "7 DAY · 1 DAY BUCKET" };
+
+  document.querySelectorAll("#gran button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      document.querySelectorAll("#gran button").forEach(function (x) {
+        x.setAttribute("aria-pressed", x === b ? "true" : "false");
+      });
+      curGroup = b.dataset.g;
+      document.getElementById("cmeta").textContent = meta[curGroup];
+      draw();
+    });
+  });
+
+  function pathOf(vals, len, max, close) {
+    var iw = W - PAD.l - PAD.r, ih = H - PAD.t - PAD.b, d = "";
+    for (var i = 0; i < len; i++) {
+      var x = PAD.l + (iw * i) / (len - 1);
+      var y = PAD.t + ih - (vals[i] / max) * ih;
+      d += (i ? " L" : "M") + x.toFixed(1) + " " + y.toFixed(1);
+    }
+    if (close) d += " L" + (PAD.l + iw) + " " + (PAD.t + ih) + " L" + PAD.l + " " + (PAD.t + ih) + " Z";
+    return d;
+  }
+
+  function labels(group, len) {
+    var out = [], step = Math.max(1, round(len / 7));
+    for (var i = 0; i < len; i += step) {
+      if (group === "minute") out.push("-" + (len - i) + "m");
+      else if (group === "hour") out.push(String((i + 14) % 24).padStart(2, "0") + "h");
+      else out.push(["10/21", "10/22", "10/23", "10/24", "10/25", "10/26", "10/27"][i] || "");
+    }
+    out.push("now");
+    return out;
+  }
+
+  function draw() {
+    var s = series(curGroup), len = s.len;
+    var max = Math.max.apply(null, s.inp) * 1.1;
+    cur = { s: s, max: max, len: len };
+
+    var grid = "";
+    for (var g = 0; g <= 4; g++) {
+      var y = PAD.t + ((H - PAD.t - PAD.b) * g) / 4;
+      grid += '<line x1="0" y1="' + y + '" x2="' + W + '" y2="' + y + '" stroke="#111c16" stroke-width="1"/>';
+    }
+
+    svg.innerHTML = '<defs><linearGradient id="bf" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0" stop-color="#35f49b" stop-opacity=".26"/>' +
+      '<stop offset="1" stop-color="#35f49b" stop-opacity="0"/></linearGradient></defs>' +
+      grid +
+      '<path d="' + pathOf(s.inp, len, max, true) + '" fill="#2a4a3b" fill-opacity=".18"/>' +
+      '<path d="' + pathOf(s.inp, len, max, false) + '" fill="none" stroke="#3d6151" stroke-width="1"/>' +
+      '<path d="' + pathOf(s.out, len, max, true) + '" fill="url(#bf)"/>' +
+      '<path d="' + pathOf(s.out, len, max, false) + '" fill="none" stroke="#35f49b" stroke-width="1.6"/>' +
+      '<line id="cross" x1="0" x2="0" y1="0" y2="' + H + '" stroke="#2f5a45" opacity="0"/>' +
+      '<circle id="dot" r="3" fill="#070c09" stroke="#8bffc9" stroke-width="1.6" opacity="0"/>';
+
+    document.getElementById("ymax").textContent = "y: 0 — " + fmt(max);
+    document.getElementById("xrow").innerHTML = labels(curGroup, len)
+      .map(function (t) { return "<span>" + t + "</span>"; }).join("");
+
+    var meter = document.getElementById("meter");
+    var bars = "";
+    var vals = s.out.slice(-48);
+    for (var i = 0; i < vals.length; i++) {
+      var v = vals[i] / (max * 0.75);
+      var hh = Math.max(2, round(Math.min(1, v) * 26));
+      var hot = v > 0.82 ? " peak" : v > 0.18 ? " on" : "";
+      bars += '<i class="' + hot + '" style="height:' + hh + 'px"></i>';
+    }
+    meter.innerHTML = bars;
+  }
+
+  function bucket(idx) {
+    if (curGroup === "minute") return "t-" + (cur.len - idx) + "m";
+    if (curGroup === "hour") return "10/27 " + String((idx + 14) % 24).padStart(2, "0") + ":00";
+    return ["10/21", "10/22", "10/23", "10/24", "10/25", "10/26", "10/27"][idx] || "";
+  }
+
+  function move(e) {
+    if (!cur) return;
+    var r = svg.getBoundingClientRect();
+    var p = Math.min(0.999, Math.max(0.001, (e.clientX - r.left) / r.width));
+    var idx = round(p * (cur.len - 1));
+    var iw = W - PAD.l - PAD.r, ih = H - PAD.t - PAD.b;
+    var x = PAD.l + (iw * idx) / (cur.len - 1);
+    var y = PAD.t + ih - (cur.s.out[idx] / cur.max) * ih;
+
+    var cr = document.getElementById("cross");
+    cr.setAttribute("x1", x); cr.setAttribute("x2", x); cr.setAttribute("opacity", ".6");
+    var d = document.getElementById("dot");
+    d.setAttribute("cx", x); d.setAttribute("cy", y); d.setAttribute("opacity", "1");
+
+    tip.style.left = ((x / W) * r.width) + "px";
+    tip.style.top = ((y / H) * r.height) + "px";
+    tip.style.opacity = "1";
+    tip.innerHTML = bucket(idx) + "<br>OUT <b>" + fmt(cur.s.out[idx]) + "</b><br>IN <b>" +
+      fmt(cur.s.inp[idx]) + "</b>";
+  }
+
+  function leave() {
+    tip.style.opacity = "0";
+    document.getElementById("cross").setAttribute("opacity", "0");
+    document.getElementById("dot").setAttribute("opacity", "0");
+  }
+  cbox.addEventListener("mousemove", move);
+  cbox.addEventListener("mouseleave", leave);
+
+  var RANK = {
+    project: [["TokenPivot", 4820000], ["hermes-core", 3610000], ["docs-site", 2140000], ["infra-tools", 1280000], ["unassigned", 1000000]],
+    model: [["gpt-6-astra", 5420000], ["claude-opus-4", 3980000], ["deepseek-v4.1", 2210000], ["gemini-3-pro", 1240000]],
+    provider: [["openai", 5420000], ["anthropic", 3980000], ["deepseek", 2210000], ["google", 1240000]]
+  };
+  var rk = "project";
+
+  function renderRank() {
+    var rows = RANK[rk], top = rows[0][1];
+    var total = rows.reduce(function (a, r) { return a + r[1]; }, 0);
+    document.getElementById("rank").innerHTML = rows.map(function (r) {
+      return '<div class="srow" style="display:block;padding:6px 0">' +
+        '<div style="display:flex;gap:8px;align-items:center">' +
+        '<span class="nm">' + r[0] + '</span>' +
+        '<span class="ag">' + fmt(r[1]) + '</span>' +
+        '<span class="ag">' + ((r[1] / total) * 100).toFixed(1) + '%</span></div>' +
+        '<div class="bar"><i style="width:' + ((r[1] / top) * 100).toFixed(1) + '%"></i></div></div>';
+    }).join("");
+  }
+
+  var REQS = [
+    ["10:42:07", "dsh", "openai", "gpt-6-astra", "TokenPivot", "12.4K", "3.1K", "8400", "ok"],
+    ["10:41:52", "pi", "anthropic", "claude-opus-4", "hermes-core", "31.8K", "7.2K", "14200", "ok"],
+    ["10:41:33", "dsh", "openai", "gpt-6-astra", "docs-site", "4.9K", "1.2K", "3100", "ok"],
+    ["10:41:10", "pi", "deepseek", "deepseek-v4.1", "TokenPivot", "22.6K", "5.8K", "11700", "warn"],
+    ["10:40:58", "dsh", "anthropic", "claude-opus-4", "infra-tools", "8.1K", "2.3K", "6900", "ok"]
+  ];
+  document.getElementById("reqs").innerHTML = REQS.map(function (r) {
+    return "<tr>" +
+      '<td class="m hi">' + r[0] + "</td>" +
+      '<td class="m">' + r[1] + "</td>" +
+      '<td class="m">' + r[2] + "</td>" +
+      '<td class="m">' + r[3] + "</td>" +
+      '<td class="m">' + r[4] + "</td>" +
+      '<td class="m">' + r[5] + "</td>" +
+      '<td class="m">' + r[6] + "</td>" +
+      '<td class="m r">' + r[7] + "</td>" +
+      '<td class="m r ' + r[8] + '">' + (r[8] === "ok" ? "200" : "429→200") + "</td>" +
+      "</tr>";
+  }).join("");
+
+  // 点击排名标题切换维度
+  document.querySelector('.blk .cap').addEventListener("click", function () {
+    var order = ["project", "model", "provider"];
+    rk = order[(order.indexOf(rk) + 1) % order.length];
+    this.firstElementChild.textContent = (rk === "project" ? "TOP_PROJECT" : rk === "model" ? "TOP_MODEL" : "TOP_PROVIDER");
+    renderRank();
+  });
+
+  draw();
+  renderRank();
+})();
+</script>
+</body>
+</html>

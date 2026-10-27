@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenPivot · C 极简数据看板</title>
+<style>
+  :root{
+    --bg:#0a0a0b;
+    --ink:#f4f1ea;
+    --ink-2:#a9a49a;
+    --dim:#6e6a62;
+    --line:rgba(244,241,234,.13);
+    --line-2:rgba(244,241,234,.07);
+    --amber:#e0a64b;
+    --amber-soft:rgba(224,166,75,.14);
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:13px;line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1160px;margin:0 auto;padding:0 34px 64px}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+  .hr{height:1px;background:var(--line);border:0;margin:0}
+  .hr-soft{height:1px;background:var(--line-2);border:0;margin:0}
+
+  /* masthead */
+  header{display:flex;align-items:flex-end;gap:18px;flex-wrap:wrap;padding:30px 0 18px}
+  .mh-l{flex:1;min-width:220px}
+  .mh-l .mark{display:flex;align-items:center;gap:9px;font-size:11px;letter-spacing:.2em;color:var(--ink-2)}
+  .mh-l .mark i{width:8px;height:8px;background:var(--amber);display:inline-block}
+  .date{margin-top:9px;font-size:12px;color:var(--dim)}
+  nav{display:flex;gap:20px;font-size:11.5px;color:var(--dim);align-items:center;flex-wrap:wrap}
+  nav a{color:var(--dim);text-decoration:none;padding-bottom:2px;border-bottom:1px solid transparent}
+  nav a:hover{color:var(--ink-2)}
+  nav a[aria-current]{color:var(--ink);border-bottom-color:var(--amber)}
+  .wsname{color:var(--ink-2);font-size:11.5px;letter-spacing:.02em}
+
+  /* hero */
+  .hero{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:0;padding:26px 0 0}
+  .hero .l{padding-right:34px;border-right:1px solid var(--line-2)}
+  .k{font-size:10.5px;letter-spacing:.18em;color:var(--dim);text-transform:uppercase}
+  .big{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:clamp(56px,8.4vw,96px);
+    line-height:.92;letter-spacing:-.045em;font-weight:500;margin:12px 0 0;display:flex;align-items:baseline;gap:10px}
+  .big u{text-decoration:none;font-size:.28em;letter-spacing:0;color:var(--dim);font-weight:400}
+  .delta{margin-top:14px;display:flex;gap:14px;align-items:center;font-size:11.5px;color:var(--dim);flex-wrap:wrap}
+  .delta .a{color:var(--amber)}
+  .delta .bar{width:96px;height:2px;background:var(--line);position:relative}
+  .delta .bar i{position:absolute;left:0;top:0;height:2px;width:62%;background:var(--amber)}
+
+  .hero .r{padding-left:34px;display:flex;flex-direction:column}
+  .stat{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:11px 0;border-bottom:1px solid var(--line-2)}
+  .stat:first-child{padding-top:2px}
+  .stat:last-child{border-bottom:0}
+  .stat .n{font-size:11.5px;color:var(--ink-2)}
+  .stat .n em{font-style:normal;color:var(--dim);font-size:10.5px;margin-left:6px}
+  .stat .v{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:17px;letter-spacing:-.01em}
+  .stat .v small{color:var(--dim);font-size:10.5px;margin-left:2px}
+
+  /* section head */
+  .sh{display:flex;align-items:baseline;gap:12px;padding:30px 0 12px;flex-wrap:wrap}
+  .sh h2{font-size:12px;font-weight:600;letter-spacing:.13em;margin:0;color:var(--ink-2);text-transform:uppercase}
+  .sh .sp{flex:1}
+  .sh .meta{font-size:11px;color:var(--dim);font-family:var(--mono)}
+  .txtseg{display:inline-flex;gap:16px;font-size:11px;color:var(--dim)}
+  .txtseg button{border:0;background:none;padding:0 0 2px;color:inherit;font:inherit;cursor:pointer;border-bottom:1px solid transparent}
+  .txtseg button:hover{color:var(--ink-2)}
+  .txtseg button[aria-pressed="true"]{color:var(--ink);border-bottom-color:var(--amber)}
+
+  /* filters as underlined text */
+  .filters{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:0 0 12px;font-size:11px;color:var(--dim)}
+  .filters .lbl{letter-spacing:.16em;font-size:10px}
+  .f{display:inline-flex;gap:7px;align-items:center;border:0;background:none;color:var(--dim);
+    font:inherit;font-size:11px;cursor:pointer;padding:0 0 2px;border-bottom:1px solid transparent}
+  .f:hover{color:var(--ink-2)}
+  .f[aria-pressed="true"]{color:var(--ink);border-bottom-color:var(--amber)}
+  .f .sep{color:rgba(244,241,234,.22)}
+
+  /* chart */
+  .chartbox{position:relative;padding-top:6px}
+  svg.line{display:block;width:100%;height:210px;overflow:visible}
+  .xr{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:#57534c;padding-top:6px}
+  .yl{position:absolute;right:0;top:8px;display:flex;flex-direction:column;justify-content:space-between;
+    height:190px;font-family:var(--mono);font-size:9.5px;color:#4f4b45;text-align:right;pointer-events:none}
+  .tip{position:absolute;pointer-events:none;opacity:0;background:#101010;border:1px solid var(--line);
+    padding:6px 9px;font-family:var(--mono);font-size:10px;color:var(--ink-2);white-space:nowrap;
+    transform:translate(-50%,-118%);z-index:4}
+  .tip b{color:var(--ink)}
+
+  /* two col */
+  .cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:44px;padding-top:6px}
+  .rankrow{display:flex;align-items:baseline;justify-content:space-between;gap:14px;padding:12px 0;border-bottom:1px solid var(--line-2)}
+  .rankrow:last-child{border-bottom:0}
+  .rankrow .nm{font-size:12.5px;color:var(--ink)}
+  .rankrow .nm em{font-style:normal;font-size:10px;color:var(--dim);margin-left:7px;font-family:var(--mono)}
+  .rankrow .vv{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12.5px;color:var(--ink-2)}
+  .rankrow .tr{display:flex;align-items:center;gap:12px;min-width:150px;justify-content:flex-end}
+  .tline{height:2px;background:var(--line);flex:1;max-width:110px;position:relative}
+  .tline i{position:absolute;left:0;top:0;height:2px;background:var(--ink-2)}
+  .rankrow.top .tline i{background:var(--amber)}
+
+  .cells{display:grid;grid-template-columns:repeat(12,1fr);gap:5px;margin-top:6px}
+  .cell{height:26px;background:rgba(244,241,234,.05)}
+  .cell.on{background:rgba(244,241,234,.28)}
+  .cell.hi{background:var(--amber)}
+  .celllbl{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:#4f4b45;margin-top:7px}
+
+  .provrow{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line-2);font-size:12px}
+  .provrow:last-child{border-bottom:0}
+  .provrow .d{width:5px;height:5px;border-radius:50%;background:var(--ink-2)}
+  .provrow .d.amber{background:var(--amber)}
+  .provrow .nm{flex:1;color:var(--ink-2)}
+  .provrow .vv{font-family:var(--mono);font-size:11.5px;color:var(--ink-2)}
+  .provrow .pp{font-family:var(--mono);font-size:10.5px;color:var(--dim);width:52px;text-align:right}
+
+  /* detail */
+  .drow{display:grid;grid-template-columns:74px 52px minmax(0,1.5fr) minmax(0,1fr) 84px 84px 62px;
+    gap:14px;align-items:baseline;padding:10px 0;border-bottom:1px solid var(--line-2);font-size:11.5px}
+  .dhead{font-size:10px;letter-spacing:.14em;color:var(--dim);text-transform:uppercase;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .drow .t{font-family:var(--mono);font-size:10.5px;color:var(--dim)}
+  .drow .m{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink-2)}
+  .drow .p{color:var(--ink-2)}
+  .drow .r{text-align:right}
+  .tag{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;color:var(--dim)}
+  .tag.w{color:var(--amber)}
+
+  footer{display:flex;gap:12px;flex-wrap:wrap;align-items:center;padding-top:26px;font-size:10.5px;color:#5a564f}
+  footer b{color:#837e74;font-weight:600;letter-spacing:.06em}
+  footer .sp{color:#33302c}
+
+  @media (max-width:900px){
+    .wrap{padding:0 20px 48px}
+    .hero{grid-template-columns:1fr}
+    .hero .l{padding-right:0;border-right:0;border-bottom:1px solid var(--line-2);padding-bottom:22px}
+    .hero .r{padding-left:0;padding-top:14px}
+    .cols{grid-template-columns:1fr;gap:26px}
+    .drow{grid-template-columns:64px 44px minmax(0,1.2fr) 84px 74px;font-size:11px}
+    .drow > *:nth-child(4),.drow > *:nth-child(7){display:none}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="mh-l">
+      <div class="mark"><i></i>TOKENPIVOT</div>
+      <div class="date">2026 年 10 月 27 日 · 星期二 · Asia/Shanghai</div>
+    </div>
+    <nav>
+      <a href="#" aria-current="page">总览</a>
+      <a href="#">项目</a>
+      <a href="#">模型</a>
+      <a href="#">供应商</a>
+      <a href="#">数据源</a>
+      <span class="wsname">· Acme Studio</span>
+    </nav>
+  </header>
+
+  <hr class="hr" />
+
+  <section class="hero" aria-label="今日总览">
+    <div class="l">
+      <div class="k">今日消耗</div>
+      <div class="big">12.85<u>M tokens</u></div>
+      <div class="delta">
+        <span class="a">+8.4%</span>
+        <span>较昨日</span>
+        <span class="bar" aria-hidden="true"><i></i></span>
+        <span>8,412 次调用</span>
+      </div>
+    </div>
+    <div class="r">
+      <div class="stat">
+        <div class="n">输入<em>含缓存命中</em></div>
+        <div class="v">9.21<small>M</small></div>
+      </div>
+      <div class="stat">
+        <div class="n">输出</div>
+        <div class="v">3.64<small>M</small></div>
+      </div>
+      <div class="stat">
+        <div class="n">最近 60 秒<em>tokens/min</em></div>
+        <div class="v">18.4<small>K</small></div>
+      </div>
+      <div class="stat">
+        <div class="n">来源<em>最近接收</em></div>
+        <div class="v">DSH<i style="font-style:normal;color:var(--dim)"> · </i>PI<small>12s</small></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="sh">
+    <h2>用量趋势</h2>
+    <span class="meta" id="cmeta">最近 60 分钟 · 每 1 分钟</span>
+    <span class="sp"></span>
+    <div class="txtseg" id="gran" role="group" aria-label="粒度">
+      <button type="button" data-g="minute" aria-pressed="true">分钟</button>
+      <button type="button" data-g="hour" aria-pressed="false">小时</button>
+      <button type="button" data-g="day" aria-pressed="false">天</button>
+    </div>
+  </div>
+
+  <hr class="hr-soft" />
+
+  <div class="filters" style="padding-top:14px">
+    <span class="lbl">筛选</span>
+    <button class="f" aria-pressed="true" type="button">OpenAI<span class="sep">/</span></button>
+    <button class="f" aria-pressed="true" type="button">Anthropic<span class="sep">/</span></button>
+    <button class="f" aria-pressed="false" type="button">DeepSeek<span class="sep">/</span></button>
+    <button class="f" aria-pressed="false" type="button">gpt-6-astra<span class="sep">/</span></button>
+    <button class="f" aria-pressed="false" type="button">claude-opus-4<span class="sep">/</span></button>
+    <button class="f" aria-pressed="false" type="button">TokenPivot<span class="sep">/</span></button>
+    <button class="f" aria-pressed="false" type="button">hermes-core<span class="sep">/</span></button>
+    <button class="f" aria-pressed="false" type="button">未归属</button>
+  </div>
+
+  <div class="chartbox" id="cbox">
+    <svg class="line" id="chart" viewBox="0 0 900 210" preserveAspectRatio="none" role="img"
+         aria-label="示例用量趋势"></svg>
+    <div class="yl" id="yl"></div>
+    <div class="xr" id="xr"></div>
+    <div class="tip" id="tip"></div>
+  </div>
+
+  <hr class="hr" style="margin-top:20px" />
+
+  <div class="cols">
+    <div>
+      <div class="sh" style="padding:22px 0 2px">
+        <h2>项目占比</h2>
+        <span class="sp"></span>
+        <span class="meta">tokens</span>
+      </div>
+      <div id="rank"></div>
+    </div>
+
+    <div>
+      <div class="sh" style="padding:22px 0 2px">
+        <h2>24 小时分布</h2>
+        <span class="sp"></span>
+        <span class="meta">峰值 22:00</span>
+      </div>
+      <div class="cells" id="cells" aria-hidden="true"></div>
+      <div class="celllbl"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
+
+      <div class="sh" style="padding:22px 0 2px">
+        <h2>供应商</h2>
+        <span class="sp"></span>
+        <span class="meta">占比</span>
+      </div>
+      <div class="provrow"><span class="d"></span><span class="nm">OpenAI · gpt-6-astra</span><span class="vv">5.42M</span><span class="pp">42.2%</span></div>
+      <div class="provrow"><span class="d"></span><span class="nm">Anthropic · claude-opus-4</span><span class="vv">3.98M</span><span class="pp">31.0%</span></div>
+      <div class="provrow"><span class="d"></span><span class="nm">DeepSeek · deepseek-v4.1</span><span class="vv">2.21M</span><span class="pp">17.2%</span></div>
+      <div class="provrow"><span class="d amber"></span><span class="nm">Google · gemini-3-pro</span><span class="vv">1.24M</span><span class="pp">9.6%</span></div>
+    </div>
+  </div>
+
+  <hr class="hr" style="margin-top:26px" />
+
+  <div class="sh" style="padding:22px 0 10px">
+    <h2>最近请求</h2>
+    <span class="meta">示例数据 · 按完成时间倒序</span>
+    <span class="sp"></span>
+    <span class="meta">时区 Asia/Shanghai</span>
+  </div>
+  <div id="detail"></div>
+
+  <footer>
+    <b>设计预览 C · 极简数据看板</b><span class="sp">·</span>
+    <span>全部数字为示例数据，未连接采集接口，不表示真实用量。</span><span class="sp">·</span>
+    <span>琥珀色仅用于「当前 / 峰值」这类需要一眼认出的位置。</span>
+  </footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var round = Math.round;
+
+  function fmt(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+    return String(n);
+  }
+
+  function series(group) {
+    var len = group === "minute" ? 60 : group === "hour" ? 24 : 7;
+    var out = [], inp = [];
+    for (var i = 0; i < len; i++) {
+      var w = Math.sin((i / len) * Math.PI * 2.1 - 1.2) * 0.34 + 1;
+      var spike = i === round(len * 0.68) ? 1.85 : 1;
+      var base = group === "day" ? 1.7e6 : group === "hour" ? 4.1e5 : 2.6e5;
+      inp.push(round(base * w * spike * 1.15));
+      out.push(round(base * w * spike * 0.42 + (i % 5) * 1800));
+    }
+    return { inp: inp, out: out, len: len };
+  }
+
+  document.querySelectorAll(".f").forEach(function (b) {
+    b.addEventListener("click", function () {
+      b.setAttribute("aria-pressed", b.getAttribute("aria-pressed") === "true" ? "false" : "true");
+    });
+  });
+
+  var W = 900, H = 210, PAD = { t: 10, r: 46, b: 10, l: 0 };
+  var svg = document.getElementById("chart");
+  var tip = document.getElementById("tip");
+  var cbox = document.getElementById("cbox");
+  var cur = null, curGroup = "minute";
+  var meta = {
+    minute: "最近 60 分钟 · 每 1 分钟",
+    hour: "最近 24 小时 · 每 1 小时",
+    day: "最近 7 天 · 每 1 天"
+  };
+
+  document.querySelectorAll("#gran button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      document.querySelectorAll("#gran button").forEach(function (x) {
+        x.setAttribute("aria-pressed", x === b ? "true" : "false");
+      });
+      curGroup = b.dataset.g;
+      document.getElementById("cmeta").textContent = meta[curGroup];
+      draw();
+    });
+  });
+
+  function pathOf(vals, len, max, close) {
+    var iw = W - PAD.l - PAD.r, ih = H - PAD.t - PAD.b, d = "";
+    for (var i = 0; i < len; i++) {
+      var x = PAD.l + (iw * i) / (len - 1);
+      var y = PAD.t + ih - (vals[i] / max) * ih;
+      d += (i ? " L" : "M") + x.toFixed(1) + " " + y.toFixed(1);
+    }
+    if (close) d += " L" + (PAD.l + iw) + " " + (PAD.t + ih) + " L" + PAD.l + " " + (PAD.t + ih) + " Z";
+    return d;
+  }
+
+  function labels(group, len) {
+    var out = [], step = Math.max(1, round(len / 6));
+    for (var i = 0; i < len; i += step) {
+      if (group === "minute") out.push("-" + (len - i) + "m");
+      else if (group === "hour") out.push(String((i + 14) % 24).padStart(2, "0") + ":00");
+      else out.push(["10/21", "10/22", "10/23", "10/24", "10/25", "10/26", "10/27"][i] || "");
+    }
+    out.push("现在");
+    return out;
+  }
+
+  function draw() {
+    var s = series(curGroup), len = s.len;
+    var max = Math.max.apply(null, s.inp) * 1.05;
+    cur = { s: s, max: max, len: len };
+
+    var grid = "";
+    for (var g = 0; g <= 3; g++) {
+      var y = PAD.t + ((H - PAD.t - PAD.b) * g) / 3;
+      grid += '<line x1="0" y1="' + y + '" x2="' + (W - PAD.r) + '" y2="' + y + '" stroke="rgba(244,241,234,.07)" stroke-width="1"/>';
+    }
+
+    var lastX = PAD.l + (W - PAD.l - PAD.r);
+    var lastY = PAD.t + (H - PAD.t - PAD.b) - (s.out[len - 1] / max) * (H - PAD.t - PAD.b);
+
+    svg.innerHTML = grid +
+      '<path d="' + pathOf(s.inp, len, max, false) + '" fill="none" stroke="rgba(244,241,234,.22)" stroke-width="1"/>' +
+      '<path d="' + pathOf(s.out, len, max, false) + '" fill="none" stroke="rgba(244,241,234,.92)" stroke-width="1.35"/>' +
+      '<circle cx="' + lastX + '" cy="' + lastY + '" r="3" fill="' + "#e0a64b" + '"/>' +
+      '<line id="cross" x1="0" x2="0" y1="0" y2="' + H + '" stroke="rgba(224,166,75,.5)" opacity="0"/>' +
+      '<circle id="dot" r="2.6" fill="#0a0a0b" stroke="#e0a64b" stroke-width="1.4" opacity="0"/>';
+
+    document.getElementById("xr").innerHTML = labels(curGroup, len)
+      .map(function (t) { return "<span>" + t + "</span>"; }).join("");
+
+    var ys = "";
+    for (var i = 3; i >= 0; i--) {
+      ys += "<span>" + fmt(round((max * i) / 3)) + "</span>";
+    }
+    document.getElementById("yl").innerHTML = ys;
+  }
+
+  function bucket(idx) {
+    if (curGroup === "minute") return (cur.len - idx) + " 分钟前";
+    if (curGroup === "hour") return "10/27 " + String((idx + 14) % 24).padStart(2, "0") + ":00";
+    return ["10/21", "10/22", "10/23", "10/24", "10/25", "10/26", "10/27"][idx] || "";
+  }
+
+  function move(e) {
+    if (!cur) return;
+    var r = svg.getBoundingClientRect();
+    var p = Math.min(0.999, Math.max(0.001, (e.clientX - r.left) / r.width));
+    var idx = round(p * (cur.len - 1));
+    var iw = W - PAD.l - PAD.r, ih = H - PAD.t - PAD.b;
+    var x = PAD.l + (iw * idx) / (cur.len - 1);
+    var y = PAD.t + ih - (cur.s.out[idx] / cur.max) * ih;
+
+    var cr = document.getElementById("cross");
+    cr.setAttribute("x1", x); cr.setAttribute("x2", x); cr.setAttribute("opacity", ".7");
+    var d = document.getElementById("dot");
+    d.setAttribute("cx", x); d.setAttribute("cy", y); d.setAttribute("opacity", "1");
+
+    tip.style.left = ((x / W) * r.width) + "px";
+    tip.style.top = ((y / H) * r.height) + "px";
+    tip.style.opacity = "1";
+    tip.innerHTML = "<div style='color:#6e6a62'>" + bucket(idx) + "</div>" +
+      "输出 <b>" + fmt(cur.s.out[idx]) + "</b><br>输入 " + fmt(cur.s.inp[idx]);
+  }
+
+  function leave() {
+    tip.style.opacity = "0";
+    document.getElementById("cross").setAttribute("opacity", "0");
+    document.getElementById("dot").setAttribute("opacity", "0");
+  }
+  cbox.addEventListener("mousemove", move);
+  cbox.addEventListener("mouseleave", leave);
+
+  var RANK = [
+    ["TokenPivot", "tp", 4820000], ["hermes-core", "hc", 3610000],
+    ["docs-site", "ds", 2140000], ["infra-tools", "it", 1280000],
+    ["未归属", "—", 1000000]
+  ];
+  var total = RANK.reduce(function (a, r) { return a + r[2]; }, 0);
+  var top = RANK[0][2];
+  document.getElementById("rank").innerHTML = RANK.map(function (r, i) {
+    return '<div class="rankrow' + (i === 0 ? " top" : "") + '">' +
+      '<div class="nm">' + r[0] + '<em>' + r[1] + '</em></div>' +
+      '<div class="tr"><span class="tline"><i style="width:' + ((r[2] / top) * 100).toFixed(1) + '%"></i></span>' +
+      '<span class="vv">' + fmt(r[2]) + '</span>' +
+      '<span class="pp" style="font-family:var(--mono);font-size:10.5px;color:var(--dim);width:48px;text-align:right">' +
+      ((r[2] / total) * 100).toFixed(1) + '%</span></div></div>';
+  }).join("");
+
+  // 24 小时分布：固定形状，峰值出现在 22 点
+  var hours = [4, 3, 2, 2, 2, 3, 6, 9, 14, 22, 30, 28, 25, 31, 36, 34, 30, 26, 22, 19, 24, 38, 52, 41];
+  var hmax = Math.max.apply(null, hours);
+  document.getElementById("cells").innerHTML = hours.map(function (v) {
+    var cls = v >= hmax * 0.95 ? "cell hi" : v >= hmax * 0.55 ? "cell on" : "cell";
+    return '<div class="' + cls + '" title="' + v + '"></div>';
+  }).join("");
+
+  var REQ = [
+    ["10:42:07", "DSH", "OpenAI / gpt-6-astra", "TokenPivot", "12.4K", "3.1K", "8.4s", false],
+    ["10:41:52", "PI", "Anthropic / claude-opus-4", "hermes-core", "31.8K", "7.2K", "14.2s", false],
+    ["10:41:33", "DSH", "OpenAI / gpt-6-astra", "docs-site", "4.9K", "1.2K", "3.1s", false],
+    ["10:41:10", "PI", "DeepSeek / deepseek-v4.1", "TokenPivot", "22.6K", "5.8K", "11.7s", true],
+    ["10:40:58", "DSH", "Anthropic / claude-opus-4", "infra-tools", "8.1K", "2.3K", "6.9s", false]
+  ];
+  var head = '<div class="drow dhead"><span>时间</span><span>来源</span><span>供应商 / 模型</span>' +
+    '<span>项目</span><span class="r">输入</span><span class="r">输出</span><span class="r">状态</span></div>';
+  document.getElementById("detail").innerHTML = head + REQ.map(function (r) {
+    return '<div class="drow">' +
+      '<span class="t">' + r[0] + '</span>' +
+      '<span class="t" style="color:var(--ink-2)">' + r[1] + '</span>' +
+      '<span class="p">' + r[2] + '</span>' +
+      '<span class="p">' + r[3] + '</span>' +
+      '<span class="m r">' + r[4] + '</span>' +
+      '<span class="m r">' + r[5] + '</span>' +
+      '<span class="r"><span class="tag' + (r[7] ? " w" : "") + '">' + (r[7] ? "重试后成功" : "正常") + '</span></span>' +
+      '</div>';
+  }).join("");
+
+  draw();
+})();
+</script>
+</body>
+</html>
