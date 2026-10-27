@@ -395,7 +395,7 @@ info:
     6. 项目归属与跨空间校验（`PROJECT_INVALID`），不能降级为 `null`。
     7. 时间窗口与第 5.3 节采样点、`expired` 先于查重。
     8. 每项独立事务、提交后才 `accepted`、Commit 结果不明只能 `retryable`。
-    9. 规范化序列化与 SHA-256 摘要、同版本比较、跨版本无损重建与 `NORMALIZATION_INCOMPATIBLE`。
+    9. 规范化序列化与 SHA-256 摘要、同版本比较、跨版本把旧行与本次请求双方投影到共同版本比较（任一方无法无损形成则 `NORMALIZATION_INCOMPATIBLE`）。
     10. `Content-Type` 校验（`415`）、请求体字节上限（`413`）、8 秒处理预算与逐项 `DEADLINE_EXCEEDED`。
     11. 认证与身份来源（只认 `Authorization: Bearer`，不回退 Cookie）。
 
