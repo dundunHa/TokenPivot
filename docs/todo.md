@@ -1,13 +1,11 @@
 # TODO
 
-<!-- todo-meta: next-id=53 -->
+<!-- todo-meta: next-id=54 -->
 
 ## 里程碑：工程初始化
 
-- [x] T-051 {done} {P1} **开发运行、构建与基础检查** 基于 T-049、T-050、T-031 提供本地启动说明、配置示例及构建、测试、格式和类型检查入口；验收新环境按文档可运行并通过基础检查，不引入复杂发布平台。已完成实现与主代理验收，等 review 收口；版本基线统一另立 T-052。
-  - 架构: docs/architecture.md
-  - plan: docs/plans/2026-10-27-dev-build-basic-checks.md
-- [ ] T-052 {P2} **统一工具链版本基线（Go / Node / npm / PostgreSQL）** 统一 Go/Node/npm/PostgreSQL 版本基线到本机实测可用版本。已定：Node 等 2026-10-28 转 LTS 后按 v26 线写；Go 1.26.4 与 PG 18.4 属降级，是否采用待规划确认。
+- [ ] T-053 {P2} **评估并对齐 Node 26 类型声明（@types/node）** web/package.json 的 @types/node 仍为 24.19.2，与 Node 26 运行时主版本不一致；单独评估是否对齐，不在 T-052 内改依赖图。
+  - plan: docs/plans/2026-10-27-toolchain-baseline.md
 
 ## 里程碑一：采集打通
 
