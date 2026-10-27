@@ -1,0 +1,5 @@
+/web/node_modules/
+/web/dist/
+/web/.env
+/web/.env.*
+!/web/.env.example

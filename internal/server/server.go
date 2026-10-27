@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -20,8 +21,9 @@ const (
 	ReadyTimeout      = time.Second
 )
 
-// NewHandler exposes liveness and a bounded, uncached readiness check.
-func NewHandler(checkReady func(context.Context) error) http.Handler {
+// NewHandler exposes liveness and bounded, uncached readiness, keeping API and
+// probe paths on the backend while optionally serving a frontend.
+func NewHandler(checkReady func(context.Context) error, frontend http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -45,7 +47,18 @@ func NewHandler(checkReady func(context.Context) error) http.Handler {
 			}
 		}
 	})
-	return mux
+	if frontend == nil {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, prefix := range []string{"/api", "/healthz", "/readyz"} {
+			if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, prefix+"/") {
+				mux.ServeHTTP(w, r)
+				return
+			}
+		}
+		frontend.ServeHTTP(w, r)
+	})
 }
 
 // Run serves listener until cancellation or a serving error. Cancellation drains

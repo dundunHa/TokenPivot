@@ -13,6 +13,7 @@ import (
 	"github.com/dundunHa/TokenPivot/internal/config"
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/dundunHa/TokenPivot/internal/server"
+	"github.com/dundunHa/TokenPivot/web"
 )
 
 func main() {
@@ -28,6 +29,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	frontend, err := web.Handler()
+	if err != nil {
+		return fmt.Errorf("frontend: %w", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	pool, err := database.Open(ctx, cfg.DatabaseURL)
@@ -35,7 +40,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	srv := &http.Server{
-		Handler:           server.NewHandler(pool.Ping),
+		Handler:           server.NewHandler(pool.Ping, frontend),
 		ReadHeaderTimeout: server.ReadHeaderTimeout,
 		ReadTimeout:       server.ReadTimeout,
 		WriteTimeout:      server.WriteTimeout,

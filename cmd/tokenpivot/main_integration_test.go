@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/dundunHa/TokenPivot/internal/database"
+	"github.com/dundunHa/TokenPivot/web"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"net/url"
@@ -302,6 +303,8 @@ func TestDatabaseDisconnectRecovery(t *testing.T) {
 	}
 	cmd, logs := child(t, addr)
 	cmd.Env = append(cmd.Env, "TOKENPIVOT_DATABASE_URL="+u.String(), "PGPASSFILE=/dev/null", "PGSERVICEFILE=/dev/null")
+	// The embedded service must not depend on a repository or dist working directory.
+	cmd.Dir = t.TempDir()
 	if err := cmd.Start(); err != nil {
 		t.Fatal("service start failed")
 	}
@@ -325,11 +328,13 @@ func TestDatabaseDisconnectRecovery(t *testing.T) {
 		t.Fatal("service startup timed out")
 	}
 	probe(t, addr, "/readyz", 200)
+	assertFrontendAndProbeRouting(t, addr)
 	proxy.block(true)
 	for range 3 {
 		probe(t, addr, "/healthz", 200)
 		probe(t, addr, "/readyz", 503)
 	}
+	assertFrontendAndProbeRouting(t, addr)
 	proxy.block(false)
 	deadline := time.Now().Add(5 * time.Second)
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -370,6 +375,63 @@ func TestDatabaseDisconnectRecovery(t *testing.T) {
 	checkLogs(t, logs.text(), true, true)
 	t.Logf("disconnect recovery and shutdown exit=0 close_duration=%s", time.Since(start))
 	assertNoServiceConnections(t, ownerURL)
+}
+
+// Exercise the actual service process both before and during a database outage.
+// With uiembed, this also proves the real embedded frontend stays available.
+func assertFrontendAndProbeRouting(t *testing.T, addr string) {
+	t.Helper()
+	frontend, err := web.Handler()
+	if err != nil {
+		t.Fatal("frontend initialization failed")
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	for _, tt := range []struct {
+		method, path string
+		status       int
+		html         bool
+	}{
+		{"GET", "/", 200, true},
+		{"GET", "/test-deep-link", 200, true},
+		{"HEAD", "/test-deep-link", 200, true},
+		{"GET", "/assets/missing.js", 404, false},
+		{"GET", "/api/not-implemented", 404, false},
+		{"POST", "/api", 404, false},
+		{"GET", "/healthz/", 404, false},
+		{"GET", "/readyz/", 404, false},
+		{"POST", "/healthz", 405, false},
+		{"POST", "/readyz", 405, false},
+	} {
+		want := tt.status
+		wantHTML := tt.html && frontend != nil
+		if tt.html && frontend == nil {
+			want = 404
+		}
+		req, err := http.NewRequest(tt.method, "http://"+addr+tt.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Accept", "text/html")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal("routing request failed")
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatal("routing response read failed")
+		}
+		isHTML := strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html")
+		if resp.StatusCode != want || isHTML != wantHTML {
+			t.Fatalf("%s %s: status=%d html=%t, want %d html=%t", tt.method, tt.path, resp.StatusCode, isHTML, want, wantHTML)
+		}
+		if tt.method == "HEAD" && len(body) != 0 {
+			t.Fatal("HEAD returned a body")
+		}
+		if wantHTML && resp.Header.Get("Cache-Control") != "no-cache" {
+			t.Fatal("frontend cache policy changed")
+		}
+	}
 }
 
 func assertNoServiceConnections(t *testing.T, ownerURL string) {
