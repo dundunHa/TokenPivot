@@ -34,7 +34,7 @@ npm --prefix web ci
 
 ## 工具链与本地数据库
 
-固定 Go **1.26.4**、pgx **v5.11.0**、goose **v3.29.0**；本地验收 PostgreSQL **18.4**。将独立安装的工具 `bin` 放入当前 shell 的 PATH，不修改全局配置，使用 `GOTOOLCHAIN=local`。
+Go 最低要求 **1.26.4**（新机器用 1.26.10 也满足，但不把它当作目标）；固定 pgx **v5.11.0**、goose **v3.29.0**；本地验收 PostgreSQL **18.4**。将独立安装的工具 `bin` 放入当前 shell 的 PATH，不修改全局配置，使用 `GOTOOLCHAIN=local`。
 
 PG 18.4 这一项只有客户端/开发库证据（本机 `psql --version` 与 `pg_config --version` 均为 18.4），**未核实实际运行服务端**；本次只是改声明，不连接、不升级、不降级任何实例。版本口径来源见 [T-052 工具链版本基线计划](docs/plans/2026-10-27-toolchain-baseline.md)。
 
