@@ -43,21 +43,28 @@ ID 用 UUID v7，由数据库默认值 `uuidv7()` 生成，写入后用 `RETURNI
 
 | 字段 | 类型/空值 | 用途 |
 |---|---|---|
-| id | uuid，必填 | 内部事件身份 |
-| workspace_id/source_id | uuid，必填 | 服务端认证归属 |
-| source_event_id | text，必填 | 插件稳定业务事件 ID，不得复用 |
-| payload_hash/normalization_version | text，必填 | 规范化业务内容比较，规范升级不能破坏旧摘要判定 |
-| project_id | uuid，可空 | 无法归属；非法或跨空间 ID 不等于无法归属 |
+| id | uuid，必填 | 内部事件身份，也是明细游标的次序键；数据库默认 `uuidv7()` |
+| workspace_id/source_id | uuid，必填 | 服务端认证归属；source_id 是稳定的插件实例，不是凭证 ID |
+| source_event_id | text，必填 | 插件稳定业务事件 ID，不得复用；排序规则 COLLATE "C"，相等即逐字节相同，不受 locale 升级影响 |
+| normalization_version | text，必填 | 比较依据所属的规范化算法版本 |
+| payload_hash | bytea，必填 | 规范化业务内容的原始摘要字节（SHA-256 的 32 字节），按字节比较，不用十六进制文本 |
+| project_id | uuid，可空 | NULL 只表示未归属；非法或跨空间 ID 由入口拒绝，不得降为 NULL |
 | provider/model | text，必填 | 独立维度，别名合并规则未定前按原身份区分 |
-| occurred_at/received_at | timestamptz，必填 | 完成时刻/首次成功接收时刻；重传不改写 |
+| occurred_at/received_at | timestamptz，必填，无默认值 | 完成时刻/首次成功接收时刻；重传不改写，也不让数据库默默选时钟 |
 | input_tokens/output_tokens/total_tokens | bigint，可空 | 未知不能当零；total 按可验证归一化规则生成 |
 | cache_read_tokens/cache_write_tokens/reasoning_tokens | bigint，可空 | 来源可获取的子集，不额外加到 total |
-| 用量质量标记 | 每指标质量值，具体列待格式确定 | known/estimated/missing，禁止只用一个全局完整标记掩盖分字段差异 |
+| `<metric>_quality`（每个指标一列） | text，必填 | known/estimated/missing，禁止只用一个全局完整标记掩盖分字段差异；指标值为 NULL 当且仅当质量为 missing，由入口校验，迁移不加 CHECK |
 | status/duration_ms | text / bigint，可空 | 来源不可得时为空；不用这些字段虚构延迟分位数 |
 
-数据库唯一键：`(workspace_id,source_id,source_event_id)`，不能用“先查后插”替代。只在首次成功插入时更新分钟汇总，两个写入在同一事务内。
+不加 created_at/updated_at：received_at 已是写入时间，行不可变；也不存原始报文或 jsonb，比较集合已落成列。
 
-候选索引：`(workspace_id,occurred_at,id)` 支持明细游标与滚动速率；received_at 支持保留清理；source_id/project_id 引用索引。其他组合筛选索引按 EXPLAIN 与真实访问路径决定，不预建所有排列。
+数据库唯一键：`(workspace_id,source_id,source_event_id)`，约束名 `uk_usage_events_workspace_id_source_id_source_event_id`，不能用“先查后插”替代。只在首次成功插入时更新分钟汇总，两个写入在同一事务内。生产 SQL 的约定：冲突目标只用这三列推断，冲突动作只用 `DO NOTHING`；身份查询三列齐全；不对本表加行锁；只有身份键竞争走 duplicate/conflict 路径，其他 23505 属存储失败。
+
+已建索引：主键 `(id)`；身份键唯一约束（其前缀 `(workspace_id,source_id)` 同时覆盖按 source 的访问，所以不再单建 source_id 索引）；`idx_usage_events_workspace_id_occurred_at_id` `(workspace_id,occurred_at,id)` 支持明细游标与 60 秒滚动速率；`idx_usage_events_received_at` `(received_at)` 支持按首次接收时间的保留清理。不建 project_id 索引：项目只归档不删除、不级联，没有“删父行前检查”的路径；按项目筛选的组合索引由查询任务按 EXPLAIN 增补。其他组合筛选索引同样按真实访问路径决定，不预建所有排列。
+
+权限与不可变：服务角色 `tokenpivot_app` 在本表上只有 SELECT、INSERT，不授予 UPDATE、DELETE、TRUNCATE、REFERENCES、TRIGGER。因此 `UPDATE`、`ON CONFLICT DO UPDATE`、`SELECT … FOR SHARE` 对服务角色都因权限不足失败，即使 SQL 写错也无法覆盖内容或续期 received_at；清理所需的 DELETE 由保留清理任务在自己的迁移里另行授权。无 RLS 时租户隔离靠每条 SQL 都带认证得到的 workspace_id，由写入与读查询任务各自实现并测试。
+
+比较依据与校验边界：持久化 normalization_version、payload_hash 和比较集合的每个字段（按冻结精度成列）；跨版本比较须基于实际留存信息，类型化列不保证能按新规则无损重建。数据库不校验摘要与列是否一致、不校验非负与取值范围、不建外键与 CHECK；这些都由入口校验一次，存储层不重复。
 
 保留按首次 received_at 180 天。时间有效性校验先于查重：过期返回 expired，不要求继续识别 duplicate/conflict。清理与有效写入边界使用一致服务端截点；未来事件不进入表。修改 occurred_at 是修改业务内容，不是合法重试；超出防重期限后不承诺识别被篡改身份。
 
@@ -93,6 +100,6 @@ TODO（待确认）：来源仅总量的标准字段、来源总量与分项不�
 
 分钟数据按 bucket_start 保留13个日历月；明细按 received_at 保留180天。晚到事件可能让部分更老发生时段仍有明细，但不允许重建不完整旧桶。只重建已证明完整的范围，暂停摄入与清理后事务替换，其他范围不变。备份必须包含超过明细覆盖期的汇总。
 
-约1800万明细行的规划量需要评估分区，但时间分区不能破坏跨分区的业务唯一性。首版物理分区策略、清理批量、恢复目标和精确索引须在实施计划确认；不在路线阶段生成未经验证的DDL。
+约1800万明细行的规划量需要评估分区，但时间分区不能破坏跨分区的业务唯一性。首版物理分区策略、清理批量、恢复目标和精确索引须在实施计划确认；不在路线阶段生成未经验证的DDL。明细首版（迁移 00003）落为普通表、不分区，索引按上文已建的四条固定；分区与清理批量留待后续任务在真实数据下另行评估。
 
 完整事务、安全及验收规则见 [架构](architecture.md)；本文件与后续迁移须同步维护。
