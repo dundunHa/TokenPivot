@@ -108,6 +108,8 @@ GRANT CONNECT, CREATE ON DATABASE tokenpivot_test TO tokenpivot_owner;
 GRANT CONNECT ON DATABASE tokenpivot_test TO tokenpivot_app;
 ```
 
+测试服务角色必须使用密码认证（推荐 `scram-sha-256`），不能命中 `trust`；在专用实例的 `pg_hba.conf` 中，将精确测试库/服务角色/回环地址规则放在通配规则之前，reload 后验证正确密码可连接。测试会用同一真实角色的错误密码断言 SQLSTATE `28P01`，并验证服务退出和日志脱敏。
+
 安全注入 `TOKENPIVOT_TEST_DATABASE_URL`（迁移 owner）和 `TOKENPIVOT_TEST_APP_DATABASE_URL`（服务角色）。URL 必须明确回环 **IP**（例如 127.0.0.1）、同一 host/端口和 `_test` 数据库、不同用户及 sslmode；查询参数仅接受 sslmode/search_path。测试验证角色身份及权限，缺变量直接失败，不 skip。测试清除 PG 默认环境并隔离默认凭证文件；只使用明确注入的两个测试 URL。每个用例新建随机 schema、设置 search_path，记录非敏感归属，关闭本次连接/进程后仅清理本次 schema；失败保留并报告 schema 名，不删除数据库、不扫描清空旧对象。
 
 先结束手工验收进程，独占运行；**禁止同库并行多套测试或手工迁移**：

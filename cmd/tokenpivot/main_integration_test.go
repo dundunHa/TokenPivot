@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"net/url"
 	"sync"
 
@@ -424,6 +425,25 @@ func TestDatabaseStartupFailures(t *testing.T) {
 		t.Fatal("invalid URL")
 	}
 	invalid.User = url.UserPassword("synthetic-sensitive-marker", "synthetic-sensitive-marker")
+	wrongPassword, err := url.Parse(appURL)
+	if err != nil {
+		t.Fatal("invalid URL")
+	}
+	wrongPassword.User = url.UserPassword(wrongPassword.User.Username(), "synthetic-sensitive-marker")
+	// The real service identity already connected successfully in integrationSchema.
+	// Require password rejection specifically, not an absent role or a trust rule.
+	authCtx, authCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	authConn, authErr := pgx.Connect(authCtx, wrongPassword.String())
+	authCancel()
+	if authConn != nil {
+		if err := authConn.Close(context.Background()); err != nil {
+			t.Error("authentication probe close failed")
+		}
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(authErr, &pgErr) || pgErr.Code != "28P01" {
+		t.Fatal("test service role must reject wrong passwords with SQLSTATE 28P01")
+	}
 	unreachable, err := url.Parse(appURL)
 	if err != nil {
 		t.Fatal("invalid URL")
@@ -444,6 +464,7 @@ func TestDatabaseStartupFailures(t *testing.T) {
 	for _, tt := range []struct{ name, addr, value, stage string }{
 		{"occupied", occupied.Addr().String(), appURL, "listen"},
 		{"invalid identity", vacantAddr, invalid.String(), "ping"},
+		{"wrong password", vacantAddr, wrongPassword.String(), "ping"},
 		{"unreachable", vacantAddr, unreachable.String(), "ping"},
 		{"timeout", vacantAddr, slow.String(), "ping"},
 	} {
