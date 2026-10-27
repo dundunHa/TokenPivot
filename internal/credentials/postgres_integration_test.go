@@ -227,14 +227,15 @@ type storedRow struct {
 	WorkspaceID ID
 	SourceID    ID
 	RevokedAt   *time.Time
+	CreatedAt   time.Time
 }
 
 func loadRow(t *testing.T, ctx context.Context, pool *pgxpool.Pool, credentialID ID) storedRow {
 	t.Helper()
 	var row storedRow
 	var revokedAt pgtype.Timestamptz
-	if err := pool.QueryRow(ctx, "SELECT workspace_id, source_id, revoked_at FROM ingest_credentials WHERE id=$1", credentialID).
-		Scan(&row.WorkspaceID, &row.SourceID, &revokedAt); err != nil {
+	if err := pool.QueryRow(ctx, "SELECT workspace_id, source_id, revoked_at, created_at FROM ingest_credentials WHERE id=$1", credentialID).
+		Scan(&row.WorkspaceID, &row.SourceID, &revokedAt, &row.CreatedAt); err != nil {
 		t.Fatal(database.SafeError("load credential", err))
 	}
 	if revokedAt.Valid {
@@ -567,7 +568,8 @@ func TestConcurrentRotateCreatesIndependentCredentials(t *testing.T) {
 	before := loadRow(t, ctx, pool, old.ID)
 
 	// The same old credential is rotated concurrently: each worker must get its
-	// own new row while the old row stays byte-identical.
+	// own new row while the old row's ownership, revocation state and creation
+	// time stay unchanged.
 	const workers = 8
 	start := make(chan struct{})
 	rotated := make([]IssuedCredential, workers)
@@ -607,6 +609,16 @@ func TestConcurrentRotateCreatesIndependentCredentials(t *testing.T) {
 		}
 		ids[credential.ID.Bytes] = true
 		tokens[credential.Token] = true
+		authenticated, authErr := service.Authenticate(ctx, credential.Token)
+		if authErr != nil {
+			t.Fatalf("concurrent rotate %d new token error=%v want nil", slot, authErr)
+		}
+		if authenticated.ID.Bytes != credential.ID.Bytes ||
+			authenticated.WorkspaceID.Bytes != credential.WorkspaceID.Bytes ||
+			authenticated.SourceID.Bytes != credential.SourceID.Bytes ||
+			authenticated.RevokedAt != nil {
+			t.Fatalf("concurrent rotate %d new token authenticated as a different identity", slot)
+		}
 	}
 	if len(ids) != workers || len(tokens) != workers {
 		t.Fatalf("distinct rotated ids=%d tokens=%d want=%d", len(ids), len(tokens), workers)
@@ -615,11 +627,11 @@ func TestConcurrentRotateCreatesIndependentCredentials(t *testing.T) {
 	if after.WorkspaceID.Bytes != before.WorkspaceID.Bytes || after.SourceID.Bytes != before.SourceID.Bytes {
 		t.Fatal("concurrent rotate changed the old ownership")
 	}
+	if !after.CreatedAt.Equal(before.CreatedAt) {
+		t.Fatal("concurrent rotate changed the old created_at")
+	}
 	if before.RevokedAt == nil && after.RevokedAt != nil {
 		t.Fatal("concurrent rotate revoked the old credential")
-	}
-	if before.RevokedAt != nil && (after.RevokedAt == nil || !after.RevokedAt.Equal(*before.RevokedAt)) {
-		t.Fatal("concurrent rotate changed the old revoked_at")
 	}
 	if _, err := service.Authenticate(ctx, old.Token); err != nil {
 		t.Fatalf("old token error=%v want nil: rotate must not revoke it", err)
