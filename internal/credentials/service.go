@@ -76,15 +76,10 @@ func New(s store) *Service {
 	return &Service{store: s}
 }
 
-// newToken returns a fresh plaintext token. crypto/rand.Text is used only when
-// it produced randomness; an empty result is reported as an error, never
-// retried silently or accepted.
-func newToken() (string, error) {
-	random := rand.Text()
-	if random == "" {
-		return "", errors.New("credentials: token generation failed")
-	}
-	return tokenPrefix + random, nil
+// newToken returns a fresh plaintext token: the prefix followed by
+// crypto/rand.Text, which always yields at least 128 bits of randomness.
+func newToken() string {
+	return tokenPrefix + rand.Text()
 }
 
 // secretHash is the raw 32-byte SHA-256 digest of the full token.
@@ -163,10 +158,7 @@ func (s *Service) Revoke(ctx context.Context, workspaceID, credentialID ID) erro
 
 // issue generates a token and stores only its digest.
 func (s *Service) issue(ctx context.Context, workspaceID, sourceID ID) (IssuedCredential, error) {
-	token, err := newToken()
-	if err != nil {
-		return IssuedCredential{}, err
-	}
+	token := newToken()
 	hash := secretHash(token)
 	credential, err := s.store.Insert(ctx, workspaceID, sourceID, hash[:])
 	if err != nil {
