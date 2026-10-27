@@ -1,6 +1,6 @@
 # TokenPivot 根命令入口：只组合已有的 go / npm 命令。
 # 不安装依赖、不执行迁移、不管理后台进程，也不加载任何 .env 文件。
-# 需要 Go 1.27.3（含同一安装的 gofmt）、Node 24.22.1、npm 11.19.1、make、POSIX shell；
+# 需要 Go 1.26.4（含同一安装的 gofmt）、Node 26、npm 随 Node 26 分发（本机 11.20.0）、make、POSIX shell；
 # make check 另需 race 用的本地 C 编译工具链。配置只经进程环境注入。
 
 .DEFAULT_GOAL := help
