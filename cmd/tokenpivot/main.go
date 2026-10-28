@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/dundunHa/TokenPivot/internal/auth"
 	"github.com/dundunHa/TokenPivot/internal/config"
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/dundunHa/TokenPivot/internal/server"
@@ -39,8 +40,14 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	authStore := auth.NewPostgres(pool)
+	authService := auth.New(authStore, authStore, auth.NewLimiter(nil))
 	srv := &http.Server{
-		Handler:           server.NewHandler(pool.Ping, frontend),
+		Handler: server.NewHandler(server.Options{
+			CheckReady: pool.Ping,
+			Frontend:   frontend,
+			Auth:       server.NewAuth(authService, cfg.WebOrigin),
+		}),
 		ReadHeaderTimeout: server.ReadHeaderTimeout,
 		ReadTimeout:       server.ReadTimeout,
 		WriteTimeout:      server.WriteTimeout,

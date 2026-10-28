@@ -1,6 +1,6 @@
 # TokenPivot
 
-Go HTTP 服务和独立 PostgreSQL 迁移入口。迁移 00002 已建立四张基础业务表（`workspaces`、`projects`、`sources`、`ingest_credentials`），但还没有业务 API；数据库连接可用不代表业务已可用。服务启动必须连接数据库，**不会自动迁移**。 可选内嵌前端工程占位页仅在构建时需要 Node，运行不依赖 Node 或磁盘前端文件。
+Go HTTP 服务和独立 PostgreSQL 迁移入口。迁移 00002 建立了四张基础业务表（`workspaces`、`projects`、`sources`、`ingest_credentials`），00003/00004 是采集落库与分钟聚合，00005 是浏览器账号的 `users`/`sessions`；目前只有浏览器认证这一组业务 API，采集与查询接口仍属其他任务。服务启动必须连接数据库，**不会自动迁移**。 可选内嵌前端工程占位页仅在构建时需要 Node，运行不依赖 Node 或磁盘前端文件。
 
 ## 工具前提、首次安装与根命令入口
 
@@ -63,12 +63,13 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 | `TOKENPIVOT_HTTP_ADDR` | 默认 `127.0.0.1:8080`，显式空值非法；host:port，端口数字 1–65535 |
 | `TOKENPIVOT_DATABASE_URL` | 服务必填，PostgreSQL URL，明确 host、database、user、sslmode |
 | `TOKENPIVOT_MIGRATION_DATABASE_URL` | 独立迁移账号，必填；不会回退到服务 URL |
+| `TOKENPIVOT_WEB_ORIGIN` | 服务必填，唯一可信浏览器 origin，如 `http://127.0.0.1:5173`；一个 http(s) origin，不含用户信息、路径、查询、片段或尾斜杠，scheme/host 规范化为小写并省略默认端口。`https` 用于生产；`http` 只允许 `localhost`、`127.0.0.1`、`::1` 回环地址，非回环 http 在启动时直接失败 |
 
 哪个进程需要哪些变量（各变量之间没有回退关系）：
 
 | 进程 | 需要的变量 |
 |---|---|
-| Go 服务（`make dev-go`、`bin/tokenpivot-api`、`bin/tokenpivot`） | 服务连接 `TOKENPIVOT_DATABASE_URL`，可选监听地址 `TOKENPIVOT_HTTP_ADDR` |
+| Go 服务（`make dev-go`、`bin/tokenpivot-api`、`bin/tokenpivot`） | 服务连接 `TOKENPIVOT_DATABASE_URL`、可信 origin `TOKENPIVOT_WEB_ORIGIN`，可选监听地址 `TOKENPIVOT_HTTP_ADDR` |
 | 独立迁移（`bin/tokenpivot-migrate`） | 只需 `TOKENPIVOT_MIGRATION_DATABASE_URL`；不要同时向服务进程注入迁移账号 |
 | Vite 开发服务（`make dev-web`） | 只需可选的公开上游地址 `TOKENPIVOT_DEV_API_TARGET`，不接收任何连接信息 |
 | 集成测试（`make test-integration`） | `TOKENPIVOT_TEST_DATABASE_URL` 与 `TOKENPIVOT_TEST_APP_DATABASE_URL` |
@@ -95,8 +96,8 @@ postgres://tokenpivot_owner@127.0.0.1:5432/tokenpivot_local?sslmode=disable&sear
 ```
 
 ```sh
-# 终端一：只注入 TOKENPIVOT_DATABASE_URL（最小权限的服务角色）
-TOKENPIVOT_HTTP_ADDR=127.0.0.1:8080 make dev-go
+# 终端一：注入服务连接（最小权限的服务角色）与可信 Web origin
+TOKENPIVOT_HTTP_ADDR=127.0.0.1:8080 TOKENPIVOT_WEB_ORIGIN=http://127.0.0.1:5173 make dev-go
 ```
 
 ```sh
@@ -115,7 +116,7 @@ TOKENPIVOT_DEV_API_TARGET=http://127.0.0.1:8080 make dev-web
 ./bin/tokenpivot-migrate up
 ```
 
-发布顺序：**独立迁移成功 → 启动/发布服务**。迁移命令只支持 `status`、`up`、`down-one`，SQL 内嵌，不依赖工作目录；首次 `status` 可能创建历史表，并非绝对只读。重复 `up` 成功并记录 `no change`。第一条 bootstrap 的 Up/Down 仅 `SELECT 1`，不建业务对象；00002 起才有业务表（四张基础表），`goose_db_version` 始终由 goose 管理、down 不删除。后续文件从 00003 编号，已在共享环境执行的文件不能改写。
+发布顺序：**独立迁移成功 → 启动/发布服务**。迁移命令只支持 `status`、`up`、`down-one`，SQL 内嵌，不依赖工作目录；首次 `status` 可能创建历史表，并非绝对只读。重复 `up` 成功并记录 `no change`。第一条 bootstrap 的 Up/Down 仅 `SELECT 1`，不建业务对象；00002 起才有业务表（四张基础表，00003 起逐版增加），`goose_db_version` 始终由 goose 管理、down 不删除。后续文件从 00003 编号，已在共享环境执行的文件不能改写。
 
 第一次在有业务表的库上执行 `up` 之前，按顺序自查（管理员在 `psql` 里执行）：
 
@@ -155,6 +156,27 @@ curl -i -X POST http://127.0.0.1:18080/readyz
 
 stderr 输出 slog JSON；数据库错误只包含安全阶段/类别，不输出原始 Error/Detail/Hint、SQL、完整 URL 或配置。goose 内部日志丢弃，入口自行记录版本和结果；解锁/关闭失败仍是失败。
 
+## 浏览器账号与会话
+
+迁移 00005 增加 `users` 与 `sessions` 两张表，服务提供四个浏览器认证端点（格式依据见 [OpenAPI 接口文档](docs/openapi/openapi.yaml)，字段与权限见 [数据模型](docs/data-model.md)）：
+
+| 操作 | 方法与路径 | 成功 |
+|---|---|---|
+| 注册 | `POST /api/v1/auth/register` | 201 `{user, expires_at}` + 会话 Cookie |
+| 登录 | `POST /api/v1/auth/login` | 200 `{user, expires_at}` + 新会话 Cookie |
+| 当前会话 | `GET /api/v1/auth/session` | 200 `{user, expires_at}`，每次有效请求续期 |
+| 登出 | `POST /api/v1/auth/logout` | 204，清 Cookie；重复登出仍 204 |
+
+约束：
+
+- 密码直接注册，不需要邮箱验证；密码以 Argon2id 编码存储（m=19456 KiB、t=2、p=1，16 字节 salt、32 字节 key），会话令牌为 `tps_` + `crypto/rand.Text()`，数据库只存 SHA-256 原始 32 字节摘要。
+- 会话 30 天精确滑动，每次有效认证用一条 `UPDATE ... RETURNING` 续期并返回到期时间；没有刷新阈值，也没有绝对截止时间。
+- Cookie 名 `tokenpivot_session`，`Path=/`、无 `Domain`、`HttpOnly`、`SameSite=Lax`；可信 origin 为 `https` 时 `Secure=true`，回环开发 `http` 时为 `false`。
+- 注册、登录、登出等写请求要求恰好一个 `Origin` 且与 `TOKENPIVOT_WEB_ORIGIN` 完全相等，否则 403 且不写库；`GET /api/v1/auth/session` 不要求 Origin。
+- 四个端点的所有响应都带 `Cache-Control: no-store`。限流是单进程内存固定窗口：每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次；IP 只取 `RemoteAddr`，不信任任何转发头，多实例不共享计数。
+- 采集端点尚未实现（属后续任务），其接口规则已冻结为只认 `Authorization: Bearer`：即使同时携带有效 Cookie 也不回退浏览器身份。
+- 注册用户还不会自动获得个人空间（属 T-019），本任务不宣称端到端注册流程可用。
+
 ## 验证
 
 普通检查不需要 PostgreSQL、连接变量、业务表或登录，用根入口一条命令：
@@ -182,7 +204,7 @@ GRANT CONNECT ON DATABASE tokenpivot_test TO tokenpivot_app;
 
 测试服务角色必须使用密码认证（推荐 `scram-sha-256`），不能命中 `trust`；在专用实例的 `pg_hba.conf` 中，将精确测试库/服务角色/回环地址规则放在通配规则之前，reload 后验证正确密码可连接。测试会用同一真实角色的错误密码断言 SQLSTATE `28P01`，并验证服务退出和日志脱敏。服务测试账号还必须就是 `tokenpivot_app`，或者无需 `SET ROLE` 就能直接使用它的权限（例如把 `tokenpivot_app` 授予该账号）；每轮集成测试开头都会用 `pg_has_role` 检查这一点，不满足就以 `test service role must have tokenpivot_app privileges` 失败，因为迁移只向这个固定角色授权。
 
-安全注入 `TOKENPIVOT_TEST_DATABASE_URL`（迁移 owner）和 `TOKENPIVOT_TEST_APP_DATABASE_URL`（服务角色）。URL 必须明确回环 **IP**（例如 127.0.0.1）、同一 host/端口和 `_test` 数据库、不同用户及 sslmode；查询参数仅接受 sslmode/search_path。测试验证角色身份及权限，缺变量直接失败，不 skip。测试清除 PG 默认环境并隔离默认凭证文件；只使用明确注入的两个测试 URL。每个用例新建随机 `t050_` 前缀 schema、设置 search_path，记录非敏感归属，关闭本次连接/进程后仅清理本次 schema。清理**通常仍会执行**；只有在归属检查失败、清理本身失败等情形才会保留该 schema、报出 schema 名并使测试失败，供人工核对——这不是“失败一律保留”，也不代表测试从不清理。不删除数据库、不扫描清空旧对象。
+安全注入 `TOKENPIVOT_TEST_DATABASE_URL`（迁移 owner）和 `TOKENPIVOT_TEST_APP_DATABASE_URL`（服务角色）。URL 必须明确回环 **IP**（例如 127.0.0.1）、同一 host/端口和 `_test` 数据库、不同用户及 sslmode；查询参数仅接受 sslmode/search_path。测试验证角色身份及权限，缺变量直接失败，不 skip。测试清除 PG 默认环境并隔离默认凭证文件；只使用明确注入的两个测试 URL。每个用例新建随机前缀 schema（如 `t050_`、`t016_`）、设置 search_path，记录非敏感归属，关闭本次连接/进程后仅清理本次 schema。清理**通常仍会执行**；只有在归属检查失败、清理本身失败等情形才会保留该 schema、报出 schema 名并使测试失败，供人工核对——这不是“失败一律保留”，也不代表测试从不清理。不删除数据库、不扫描清空旧对象。
 
 先结束手工验收进程，独占运行；**禁止同库并行多套测试或手工迁移**：
 
@@ -192,7 +214,7 @@ make test-integration
 
 该目标先构建前端（联合标签需要真实 `web/dist`），再执行 `GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -count=1 -p 1 -v ./...`。`-count=1` 避免测试缓存掩盖本次库状态，`-p 1` 保持包级串行；它是有数据库写入的显式操作，**不包含在 `make check` 里**。缺变量时会看到 `explicit integration database variables required` 并非零，此刻不会接触数据库。
 
-覆盖单连接初始化/重复迁移/撤销重上、同连接锁与 SQL、事务回滚、争锁/取消/杀进程恢复、最小权限、服务信号退出和真实 TCP 断连恢复，以及 00002 四张基础表的列与默认值、索引、无外键/CHECK/触发器/RLS、`tokenpivot_app` 只有 SELECT/INSERT/UPDATE 权限、唯一性范围（含归档后 key 仍被占用、大小写按字节判等）、同 source 多凭证轮换与撤销、`UpTo(2)`/`DownTo(1)` 回退重上。测试专用 TCP 转发器阻断服务连接，不停止数据库、不终止未知会话。Unix 子进程信号测试不覆盖 Windows 服务管理。
+覆盖单连接初始化/重复迁移/撤销重上、同连接锁与 SQL、事务回滚、争锁/取消/杀进程恢复、最小权限、服务信号退出和真实 TCP 断连恢复，以及 00002 四张基础表的列与默认值、索引、无外键/CHECK/触发器/RLS、`tokenpivot_app` 只有 SELECT/INSERT/UPDATE 权限、唯一性范围（含归档后 key 仍被占用、大小写按字节判等）、同 source 多凭证轮换与撤销、00005 的 `users`/`sessions` 列与索引、权限与唯一性、注册事务回滚、过期与已撤销会话、并发续期与登出竞争、`UpTo(2)`/`DownTo(1)` 回退重上。测试专用 TCP 转发器阻断服务连接，不停止数据库、不终止未知会话。Unix 子进程信号测试不覆盖 Windows 服务管理。
 
 
 ## 前端开发与内嵌构建
@@ -216,6 +238,6 @@ TOKENPIVOT_HTTP_ADDR=127.0.0.1:18080 /tmp/tokenpivot-t031-ui
 
 带标签缺少 dist 时编译失败；缺少可读普通 index.html 时初始化失败，不会启动成假成功。构建后可将二进制放到不含仓库的目录运行。页面与 API 必须同源，生产 TLS 由外层入口提供。所有静态成功响应 `Cache-Control: no-cache`；不存在的资源不返回 HTML，只有显式接受 HTML 的无扩展名导航可回退入口。带哈希资源不承诺升级后旧页面永远可用。
 
-当前除迁移 00002 的四张基础表外没有其他业务表，也没有业务 API、认证授权、TLS、请求 ID、指标追踪、后台任务、Redis/队列；占位页不是产品视觉或业务页面。根 [Makefile](Makefile) 只是薄命令入口，不建设 CI、Docker、统一 lint 平台或热重载/后台进程管理。公网部署前须独立完成入口与业务安全设计。
+当前业务表为迁移 00002 的四张基础表加 00003/00004 的采集表与 00005 的 `users`/`sessions`；有浏览器认证，但仍没有采集/查询业务 API、owner 授权、TLS、请求 ID、指标追踪、后台任务、Redis/队列；占位页不是产品视觉或业务页面。根 [Makefile](Makefile) 只是薄命令入口，不建设 CI、Docker、统一 lint 平台或热重载/后台进程管理。公网部署前须独立完成入口与业务安全设计。
 
 前端和数据库联合验收：完成前端构建并安全注入上述两个测试 URL 后，独占测试库执行 `make test-integration`（即 `GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -count=1 -p 1 -v ./...`）；不能用分别编译两个标签代替联合验收。
