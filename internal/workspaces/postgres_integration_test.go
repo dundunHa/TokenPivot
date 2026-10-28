@@ -209,24 +209,24 @@ func openAppConn(t *testing.T, ctx context.Context, appURL string) *pgx.Conn {
 	return conn
 }
 
-// waitForLockedStatement waits until a backend other than observer is blocked on
-// a row lock while running a statement matching pattern. It polls pg_stat_activity
-// with a deadline, so the race order is asserted from observable server state
-// instead of being assumed from a sleep.
-func waitForLockedStatement(t *testing.T, ctx context.Context, observer *pgx.Conn, pattern string) {
+// waitForLockedBackend waits until the named backend is blocked on a lock. It
+// polls pg_stat_activity by pid with a deadline, so the race order is asserted
+// from observable server state instead of from a sleep, and an unrelated backend
+// that happens to wait on a lock can never be mistaken for the one under test.
+func waitForLockedBackend(t *testing.T, ctx context.Context, observer *pgx.Conn, pid int32) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		var waiting int
-		err := observer.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1 AND pid <> pg_backend_pid()", pattern).Scan(&waiting)
+		var waiting bool
+		err := observer.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')", pid).Scan(&waiting)
 		if err != nil {
 			t.Fatal(database.SafeError("read lock wait", err))
 		}
-		if waiting > 0 {
+		if waiting {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no statement matching %q waited on a row lock", pattern)
+			t.Fatalf("backend %d never waited on a lock", pid)
 		}
 		select {
 		case <-ctx.Done():
@@ -387,6 +387,13 @@ func TestCreatePersonalConcurrencyCreatesOneWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Pin the backend id of the second connection before it runs anything, so the
+	// wait is observed on that exact backend rather than on any lock waiter.
+	var secondPID int32
+	if err := secondConn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&secondPID); err != nil {
+		t.Fatal(database.SafeError("read second backend pid", err))
+	}
+
 	// The second transaction starts while the lock is held and must wait.
 	type result struct {
 		workspace Workspace
@@ -397,7 +404,7 @@ func TestCreatePersonalConcurrencyCreatesOneWorkspace(t *testing.T) {
 		workspace, err := createInTx(t, ctx, secondConn, userID)
 		second <- result{workspace: workspace, err: err}
 	}()
-	waitForLockedStatement(t, ctx, observer, "%FROM users WHERE id = $1 FOR UPDATE%")
+	waitForLockedBackend(t, ctx, observer, secondPID)
 
 	if err := firstTx.Commit(ctx); err != nil {
 		t.Fatal(database.SafeError("commit first", err))
@@ -465,18 +472,18 @@ type injectedStore struct {
 	failMembership bool
 }
 
-func (s injectedStore) InsertWorkspace(ctx context.Context, name string) (Workspace, error) {
+func (s injectedStore) insertWorkspace(ctx context.Context, name string) (Workspace, error) {
 	if s.failWorkspace {
 		return Workspace{}, database.SafeError("workspaces insert", errors.New("synthetic-workspace-failure"))
 	}
-	return s.createStore.InsertWorkspace(ctx, name)
+	return s.createStore.insertWorkspace(ctx, name)
 }
 
-func (s injectedStore) InsertOwnerMembership(ctx context.Context, workspaceID, userID ID) error {
+func (s injectedStore) insertOwnerMembership(ctx context.Context, workspaceID, userID ID) error {
 	if s.failMembership {
 		return database.SafeError("workspaces membership insert", errors.New("synthetic-membership-failure"))
 	}
-	return s.createStore.InsertOwnerMembership(ctx, workspaceID, userID)
+	return s.createStore.insertOwnerMembership(ctx, workspaceID, userID)
 }
 
 // TestCreatePersonalFailureRollsBackEverything injects a workspace insert
@@ -634,14 +641,18 @@ func TestPersonalHistoryIsNotShared(t *testing.T) {
 	if err := pool.QueryRow(ctx, "INSERT INTO sources (workspace_id, platform, instance_key) VALUES ($1,$2,$3) RETURNING id", personal.ID, "synthetic-platform", "synthetic-instance").Scan(&sourceID); err != nil {
 		t.Fatal(database.SafeError("seed source", err))
 	}
-	if _, err := pool.Exec(ctx, "INSERT INTO ingest_credentials (workspace_id, source_id, secret_hash) VALUES ($1,$2,$3)", personal.ID, sourceID, []byte("synthetic-digest-32-bytes-........")); err != nil {
+	// Each seeded row keeps its own identity, so the assertions below can prove
+	// that specific row still exists and still belongs to the personal workspace
+	// instead of only counting rows that could have been re-created.
+	var credentialID, eventID ID
+	if err := pool.QueryRow(ctx, "INSERT INTO ingest_credentials (workspace_id, source_id, secret_hash) VALUES ($1,$2,$3) RETURNING id", personal.ID, sourceID, []byte("synthetic-digest-32-bytes-........")).Scan(&credentialID); err != nil {
 		t.Fatal(database.SafeError("seed credential", err))
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO usage_events (workspace_id, source_id, source_event_id, project_id, provider, model, occurred_at, received_at, normalization_version, payload_hash,
+	if err := pool.QueryRow(ctx, `INSERT INTO usage_events (workspace_id, source_id, source_event_id, project_id, provider, model, occurred_at, received_at, normalization_version, payload_hash,
 input_tokens, input_tokens_quality, output_tokens, output_tokens_quality, total_tokens, total_tokens_quality,
 cache_read_tokens, cache_read_tokens_quality, cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality)
-VALUES ($1,$2,$3,$4,'synthetic-provider','synthetic-model',now(),now(),'v1','\x00',10,'known',20,'known',30,'known',0,'known',0,'known',0,'known')`,
-		personal.ID, sourceID, "synthetic-event", projectID); err != nil {
+VALUES ($1,$2,$3,$4,'synthetic-provider','synthetic-model',now(),now(),'v1','\x00',10,'known',20,'known',30,'known',0,'known',0,'known',0,'known') RETURNING id`,
+		personal.ID, sourceID, "synthetic-event", projectID).Scan(&eventID); err != nil {
 		t.Fatal(database.SafeError("seed usage event", err))
 	}
 
@@ -652,16 +663,26 @@ VALUES ($1,$2,$3,$4,'synthetic-provider','synthetic-model',now(),now(),'v1','\x0
 		t.Fatalf("team role=%q found=%t err=%v", role, found, err)
 	}
 
-	// The personal history stays in the personal workspace only.
-	var projectWorkspace, sourceWorkspace ID
-	if err := pool.QueryRow(ctx, "SELECT workspace_id FROM projects WHERE id=$1", projectID).Scan(&projectWorkspace); err != nil {
-		t.Fatal(database.SafeError("load project", err))
-	}
-	if err := pool.QueryRow(ctx, "SELECT workspace_id FROM sources WHERE id=$1", sourceID).Scan(&sourceWorkspace); err != nil {
-		t.Fatal(database.SafeError("load source", err))
-	}
-	if projectWorkspace != personal.ID || sourceWorkspace != personal.ID {
-		t.Fatal("a business row moved out of the personal workspace")
+	// Every seeded row must still exist under its own id and still point at the
+	// personal workspace: joining another workspace neither moves nor re-creates
+	// the history.
+	for _, row := range []struct {
+		name  string
+		query string
+		id    ID
+	}{
+		{"project", "SELECT workspace_id FROM projects WHERE id=$1", projectID},
+		{"source", "SELECT workspace_id FROM sources WHERE id=$1", sourceID},
+		{"ingest credential", "SELECT workspace_id FROM ingest_credentials WHERE id=$1", credentialID},
+		{"usage event", "SELECT workspace_id FROM usage_events WHERE id=$1", eventID},
+	} {
+		var workspaceID ID
+		if err := pool.QueryRow(ctx, row.query, row.id).Scan(&workspaceID); err != nil {
+			t.Fatalf("%s row is gone after the team membership: %v", row.name, database.SafeError("load "+row.name, err))
+		}
+		if workspaceID != personal.ID {
+			t.Fatalf("%s row workspace_id changed away from the personal workspace", row.name)
+		}
 	}
 	var inTeam int
 	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM projects WHERE workspace_id=$1)

@@ -39,7 +39,7 @@ func (f *fakeCreateStore) addUser(id ID) {
 	f.users[id.Bytes] = true
 }
 
-func (f *fakeCreateStore) LockUser(ctx context.Context, userID ID) (bool, error) {
+func (f *fakeCreateStore) lockUser(ctx context.Context, userID ID) (bool, error) {
 	f.calls = append(f.calls, "lock")
 	if f.lockErr != nil {
 		return false, f.lockErr
@@ -47,7 +47,7 @@ func (f *fakeCreateStore) LockUser(ctx context.Context, userID ID) (bool, error)
 	return f.users[userID.Bytes], nil
 }
 
-func (f *fakeCreateStore) PersonalWorkspace(ctx context.Context, userID ID) (Workspace, bool, error) {
+func (f *fakeCreateStore) personalWorkspace(ctx context.Context, userID ID) (Workspace, bool, error) {
 	f.calls = append(f.calls, "lookup")
 	if f.lookupErr != nil {
 		return Workspace{}, false, f.lookupErr
@@ -56,7 +56,7 @@ func (f *fakeCreateStore) PersonalWorkspace(ctx context.Context, userID ID) (Wor
 	return workspace, ok, nil
 }
 
-func (f *fakeCreateStore) InsertWorkspace(ctx context.Context, name string) (Workspace, error) {
+func (f *fakeCreateStore) insertWorkspace(ctx context.Context, name string) (Workspace, error) {
 	f.calls = append(f.calls, "insert workspace")
 	if f.insertErr != nil {
 		return Workspace{}, f.insertErr
@@ -68,7 +68,7 @@ func (f *fakeCreateStore) InsertWorkspace(ctx context.Context, name string) (Wor
 	return workspace, nil
 }
 
-func (f *fakeCreateStore) InsertOwnerMembership(ctx context.Context, workspaceID, userID ID) error {
+func (f *fakeCreateStore) insertOwnerMembership(ctx context.Context, workspaceID, userID ID) error {
 	f.calls = append(f.calls, "insert membership")
 	if f.memberErr != nil {
 		return f.memberErr
