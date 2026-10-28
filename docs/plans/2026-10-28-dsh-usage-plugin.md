@@ -21,9 +21,9 @@
 
 1. 监听 host 事件 `session/event`，只处理 `assistant/message`（`data.usage` 存在）与 `compaction/summary`（`data.usage` 存在）。
 2. `source_event_id`：`dsh:msg:<message.id>`、`dsh:compaction:<session.id>:<compactionId>`。fork/seed 出的会话复制父会话事件时 message.id 不变，服务端按同一身份判 duplicate。
-3. 用量映射：DSH 的 `inputTokens` 不含缓存，所以 `input_tokens = inputTokens + cacheReadTokens + cacheWriteTokens`；`output_tokens = outputTokens`；`total = input + output`，与 DSH `totalTokens` 不一致时标缺失；缓存字段没出现标缺失；`reasoning_tokens` 有字段才报，否则缺失。`status`、`duration_ms` 取不到，填 null。
+3. 用量映射：DSH 的 `inputTokens` 是否含缓存随路由而定，用 DSH `totalTokens` 判定（规则见核实文档“对插件的约束”第 0 条）；判定不了时 input/total 记 estimated，不记 missing（missing 会被服务端推导成 known）；`output_tokens = outputTokens`；缓存字段没出现标缺失；`reasoning_tokens` 有字段才报，否则缺失。`status`、`duration_ms` 取不到，填 null。
 4. 不上报 prompt、回复内容、路径、cwd、会话标题；cwd 只在本地用于匹配项目映射。
-5. 本地队列：JSON 文件原子写（写临时文件再 rename），默认目录 `~/.tokenpivot/dsh/`；按结果出队：accepted/duplicate/conflict/expired/rejected 出队（后三种追加到 `dead-letter.jsonl` 留证），retryable、5xx、网络错误保留并指数退避（遵守 `Retry-After`）；401/403 暂停上报直至配置变化或重启；413 把批次对半拆。队列有上限，超出丢最旧并计数日志。
+5. 本地队列：JSON 文件原子写（写临时文件再 rename），默认目录 `~/.tokenpivot/dsh/`；按结果出队：accepted/duplicate 出队；conflict/expired/rejected 出队并连同事件体追加到 `dead-letter.jsonl`，但 rejected+FUTURE_EVENT 保留重试；retryable、429、5xx、网络错误保留并指数退避（遵守 `Retry-After`）；整批 400/401/403/415 暂停上报，token 变化时自动恢复；只有 413 把批次对半拆。（2026-10-28 按只读评审修订）队列有上限，超出丢最旧并计数日志。
 6. 重传沿用同一 `source_event_id` 与相同内容（入队时就冻结事件体）。
 7. 令牌只从 volatile 配置读，不写日志、不落盘。
 
