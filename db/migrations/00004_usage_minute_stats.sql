@@ -44,7 +44,7 @@ CREATE TABLE usage_minute_stats (
 COMMENT ON TABLE usage_minute_stats IS 'Additive per-minute usage statistics, incremented only in the transaction that first inserted the detail event. The service role holds only SELECT, INSERT and UPDATE.';
 COMMENT ON COLUMN usage_minute_stats.bucket_start IS 'UTC minute start of occurred_at. Never received_at, never a session time zone.';
 COMMENT ON COLUMN usage_minute_stats.project_id IS 'NULL means the events are not attributed to a project; the unique constraint treats those rows as one bucket, not as distinct.';
-COMMENT ON COLUMN usage_minute_stats.event_count IS 'Accepted request-level events in this bucket. A real zero token value still increments it; missing metrics never do.';
+COMMENT ON COLUMN usage_minute_stats.event_count IS 'Every accepted request-level event increments this by exactly one, whether its token values are real zeros or entirely missing.';
 COMMENT ON COLUMN usage_minute_stats.input_tokens_sum IS 'Every metric column group holds the sum of known and estimated values plus the known, estimated and missing counts; missing contributes no value.';
 GRANT SELECT, INSERT, UPDATE ON usage_minute_stats TO tokenpivot_app;
 

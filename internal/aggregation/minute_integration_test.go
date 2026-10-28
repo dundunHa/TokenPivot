@@ -728,8 +728,12 @@ func TestApplyRequestTransactionPattern(t *testing.T) {
 			inputs[i].Output = knownMetric(1)
 			inputs[i].Total = knownMetric(int64(11 + i))
 			inputs[i].CacheRead = missingMetric()
-			inputs[i].CacheWrite = missingMetric()
-			inputs[i].Reasoning = knownMetric(2)
+			// cache_write carries a distinct known value while cache_read stays missing,
+			// so a swapped or dropped column between the two cache metrics cannot pass.
+			inputs[i].CacheWrite = knownMetric(3)
+			// One estimated metric per event proves the estimated count and its value
+			// sum accumulate without ever being reclassified as known.
+			inputs[i].Reasoning = estimatedMetric(2)
 		}
 		type result struct {
 			index int
@@ -793,24 +797,54 @@ func TestApplyRequestTransactionPattern(t *testing.T) {
 			wantTotal += *input.Total.Value
 			wantReasoning += *input.Reasoning.Value
 		}
-		if row.sum[metricIndex("input_tokens")] != wantInput || row.sum[metricIndex("output_tokens")] != wantOutput || row.sum[metricIndex("total_tokens")] != wantTotal || row.sum[metricIndex("reasoning_tokens")] != wantReasoning {
-			t.Fatalf("sums input=%d output=%d total=%d reasoning=%d want %d/%d/%d/%d", row.sum[0], row.sum[1], row.sum[2], row.sum[5], wantInput, wantOutput, wantTotal, wantReasoning)
+		if wantInput != 108 || wantOutput != 8 || wantTotal != 116 || wantReasoning != 16 {
+			t.Fatalf("fixture sums input=%d output=%d total=%d reasoning=%d, the explicit expectations below assume 108/8/116/16", wantInput, wantOutput, wantTotal, wantReasoning)
 		}
-		for i := range minuteMetrics {
-			known := row.known[i]
-			estimated := row.estimated[i]
-			missing := row.missing[i]
-			if known+estimated+missing != int64(events) {
-				t.Fatalf("metric %s known=%d estimated=%d missing=%d do not add up to %d", minuteMetrics[i], known, estimated, missing, events)
+		// Expected columns are written out independently of the writer's own delta
+		// computation, so a wrong metric mapping cannot make the test agree with
+		// itself. The eight inputs are: input known 10..17, output known 1, total
+		// known 11..18, cache_read missing, cache_write known 3, reasoning estimated 2.
+		type expectation struct {
+			metric           string
+			sum              int64
+			known, estimated int64
+			missing          int64
+		}
+		expected := []expectation{
+			{"input_tokens", 108, 8, 0, 0},
+			{"output_tokens", 8, 8, 0, 0},
+			{"total_tokens", 116, 8, 0, 0},
+			{"cache_read_tokens", 0, 0, 0, 8},
+			{"cache_write_tokens", 24, 8, 0, 0},
+			{"reasoning_tokens", 16, 0, 8, 0},
+		}
+		if len(expected) != len(minuteMetrics) {
+			t.Fatalf("expectation list has %d metrics, want %d", len(expected), len(minuteMetrics))
+		}
+		for i, want := range expected {
+			if minuteMetrics[i] != want.metric {
+				t.Fatalf("expectation %d is %s but the column order says %s", i, want.metric, minuteMetrics[i])
 			}
-		}
-		if got := row.missing[metricIndex("cache_read_tokens")]; got != int64(events) {
-			t.Fatalf("cache_read missing=%d want=%d", got, events)
+			if got := row.sum[i]; got != want.sum {
+				t.Fatalf("%s sum=%d want=%d", want.metric, got, want.sum)
+			}
+			if got := row.known[i]; got != want.known {
+				t.Fatalf("%s known=%d want=%d", want.metric, got, want.known)
+			}
+			if got := row.estimated[i]; got != want.estimated {
+				t.Fatalf("%s estimated=%d want=%d", want.metric, got, want.estimated)
+			}
+			if got := row.missing[i]; got != want.missing {
+				t.Fatalf("%s missing=%d want=%d", want.metric, got, want.missing)
+			}
+			if want.known+want.estimated+want.missing != events {
+				t.Fatalf("%s expectation %d/%d/%d does not add up to %d events", want.metric, want.known, want.estimated, want.missing, events)
+			}
 		}
 		if count := countBuckets(t, ctx, owner, in.WorkspaceID); count != 1 {
 			t.Fatalf("buckets=%d want=1", count)
 		}
-		t.Logf("events=%d concurrent increments merged into one bucket", events)
+		t.Logf("events=%d concurrent increments merged into one bucket with all six metric column groups matching", events)
 	})
 }
 
@@ -1057,6 +1091,76 @@ func TestApplyRequestFailures(t *testing.T) {
 				t.Fatalf("%s wrote %d minute buckets", name, buckets)
 			}
 		}
+	})
+
+	// The service role is denied UPDATE in this schema only, so the writer fails at
+	// the statement instead of succeeding. The grant is restored by a cleanup that
+	// also runs on t.Fatal, and the restore is proven before the subtest returns, so
+	// the following subtests keep their normal privileges.
+	t.Run("permission denied", func(t *testing.T) {
+		table := pgx.Identifier{e.schema}.Sanitize() + ".usage_minute_stats"
+		restore := func(ctx context.Context) error {
+			_, err := owner.Exec(ctx, "GRANT SELECT, INSERT, UPDATE ON "+table+" TO tokenpivot_app")
+			return err
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := restore(cleanupCtx); err != nil {
+				t.Error(database.SafeError("restore grace", err))
+			}
+		})
+
+		in := minuteInput(t)
+		tx := beginWithProbe(t, ctx, app, in, "synthetic-permission-denied")
+		if _, err := owner.Exec(ctx, "REVOKE INSERT, UPDATE ON "+table+" FROM tokenpivot_app"); err != nil {
+			t.Fatal(database.SafeError("revoke for probe", err))
+		}
+		// Confirm the revocation actually reached the role under test before relying
+		// on it, so a no-op REVOKE cannot make this subtest pass for the wrong reason.
+		for _, privilege := range []string{"INSERT", "UPDATE"} {
+			var granted bool
+			if err := owner.QueryRow(ctx, "SELECT has_table_privilege('tokenpivot_app', $1, $2)", table, privilege).Scan(&granted); err != nil {
+				t.Fatal(database.SafeError("verify revocation", err))
+			}
+			if granted {
+				t.Fatalf("revoke left %s granted on %s", privilege, e.schema+".usage_minute_stats")
+			}
+		}
+		err := ApplyRequest(ctx, tx, in)
+		if err == nil {
+			t.Fatal("writer succeeded without INSERT and UPDATE")
+		}
+		if errors.Is(err, ErrNonRequestLevel) || errors.Is(err, ErrInvalidMetric) {
+			t.Fatalf("error=%v looks like a validation failure, not a database denial", err)
+		}
+		requireSanitized(t, err)
+		// The caller owns rollback: the detail probe it inserted must not survive
+		// together with any minute row.
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) && !errors.Is(rollbackErr, pgconn.ErrConnClosed) {
+			t.Fatal(database.SafeError("rollback after denial", rollbackErr))
+		}
+		requireNothingWritten(t, ctx, owner, in.WorkspaceID, "permission denied write")
+
+		if err := restore(ctx); err != nil {
+			t.Fatal(database.SafeError("restore grants", err))
+		}
+		for _, privilege := range []string{"SELECT", "INSERT", "UPDATE"} {
+			var granted bool
+			if err := owner.QueryRow(ctx, "SELECT has_table_privilege('tokenpivot_app', $1, $2)", table, privilege).Scan(&granted); err != nil {
+				t.Fatal(database.SafeError("verify restore", err))
+			}
+			if !granted {
+				t.Fatalf("restore did not return %s on %s", privilege, e.schema+".usage_minute_stats")
+			}
+		}
+		// The identical input now succeeds, which proves the earlier error came from
+		// the revoked privilege and not from the input itself.
+		commitEvent(t, ctx, app, in, "synthetic-permission-restored")
+		if row := readBucket(t, ctx, owner, in); row.eventCount != 1 {
+			t.Fatalf("event_count=%d want=1 after the privilege was restored", row.eventCount)
+		}
+		t.Log("revoked INSERT and UPDATE denied the writer, rollback left nothing and the restored grant accepted the same input")
 	})
 
 	t.Run("cancellation", func(t *testing.T) {
