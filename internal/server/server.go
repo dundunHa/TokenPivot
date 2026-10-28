@@ -12,6 +12,7 @@ import (
 
 	"github.com/dundunHa/TokenPivot/internal/auth"
 	"github.com/dundunHa/TokenPivot/internal/config"
+	"github.com/dundunHa/TokenPivot/internal/ingestion"
 )
 
 // HTTP timeouts bound slow connections and the shutdown drain period.
@@ -37,13 +38,17 @@ type Options struct {
 	// leaves them absent. They also need Options.Auth for the session and
 	// Origin gates.
 	Credentials *Credentials
+	// Ingestion enables the Bearer-authenticated batch ingestion route; nil
+	// leaves it absent.
+	Ingestion *ingestion.Handler
 }
 
 // NewHandler exposes liveness and bounded, uncached readiness, keeping API and
 // probe paths on the backend while optionally serving a frontend. Browser
-// authentication routes are registered only when Options.Auth is set, and the
+// authentication routes are registered only when Options.Auth is set, the
 // owner-only credential routes only when both Options.Auth and
-// Options.Credentials are set.
+// Options.Credentials are set, and the batch ingestion route only when
+// Options.Ingestion is set.
 func NewHandler(options Options) http.Handler {
 	checkReady := options.CheckReady
 	if checkReady == nil {
@@ -74,6 +79,7 @@ func NewHandler(options Options) http.Handler {
 	})
 	options.Auth.routes(mux)
 	options.Credentials.routes(mux, options.Auth)
+	options.Ingestion.Register(mux)
 	if options.Frontend == nil {
 		return mux
 	}

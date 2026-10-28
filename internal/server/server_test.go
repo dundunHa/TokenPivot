@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dundunHa/TokenPivot/internal/ingestion"
 )
 
 func TestHandler(t *testing.T) {
@@ -314,4 +316,54 @@ func TestReadinessFailures(t *testing.T) {
 			t.Fatalf("unexpected checks: %d", calls)
 		}
 	}
+}
+
+func TestIngestionRouteRegistration(t *testing.T) {
+	// The service dependencies are deliberately nil: every assertion below is
+	// decided by the mux or by the batch-wide gates that run before any dependency
+	// is touched, so a nil store can never be dereferenced here.
+	handler := ingestion.NewHandler(ingestion.New(nil, nil, nil))
+
+	t.Run("absent by default", func(t *testing.T) {
+		h := NewHandler(Options{})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/ingestion/events", nil))
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status=%d want=404", w.Code)
+		}
+	})
+
+	t.Run("registered when supplied", func(t *testing.T) {
+		h := NewHandler(Options{Ingestion: handler})
+		for _, tt := range []struct {
+			method string
+			status int
+		}{
+			{"POST", http.StatusUnsupportedMediaType},
+			{"GET", http.StatusMethodNotAllowed},
+			{"PUT", http.StatusMethodNotAllowed},
+		} {
+			w := httptest.NewRecorder()
+			request := httptest.NewRequest(tt.method, "/api/v1/ingestion/events", nil)
+			request.Header.Set("Content-Type", "text/plain")
+			h.ServeHTTP(w, request)
+			if w.Code != tt.status {
+				t.Fatalf("%s status=%d want=%d", tt.method, w.Code, tt.status)
+			}
+		}
+	})
+
+	t.Run("other API paths keep their pre-existing behavior", func(t *testing.T) {
+		frontend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})
+		h := NewHandler(Options{Frontend: frontend, Ingestion: handler})
+		for _, path := range []string{"/api", "/api/v1", "/api/v1/ingestion", "/api/v1/ingestion/events/", "/api/v1/ingestion/events/extra"} {
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest("POST", path, nil))
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("%s status=%d want=404", path, w.Code)
+			}
+		}
+	})
 }
