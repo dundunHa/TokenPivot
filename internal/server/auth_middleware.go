@@ -150,13 +150,13 @@ func (a *Auth) clock() time.Time {
 
 // sessionCookieMaxAge converts the database expiry into whole seconds, rounded up
 // so a sub-second response delay does not shorten a fresh 30-day window (2592000
-// seconds). A non-positive remaining time means the expiry already passed: the
-// cookie then carries no Max-Age and its past Expires removes it, which is the
-// only safe reading of an expiry that is not in the future.
+// seconds). A non-positive remaining time means the expiry already passed, so the
+// cookie is deleted: -1 serialises as Max-Age=0, and the past expiry the database
+// returned is still sent as Expires.
 func sessionCookieMaxAge(expiresAt, now time.Time) int {
 	remaining := expiresAt.Sub(now)
 	if remaining <= 0 {
-		return 0
+		return -1
 	}
 	seconds := remaining / time.Second
 	if remaining%time.Second != 0 {

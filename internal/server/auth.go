@@ -160,9 +160,10 @@ var (
 // decodeAuthRequest parses the authentication body without relying on struct
 // field matching. encoding/json matches object keys case-insensitively, so
 // "EMAIL" would bind to Email and a body carrying both "email" and "EMAIL" would
-// be ambiguous. This parser accepts only the exact key literals "email" and
-// "password": a differently cased, escaped (`"\u0065mail"`) or otherwise different
-// key is an unknown field, and the same key twice is a duplicate.
+// be ambiguous. This parser compares the decoded key exactly: only "email" and
+// "password" are known fields, so a differently cased key is an unknown field,
+// while an escaped spelling such as `"\u0065mail"` decodes to the same key and is
+// accepted. The same decoded key twice is a duplicate.
 func decodeAuthRequest(body []byte) (authRequest, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	token, err := decoder.Token()
@@ -175,7 +176,6 @@ func decodeAuthRequest(body []byte) (authRequest, error) {
 	var request authRequest
 	seen := make(map[string]struct{}, 2)
 	for decoder.More() {
-		before := decoder.InputOffset()
 		keyToken, err := decoder.Token()
 		if err != nil {
 			return authRequest{}, errAuthBodyShape
@@ -184,10 +184,11 @@ func decodeAuthRequest(body []byte) (authRequest, error) {
 		if !ok {
 			return authRequest{}, errAuthBodyShape
 		}
-		// The raw literal, not the decoded key, decides acceptance: only these two
-		// exact spellings are known fields.
-		switch rawKeyLiteral(body[before:decoder.InputOffset()]) {
-		case `"email"`, `"password"`:
+		// The decoded key decides acceptance and is case-sensitive: an escaped
+		// spelling of a known key is that same field, a differently cased key is
+		// unknown, and the decoded key is also the duplicate-detection identity.
+		switch key {
+		case "email", "password":
 		default:
 			return authRequest{}, errAuthBodyFields
 		}
@@ -219,17 +220,6 @@ func decodeAuthRequest(body []byte) (authRequest, error) {
 		return authRequest{}, errAuthBodyFields
 	}
 	return request, nil
-}
-
-// rawKeyLiteral returns the JSON string literal at the end of one token segment.
-// The segment starts right after the previous token, so it may hold whitespace
-// and the separating comma before the literal.
-func rawKeyLiteral(segment []byte) string {
-	start := bytes.IndexByte(segment, '"')
-	if start < 0 {
-		return ""
-	}
-	return string(segment[start:])
 }
 
 // isJSONContentType accepts application/json with optional parameters such as a
