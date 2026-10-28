@@ -561,26 +561,27 @@ func TestAuthBodyValidation(t *testing.T) {
 		"invalid email":      {"application/json", `{"email":"synthetic.example.com","password":"synthetic-password"}`, http.StatusBadRequest},
 		"short password":     {"application/json", `{"email":"synthetic@example.com","password":"short"}`, http.StatusBadRequest},
 		// encoding/json matches struct keys case-insensitively, so these bodies
-		// would otherwise bind to Email/Password. Only the exact spellings count.
-		"uppercase email key":    {"application/json", `{"EMAIL":"synthetic@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
-		"uppercase password key": {"application/json", `{"email":"synthetic@example.com","PASSWORD":"synthetic-password"}`, http.StatusBadRequest},
-		"mixed case duplicate":   {"application/json", `{"email":"synthetic@example.com","EMAIL":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
-		"escaped duplicate key":  {"application/json", `{"email":"synthetic@example.com","\u0065mail":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
-		"escaped key alone":      {"application/json", `{"\u0065mail":"synthetic@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
-		"missing password":       {"application/json", `{"email":"synthetic@example.com"}`, http.StatusBadRequest},
-		"missing email":          {"application/json", `{"password":"synthetic-password"}`, http.StatusBadRequest},
-		"both empty":             {"application/json", `{}`, http.StatusBadRequest},
-		"non-string email":       {"application/json", `{"email":42,"password":"synthetic-password"}`, http.StatusBadRequest},
-		"object password":        {"application/json", `{"email":"synthetic@example.com","password":{"value":"synthetic-password"}}`, http.StatusBadRequest},
-		"nested object":          {"application/json", `{"email":{"value":"synthetic@example.com"},"password":"synthetic-password"}`, http.StatusBadRequest},
-		"whitespace padded key":  {"application/json", `{" email":"synthetic@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
-		"single quotation marks": {"application/json", `{'email':'synthetic@example.com','password':'synthetic-password'}`, http.StatusBadRequest},
-		"two objects":            {"application/json", `{"email":"synthetic@example.com","password":"synthetic-password"}{"email":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
-		"null body":              {"application/json", `null`, http.StatusBadRequest},
-		"number body":            {"application/json", `1`, http.StatusBadRequest},
-		"string body":            {"application/json", `"synthetic"`, http.StatusBadRequest},
-		"unterminated object":    {"application/json", `{"email":"synthetic@example.com","password":"synthetic-password"`, http.StatusBadRequest},
-		"key without value":      {"application/json", `{"email":"synthetic@example.com","password"}`, http.StatusBadRequest},
+		// would otherwise bind to Email/Password. Only the decoded exact spellings
+		// count, and a second spelling of the same decoded key is a duplicate.
+		"uppercase email key":     {"application/json", `{"EMAIL":"synthetic@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"uppercase password key":  {"application/json", `{"email":"synthetic@example.com","PASSWORD":"synthetic-password"}`, http.StatusBadRequest},
+		"mixed case duplicate":    {"application/json", `{"email":"synthetic@example.com","EMAIL":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"escaped duplicate key":   {"application/json", `{"email":"synthetic@example.com","\u0065mail":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"both password spellings": {"application/json", `{"email":"synthetic@example.com","password":"synthetic-password","\u0070assword":"other-password"}`, http.StatusBadRequest},
+		"missing password":        {"application/json", `{"email":"synthetic@example.com"}`, http.StatusBadRequest},
+		"missing email":           {"application/json", `{"password":"synthetic-password"}`, http.StatusBadRequest},
+		"both empty":              {"application/json", `{}`, http.StatusBadRequest},
+		"non-string email":        {"application/json", `{"email":42,"password":"synthetic-password"}`, http.StatusBadRequest},
+		"object password":         {"application/json", `{"email":"synthetic@example.com","password":{"value":"synthetic-password"}}`, http.StatusBadRequest},
+		"nested object":           {"application/json", `{"email":{"value":"synthetic@example.com"},"password":"synthetic-password"}`, http.StatusBadRequest},
+		"whitespace padded key":   {"application/json", `{" email":"synthetic@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"single quotation marks":  {"application/json", `{'email':'synthetic@example.com','password':'synthetic-password'}`, http.StatusBadRequest},
+		"two objects":             {"application/json", `{"email":"synthetic@example.com","password":"synthetic-password"}{"email":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"null body":               {"application/json", `null`, http.StatusBadRequest},
+		"number body":             {"application/json", `1`, http.StatusBadRequest},
+		"string body":             {"application/json", `"synthetic"`, http.StatusBadRequest},
+		"unterminated object":     {"application/json", `{"email":"synthetic@example.com","password":"synthetic-password"`, http.StatusBadRequest},
+		"key without value":       {"application/json", `{"email":"synthetic@example.com","password"}`, http.StatusBadRequest},
 	} {
 		t.Run(name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, registerPath, strings.NewReader(tt.body))
@@ -604,14 +605,19 @@ func TestAuthBodyValidation(t *testing.T) {
 }
 
 // TestAuthBodyAcceptsOnlyExactKeySpelling pins the strict key rule from both
-// sides: JSON formatting and field order are free, but a differently cased,
-// escaped or padded key name is an unknown field and never reaches storage.
+// sides. Acceptance compares the decoded key exactly: JSON formatting, field
+// order and an escaped spelling of a known key are free, but a differently cased,
+// padded or otherwise different key name is an unknown field, a second spelling of
+// the same decoded key is a duplicate, and neither reaches storage.
 func TestAuthBodyAcceptsOnlyExactKeySpelling(t *testing.T) {
 	for name, body := range map[string]string{
-		"canonical":          `{"email":"synthetic@example.com","password":"synthetic-password"}`,
-		"field order":        `{"password":"synthetic-password","email":"synthetic@example.com"}`,
-		"formatted":          "{\n  \"email\": \"synthetic@example.com\",\n  \"password\": \"synthetic-password\"\n}\n",
-		"escaped value only": `{"email":"synthetic@example.com","password":"synthetic-\u0070assword"}`,
+		"canonical":            `{"email":"synthetic@example.com","password":"synthetic-password"}`,
+		"field order":          `{"password":"synthetic-password","email":"synthetic@example.com"}`,
+		"formatted":            "{\n  \"email\": \"synthetic@example.com\",\n  \"password\": \"synthetic-password\"\n}\n",
+		"escaped value only":   `{"email":"synthetic@example.com","password":"synthetic-\u0070assword"}`,
+		"escaped email key":    `{"\u0065mail":"synthetic@example.com","password":"synthetic-password"}`,
+		"escaped password key": `{"email":"synthetic@example.com","\u0070assword":"synthetic-password"}`,
+		"both keys escaped":    `{"\u0065mail":"synthetic@example.com","\u0070assword":"synthetic-password"}`,
 	} {
 		t.Run("accepted "+name, func(t *testing.T) {
 			_, store, h := authHandler(t)
@@ -629,17 +635,17 @@ func TestAuthBodyAcceptsOnlyExactKeySpelling(t *testing.T) {
 		})
 	}
 	for name, body := range map[string]string{
-		"uppercase email":        `{"EMAIL":"synthetic@example.com","password":"synthetic-password"}`,
-		"uppercase password":     `{"email":"synthetic@example.com","PASSWORD":"synthetic-password"}`,
-		"title case":             `{"Email":"synthetic@example.com","Password":"synthetic-password"}`,
-		"escaped email key":      `{"\u0065mail":"synthetic@example.com","password":"synthetic-password"}`,
-		"mixed case duplicate":   `{"email":"synthetic@example.com","EMAIL":"other@example.com","password":"synthetic-password"}`,
-		"escaped duplicate":      `{"email":"synthetic@example.com","\u0065mail":"other@example.com","password":"synthetic-password"}`,
-		"padded key":             `{" email":"synthetic@example.com","password":"synthetic-password"}`,
-		"padded password key":    `{"email":"synthetic@example.com","password ":"synthetic-password"}`,
-		"extra field alongside":  `{"email":"synthetic@example.com","password":"synthetic-password","EMAIL":"other@example.com"}`,
-		"user id field":          `{"email":"synthetic@example.com","password":"synthetic-password","user_id":"synthetic-forged"}`,
-		"only password supplied": `{"password":"synthetic-password"}`,
+		"uppercase email":            `{"EMAIL":"synthetic@example.com","password":"synthetic-password"}`,
+		"uppercase password":         `{"email":"synthetic@example.com","PASSWORD":"synthetic-password"}`,
+		"title case":                 `{"Email":"synthetic@example.com","Password":"synthetic-password"}`,
+		"mixed case duplicate":       `{"email":"synthetic@example.com","EMAIL":"other@example.com","password":"synthetic-password"}`,
+		"escaped duplicate":          `{"email":"synthetic@example.com","\u0065mail":"other@example.com","password":"synthetic-password"}`,
+		"escaped password duplicate": `{"email":"synthetic@example.com","password":"synthetic-password","\u0070assword":"synthetic-other-password"}`,
+		"padded key":                 `{" email":"synthetic@example.com","password":"synthetic-password"}`,
+		"padded password key":        `{"email":"synthetic@example.com","password ":"synthetic-password"}`,
+		"extra field alongside":      `{"email":"synthetic@example.com","password":"synthetic-password","EMAIL":"other@example.com"}`,
+		"user id field":              `{"email":"synthetic@example.com","password":"synthetic-password","user_id":"synthetic-forged"}`,
+		"only password supplied":     `{"password":"synthetic-password"}`,
 	} {
 		t.Run("rejected "+name, func(t *testing.T) {
 			_, store, h := authHandler(t)

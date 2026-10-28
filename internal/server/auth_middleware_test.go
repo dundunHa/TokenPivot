@@ -155,7 +155,8 @@ func TestCookieSecureFollowsOrigin(t *testing.T) {
 // TestSessionCookieMaxAgeFollowsDatabaseExpiry proves the cookie Max-Age is the
 // whole number of seconds left until the stored expiry, not a fixed lifetime: a
 // fresh 30-day session still reports 2592000, a delayed response reports the
-// remaining time, and an expiry that already passed is not extended.
+// remaining time, and an expiry that already passed becomes the delete value -1
+// instead of a 0 that Go omits from the header.
 func TestSessionCookieMaxAgeFollowsDatabaseExpiry(t *testing.T) {
 	expiry := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
 	for _, tt := range []struct {
@@ -167,8 +168,8 @@ func TestSessionCookieMaxAgeFollowsDatabaseExpiry(t *testing.T) {
 		{"one second late", expiry.Add(-auth.SessionLifetime + time.Second), int(auth.SessionLifetime.Seconds()) - 1},
 		{"sub-second delay rounds up", expiry.Add(-auth.SessionLifetime + time.Millisecond), int(auth.SessionLifetime.Seconds())},
 		{"mid lifetime", expiry.Add(-7 * time.Minute), 420},
-		{"expired", expiry.Add(time.Second), 0},
-		{"exactly at expiry", expiry, 0},
+		{"expired", expiry.Add(time.Second), -1},
+		{"exactly at expiry", expiry, -1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := sessionCookieMaxAge(expiry, tt.now); got != tt.want {
@@ -223,12 +224,28 @@ func TestSessionCookieMaxAgeUsesDatabaseExpiryThroughHTTP(t *testing.T) {
 		t.Fatalf("cookie Expires %s differs from the stored expiry %s", renewed.Expires, storedExpiry)
 	}
 
-	// A response written after the stored expiry gets no positive lifetime.
+	// A response written after the stored expiry deletes the cookie: Max-Age=-1
+	// is serialised as Max-Age=0, and the past expiry the database returned still
+	// rides along as Expires.
 	responseTime = storedExpiry.Add(time.Second)
 	delayed := httptest.NewRecorder()
 	h.ServeHTTP(delayed, req)
-	if got := sessionCookie(t, delayed).MaxAge; got > 0 {
-		t.Fatalf("expired session cookie Max-Age = %d, want no positive lifetime", got)
+	if delayed.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", delayed.Code, delayed.Body.String())
+	}
+	past := sessionCookie(t, delayed)
+	if past.MaxAge != -1 {
+		t.Fatalf("past-expiry cookie Max-Age = %d, want -1", past.MaxAge)
+	}
+	if past.Expires.After(responseTime) {
+		t.Fatalf("past-expiry cookie Expires %s is still in the future", past.Expires)
+	}
+	header := strings.Join(delayed.Header().Values("Set-Cookie"), "\n")
+	if !strings.Contains(header, "Max-Age=0") {
+		t.Fatalf("past-expiry Set-Cookie header lacks the delete directive: %q", header)
+	}
+	if want := past.Expires.UTC().Format(http.TimeFormat); !strings.Contains(header, "Expires="+want) {
+		t.Fatalf("past-expiry Set-Cookie header lacks Expires=%s: %q", want, header)
 	}
 }
 
