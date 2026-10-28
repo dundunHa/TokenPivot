@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dundunHa/TokenPivot/internal/auth"
 	"github.com/dundunHa/TokenPivot/internal/credentials"
 	"github.com/dundunHa/TokenPivot/internal/workspaces"
 )
@@ -90,6 +91,15 @@ func (f *credentialFakeStore) seedCredential(workspaceID, sourceID credentials.I
 	defer f.mu.Unlock()
 	f.rows[credential.ID.Bytes] = credentialRow{credential: credential}
 	return credential
+}
+
+// storedCredential reads the row as it is persisted now. seedCredential returns a
+// copy, so asserting "nothing changed" has to read the stored row, not that copy.
+func (f *credentialFakeStore) storedCredential(credentialID credentials.ID) (credentialRow, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.rows[credentialID.Bytes]
+	return row, ok
 }
 
 func (f *credentialFakeStore) List(ctx context.Context, workspaceID, sourceID credentials.ID) ([]credentials.Credential, error) {
@@ -240,6 +250,9 @@ type credentialFixture struct {
 	store   *credentialFakeStore
 	roles   *roleFakeStore
 	service *credentials.Service
+	// authStore is the session store behind the shared requester middleware, so
+	// a test can force the session dependency to fail.
+	authStore *authFakeStore
 	// ownerCookie is a valid session of the seeded owner account.
 	ownerCookie *http.Cookie
 	ownerID     workspaces.ID
@@ -281,6 +294,7 @@ func newCredentialFixture(t *testing.T) *credentialFixture {
 		store:       store,
 		roles:       roles,
 		service:     service,
+		authStore:   authStore,
 		ownerCookie: sessionCookie(t, recorder),
 		ownerID:     workspaces.ID{Bytes: user.ID, Valid: true},
 		workspaceID: idWithByte(0x21),
@@ -561,26 +575,33 @@ func TestCredentialWritesRequireOrigin(t *testing.T) {
 }
 
 // TestCredentialWritesRequireOwner covers 401 without a session and 403 for a
-// member or a non-member, with no storage write.
+// member or a non-member, with no storage write and no change to the seeded row.
 func TestCredentialWritesRequireOwner(t *testing.T) {
 	fixture := newCredentialFixture(t)
 	seeded := fixture.store.seedCredential(fixture.workspaceID, fixture.sourceID, nil)
-
-	anonymous := httptest.NewRequest(http.MethodPost, fixture.collectionPath(), strings.NewReader(""))
-	anonymous.Header.Set("Origin", testOrigin)
-	if w := fixture.doRequest(t, anonymous); w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "UNAUTHENTICATED") {
-		t.Fatalf("anonymous issue status/body = %d %s", w.Code, w.Body.String())
-	}
-	if calls := fixture.store.callCount("Insert"); calls != 0 {
-		t.Fatalf("anonymous issue inserted %d rows", calls)
-	}
-
-	fixture.roles.setRole(fixture.ownerID, fixture.workspaceID, workspaces.RoleMember)
-	for name, path := range map[string]string{
+	writePaths := map[string]string{
 		"issue":  fixture.collectionPath(),
 		"rotate": fixture.rotatePath(seeded.ID.String()),
 		"revoke": fixture.revokePath(seeded.ID.String()),
-	} {
+	}
+
+	// No session at all is 401 on every write and never reaches storage.
+	before := map[string]int{"Insert": fixture.store.callCount("Insert"), "Revoke": fixture.store.callCount("Revoke")}
+	for name, path := range writePaths {
+		anonymous := httptest.NewRequest(http.MethodPost, path, strings.NewReader(""))
+		anonymous.Header.Set("Origin", testOrigin)
+		if w := fixture.doRequest(t, anonymous); w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "UNAUTHENTICATED") {
+			t.Fatalf("anonymous %s status/body = %d %s", name, w.Code, w.Body.String())
+		}
+	}
+	for method, count := range before {
+		if after := fixture.store.callCount(method); after != count {
+			t.Fatalf("anonymous writes reached %s %d times", method, after-count)
+		}
+	}
+
+	fixture.roles.setRole(fixture.ownerID, fixture.workspaceID, workspaces.RoleMember)
+	for name, path := range writePaths {
 		if w := fixture.do(t, http.MethodPost, path, ""); w.Code != http.StatusForbidden {
 			t.Fatalf("member %s status = %d", name, w.Code)
 		}
@@ -591,7 +612,13 @@ func TestCredentialWritesRequireOwner(t *testing.T) {
 	if calls := fixture.store.callCount("Revoke"); calls != 0 {
 		t.Fatalf("member revoke reached storage %d times", calls)
 	}
-	if seeded.RevokedAt != nil {
+	// seedCredential returns a copy, so the "nothing changed" check has to read
+	// the persisted row instead of that copy.
+	row, ok := fixture.store.storedCredential(seeded.ID)
+	if !ok {
+		t.Fatal("seeded credential disappeared")
+	}
+	if row.credential.RevokedAt != nil {
 		t.Fatal("seeded credential changed without a successful revoke")
 	}
 }
@@ -663,6 +690,9 @@ func TestCredentialRejectsBodyAndMalformedIDs(t *testing.T) {
 	if calls := fixture.store.callCount("Insert"); calls != 0 {
 		t.Fatalf("bodies with fields inserted %d rows", calls)
 	}
+	if calls := fixture.store.callCount("Revoke"); calls != 0 {
+		t.Fatalf("bodies with fields reached revoke %d times", calls)
+	}
 
 	for name, path := range map[string]string{
 		"list":     "/api/v1/workspaces/not-a-uuid/sources/" + fixture.sourceID.String() + "/credentials",
@@ -682,6 +712,51 @@ func TestCredentialRejectsBodyAndMalformedIDs(t *testing.T) {
 				t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// TestCredentialWritesRejectNonEmptyBody proves rotate and revoke, like issue,
+// refuse any request body before touching the credential row.
+func TestCredentialWritesRejectNonEmptyBody(t *testing.T) {
+	fixture := newCredentialFixture(t)
+	seeded := fixture.store.seedCredential(fixture.workspaceID, fixture.sourceID, nil)
+
+	for name, path := range map[string]string{
+		"issue":  fixture.collectionPath(),
+		"rotate": fixture.rotatePath(seeded.ID.String()),
+		"revoke": fixture.revokePath(seeded.ID.String()),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for bodyName, body := range map[string]string{
+				"workspace_id": `{"workspace_id":"synthetic"}`,
+				"source_id":    `{"source_id":"synthetic"}`,
+				"revoke old":   `{"revoke_old":true}`,
+				"empty object": `{}`,
+			} {
+				t.Run(bodyName, func(t *testing.T) {
+					w := fixture.do(t, http.MethodPost, path, body)
+					if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "INVALID_ARGUMENT") {
+						t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
+					}
+					if strings.Contains(w.Body.String(), "synthetic") {
+						t.Fatal("response echoed the rejected body")
+					}
+				})
+			}
+		})
+	}
+	if calls := fixture.store.callCount("Insert"); calls != 0 {
+		t.Fatalf("non-empty bodies inserted %d rows", calls)
+	}
+	if calls := fixture.store.callCount("Revoke"); calls != 0 {
+		t.Fatalf("non-empty bodies reached revoke %d times", calls)
+	}
+	row, ok := fixture.store.storedCredential(seeded.ID)
+	if !ok {
+		t.Fatal("seeded credential disappeared")
+	}
+	if row.credential.RevokedAt != nil {
+		t.Fatal("a rejected body changed the credential")
 	}
 }
 
@@ -725,6 +800,72 @@ func TestCredentialLostResponseIsRecoveredFromListThenRevoked(t *testing.T) {
 	third := decodeList(t, fixture.do(t, http.MethodGet, fixture.collectionPath(), ""))
 	if third.Credentials[0].RevokedAt == nil || *third.Credentials[0].RevokedAt != firstStamp {
 		t.Fatalf("repeated revoke changed revoked_at: %v -> %v", firstStamp, third.Credentials[0].RevokedAt)
+	}
+}
+
+// TestCredentialRotateLostResponseIsRecoveredFromListThenRevoked covers the same
+// recovery for rotation: the response carrying the only plaintext is lost, so the
+// owner lists the source, finds the new credential and revokes it. The old
+// credential keeps its own state throughout.
+func TestCredentialRotateLostResponseIsRecoveredFromListThenRevoked(t *testing.T) {
+	fixture := newCredentialFixture(t)
+	active := fixture.store.seedCredential(fixture.workspaceID, fixture.sourceID, nil)
+	rotated := fixture.do(t, http.MethodPost, fixture.rotatePath(active.ID.String()), "")
+	if rotated.Code != http.StatusCreated {
+		t.Fatalf("rotate status = %d: %s", rotated.Code, rotated.Body.String())
+	}
+	body := decodeIssued(t, rotated)
+
+	// The rotate response is now "lost": the list must locate the new credential.
+	list := decodeList(t, fixture.do(t, http.MethodGet, fixture.collectionPath(), ""))
+	if len(list.Credentials) != 2 {
+		t.Fatalf("list after a lost rotation = %+v", list)
+	}
+	revokedByID := make(map[string]*string, len(list.Credentials))
+	for _, item := range list.Credentials {
+		revokedByID[item.CredentialID] = item.RevokedAt
+	}
+	rotatedRevokedAt, found := revokedByID[body.CredentialID]
+	if !found {
+		t.Fatalf("list is missing the rotated credential %s", body.CredentialID)
+	}
+	if rotatedRevokedAt != nil {
+		t.Fatalf("rotated credential already revoked: %v", *rotatedRevokedAt)
+	}
+	// seedCredential returns a copy, so the old row is read from the store.
+	oldRow, ok := fixture.store.storedCredential(active.ID)
+	if !ok {
+		t.Fatal("old credential disappeared")
+	}
+	if oldRow.credential.RevokedAt != nil {
+		t.Fatal("rotation changed the old credential revocation state")
+	}
+	if _, err := fixture.service.Authenticate(context.Background(), body.Token); err != nil {
+		t.Fatalf("rotated token does not authenticate: %v", err)
+	}
+
+	// Revoke only the new credential found through the list.
+	if w := fixture.do(t, http.MethodPost, fixture.revokePath(body.CredentialID), ""); w.Code != http.StatusNoContent {
+		t.Fatalf("revoke status = %d: %s", w.Code, w.Body.String())
+	}
+	after := decodeList(t, fixture.do(t, http.MethodGet, fixture.collectionPath(), ""))
+	if len(after.Credentials) != 2 {
+		t.Fatalf("list after revoke = %+v", after)
+	}
+	for _, item := range after.Credentials {
+		switch item.CredentialID {
+		case body.CredentialID:
+			if item.RevokedAt == nil {
+				t.Fatal("revoked rotated credential still lists as active")
+			}
+		case active.ID.String():
+			if item.RevokedAt != nil {
+				t.Fatal("revoking the rotated credential changed the old one")
+			}
+		}
+	}
+	if _, err := fixture.service.Authenticate(context.Background(), body.Token); !errors.Is(err, credentials.ErrUnauthenticated) {
+		t.Fatalf("revoked rotated token authenticate error = %v", err)
 	}
 }
 
@@ -824,7 +965,11 @@ func TestCredentialDatabaseFailureIsNotSuccess(t *testing.T) {
 	if w := fixture.do(t, http.MethodPost, fixture.revokePath(seeded.ID.String()), ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("revoke status = %d", w.Code)
 	}
-	if seeded.RevokedAt != nil {
+	row, ok := fixture.store.storedCredential(seeded.ID)
+	if !ok {
+		t.Fatal("seeded credential disappeared")
+	}
+	if row.credential.RevokedAt != nil {
 		t.Fatal("a failed revoke reported the credential as revoked")
 	}
 
@@ -833,6 +978,56 @@ func TestCredentialDatabaseFailureIsNotSuccess(t *testing.T) {
 	fixture.roles.setError(errors.New("synthetic database failure"))
 	if w := fixture.do(t, http.MethodGet, fixture.collectionPath(), ""); w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "INTERNAL") {
 		t.Fatalf("owner lookup failure status/body = %d %s", w.Code, w.Body.String())
+	}
+}
+
+// TestCredentialSessionUnavailableIs503 proves a session dependency failure is
+// the documented 503 UNAVAILABLE, not a 401 or a 500, and never touches the
+// credential store.
+func TestCredentialSessionUnavailableIs503(t *testing.T) {
+	fixture := newCredentialFixture(t)
+	seeded := fixture.store.seedCredential(fixture.workspaceID, fixture.sourceID, nil)
+	fixture.authStore.failures.authenticate = errors.Join(auth.ErrUnavailable, errors.New("synthetic database failure"))
+
+	cases := map[string]struct {
+		method string
+		path   string
+	}{
+		"list":   {http.MethodGet, fixture.collectionPath()},
+		"issue":  {http.MethodPost, fixture.collectionPath()},
+		"rotate": {http.MethodPost, fixture.rotatePath(seeded.ID.String())},
+		"revoke": {http.MethodPost, fixture.revokePath(seeded.ID.String())},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := fixture.do(t, tc.method, tc.path, "")
+			if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "UNAVAILABLE") {
+				t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
+			}
+			if got := w.Header().Get("Cache-Control"); got != noStoreValue {
+				t.Fatalf("Cache-Control = %q", got)
+			}
+			if strings.Contains(w.Body.String(), "synthetic database failure") {
+				t.Fatal("database message leaked into the response")
+			}
+		})
+	}
+	// The session gate fails before the owner lookup and before storage.
+	if calls := fixture.roles.callCount(); calls != 0 {
+		t.Fatalf("unavailable session reached the role lookup %d times", calls)
+	}
+	if calls := fixture.store.callCount("Insert"); calls != 0 {
+		t.Fatalf("unavailable session inserted %d rows", calls)
+	}
+	if calls := fixture.store.callCount("Revoke"); calls != 0 {
+		t.Fatalf("unavailable session reached revoke %d times", calls)
+	}
+	row, ok := fixture.store.storedCredential(seeded.ID)
+	if !ok {
+		t.Fatal("seeded credential disappeared")
+	}
+	if row.credential.RevokedAt != nil {
+		t.Fatal("an unavailable session changed the credential")
 	}
 }
 
