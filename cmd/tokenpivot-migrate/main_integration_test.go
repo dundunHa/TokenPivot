@@ -199,24 +199,24 @@ func TestSingleConnectionMatrix(t *testing.T) {
 				if version != want {
 					t.Fatalf("version=%d want=%d", version, want)
 				}
-				// The auth tables exist only while migration 00005 is applied, and its
-				// down-one must leave every earlier table in place.
-				var authTables, usageMinuteStats, usageEvents, foundation bool
-				if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.users') IS NOT NULL, to_regclass(current_schema()||'.usage_minute_stats') IS NOT NULL, to_regclass(current_schema()||'.usage_events') IS NOT NULL, to_regclass(current_schema()||'.workspaces') IS NOT NULL").Scan(&authTables, &usageMinuteStats, &usageEvents, &foundation); err != nil {
+				// workspace_memberships exists only while migration 00006 is applied,
+				// and its down-one must leave every earlier table in place.
+				var memberships, authTables, usageMinuteStats, usageEvents, foundation bool
+				if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.workspace_memberships') IS NOT NULL, to_regclass(current_schema()||'.users') IS NOT NULL, to_regclass(current_schema()||'.usage_minute_stats') IS NOT NULL, to_regclass(current_schema()||'.usage_events') IS NOT NULL, to_regclass(current_schema()||'.workspaces') IS NOT NULL").Scan(&memberships, &authTables, &usageMinuteStats, &usageEvents, &foundation); err != nil {
 					t.Fatal(database.SafeError("table set", err))
 				}
 				switch command {
 				case "status":
-					if authTables || usageMinuteStats || usageEvents || foundation {
+					if memberships || authTables || usageMinuteStats || usageEvents || foundation {
 						t.Fatal("business tables exist before up")
 					}
 				case "down-one":
-					if authTables || !usageMinuteStats || !usageEvents || !foundation {
-						t.Fatal("down-one did not only remove the auth tables")
+					if memberships || !authTables || !usageMinuteStats || !usageEvents || !foundation {
+						t.Fatal("down-one did not only remove the latest migration's table")
 					}
 				default:
-					if !authTables || !usageMinuteStats || !usageEvents || !foundation {
-						t.Fatal("up did not create the auth, minute stats, usage event and foundation tables")
+					if !memberships || !authTables || !usageMinuteStats || !usageEvents || !foundation {
+						t.Fatal("up did not create the membership, auth, minute stats, usage event and foundation tables")
 					}
 				}
 				t.Logf("command=%s exit=0 duration=%s version=%d", command, time.Since(start), version)
