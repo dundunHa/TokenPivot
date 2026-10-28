@@ -12,8 +12,10 @@ import (
 
 	"github.com/dundunHa/TokenPivot/internal/auth"
 	"github.com/dundunHa/TokenPivot/internal/config"
+	"github.com/dundunHa/TokenPivot/internal/credentials"
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/dundunHa/TokenPivot/internal/server"
+	"github.com/dundunHa/TokenPivot/internal/workspaces"
 	"github.com/dundunHa/TokenPivot/web"
 )
 
@@ -42,11 +44,14 @@ func run(logger *slog.Logger) error {
 	}
 	authStore := auth.NewPostgres(pool)
 	authService := auth.New(authStore, authStore, auth.NewLimiter(nil))
+	credentialService := credentials.New(credentials.NewPostgres(pool))
+	workspaceService := workspaces.New(workspaces.NewPostgres(pool))
 	srv := &http.Server{
 		Handler: server.NewHandler(server.Options{
-			CheckReady: pool.Ping,
-			Frontend:   frontend,
-			Auth:       server.NewAuth(authService, cfg.WebOrigin),
+			CheckReady:  pool.Ping,
+			Frontend:    frontend,
+			Auth:        server.NewAuth(authService, cfg.WebOrigin),
+			Credentials: server.NewCredentials(credentialService, workspaceService),
 		}),
 		ReadHeaderTimeout: server.ReadHeaderTimeout,
 		ReadTimeout:       server.ReadTimeout,

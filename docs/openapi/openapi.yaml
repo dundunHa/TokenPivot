@@ -1,18 +1,18 @@
 openapi: 3.1.0
 info:
-  title: TokenPivot 用量采集与浏览器认证接口
+  title: TokenPivot 用量采集、浏览器认证与凭证管理接口
   version: 'v1'
-  summary: 同步批量采集端点与浏览器账号会话接口的唯一格式依据（外部格式主版本 v1）
+  summary: 同步批量采集端点、浏览器账号会话接口与 owner 凭证管理接口的唯一格式依据（外部格式主版本 v1）
   description: |
     # 1. 范围与文档边界
 
-    本文冻结 TokenPivot 首版两组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）与**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）。
+    本文冻结 TokenPivot 首版三组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）、**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）与 **owner 凭证管理**（列表、签发、轮换、撤销，以及会话、`Origin`、owner 准入与错误码）。
 
-    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点。查询接口（筛选、分组、粒度、时区、游标）属 T-023，凭证签发/轮换/撤销属 T-010，工作空间与成员管理属 T-019；这些路径都不在本文。
+    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。查询接口（筛选、分组、粒度、时区、游标）属 T-023，工作空间与成员管理属 T-019；这些路径都不在本文。
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
-    - 两组接口的认证互不替代：采集只认 `Authorization: Bearer` 且**不回退 Cookie**；浏览器认证只认会话 Cookie 并对写请求校验 Origin。同一请求同时携带两者时，各自按所属端点规则判定。
+    - 三组接口的认证互不替代：采集只认 `Authorization: Bearer` 且**不回退 Cookie**；浏览器认证与凭证管理只认会话 Cookie，凭证管理的写操作还要求 `Origin`，插件令牌 `tpk_` 不能用于凭证管理。同一请求同时携带多种凭据时，各自按所属端点规则判定。
 
     # 2. 外部格式版本与规范化版本
 
@@ -44,7 +44,7 @@ info:
     - `received_at` 由服务端在首次接受事务内采样，客户端不得提交；出现即按未知字段拒绝。
     - 插件端点**不回退 Cookie**：即使同时携带有效浏览器 Cookie，也不会把请求改成浏览器用户身份；没有 Bearer、Bearer 无效或已撤销一律 `401 UNAUTHENTICATED`。
     - 已认证但没有采集权限返回 `403 PERMISSION_DENIED`，不自动重试。
-    - 凭证的签发、轮换、撤销路径不写入本文（属 T-010 的接口文档追加）；轮换不改变 source，因此轮换后用新凭证重传同一请求仍按原身份判定。
+    - 凭证的签发、轮换、撤销路径见 `credentials` 标签下的四个端点；轮换不改变 source，因此轮换后用新凭证重传同一请求仍按原身份判定。
 
     ## 4.2 浏览器端点（会话 Cookie）
 
@@ -454,6 +454,8 @@ tags:
     description: '插件凭证认证的同步批量采集端点。只接受 `Authorization: Bearer`，不回退 Cookie。'
   - name: browser-auth
     description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出这些写操作必须携带与可信 Web origin 完全一致的 `Origin`。'
+  - name: credentials
+    description: 'owner 管理接入凭证的端点。只认浏览器会话 Cookie 且要求 workspace owner；列表是读请求、不要求 `Origin`，签发、轮换、撤销三个写操作必须携带可信 `Origin`。插件令牌 `tpk_` 不能用于这些路径。'
 
 paths:
   /api/v1/ingestion/events:
@@ -819,6 +821,361 @@ paths:
           $ref: '#/components/responses/AuthInternal'
         '503':
           $ref: '#/components/responses/AuthUnavailable'
+  /api/v1/workspaces/{workspaceID}/sources/{sourceID}/credentials:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+      - $ref: '#/components/parameters/SourceID'
+    get:
+      tags:
+        - credentials
+      operationId: listSourceCredentials
+      summary: 列出该 workspace 与 source 下的凭证元数据
+      description: |
+        owner 管理的凭证列表，返回路径 `workspaceID` 与 `sourceID` 下的**全部**凭证元数据，包括已撤销的，用 `revoked_at` 表达撤销状态。
+
+        这是读请求：只要求有效浏览器会话和 workspace owner，**不要求 `Origin`**；缺失或错误的 `Origin` 不影响结果。列表不创建、不修改任何凭证，不使用缓存，也不返回 `token`、`secret_hash` 或任何摘要派生值——明文只在签发/轮换响应中出现一次，此处不可恢复。
+
+        `sourceID` 不属于路径 `workspaceID` 时返回 `404 NOT_FOUND`，不返回跨空间元数据，因此 `200` 且空数组只表示该 source 存在但还没有凭证。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '该 source 下的凭证元数据，已撤销项也包含在内；按创建顺序排列。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialList'
+              example:
+                credentials:
+                  - credential_id: 018f3c5e-1a2b-7c3d-8e9f-0a1b2c3d4e5f
+                    workspace_id: 018f3c5e-0a1b-7c3d-8e9f-0a1b2c3d4e5f
+                    source_id: 018f3c5e-2b3c-7d4e-9f0a-1b2c3d4e5f60
+                    revoked_at: null
+        '400':
+          description: '`INVALID_ARGUMENT`：`workspaceID` 或 `sourceID` 不是合法 UUID。不读取、不创建也不修改凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: INVALID_ARGUMENT
+                  message: path parameter must be a UUID
+        '401':
+          description: '`UNAUTHENTICATED`：无 Cookie，或会话格式错误、不存在、已过期、已撤销。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：会话有效但不是该 workspace 的 owner（含非成员）。不返回任何元数据。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace owner required
+        '404':
+          description: '`NOT_FOUND`：source 不存在或不属于路径 workspace。不返回跨空间元数据。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: credential resource not found
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/CredentialUnavailable'
+    post:
+      tags:
+        - credentials
+      operationId: issueSourceCredential
+      summary: 为该 source 签发新凭证
+      description: |
+        owner 为路径 `sourceID` 签发一个绑定该 workspace 与 source 的新凭证，`201` 返回凭证 ID、固定归属和**一次性明文令牌** `token`（`tpk_` + 随机串）。数据库只保存完整令牌的 SHA-256 摘要，不保存明文；响应之后无法再取回该明文。
+
+        请求体必须为空：`workspace_id`、`source_id`、`role`、凭证 TTL 等字段都不被接受，出现任何内容即 `400 INVALID_ARGUMENT` 且不创建凭证。归属只取自路径与数据库行，客户端不能指定。
+
+        写操作必须携带与可信 Web origin 完全一致的 `Origin`。准入顺序固定为 **`Origin` → 会话 → owner（含 `workspaceID` 解析）→ 请求体为空 → `sourceID` 解析 → 数据库**：`Origin` 缺失或不等时在会话检查之前就返回 `403`，因此同时缺 Cookie 又缺 `Origin` 的请求得到 `403` 而非 `401`；归属校验全部通过后才创建凭证，任一失败都不创建。签发**不是幂等操作**：响应丢失后重试可能留下多个有效凭证，此时用列表取得多余凭证的 ID 再撤销。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      responses:
+        '201':
+          description: '凭证已创建；`token` 只在此响应中出现一次。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedCredential'
+              example:
+                credential_id: 018f3c5e-1a2b-7c3d-8e9f-0a1b2c3d4e5f
+                workspace_id: 018f3c5e-0a1b-7c3d-8e9f-0a1b2c3d4e5f
+                source_id: 018f3c5e-2b3c-7d4e-9f0a-1b2c3d4e5f60
+                token: tpk_SYNTHETICONLYNOTAREALTOKEN
+        '400':
+          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不创建也不修改凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              examples:
+                body:
+                  value:
+                    error:
+                      code: INVALID_ARGUMENT
+                      message: request body must be empty
+                path:
+                  value:
+                    error:
+                      code: INVALID_ARGUMENT
+                      message: path parameter must be a UUID
+        '401':
+          description: '`UNAUTHENTICATED`：无 Cookie，或会话不可用。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：`Origin` 缺失、为 `null`、多值或不等于可信 origin，或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: request origin is not allowed
+        '404':
+          description: '`NOT_FOUND`：source 不存在或不属于路径 workspace。不创建凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: credential resource not found
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/CredentialUnavailable'
+  /api/v1/workspaces/{workspaceID}/credentials/{credentialID}/rotate:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+      - $ref: '#/components/parameters/CredentialID'
+    post:
+      tags:
+        - credentials
+      operationId: rotateCredential
+      summary: 轮换凭证，返回同 source 的新凭证
+      description: |
+        为 `credentialID` 所在凭证的**固定** workspace 与 source 创建一个新凭证，`201` 返回新凭证 ID、固定归属和一次性明文 `token`。新 source 只从旧凭证行读取，客户端不能借轮换把凭证移到其他 source。
+
+        旧凭证**保持原有撤销状态**：轮换不撤销、不复活旧凭证，因此轮换后旧令牌仍可用，直到 owner 显式调用撤销。已撤销的旧凭证也能作为轮换来源。
+
+        请求体必须为空。写操作必须携带可信 `Origin`，准入顺序与签发相同（`Origin` → 会话 → owner → 请求体 → `credentialID` 解析 → 数据库），任一失败都不创建凭证。与签发一样，轮换不是幂等操作，并发轮换会各自创建独立有效凭证，这是明确行为，不做隐形去重。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      responses:
+        '201':
+          description: '新凭证已创建；旧凭证状态未改变。`token` 只在此响应中出现一次。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedCredential'
+              example:
+                credential_id: 018f3c5e-3c4d-7e5f-8a1b-2c3d4e5f6071
+                workspace_id: 018f3c5e-0a1b-7c3d-8e9f-0a1b2c3d4e5f
+                source_id: 018f3c5e-2b3c-7d4e-9f0a-1b2c3d4e5f60
+                token: tpk_SYNTHETICONLYNOTAREALTOKEN
+        '400':
+          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不创建也不修改凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: INVALID_ARGUMENT
+                  message: request body must be empty
+        '401':
+          description: '`UNAUTHENTICATED`：无 Cookie，或会话不可用。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：`Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace owner required
+        '404':
+          description: '`NOT_FOUND`：凭证不存在或不属于路径 workspace。不创建新凭证，原凭证不变。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: credential resource not found
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/CredentialUnavailable'
+  /api/v1/workspaces/{workspaceID}/credentials/{credentialID}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+      - $ref: '#/components/parameters/CredentialID'
+    post:
+      tags:
+        - credentials
+      operationId: revokeCredential
+      summary: 撤销凭证
+      description: |
+        按 `credential_id` + `workspace_id` 条件更新 `revoked_at = COALESCE(revoked_at, now())`，成功返回 `204` 空响应。
+
+        撤销可安全重试：重复撤销保留首次 `revoked_at` 并返回相同的 `204`。撤销只更新凭证行，不删除 source、事件或防重依据，因此之后为同 source 签发新凭证并重传旧请求仍按原防重规则处理。
+
+        生效边界：撤销提交后**开始**的认证都会失败，但提交前已通过认证的在途请求允许完成，本端点不提供全局即时停用。
+
+        请求体必须为空。写操作必须携带可信 `Origin`，准入顺序与签发相同（`Origin` → 会话 → owner → 请求体 → `credentialID` 解析 → 数据库）。凭证不属于路径 workspace 时返回 `404 NOT_FOUND`，且不泄露其存在性。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      responses:
+        '204':
+          description: '凭证已撤销，或本就处于撤销状态；无响应体。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+        '400':
+          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不创建也不修改凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: INVALID_ARGUMENT
+                  message: request body must be empty
+        '401':
+          description: '`UNAUTHENTICATED`：无 Cookie，或会话不可用。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：`Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace owner required
+        '404':
+          description: '`NOT_FOUND`：凭证不存在或不属于路径 workspace。原凭证状态不变。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: credential resource not found
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/CredentialUnavailable'
 
 components:
   securitySchemes:
@@ -829,7 +1186,7 @@ components:
       description: |
         插件接入凭证。令牌形如 `tpk_` + 随机串，由 T-010 签发；随机部分长度由签发方决定，客户端与本文都不硬编码它。
 
-        认证成功即固定 `workspace_id` 与 `source_id`，身份只从认证取得，请求载荷中不得出现它们。令牌只以**摘要**形式存储，算法为对完整令牌计算 SHA-256、存 32 字节摘要（与 T-010 计划 `docs/plans/2026-10-27-ingestion-credentials.md` 第 63 行的 `secret_hash` 一致；本文只引用该算法，不重新定义令牌格式）。明文只在签发/轮换响应中出现一次；本文不描述签发、轮换、撤销路径。
+        认证成功即固定 `workspace_id` 与 `source_id`，身份只从认证取得，请求载荷中不得出现它们。令牌只以**摘要**形式存储，算法为对完整令牌计算 SHA-256、存 32 字节摘要（与 T-010 计划 `docs/plans/2026-10-27-ingestion-credentials.md` 第 63 行的 `secret_hash` 一致；本文只引用该算法，不重新定义令牌格式）。明文只在签发/轮换响应中出现一次；签发、轮换、撤销路径见 `credentials` 标签下的四个端点，插件令牌不能用于它们。
 
         请求只接受 `Authorization: Bearer <token>`；不回退 Cookie；没有该头、格式错误、已撤销统一返回 `401 UNAUTHENTICATED`，不泄露具体原因。
 
@@ -844,7 +1201,7 @@ components:
 
         签发和实际续期时写 `Expires=<数据库返回的 expires_at>`，`Max-Age` 固定为 2592000 秒（30 天）——因为每个签发或续期后的 `expires_at` 都由数据库取 `now() + interval '30 days'`，两者表达同一期限。会话为 30 天精确滑动过期，无绝对上限；过期行暂不清理，但不会通过认证。
 
-        Cookie 只用于浏览器端点。采集端点和任何后续 owner 管理路由都**不得**因此把插件请求改成浏览器身份；owner 判断由 T-019 提供，本文不定义。
+        Cookie 只用于浏览器端点。采集端点和 owner 凭证管理路由都**不得**因此把插件请求改成浏览器身份；凭证管理的 owner 判断要求该用户是路径 workspace 的成员且角色为 `owner`，非成员与 `member` 一律 `403 PERMISSION_DENIED`。
 
   parameters:
     TrustedOrigin:
@@ -856,10 +1213,34 @@ components:
       schema:
         type: string
         pattern: '^https?://[^/?#@]+$'
+    WorkspaceID:
+      name: workspaceID
+      in: path
+      required: true
+      description: 'workspace 的 UUID。owner 判断与归属校验都使用它；客户端不能借请求体改用别的 workspace。'
+      schema:
+        type: string
+        format: uuid
+    SourceID:
+      name: sourceID
+      in: path
+      required: true
+      description: '采集 source 的 UUID。必须属于路径 `workspaceID`，否则返回 `404 NOT_FOUND`。'
+      schema:
+        type: string
+        format: uuid
+    CredentialID:
+      name: credentialID
+      in: path
+      required: true
+      description: '凭证的 UUID。必须属于路径 `workspaceID`，否则返回 `404 NOT_FOUND`，不泄露其是否存在。'
+      schema:
+        type: string
+        format: uuid
 
   headers:
     NoStore:
-      description: '固定为 `no-store`。四个认证端点的所有成功与失败响应都带此头，缓存响应不能替代新的会话认证、撤销检查或续期。'
+      description: '固定为 `no-store`。认证端点与凭证管理端点的所有成功与失败响应都带此头，缓存响应不能替代新的会话认证、撤销检查或续期。'
       schema:
         type: string
         const: no-store
@@ -950,6 +1331,19 @@ components:
             error:
               code: INTERNAL
               message: internal error
+    CredentialUnavailable:
+      description: '`UNAVAILABLE`：会话存储等依赖不可用，请求在读取或创建凭证之前就停止。不得据此判定请求未认证或凭证已撤销、已创建；按原请求重试。写操作的 `Origin` 先于会话校验，因此 `Origin` 不合法时仍得到 `403` 而不是本码。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CredentialError'
+          example:
+            error:
+              code: UNAVAILABLE
+              message: service is unavailable
     AuthUnavailable:
       description: '`UNAVAILABLE`：数据库等依赖不可用。不得据此宣称会话已撤销或账号已创建；按原请求重试。'
       headers:
@@ -1580,6 +1974,124 @@ components:
         | `RATE_LIMITED` | 429 |
         | `INTERNAL` | 500 |
         | `UNAVAILABLE` | 503 |
+
+    CredentialList:
+      type: object
+      additionalProperties: false
+      required:
+        - credentials
+      properties:
+        credentials:
+          type: array
+          description: |
+            路径 `workspaceID` 与 `sourceID` 下的全部凭证元数据，包括已撤销的，按创建顺序排列。该 source 存在但还没有凭证时是空数组；source 不属于该 workspace 时整个响应是 `404 NOT_FOUND`，不会返回空数组。
+
+            这里只列元数据：明文令牌只在签发/轮换响应中出现一次，列表不能恢复它，也不返回 `secret_hash` 或任何摘要派生值。
+          items:
+            $ref: '#/components/schemas/Credential'
+      description: owner 管理的凭证列表响应。字段直接放在顶层，不使用统一响应包装。
+
+    Credential:
+      type: object
+      additionalProperties: false
+      required:
+        - credential_id
+        - workspace_id
+        - source_id
+        - revoked_at
+      properties:
+        credential_id:
+          type: string
+          format: uuid
+          description: '凭证的 UUID 身份。签发/轮换响应丢失后，owner 用它定位多余凭证并调用撤销。'
+        workspace_id:
+          type: string
+          format: uuid
+          description: '凭证创建时固定的 workspace。轮换不会改变它。'
+        source_id:
+          type: string
+          format: uuid
+          description: '凭证创建时固定的 source。轮换不会改变它，撤销也不会删除 source。'
+        revoked_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: '撤销时间（RFC 3339，UTC）。`null` 表示凭证仍有效。重复撤销保留首次时间；轮换既不撤销也不复活旧凭证，因此这里如实反映旧凭证的原有状态。'
+      description: 一条凭证的元数据。不含 `token`、`secret_hash` 或摘要派生值。
+
+    IssuedCredential:
+      type: object
+      additionalProperties: false
+      required:
+        - credential_id
+        - workspace_id
+        - source_id
+        - token
+      properties:
+        credential_id:
+          type: string
+          format: uuid
+          description: 新创建凭证的 UUID 身份。
+        workspace_id:
+          type: string
+          format: uuid
+          description: 固定 workspace，取自路径或旧凭证行，不取自请求体。
+        source_id:
+          type: string
+          format: uuid
+          description: 固定 source，取自路径或旧凭证行。轮换时客户端不能指定新 source。
+        token:
+          type: string
+          description: |
+            一次性明文令牌，形如 `tpk_` + 随机串（随机部分长度由签发方决定，客户端不得硬编码）。插件以 `Authorization: Bearer <token>` 使用。
+
+            只在本响应中出现一次；数据库只保存完整令牌的 SHA-256 摘要，无法再次取回明文。响应丢失时用列表取得 credential ID 并撤销多余凭证，或再次签发/轮换；不要为了重放响应而缓存明文。
+      description: |
+        签发与轮换的成功响应。新凭证创建时总是有效，因此不返回 `revoked_at`。
+
+        签发与轮换都不是幂等操作：超时或 5xx 后重试可能创建多个有效凭证，客户端在收到成功响应前不应自动重放。
+
+    CredentialError:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_ARGUMENT
+                - UNAUTHENTICATED
+                - PERMISSION_DENIED
+                - NOT_FOUND
+                - INTERNAL
+                - UNAVAILABLE
+              description: '程序分支依据。新增值属向后兼容变更，客户端必须忽略未知值而不是崩溃。'
+            message:
+              type: string
+              description: 面向人的短说明。不含令牌、`secret_hash`、会话令牌、数据库 URL 或 SQL。
+          description: 单一错误对象。
+      description: |
+        owner 管理凭证端点的错误体，形状与 `AuthError` 相同，但按这些端点实际返回的码范围收敛：
+
+        | code | 状态码 | 情况 |
+        |---|---|---|
+        | `INVALID_ARGUMENT` | 400 | 请求体非空，或路径参数不是合法 UUID |
+        | `UNAUTHENTICATED` | 401 | 无 Cookie，或会话不可用 |
+        | `PERMISSION_DENIED` | 403 | 写操作 `Origin` 不合法，或会话用户不是该 workspace 的 owner |
+        | `NOT_FOUND` | 404 | source/credential 不存在或不属于路径 workspace |
+        | `INTERNAL` | 500 | 数据库等服务端故障；不假装成功 |
+        | `UNAVAILABLE` | 503 | 会话存储等依赖不可用；请求在读取或创建凭证前停止 |
+
+        所有响应都带 `Cache-Control: no-store`。插件令牌 `tpk_` 不能用于这些端点：管理 API 只认浏览器会话 Cookie。
 
   examples:
     MixedBatchRequest:
