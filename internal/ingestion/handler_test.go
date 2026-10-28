@@ -1385,7 +1385,9 @@ func TestCommitDeadlineIsDeadlineNotInternal(t *testing.T) {
 		environment := newTestEnvironment(t)
 		environment.store.commitWaitsForContext = true
 		service := New(environment.store, environment.auth, nil)
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		// The item deadline is the request end minus the fixed reserve, so the
+		// budget must exceed the reserve for the commit to be reached at all.
+		ctx, cancel := context.WithTimeout(context.Background(), responseReserve+20*time.Millisecond)
 		defer cancel()
 		items := []item{{event: mustDecodeEvent(t, validEventJSON("req-commit-deadline", fixedNow))}}
 		results := service.process(ctx, credentials.Credential{WorkspaceID: syntheticWorkspace, SourceID: syntheticSource}, items)
@@ -1478,11 +1480,13 @@ func TestRollbackUsesItsOwnBoundedContext(t *testing.T) {
 // TestSlowRollbackStaysInsideTheRequestBudget drives the real handler with a fake
 // rollback that only ends when its own context does. The budget is injected through
 // the request context, so the same arithmetic as the frozen 8 seconds is exercised
-// without waiting 8 real seconds: item work must stop one reserve early, the
-// rollback must be capped at the request end rather than at its own 2 second
-// budget, and every position must still come back as a result.
+// without waiting 8 real seconds: per-item work must stop one reserve before the
+// request end, the rollback must be capped at the request end rather than at its own
+// 2 second budget, and every position must still come back as a result. The injected
+// budget must exceed the reserve, because the item deadline is now a fixed offset
+// from the request end and a shorter budget would give the items no time at all.
 func TestSlowRollbackStaysInsideTheRequestBudget(t *testing.T) {
-	const budget = 300 * time.Millisecond
+	budget := responseReserve + 500*time.Millisecond
 	environment := newTestEnvironment(t)
 	environment.store.failure["insert"] = errors.New("synthetic: driver detail")
 	environment.store.rollbackWaitsForContext = true
@@ -1541,30 +1545,68 @@ func TestSlowRollbackStaysInsideTheRequestBudget(t *testing.T) {
 	}
 }
 
-// TestResponseReserveKeepsRollbackInsideTheFrozenBudget pins the arithmetic of the
-// production budget: per-item work ends one second early, and a rollback that
-// starts at that point still ends no later than the documented 8 seconds.
-func TestResponseReserveKeepsRollbackInsideTheFrozenBudget(t *testing.T) {
+// TestResponseReserveStopsItemsOneSecondBeforeTheRequestEnd pins the arithmetic of
+// the production budget: the per-item deadline is always the request end minus
+// responseReserve, never a fraction of whatever is left when process is entered, so a
+// late request gets less item time instead of a bigger reserve.
+func TestResponseReserveStopsItemsOneSecondBeforeTheRequestEnd(t *testing.T) {
+	t.Run("entering 6.5 seconds late still leaves the fixed reserve", func(t *testing.T) {
+		// A deadline 1.5 seconds away stands in for the 6.5 seconds already spent,
+		// so no real waiting is involved.
+		requestEnd := time.Now().Add(processingBudget - 6500*time.Millisecond)
+		requestCtx, cancel := context.WithDeadline(context.Background(), requestEnd)
+		defer cancel()
+
+		itemCtx, cancelItems, wantEnd := withResponseReserve(requestCtx)
+		defer cancelItems()
+		if !wantEnd.Equal(requestEnd) {
+			t.Fatalf("request end=%s want %s", wantEnd, requestEnd)
+		}
+		itemEnd, ok := itemCtx.Deadline()
+		if !ok {
+			t.Fatal("the item budget has no deadline")
+		}
+		if want := requestEnd.Add(-responseReserve); !itemEnd.Equal(want) {
+			t.Fatalf("item deadline=%s want %s (request end minus the %s reserve)", itemEnd, want, responseReserve)
+		}
+		if err := itemCtx.Err(); err != nil {
+			t.Fatalf("the item budget is already over: %v", err)
+		}
+	})
+
+	t.Run("entering 7.5 seconds late stops every item unstarted", func(t *testing.T) {
+		// The item deadline (request end minus the reserve) is already past, so no
+		// position may open a transaction and every one is retryable.
+		environment := newTestEnvironment(t)
+		requestEnd := time.Now().Add(processingBudget - 7500*time.Millisecond)
+		requestCtx, cancel := context.WithDeadline(context.Background(), requestEnd)
+		defer cancel()
+		items := []item{
+			{event: mustDecodeEvent(t, validEventJSON("req-reserve-1", fixedNow))},
+			{event: mustDecodeEvent(t, validEventJSON("req-reserve-2", fixedNow))},
+		}
+		results := New(environment.store, environment.auth, nil).process(requestCtx, credentials.Credential{
+			WorkspaceID: syntheticWorkspace, SourceID: syntheticSource,
+		}, items)
+		if len(results) != len(items) {
+			t.Fatalf("results=%d want=%d", len(results), len(items))
+		}
+		for i, result := range results {
+			if result.status != statusRetryable || result.code != codeDeadlineExceeded {
+				t.Fatalf("result %d=%+v want retryable/DEADLINE_EXCEEDED", i, result)
+			}
+		}
+		if begins := environment.store.called("begin"); begins != 0 {
+			t.Fatalf("item transactions=%d want=0 when the item budget is already over", begins)
+		}
+	})
+
+	// The rollback cap is independent of the reserve: a rollback that starts at the
+	// item deadline must be capped by the request end, not extended by its own
+	// budget.
 	entry := time.Now()
 	requestEnd := entry.Add(processingBudget)
-	requestCtx, cancel := context.WithDeadline(context.Background(), requestEnd)
-	defer cancel()
-
-	itemCtx, cancelItems, wantEnd := withResponseReserve(requestCtx)
-	defer cancelItems()
-	if !wantEnd.Equal(requestEnd) {
-		t.Fatalf("request end=%s want %s", wantEnd, requestEnd)
-	}
-	itemEnd, ok := itemCtx.Deadline()
-	if !ok {
-		t.Fatal("the item budget has no deadline")
-	}
-	if want := requestEnd.Add(-responseReserve); !itemEnd.Equal(want) {
-		t.Fatalf("item deadline=%s want %s (request end minus the %s reserve)", itemEnd, want, responseReserve)
-	}
-
-	// A rollback that starts exactly at the item deadline must be capped by the
-	// request end, not extended by its own 2 second budget.
+	itemEnd := requestEnd.Add(-responseReserve)
 	if got := rollbackDeadline(requestEnd, itemEnd); !got.Equal(requestEnd) {
 		t.Fatalf("slow rollback deadline=%s want the request end %s", got, requestEnd)
 	}

@@ -41,15 +41,12 @@ const (
 	maxBodyBytes = 1 << 20
 	// processingBudget bounds one request from the moment the handler starts.
 	processingBudget = 8 * time.Second
-	// responseReserve is held back from processingBudget for the rollback of a slow
+	// responseReserve is held back from the request end for the rollback of a slow
 	// item and for writing the response. Per-item work therefore stops at
-	// 8s-responseReserve = 7s, which leaves a full second to roll back and answer
-	// inside the documented 8 seconds and well below the 10s server WriteTimeout.
+	// requestEnd-responseReserve (7s for the frozen 8 second budget), which leaves a
+	// full second to roll back and answer inside the documented 8 seconds and well
+	// below the 10s server WriteTimeout.
 	responseReserve = time.Second
-	// reserveDivisor caps the reserve at half of the remaining budget, so a budget
-	// shorter than 2*responseReserve still keeps half its time for the items. With
-	// the frozen 8 second budget the cap that applies is responseReserve itself.
-	reserveDivisor = 2
 	// rollbackBudget bounds the rollback that releases an item connection. It is
 	// deliberately not the request context: a canceled request must still get the
 	// connection back, and the rollback must not hang on a dead network.
@@ -268,29 +265,18 @@ func (s *Service) process(ctx context.Context, credential credentials.Credential
 }
 
 // withResponseReserve narrows ctx so per-item work ends responseReserve before the
-// request budget runs out, and reports the request end the rollback must respect. A
-// context without a deadline has nothing to reserve from and is returned unchanged.
+// request budget runs out, and reports the request end the rollback must respect. The
+// per-item deadline is a fixed offset from the request end, never a fraction of the
+// budget remaining when process was entered, so a request that is already late gets
+// less item time instead of a larger reserve. A context without a deadline has
+// nothing to reserve from and is returned unchanged.
 func withResponseReserve(ctx context.Context) (context.Context, context.CancelFunc, time.Time) {
 	requestEnd, ok := ctx.Deadline()
 	if !ok {
 		return ctx, func() {}, time.Time{}
 	}
-	itemCtx, cancel := context.WithDeadline(ctx, requestEnd.Add(-reserveFor(time.Until(requestEnd))))
+	itemCtx, cancel := context.WithDeadline(ctx, requestEnd.Add(-responseReserve))
 	return itemCtx, cancel, requestEnd
-}
-
-// reserveFor is the part of the remaining budget held back for the rollback and the
-// response write: responseReserve for the frozen 8 second budget, and at most half of
-// a shorter one, so even a shortened budget spends most of its time on the items
-// themselves.
-func reserveFor(remaining time.Duration) time.Duration {
-	if remaining <= 0 {
-		return 0
-	}
-	if half := remaining / reserveDivisor; half < responseReserve {
-		return half
-	}
-	return responseReserve
 }
 
 // rollbackDeadline bounds one rollback: rollbackBudget from now, but never past the
