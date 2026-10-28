@@ -1,0 +1,14 @@
+{
+  "name": "@tokenpivot/dsh-usage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TokenPivot usage collector for DeepSeek Harness (host plugin)",
+  "type": "module",
+  "main": "./index.js",
+  "exports": { ".": "./index.js" },
+  "files": ["index.js", "lib/*.js", "cordis.patch.yml", "README.md"],
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test test/" },
+  "dependencies": { "@deepseek-ai/schemastery": "3.18.5-alpha.2" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

@@ -1,0 +1,9 @@
+- insert:
+    - id: tokenpivot-usage
+      name: '@tokenpivot/dsh-usage'
+      config:
+        serverUrl: ''
+        token: ''
+        projects: []
+        stateDir: '~/.tokenpivot/dsh'
+        maxQueueItems: 10000
