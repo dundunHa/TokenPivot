@@ -70,16 +70,18 @@ ID 用 UUID v7，由数据库默认值 `uuidv7()` 生成，写入后用 `RETURNI
 
 ## 5. usage_minute_stats：可加统计与质量覆盖
 
-逻辑唯一键：`(workspace_id,bucket_start,source_id,project_group,provider,model)`。
+物理唯一键：`(workspace_id,bucket_start,source_id,project_id,provider,model)`，约束名 `usage_minute_stats_key`，已由迁移 00004 用 `UNIQUE NULLS NOT DISTINCT` 实现：未归属事件存 `project_id` 为 NULL，这些行参与同一个唯一仲裁，不会分裂成多个未归属桶。逻辑上的 project_group 就映射到这一列，不另设哨兵 UUID 或生成列。
 
-- bucket_start 为 UTC 分钟起点；project_group 明确定义为实际项目或“未归属”组，不能因 SQL NULL 唯一性造成多个未归属桶。物理实现可用 NULLS NOT DISTINCT，版本与语法实施前核验。
-- 包含 source 维度，防止来源能力与完整性统计丢失；凭证 ID 不进入聚合键。
-- 对 input/output/total/cache/reasoning 分别保存：已知值之和、known_count、estimated_count、missing_count；估算值计入可展示和时必须同时携带估算标记。
-- event_count 只用于已接受事件数。首版仅请求级最终事件时可作为请求数；不允许汇总来源伪装成请求，因此未来支持汇总事件需显式新增请求数语义。
-- 全部缺失返回不可用，部分缺失返回已知部分与覆盖信息，而非伪装完整总量。真实零具有已知计数。
+- bucket_start 为 `occurred_at` 的 UTC 分钟起点（`.UTC().Truncate(time.Minute)`），不读会话时区，也不用 received_at。
+- 包含 source 维度，防止来源能力与完整性统计丢失；凭证 ID 不进入聚合键，也不在输入中。
+- 对 input/output/total/cache_read/cache_write/reasoning 六类 token 分别保存：可为 known/estimated 值之和的 `*_sum`、`*_known_count`、`*_estimated_count`、`*_missing_count`；估算值计入可展示和时同时携带估算标记。所有 sum/count 均 NOT NULL 且无默认值，迁移逐列展开六组指标。
+- event_count 只用于已接受事件数，每次写入固定加 1。首版仅请求级最终事件时可作为请求数；汇总级事件被写入端拒绝，未来支持汇总事件需显式新增请求数语义。
+- 不变量：每个桶每个指标的 known_count + estimated_count + missing_count = event_count；sum 是所有 known/estimated 输入值之和，missing 不贡献值。全部缺失返回不可用，部分缺失返回已知部分与覆盖信息，而非伪装完整总量。真实零具有已知计数。
 - 比例、缓存率在查询时按正确分母计算，不存百分比再平均。不从分钟平均值计算 p95，不承诺原型里的费用/预算/延迟分位数。
 
-候选索引以 workspace + bucket_start 时间范围为主；唯一键支持增量更新。source_id 与项目引用均有访问索引，避免与已覆盖前缀重复。高基数情况下分钟表可能接近事件数，需要以真实数据压测存储和查询。
+已建索引只有唯一约束自带的那一条，其 `(workspace_id,bucket_start,...)` 前缀同时支持按 workspace 的时间范围访问，因此不再单建重复的 workspace+bucket 索引。按 source 或按项目筛选的组合索引**暂缓、尚未建成**，由查询任务（T-024/T-027）按真实访问路径和 `EXPLAIN` 决定是否新增。高基数情况下分钟表可能接近事件数，需要以真实数据压测存储和查询。
+
+权限与写入方式：服务角色 `tokenpivot_app` 在本表上有 SELECT、INSERT、UPDATE（`ON CONFLICT DO UPDATE` 自加需要），不授予 DELETE、TRUNCATE、REFERENCES、TRIGGER。增量只由调用方事务内一条参数化 UPSERT 完成：冲突目标为上述六列推断，更新一律 `现有值 + EXCLUDED`，没有 WHERE、不先 SELECT 再写回、不在写入端重试；明细插入与分钟增量共享同一个事务，失败由调用方整体回滚。
 
 ## 6. 归一化样例（验收输入，不代表已核实插件能力）
 

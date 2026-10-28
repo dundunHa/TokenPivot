@@ -199,24 +199,24 @@ func TestSingleConnectionMatrix(t *testing.T) {
 				if version != want {
 					t.Fatalf("version=%d want=%d", version, want)
 				}
-				// usage_events exists only while its migration is applied, and the
-				// down-one of it must leave the earlier foundation tables in place.
-				var usageEvents, foundation bool
-				if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.usage_events') IS NOT NULL, to_regclass(current_schema()||'.workspaces') IS NOT NULL").Scan(&usageEvents, &foundation); err != nil {
+				// The minute stats table exists only while its migration is applied,
+				// and the down-one of it must leave the earlier tables in place.
+				var usageMinuteStats, usageEvents, foundation bool
+				if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.usage_minute_stats') IS NOT NULL, to_regclass(current_schema()||'.usage_events') IS NOT NULL, to_regclass(current_schema()||'.workspaces') IS NOT NULL").Scan(&usageMinuteStats, &usageEvents, &foundation); err != nil {
 					t.Fatal(database.SafeError("table set", err))
 				}
 				switch command {
 				case "status":
-					if usageEvents || foundation {
+					if usageMinuteStats || usageEvents || foundation {
 						t.Fatal("business tables exist before up")
 					}
 				case "down-one":
-					if usageEvents || !foundation {
-						t.Fatal("down-one did not only remove usage_events")
+					if usageMinuteStats || !usageEvents || !foundation {
+						t.Fatal("down-one did not only remove usage_minute_stats")
 					}
 				default:
-					if !usageEvents || !foundation {
-						t.Fatal("up did not create usage_events and the foundation tables")
+					if !usageMinuteStats || !usageEvents || !foundation {
+						t.Fatal("up did not create usage_minute_stats, usage_events and the foundation tables")
 					}
 				}
 				t.Logf("command=%s exit=0 duration=%s version=%d", command, time.Since(start), version)
