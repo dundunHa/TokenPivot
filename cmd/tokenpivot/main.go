@@ -43,7 +43,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	authStore := auth.NewPostgres(pool)
-	authService := auth.New(authStore, authStore, auth.NewLimiter(nil))
+	authService := auth.New(authStore, authStore, auth.NewLimiter(nil), cfg.RegistrationOpen)
 	credentialService := credentials.New(credentials.NewPostgres(pool))
 	workspaceService := workspaces.New(workspaces.NewPostgres(pool))
 	srv := &http.Server{

@@ -179,20 +179,27 @@ func applyMigrations(t *testing.T, migrationURL string) {
 	}
 }
 
-// newPostgresAuth returns a service backed by a real pool pinned to the random
-// schema.
-func newPostgresAuth(t *testing.T) (*Service, *Postgres, *pgxpool.Pool) {
-	t.Helper()
-	service, store, pool, _ := newPostgresAuthWithURL(t)
-	return service, store, pool
+// authSchema is one isolated test schema with the service wired to it. It keeps
+// both connection URLs because the service-role URL is needed for independent
+// observation connections and the migration-owner URL for privilege changes.
+type authSchema struct {
+	service  *Service
+	store    *Postgres
+	pool     *pgxpool.Pool
+	appURL   string
+	appRole  string
+	ownerURL string
 }
 
-// newPostgresAuthWithURL additionally returns the service-role connection URL, so
-// a race test can open independent connections and hold or observe a row lock
-// without depending on how many pooled connections happen to be free.
-func newPostgresAuthWithURL(t *testing.T) (*Service, *Postgres, *pgxpool.Pool, string) {
+// newAuthSchema creates a fresh random schema, applies every released migration
+// to it and returns a service pool pinned to it.
+func newAuthSchema(t *testing.T, registrationOpen bool) authSchema {
 	t.Helper()
-	_, appURL := integrationSchema(t)
+	ownerURL, appURL := integrationSchema(t)
+	parsed, err := url.Parse(appURL)
+	if err != nil || parsed.User == nil {
+		t.Fatal("invalid test service URL")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	pool, err := database.Open(ctx, appURL)
@@ -201,7 +208,31 @@ func newPostgresAuthWithURL(t *testing.T) (*Service, *Postgres, *pgxpool.Pool, s
 	}
 	t.Cleanup(pool.Close)
 	store := NewPostgres(pool)
-	return New(store, store, NewLimiter(time.Now)), store, pool, appURL
+	return authSchema{
+		service:  New(store, store, NewLimiter(time.Now), registrationOpen),
+		store:    store,
+		pool:     pool,
+		appURL:   appURL,
+		appRole:  parsed.User.Username(),
+		ownerURL: ownerURL,
+	}
+}
+
+// newPostgresAuth returns a service whose registration switch is open, which is
+// the mode the pre-existing session and login tests use.
+func newPostgresAuth(t *testing.T) (*Service, *Postgres, *pgxpool.Pool) {
+	t.Helper()
+	schema := newAuthSchema(t, true)
+	return schema.service, schema.store, schema.pool
+}
+
+// newPostgresAuthWithURL additionally returns the service-role connection URL, so
+// a race test can open independent connections and hold or observe a lock
+// without depending on how many pooled connections happen to be free.
+func newPostgresAuthWithURL(t *testing.T) (*Service, *Postgres, *pgxpool.Pool, string) {
+	t.Helper()
+	schema := newAuthSchema(t, true)
+	return schema.service, schema.store, schema.pool, schema.appURL
 }
 
 // openAppConn opens one independent service-role connection pinned to the test
@@ -243,6 +274,35 @@ func waitForLockedStatement(t *testing.T, ctx context.Context, observer *pgx.Con
 		select {
 		case <-ctx.Done():
 			t.Fatal(database.SafeError("wait for lock", ctx.Err()))
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// waitForAdvisoryLockWait waits until at least want backends other than observer
+// are blocked acquiring a PostgreSQL advisory lock. Registration waiting on
+// pg_advisory_xact_lock reports wait_event_type 'Lock' with an advisory wait
+// event, so the competition itself is observed from server state and no sleep
+// decides the order.
+func waitForAdvisoryLockWait(t *testing.T, ctx context.Context, observer *pgx.Conn, want int) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var waiting int
+		err := observer.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+WHERE wait_event_type = 'Lock' AND wait_event LIKE 'advisory%' AND pid <> pg_backend_pid()`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(database.SafeError("read advisory lock wait", err))
+		}
+		if waiting >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d backends waited on the registration advisory lock", waiting, want)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(database.SafeError("wait for advisory lock", ctx.Err()))
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
@@ -346,8 +406,15 @@ func TestConcurrentRegistrationCreatesOneAccount(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			digest := sha256.Sum256([]byte(fmt.Sprintf("tps_concurrent_registration_%d", i)))
-			err := store.InTx(ctx, func(ctx context.Context, tx Store) error {
-				_, err := tx.CreateUserWithSession(ctx, "postgres@example.com", encoding, digest[:])
+			err := store.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
+				user, err := tx.CreateUser(ctx, "postgres@example.com", encoding)
+				if err != nil {
+					return err
+				}
+				if err := tx.CreatePersonal(ctx, user.ID); err != nil {
+					return err
+				}
+				_, err = tx.CreateSession(ctx, user.ID, digest[:])
 				return err
 			})
 			mu.Lock()
@@ -397,19 +464,30 @@ func TestRegisterTransactionRollsBackUser(t *testing.T) {
 	}
 	// The store-level call is what registration runs inside its transaction, so a
 	// failure here must not leave the user row behind.
-	err = store.InTx(ctx, func(ctx context.Context, tx Store) error {
-		_, err := tx.CreateUserWithSession(ctx, "rolledback@example.com", "synthetic-encoding", colliding[:])
+	err = store.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
+		user, err := tx.CreateUser(ctx, "rolledback@example.com", "synthetic-encoding")
+		if err != nil {
+			return err
+		}
+		if err := tx.CreatePersonal(ctx, user.ID); err != nil {
+			return err
+		}
+		_, err = tx.CreateSession(ctx, user.ID, colliding[:])
 		return err
 	})
 	if err == nil {
 		t.Fatal("colliding session digest was accepted")
 	}
-	var users int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM users WHERE email='rolledback@example.com'").Scan(&users); err != nil {
-		t.Fatal(database.SafeError("count user", err))
+	var users, workspaces, memberships int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM users WHERE email='rolledback@example.com'),
+       (SELECT count(*) FROM workspaces), (SELECT count(*) FROM workspace_memberships)`).Scan(&users, &workspaces, &memberships); err != nil {
+		t.Fatal(database.SafeError("count rollback", err))
 	}
 	if users != 0 {
 		t.Fatal("failed session insert left the account committed")
+	}
+	if workspaces != 1 || memberships != 1 {
+		t.Fatalf("workspaces=%d memberships=%d, want only the first account's set", workspaces, memberships)
 	}
 	// A successful registration still commits both rows together.
 	if _, err := service.Register(ctx, "second@example.com", "synthetic-password", "127.0.0.2"); err != nil {
@@ -612,7 +690,7 @@ func TestLogoutRaceAfterCommitRejectsRenewal(t *testing.T) {
 	// The renewal is driven on the pool, so it waits on that lock; the wait is
 	// confirmed from pg_stat_activity before the logout commits.
 	renewDone := make(chan error, 1)
-	err = store.InTx(ctx, func(ctx context.Context, tx Store) error {
+	err = store.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
 		if err := tx.RevokeSession(ctx, digest); err != nil {
 			return err
 		}
@@ -667,7 +745,7 @@ func TestLogoutRaceAfterCommittedRenewalAllowsInflightRequest(t *testing.T) {
 	// and holds the row lock until it commits. A logout arriving now waits.
 	logoutDone := make(chan error, 1)
 	var renewed IssuedSession
-	err = store.InTx(ctx, func(ctx context.Context, tx Store) error {
+	err = store.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
 		issued, found, err := tx.AuthenticateSession(ctx, digest)
 		if err != nil {
 			return err
@@ -718,5 +796,338 @@ func TestRegisterSessionHasNoPlaintextToken(t *testing.T) {
 	}
 	if leaked {
 		t.Fatal("a session row contains the plaintext token")
+	}
+}
+
+// registrationCounts reads the four tables registration writes, so a test can
+// assert a whole commit or a whole rollback instead of one column.
+func registrationCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (users, workspaces, memberships, sessions int) {
+	t.Helper()
+	err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM users),
+       (SELECT count(*) FROM workspaces),
+       (SELECT count(*) FROM workspace_memberships),
+       (SELECT count(*) FROM sessions)`).Scan(&users, &workspaces, &memberships, &sessions)
+	if err != nil {
+		t.Fatal(database.SafeError("count registration rows", err))
+	}
+	return users, workspaces, memberships, sessions
+}
+
+// assertCompleteAccount proves one registered email has exactly the four rows a
+// successful registration commits: one account, one personal workspace named
+// Personal, one owner membership in it and one session.
+func assertCompleteAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, email string) {
+	t.Helper()
+	var users, owned, sessions int
+	err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM users u WHERE u.email = $1),
+       (SELECT count(*) FROM workspaces w
+          JOIN workspace_memberships m ON m.workspace_id = w.id
+          JOIN users u ON u.id = m.user_id
+         WHERE u.email = $1 AND m.role = 'owner' AND w.name = 'Personal'),
+       (SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = $1)`, email).Scan(&users, &owned, &sessions)
+	if err != nil {
+		t.Fatal(database.SafeError("load account rows", err))
+	}
+	if users != 1 || owned != 1 || sessions != 1 {
+		t.Fatalf("%s users=%d personal owner=%d sessions=%d, want 1/1/1", email, users, owned, sessions)
+	}
+}
+
+// serviceGrantee is the fixed role every migration grants business tables to. The
+// test service role inherits it, so the effective privilege of the service role
+// comes from this grantee: revoking INSERT for the role that holds the grant is
+// the only way to remove it, and has_table_privilege then reports the effective
+// state of the service role.
+const serviceGrantee = "tokenpivot_app"
+
+// setInsertPrivilege grants or revokes INSERT on one table at the grantee that
+// migrations grant to, executing the change through the migration-owner
+// connection. It always checks the app role's effective privilege afterwards,
+// which includes privileges inherited through tokenpivot_app, so a later failure
+// can be attributed to this table rather than guessed from empty counts.
+func setInsertPrivilege(t *testing.T, ctx context.Context, ownerURL, appRole, table string, grant bool) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, ownerURL)
+	if err != nil {
+		t.Fatal(database.SafeError("owner connect", err))
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Error(database.SafeError("owner close", err))
+		}
+	})
+	tableID := pgx.Identifier{table}.Sanitize()
+	roleID := pgx.Identifier{serviceGrantee}.Sanitize()
+	statement := "REVOKE INSERT ON " + tableID + " FROM " + roleID
+	if grant {
+		statement = "GRANT INSERT ON " + tableID + " TO " + roleID
+	}
+	if _, err := conn.Exec(ctx, statement); err != nil {
+		t.Fatal(database.SafeError("change insert privilege", err))
+	}
+	var effective bool
+	if err := conn.QueryRow(ctx, `SELECT has_table_privilege($1, $2, 'INSERT')`, appRole, table).Scan(&effective); err != nil {
+		t.Fatal(database.SafeError("read insert privilege", err))
+	}
+	if effective != grant {
+		t.Fatalf("effective INSERT on %s for %s = %t, want %t", table, appRole, effective, grant)
+	}
+}
+
+// TestRegisterOpenCreatesPersonalWorkspaceForEachAccount covers the open
+// deployment: consecutive registrations of different emails all succeed, each with
+// its own personal workspace, owner membership and first session, while a repeat
+// of an owned email is a conflict.
+func TestRegisterOpenCreatesPersonalWorkspaceForEachAccount(t *testing.T) {
+	schema := newAuthSchema(t, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for i, email := range []string{"first@example.com", "second@example.com"} {
+		if _, err := schema.service.Register(ctx, email, "synthetic-password", fmt.Sprintf("127.0.0.%d", i+1)); err != nil {
+			t.Fatalf("%s registration failed: %v", email, err)
+		}
+	}
+	for _, email := range []string{"first@example.com", "second@example.com"} {
+		assertCompleteAccount(t, ctx, schema.pool, email)
+	}
+	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
+	if users != 2 || workspaces != 2 || memberships != 2 || sessions != 2 {
+		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 2 each", users, workspaces, memberships, sessions)
+	}
+	if _, err := schema.service.Register(ctx, "FIRST@example.com", "synthetic-password", "127.0.0.9"); !errors.Is(err, ErrEmailUnavailable) {
+		t.Fatalf("repeat registration error = %v, want ErrEmailUnavailable", err)
+	}
+	if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 2 || workspaces != 2 || memberships != 2 || sessions != 2 {
+		t.Fatalf("a rejected repeat changed the rows: %d/%d/%d/%d", users, workspaces, memberships, sessions)
+	}
+}
+
+// TestRegisterClosedFirstUserThenRejected covers the closed deployment against a
+// real database: the first account of the empty database is created completely,
+// and every later registration of any email is refused without adding rows.
+func TestRegisterClosedFirstUserThenRejected(t *testing.T) {
+	schema := newAuthSchema(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := schema.service.Register(ctx, "first@example.com", "synthetic-password", "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	assertCompleteAccount(t, ctx, schema.pool, "first@example.com")
+	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
+	if users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
+		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
+	}
+	for _, email := range []string{"first@example.com", "second@example.com"} {
+		_, err := schema.service.Register(ctx, email, "synthetic-password", "127.0.0.2")
+		if !errors.Is(err, ErrRegistrationClosed) {
+			t.Fatalf("%s error = %v, want ErrRegistrationClosed", email, err)
+		}
+		if errors.Is(err, ErrEmailUnavailable) {
+			t.Fatalf("%s leaked the email unique conflict", email)
+		}
+	}
+	if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
+		t.Fatalf("a refused registration added rows: %d/%d/%d/%d", users, workspaces, memberships, sessions)
+	}
+}
+
+// TestRegisterClosedConcurrentFirstRegistration proves the advisory lock decides
+// the empty-database case: the lock is held by a competing transaction, every
+// registration below is observed waiting on it in pg_stat_activity, and after the
+// lock is released exactly one of them commits a complete account while the rest
+// fail with the closed error, not with an email conflict.
+func TestRegisterClosedConcurrentFirstRegistration(t *testing.T) {
+	schema := newAuthSchema(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	observer := openAppConn(t, ctx, schema.appURL)
+
+	const callers = 3
+	type outcome struct {
+		email string
+		err   error
+	}
+	results := make(chan outcome, callers)
+	var wg sync.WaitGroup
+	// The competing transaction takes the same registration lock and holds it
+	// until it is released below, so every caller must reach the lock first.
+	err := schema.store.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
+		if err := tx.LockRegistration(ctx); err != nil {
+			return err
+		}
+		for i := range callers {
+			email := fmt.Sprintf("race%d@example.com", i)
+			ip := fmt.Sprintf("127.0.1.%d", i+1)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, registerErr := schema.service.Register(ctx, email, "synthetic-password", ip)
+				results <- outcome{email: email, err: registerErr}
+			}()
+		}
+		waitForAdvisoryLockWait(t, ctx, observer, callers)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	close(results)
+	succeeded := 0
+	var winner string
+	var refused []error
+	for result := range results {
+		switch {
+		case result.err == nil:
+			succeeded++
+			winner = result.email
+		case errors.Is(result.err, ErrRegistrationClosed):
+			refused = append(refused, result.err)
+			if errors.Is(result.err, ErrEmailUnavailable) {
+				t.Fatalf("%s was refused by the email index", result.email)
+			}
+		default:
+			t.Fatalf("%s failed unexpectedly: %v", result.email, result.err)
+		}
+	}
+	if succeeded != 1 || len(refused) != callers-1 {
+		t.Fatalf("succeeded=%d refused=%d, want 1 and %d", succeeded, len(refused), callers-1)
+	}
+	assertCompleteAccount(t, ctx, schema.pool, winner)
+	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
+	if users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
+		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
+	}
+}
+
+// TestRegisterClosedWaiterSucceedsAfterRollback proves the waiter reads the lock
+// holder's outcome instead of assuming it: the holder rolls back, so the database
+// is still empty when the waiter acquires the lock and that waiter may register.
+func TestRegisterClosedWaiterSucceedsAfterRollback(t *testing.T) {
+	schema := newAuthSchema(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	observer := openAppConn(t, ctx, schema.appURL)
+
+	rollback := errors.New("synthetic rollback")
+	waiter := make(chan error, 1)
+	var session Session
+	err := schema.store.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
+		if err := tx.LockRegistration(ctx); err != nil {
+			return err
+		}
+		go func() {
+			var registerErr error
+			session, registerErr = schema.service.Register(ctx, "waiter@example.com", "synthetic-password", "127.0.2.1")
+			waiter <- registerErr
+		}()
+		waitForAdvisoryLockWait(t, ctx, observer, 1)
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("lock holder error = %v, want the injected rollback", err)
+	}
+	if waiterErr := <-waiter; waiterErr != nil {
+		t.Fatalf("the waiter failed although the lock holder rolled back: %v", waiterErr)
+	}
+	if session.User.Email != "waiter@example.com" {
+		t.Fatalf("waiter session = %+v", session)
+	}
+	assertCompleteAccount(t, ctx, schema.pool, "waiter@example.com")
+	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
+	if users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
+		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
+	}
+}
+
+// TestRegisterRollsBackAtEveryStage injects a real INSERT permission failure into
+// each of the four write stages in its own isolated schema. The effective
+// privilege is asserted to be gone before the attempt, the returned error must
+// name the intended stage, and no row of any table may survive the rollback.
+func TestRegisterRollsBackAtEveryStage(t *testing.T) {
+	for _, stage := range []struct {
+		name  string
+		table string
+		// wantStage is the fixed safe stage text the failure must carry, so a
+		// failure is attributed to the table it was injected into.
+		wantStage string
+	}{
+		{"users", "users", "auth registration"},
+		{"workspaces", "workspaces", "workspaces insert"},
+		{"workspace_memberships", "workspace_memberships", "workspaces membership insert"},
+		{"sessions", "sessions", "auth session insert"},
+	} {
+		t.Run(stage.name, func(t *testing.T) {
+			schema := newAuthSchema(t, true)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			setInsertPrivilege(t, ctx, schema.ownerURL, schema.appRole, stage.table, false)
+			_, err := schema.service.Register(ctx, "blocked@example.com", "synthetic-password", "127.0.0.3")
+			if err == nil {
+				t.Fatalf("registration succeeded although INSERT on %s was revoked", stage.table)
+			}
+			if errors.Is(err, ErrRegistrationClosed) || errors.Is(err, ErrEmailUnavailable) {
+				t.Fatalf("a dependency failure was reported as %v", err)
+			}
+			message := err.Error()
+			if !strings.Contains(message, stage.wantStage) {
+				t.Fatalf("error = %q, want the %q stage", message, stage.wantStage)
+			}
+			for _, secret := range []string{"synthetic-password", "INSERT", "token_hash", "password_hash", "$argon2id$", "postgres"} {
+				if strings.Contains(message, secret) {
+					t.Fatalf("error leaked %q: %v", secret, err)
+				}
+			}
+			users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
+			if users != 0 || workspaces != 0 || memberships != 0 || sessions != 0 {
+				t.Fatalf("%s failure left rows: users=%d workspaces=%d memberships=%d sessions=%d", stage.name, users, workspaces, memberships, sessions)
+			}
+			// Restoring the privilege and retrying the same input must produce one
+			// complete set of rows, proving the rollback left nothing behind.
+			setInsertPrivilege(t, ctx, schema.ownerURL, schema.appRole, stage.table, true)
+			if _, err := schema.service.Register(ctx, "blocked@example.com", "synthetic-password", "127.0.0.4"); err != nil {
+				t.Fatalf("retry after restoring %s failed: %v", stage.table, err)
+			}
+			assertCompleteAccount(t, ctx, schema.pool, "blocked@example.com")
+			if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
+				t.Fatalf("retry rows: users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
+			}
+		})
+	}
+}
+
+// TestRegisterClosedLockFailureIsNotClosed proves a broken lock statement is a
+// safe dependency failure: it must not be reported as a closed registration and
+// must not leave rows behind. The lock statement is made unavailable by revoking
+// EXECUTE on pg_advisory_xact_lock from the service role.
+func TestRegisterClosedLockFailureIsNotClosed(t *testing.T) {
+	schema := newAuthSchema(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	owner, err := pgx.Connect(ctx, schema.ownerURL)
+	if err != nil {
+		t.Fatal(database.SafeError("owner connect", err))
+	}
+	defer func() {
+		if err := owner.Close(context.Background()); err != nil {
+			t.Error(database.SafeError("owner close", err))
+		}
+	}()
+	roleID := pgx.Identifier{schema.appRole}.Sanitize()
+	if _, err := owner.Exec(ctx, "REVOKE EXECUTE ON FUNCTION pg_advisory_xact_lock(int4, int4) FROM "+roleID); err != nil {
+		t.Fatal(database.SafeError("revoke lock function", err))
+	}
+	_, err = schema.service.Register(ctx, "blocked@example.com", "synthetic-password", "127.0.0.5")
+	if err == nil {
+		t.Fatal("registration succeeded without the registration lock")
+	}
+	if errors.Is(err, ErrRegistrationClosed) || errors.Is(err, ErrEmailUnavailable) {
+		t.Fatalf("a lock failure was reported as %v", err)
+	}
+	if !strings.Contains(err.Error(), "auth registration lock") {
+		t.Fatalf("error = %q, want the registration lock stage", err.Error())
+	}
+	if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 0 || workspaces != 0 || memberships != 0 || sessions != 0 {
+		t.Fatalf("a lock failure left rows: %d/%d/%d/%d", users, workspaces, memberships, sessions)
 	}
 }

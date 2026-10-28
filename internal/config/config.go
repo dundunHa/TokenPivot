@@ -17,6 +17,10 @@ type Config struct {
 	// WebOrigin is the single trusted browser origin. It decides Origin checks
 	// for write requests and whether the session cookie is Secure.
 	WebOrigin Origin
+	// RegistrationOpen decides whether accounts may be created after the first
+	// one. It is read once at startup and never reloaded; the service keeps it as
+	// an immutable startup setting.
+	RegistrationOpen bool
 }
 
 // Load reads the service's environment once and validates it. Invalid values are
@@ -45,7 +49,31 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{HTTPAddr: addr, DatabaseURL: databaseURL, WebOrigin: origin}, nil
+	registrationOpen, err := registrationOpenSetting()
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{HTTPAddr: addr, DatabaseURL: databaseURL, WebOrigin: origin, RegistrationOpen: registrationOpen}, nil
+}
+
+// registrationOpenSetting reads TOKENPIVOT_REGISTRATION_OPEN once. Unset means
+// closed; only the exact spellings "true" and "false" are accepted, so an empty
+// value, another case, surrounding whitespace, "1" or "yes" all fail at startup
+// instead of being interpreted differently by two deployments. The returned error
+// names the variable and its allowed values and never repeats the rejected value.
+func registrationOpenSetting() (bool, error) {
+	value, ok := os.LookupEnv("TOKENPIVOT_REGISTRATION_OPEN")
+	if !ok {
+		return false, nil
+	}
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New(`TOKENPIVOT_REGISTRATION_OPEN must be exactly "true" or "false"`)
+	}
 }
 
 // Origin is one normalized trusted browser origin: a lowercase scheme and a

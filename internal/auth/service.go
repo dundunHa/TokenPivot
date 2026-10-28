@@ -40,6 +40,11 @@ var (
 	ErrInvalidArgument = errors.New("auth: invalid argument")
 	// ErrEmailUnavailable reports an email already owned by another account.
 	ErrEmailUnavailable = errors.New("auth: email unavailable")
+	// ErrRegistrationClosed reports a refused account creation because the
+	// deployment keeps registration closed and the database already has a user.
+	// It is decided before any account write, so it reveals nothing about the
+	// requested email.
+	ErrRegistrationClosed = errors.New("auth: registration closed")
 	// ErrInvalidCredentials reports a failed login. Unknown email and wrong
 	// password are deliberately indistinguishable.
 	ErrInvalidCredentials = errors.New("auth: invalid credentials")
@@ -101,9 +106,6 @@ type Store interface {
 	// UserCredential returns the account for a normalized email together with
 	// its stored password encoding; found=false means no such account.
 	UserCredential(ctx context.Context, email string) (Credential, bool, error)
-	// CreateUserWithSession inserts the account and its first session as one
-	// atomic unit and returns the expiry assigned by the database.
-	CreateUserWithSession(ctx context.Context, email, passwordHash string, tokenHash []byte) (IssuedSession, error)
 	// CreateSession stores one new session for an existing account.
 	CreateSession(ctx context.Context, userID ID, tokenHash []byte) (time.Time, error)
 	// AuthenticateSession renews one valid session and returns its user and new
@@ -114,30 +116,59 @@ type Store interface {
 	RevokeSession(ctx context.Context, tokenHash []byte) error
 }
 
+// RegistrationStore is the transaction-bound write surface of registration. It
+// extends Store with the three ordered steps of one account creation plus the two
+// statements that decide whether a closed deployment may accept its first user.
+// A store handed to TxRunner.InTx is bound to one database transaction, so the
+// account, its personal workspace, the owner membership and the first session
+// commit or roll back together.
+type RegistrationStore interface {
+	Store
+	// CreateUser inserts the account and returns its database identity. Only the
+	// email unique index conflict becomes ErrEmailUnavailable.
+	CreateUser(ctx context.Context, email, passwordHash string) (User, error)
+	// CreatePersonal creates the initial personal workspace of the user and its
+	// owner membership through the workspaces transaction adapter. It never
+	// starts a transaction of its own.
+	CreatePersonal(ctx context.Context, userID ID) error
+	// LockRegistration takes the exclusive registration lock for the rest of the
+	// transaction, so at most one first-user decision runs at a time.
+	LockRegistration(ctx context.Context) error
+	// HasUsers reports whether any account exists, including one committed by a
+	// transaction that held the registration lock before this caller.
+	HasUsers(ctx context.Context) (bool, error)
+}
+
 // TxRunner runs a function inside one database transaction. The store handed to
 // the function is bound to that transaction, so every write it performs commits
-// or rolls back as a unit. Future callers that must create a workspace in the
-// same unit as registration add their writes inside this function.
+// or rolls back as a unit. Registration creates the account, its personal
+// workspace and its first session inside this single transaction.
 type TxRunner interface {
-	InTx(ctx context.Context, fn func(context.Context, Store) error) error
+	InTx(ctx context.Context, fn func(context.Context, RegistrationStore) error) error
 }
 
 // Service implements the browser account use cases on top of a store.
 type Service struct {
-	store   Store
-	tx      TxRunner
-	limiter *Limiter
+	store Store
+	tx    TxRunner
+	// registrationOpen is the immutable startup setting. When it is false, only
+	// the very first account of an empty database may be created.
+	registrationOpen bool
+	limiter          *Limiter
 }
 
 // New returns a Service. Store reads outside a transaction use store; Register
-// uses tx so the account and its first session are one atomic unit.
-func New(store Store, tx TxRunner, limiter *Limiter) *Service {
-	return &Service{store: store, tx: tx, limiter: limiter}
+// uses tx so the account, its personal workspace and its first session are one
+// atomic unit. registrationOpen is the startup configuration and is never read
+// again, so a handler can never change it per request.
+func New(store Store, tx TxRunner, limiter *Limiter, registrationOpen bool) *Service {
+	return &Service{store: store, tx: tx, limiter: limiter, registrationOpen: registrationOpen}
 }
 
 // Register validates the account input, reserves one rate-limit slot in both
-// windows, hashes the password and creates the account and its first session in
-// one transaction. The new session is returned so the caller can set a cookie.
+// windows, hashes the password outside the transaction, then creates the account,
+// its personal workspace, the owner membership and its first session in one
+// transaction. The new session is returned so the caller can set a cookie.
 func (s *Service) Register(ctx context.Context, email, password, remoteIP string) (Session, error) {
 	normalized, err := normalizeEmail(email)
 	if err != nil {
@@ -149,18 +180,41 @@ func (s *Service) Register(ctx context.Context, email, password, remoteIP string
 	if retryAfter, ok := s.limiter.Take(normalized, remoteIP); !ok {
 		return Session{}, RateLimitedError{RetryAfter: retryAfter}
 	}
+	// The encoding and the token stay outside the transaction: Argon2id must not
+	// hold a connection or the registration lock while it runs.
 	passwordHash, err := HashPassword(password)
 	if err != nil {
 		return Session{}, err
 	}
 	token := newSessionToken()
 	var issued IssuedSession
-	err = s.tx.InTx(ctx, func(ctx context.Context, tx Store) error {
-		created, err := tx.CreateUserWithSession(ctx, normalized, passwordHash, sessionTokenHash(token))
+	err = s.tx.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
+		if !s.registrationOpen {
+			// The lock is held until this transaction ends, so exactly one of the
+			// concurrent first registrations can decide the empty-database case.
+			if err := tx.LockRegistration(ctx); err != nil {
+				return err
+			}
+			taken, err := tx.HasUsers(ctx)
+			if err != nil {
+				return err
+			}
+			if taken {
+				return ErrRegistrationClosed
+			}
+		}
+		user, err := tx.CreateUser(ctx, normalized, passwordHash)
 		if err != nil {
 			return err
 		}
-		issued = created
+		if err := tx.CreatePersonal(ctx, user.ID); err != nil {
+			return err
+		}
+		expiresAt, err := tx.CreateSession(ctx, user.ID, sessionTokenHash(token))
+		if err != nil {
+			return err
+		}
+		issued = IssuedSession{User: user, ExpiresAt: expiresAt}
 		return nil
 	})
 	if err != nil {

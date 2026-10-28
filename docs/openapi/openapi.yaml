@@ -51,8 +51,9 @@ info:
     - 只认 `cookieAuth`（`tokenpivot_session`）。明文为 `tps_` + `crypto/rand.Text()`，数据库只存完整令牌的 SHA-256 原始 32 字节摘要；`tpk_` 插件令牌在这里不被接受，Bearer 头也不建立浏览器身份。
     - 会话 30 天精确滑动：每次有效认证都用一条 `UPDATE ... FROM ... RETURNING` 续期并返回到期时间，无刷新阈值、无绝对截止；数据库返回 0 行即 `401 UNAUTHENTICATED`。四个端点的所有响应都带 `Cache-Control: no-store`。
     - 写请求（注册、登录、登出）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。`GET /api/v1/auth/session` 是读请求，不要求 `Origin`。
-    - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。owner 与工作空间成员判断属 T-019，本文不定义。
+    - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。owner 与工作空间成员判断属 T-019，本文不定义；注册时会为每个新用户创建展示名固定为 `Personal` 的个人空间并写入其 `owner` 成员关系，但响应不返回工作空间字段，也没有工作空间 HTTP 接口。
     - 注册与登录限流为单进程内存固定窗口（每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次），所有合法尝试都占额度、成功不返还；达到上限的请求不执行密码哈希或写库。
+    - 注册开关由部署环境变量 `TOKENPIVOT_REGISTRATION_OPEN` 决定，启动时读取一次，未设置等同 `false`，只接受精确的 `true`/`false`。关闭时仅空库的首个用户可注册，其余一律 `403 REGISTRATION_CLOSED`；空库判定与首个用户写入在同一 `READ COMMITTED` 事务内，并在事务级排他 advisory lock 之后进行。没有查询注册状态的端点。
 
     # 5. 时间精度、180 天窗口与采样点
 
@@ -637,15 +638,21 @@ paths:
       operationId: registerBrowserAccount
       summary: 直接注册账号并创建首个会话
       description: |
-        用邮箱和密码直接创建账号，不需要邮箱验证。注册成功在**同一事务**内写入 `users` 与首个 `sessions` 行，然后返回 `201`、`{user, expires_at}` 和新的会话 Cookie，因此刚注册的用户无需再次输入密码。
+        用邮箱和密码直接创建账号，不需要邮箱验证。注册成功在**同一事务**内写入四部分数据：`users` 行、该用户展示名固定为 `Personal` 的个人空间、这条空间的 `owner` 成员关系，以及首个 `sessions` 行；然后返回 `201`、`{user, expires_at}` 和新的会话 Cookie，因此刚注册的用户无需再次输入密码。任一步失败整体回滚，不会出现只有用户没有个人空间或没有会话的半套数据。
 
         **写请求必须携带 `Origin`**：恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等。缺失、空白、`null`、多值或不等一律 `403 PERMISSION_DENIED`，且不产生任何数据库写入。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。
 
+        **注册开关**：部署环境变量 `TOKENPIVOT_REGISTRATION_OPEN` 在启动时读取一次，不在运行中热加载；未设置等同 `false`，只接受精确的 `true`/`false`，其他值使服务启动失败。开关关闭时只有**空库的首个用户**可以注册，此后所有注册一律 `403 REGISTRATION_CLOSED`；开关开放时注册不受此限制。不提供查询注册是否开放的任何端点。
+
+        **开关关闭时的并发与顺序**：空库判定与首个用户写入在同一 `READ COMMITTED` 事务内，先取事务级排他 advisory lock 再单独查询 `users` 是否为空，锁持有到该事务提交或回滚。因此同一时刻只有一个请求能做出"空库"判定：两个空的并发首注册不会都成功，且后到者看到的是前者提交或回滚之后的结果。开放模式跳过这两条语句。
+
+        **拒绝响应与账号枚举**：开关关闭且 `users` 已有数据时，准入判断先于用户写入和邮箱唯一冲突，所以已被占用的邮箱与从未注册的邮箱返回完全相同的 `403 REGISTRATION_CLOSED`，响应中不会出现 `EMAIL_UNAVAILABLE`；该响应不带 `Set-Cookie`，也不产生任何业务写入。
+
         **输入**：只接受 `application/json`；请求体上限 16 KiB；必须是一个 JSON 对象，含 `email` 与 `password` 两个字符串字段，拒绝未知字段、重复键、非法 UTF-8 与尾随内容。邮箱先 `TrimSpace` 再整体小写作为账号，长度 3–254 字节，恰好一个 `@` 且两侧非空，不含控制字符或空白；这不是完整 RFC 邮箱语法。密码为合法 UTF-8，8–64 个码点且不超过 256 字节，不 trim、不做 Unicode 规范化，哈希的是原始字节。
 
-        **限流**：与登录共享两个固定窗口——每个规范化邮箱 10 分钟 5 次、每个远端 IP 10 分钟 20 次。所有通过格式校验的尝试都占用额度，成功也不返还；超限直接 `429` 且不执行哈希或写库。
+        **限流**：与登录共享两个固定窗口——每个规范化邮箱 10 分钟 5 次、每个远端 IP 10 分钟 20 次。所有通过格式校验的尝试都占用额度，成功也不返还；开关关闭时被拒绝的合法尝试同样消耗额度。超限直接 `429`，此时不再做密码哈希、不开事务、也不做注册准入判断，所以额度耗尽优先于 `403 REGISTRATION_CLOSED`。
 
-        **注册不是幂等操作**：成功响应丢失后用同邮箱重试会得到 `409 EMAIL_UNAVAILABLE`，客户端应改用登录。直接注册的结果仍可能被用来探测邮箱是否已注册，本文不宣称注册可完全防枚举。
+        **注册不是幂等操作**：成功响应丢失后用同邮箱重试，在开放模式下得到 `409 EMAIL_UNAVAILABLE`，在关闭模式下得到 `403 REGISTRATION_CLOSED`；两种情形都应改用登录。开放模式下直接注册的结果仍可能被用来探测邮箱是否已注册，本文不宣称注册可完全防枚举；关闭模式由上面的统一拒绝避免这种探测。
       security: []
       parameters:
         - $ref: '#/components/parameters/TrustedOrigin'
@@ -657,7 +664,7 @@ paths:
               $ref: '#/components/schemas/AuthRequest'
       responses:
         '201':
-          description: '账号与首个会话已创建；`Set-Cookie` 下发 `tokenpivot_session`。'
+          description: '账号、个人空间、owner 成员关系与首个会话已创建并提交；`Set-Cookie` 下发 `tokenpivot_session`。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -668,9 +675,33 @@ paths:
         '400':
           $ref: '#/components/responses/AuthInvalidArgument'
         '403':
-          $ref: '#/components/responses/AuthPermissionDenied'
+          description: |
+            两种原因共用此状态码，靠 `code` 区分，响应都不写入、都不下发 Cookie：
+
+            - `PERMISSION_DENIED`：`Origin` 缺失、为 `null`、多值或与可信 origin 不相等。它先于 JSON 解析、限流和注册开关判断。
+            - `REGISTRATION_CLOSED`：注册开关关闭且数据库已有用户。它先于用户写入和邮箱唯一冲突，因此已占用与未占用的邮箱得到完全相同的响应。
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthError'
+              examples:
+                permissionDenied:
+                  summary: Origin 不被信任
+                  value:
+                    error:
+                      code: PERMISSION_DENIED
+                      message: request origin is not allowed
+                registrationClosed:
+                  summary: 注册开关关闭且已有用户
+                  value:
+                    error:
+                      code: REGISTRATION_CLOSED
+                      message: registration is closed
         '409':
-          description: '`EMAIL_UNAVAILABLE`：该规范化邮箱已被占用。'
+          description: '`EMAIL_UNAVAILABLE`：该规范化邮箱已被占用。仅在注册开关开放时出现；关闭且已有用户时统一为 `403 REGISTRATION_CLOSED`。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1949,6 +1980,7 @@ components:
                 - UNAUTHENTICATED
                 - EMAIL_UNAVAILABLE
                 - PERMISSION_DENIED
+                - REGISTRATION_CLOSED
                 - BODY_TOO_LARGE
                 - UNSUPPORTED_MEDIA_TYPE
                 - RATE_LIMITED
@@ -1969,6 +2001,7 @@ components:
         | `UNAUTHENTICATED` | 401 |
         | `EMAIL_UNAVAILABLE` | 409 |
         | `PERMISSION_DENIED` | 403 |
+        | `REGISTRATION_CLOSED` | 403 |
         | `BODY_TOO_LARGE` | 413 |
         | `UNSUPPORTED_MEDIA_TYPE` | 415 |
         | `RATE_LIMITED` | 429 |
