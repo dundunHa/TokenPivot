@@ -111,21 +111,36 @@ func (f *authFakeStore) UserCredential(ctx context.Context, email string) (auth.
 	return credential, ok, nil
 }
 
-func (f *authFakeStore) CreateUserWithSession(ctx context.Context, email, passwordHash string, tokenHash []byte) (auth.IssuedSession, error) {
-	f.record("CreateUserWithSession")
+func (f *authFakeStore) LockRegistration(ctx context.Context) error {
+	f.record("LockRegistration")
+	return nil
+}
+
+func (f *authFakeStore) HasUsers(ctx context.Context) (bool, error) {
+	f.record("HasUsers")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.users) > 0, nil
+}
+
+func (f *authFakeStore) CreateUser(ctx context.Context, email, passwordHash string) (auth.User, error) {
+	f.record("CreateUser")
 	if f.failures.create != nil {
-		return auth.IssuedSession{}, f.failures.create
+		return auth.User{}, f.failures.create
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, exists := f.users[email]; exists {
-		return auth.IssuedSession{}, auth.ErrEmailUnavailable
+		return auth.User{}, auth.ErrEmailUnavailable
 	}
 	user := auth.User{ID: f.identifier(), Email: email}
 	f.users[email] = auth.Credential{User: user, PasswordHash: passwordHash}
-	expiresAt := f.clock().UTC().Add(auth.SessionLifetime).Truncate(time.Second)
-	f.sessions[string(tokenHash)] = fakeSession{userID: user.ID, expiresAt: expiresAt}
-	return auth.IssuedSession{User: user, ExpiresAt: expiresAt}, nil
+	return user, nil
+}
+
+func (f *authFakeStore) CreatePersonal(ctx context.Context, userID auth.ID) error {
+	f.record("CreatePersonal")
+	return nil
 }
 
 func (f *authFakeStore) CreateSession(ctx context.Context, userID auth.ID, tokenHash []byte) (time.Time, error) {
@@ -191,18 +206,28 @@ func (f *authFakeStore) sessionExpiry(token string) (time.Time, bool) {
 }
 
 // authInTx runs the registration function directly; the store is already shared.
-func (f *authFakeStore) InTx(ctx context.Context, fn func(context.Context, auth.Store) error) error {
+func (f *authFakeStore) InTx(ctx context.Context, fn func(context.Context, auth.RegistrationStore) error) error {
 	return fn(ctx, f)
 }
 
+// newTestAuth returns an adapter whose registration is open, which keeps every
+// pre-existing HTTP test on the plain success path. The switch tests build their
+// own closed adapter below.
 func newTestAuth(t *testing.T) (*Auth, *authFakeStore) {
+	t.Helper()
+	return newTestAuthWithRegistration(t, true)
+}
+
+// newTestAuthWithRegistration returns an adapter with the given startup
+// registration setting.
+func newTestAuthWithRegistration(t *testing.T, registrationOpen bool) (*Auth, *authFakeStore) {
 	t.Helper()
 	store := newAuthFakeStore()
 	origin, err := config.ParseOrigin(testOrigin)
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := auth.New(store, store, auth.NewLimiter(nil))
+	service := auth.New(store, store, auth.NewLimiter(nil), registrationOpen)
 	return NewAuth(service, origin), store
 }
 
@@ -210,6 +235,14 @@ func newTestAuth(t *testing.T) (*Auth, *authFakeStore) {
 func authHandler(t *testing.T) (*Auth, *authFakeStore, http.Handler) {
 	t.Helper()
 	adapter, store := newTestAuth(t)
+	return adapter, store, NewHandler(Options{CheckReady: func(context.Context) error { return nil }, Auth: adapter})
+}
+
+// closedAuthHandler builds the full handler for a deployment that keeps
+// registration closed.
+func closedAuthHandler(t *testing.T) (*Auth, *authFakeStore, http.Handler) {
+	t.Helper()
+	adapter, store := newTestAuthWithRegistration(t, false)
 	return adapter, store, NewHandler(Options{CheckReady: func(context.Context) error { return nil }, Auth: adapter})
 }
 
@@ -284,6 +317,104 @@ func TestRegisterRejectsDuplicateEmail(t *testing.T) {
 	}
 	if len(w.Result().Cookies()) != 0 {
 		t.Fatal("failed registration set a cookie")
+	}
+}
+
+// TestRegisterClosedRejectsWithoutSessionOrWrites proves a closed deployment
+// refuses a second account with the documented 403, no session cookie and no
+// account write, while the very first account of the empty database still works.
+func TestRegisterClosedRejectsWithoutSessionOrWrites(t *testing.T) {
+	_, store, h := closedAuthHandler(t)
+	first := doAuthRequest(t, h, http.MethodPost, registerPath, `{"email":"first@example.com","password":"synthetic-password"}`)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first registration status = %d, want 201: %s", first.Code, first.Body.String())
+	}
+	if calls := store.callCount("CreateUser"); calls != 1 {
+		t.Fatalf("account writes after the first registration = %d, want 1", calls)
+	}
+	rejected := doAuthRequest(t, h, http.MethodPost, registerPath, `{"email":"second@example.com","password":"synthetic-password"}`)
+	if rejected.Code != http.StatusForbidden || !strings.Contains(rejected.Body.String(), "REGISTRATION_CLOSED") {
+		t.Fatalf("closed status/body = %d %s", rejected.Code, rejected.Body.String())
+	}
+	if got := rejected.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if len(rejected.Result().Cookies()) != 0 {
+		t.Fatal("a rejected registration set a session cookie")
+	}
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rejected.Body.Bytes(), &body); err != nil || body.Error.Code != "REGISTRATION_CLOSED" || body.Error.Message != "registration is closed" {
+		t.Fatalf("closed body = %s", rejected.Body.String())
+	}
+	if calls := store.callCount("CreateUser"); calls != 1 {
+		t.Fatalf("rejected registration wrote an account: %d", calls)
+	}
+	if !strings.Contains(first.Body.String(), `"expires_at":"`) {
+		t.Fatalf("the first registration body is incomplete: %s", first.Body.String())
+	}
+}
+
+// TestRegisterClosedDoesNotRevealExistence proves an occupied and a free email get
+// exactly the same closed response, so the refusal never discloses whether an
+// account exists, and EMAIL_UNAVAILABLE is not used in closed mode.
+func TestRegisterClosedDoesNotRevealExistence(t *testing.T) {
+	_, store, h := closedAuthHandler(t)
+	store.seedUser(t, "known@example.com", "synthetic-password")
+	var responses []*httptest.ResponseRecorder
+	for _, email := range []string{"known@example.com", "unknown@example.com"} {
+		w := doAuthRequest(t, h, http.MethodPost, registerPath, `{"email":"`+email+`","password":"synthetic-password"}`)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s status = %d, want 403: %s", email, w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "EMAIL_UNAVAILABLE") {
+			t.Fatalf("%s leaked the email conflict: %s", email, w.Body.String())
+		}
+		responses = append(responses, w)
+	}
+	if responses[0].Body.String() != responses[1].Body.String() {
+		t.Fatalf("bodies differ: %s vs %s", responses[0].Body.String(), responses[1].Body.String())
+	}
+	if calls := store.callCount("CreateUser"); calls != 0 {
+		t.Fatalf("a closed registration wrote an account %d times", calls)
+	}
+}
+
+// TestRegisterClosedKeepsOriginAndRateLimit proves the new mapping does not
+// override the earlier checks: a bad Origin is still PERMISSION_DENIED and an
+// exhausted window is still 429 with Retry-After.
+func TestRegisterClosedKeepsOriginAndRateLimit(t *testing.T) {
+	_, store, h := closedAuthHandler(t)
+	store.seedUser(t, "known@example.com", "synthetic-password")
+
+	req := httptest.NewRequest(http.MethodPost, registerPath, strings.NewReader(`{"email":"new@example.com","password":"synthetic-password"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "PERMISSION_DENIED") {
+		t.Fatalf("missing Origin status/body = %d %s", w.Code, w.Body.String())
+	}
+	if calls := store.callCount("HasUsers"); calls != 0 {
+		t.Fatal("an Origin rejection reached the registration decision")
+	}
+
+	var limited *httptest.ResponseRecorder
+	for range 5 {
+		limited = doAuthRequest(t, h, http.MethodPost, registerPath, `{"email":"new@example.com","password":"synthetic-password"}`)
+		if limited.Code != http.StatusForbidden {
+			t.Fatalf("attempt status = %d, want 403: %s", limited.Code, limited.Body.String())
+		}
+	}
+	limited = doAuthRequest(t, h, http.MethodPost, registerPath, `{"email":"new@example.com","password":"synthetic-password"}`)
+	if limited.Code != http.StatusTooManyRequests || !strings.Contains(limited.Body.String(), "RATE_LIMITED") {
+		t.Fatalf("exhausted status/body = %d %s", limited.Code, limited.Body.String())
+	}
+	if retryAfter := limited.Header().Get("Retry-After"); retryAfter == "" || retryAfter == "0" {
+		t.Fatalf("Retry-After = %q", retryAfter)
 	}
 }
 
@@ -629,7 +760,7 @@ func TestAuthBodyAcceptsOnlyExactKeySpelling(t *testing.T) {
 			if w.Code != http.StatusCreated {
 				t.Fatalf("status = %d, want 201: %s", w.Code, w.Body.String())
 			}
-			if calls := store.callCount("CreateUserWithSession"); calls != 1 {
+			if calls := store.callCount("CreateUser"); calls != 1 {
 				t.Fatalf("storage calls = %d, want 1", calls)
 			}
 		})
@@ -663,7 +794,7 @@ func TestAuthBodyAcceptsOnlyExactKeySpelling(t *testing.T) {
 			if len(w.Result().Cookies()) != 0 {
 				t.Fatal("a rejected body set a session cookie")
 			}
-			if calls := store.callCount("CreateUserWithSession"); calls != 0 {
+			if calls := store.callCount("CreateUser"); calls != 0 {
 				t.Fatalf("a rejected body reached storage %d times", calls)
 			}
 		})

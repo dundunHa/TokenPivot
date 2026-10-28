@@ -55,7 +55,7 @@ func TestRequireOriginRejectsWriteRequests(t *testing.T) {
 			}
 		})
 	}
-	if calls := store.callCount("CreateUserWithSession"); calls != 0 {
+	if calls := store.callCount("CreateUser"); calls != 0 {
 		t.Fatalf("forbidden requests reached storage %d times", calls)
 	}
 	if calls := store.callCount("AuthenticateSession"); calls != 0 {
@@ -131,7 +131,7 @@ func TestCookieSecureFollowsOrigin(t *testing.T) {
 				t.Fatal(err)
 			}
 			store := newAuthFakeStore()
-			adapter := NewAuth(auth.New(store, store, auth.NewLimiter(nil)), origin)
+			adapter := NewAuth(auth.New(store, store, auth.NewLimiter(nil), true), origin)
 			h := NewHandler(Options{CheckReady: func(context.Context) error { return nil }, Auth: adapter})
 			req := httptest.NewRequest(http.MethodPost, registerPath, strings.NewReader(`{"email":"synthetic@example.com","password":"synthetic-password"}`))
 			req.Header.Set("Content-Type", "application/json")
@@ -192,7 +192,7 @@ func TestSessionCookieMaxAgeUsesDatabaseExpiryThroughHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter := NewAuth(auth.New(store, store, auth.NewLimiter(nil)), origin)
+	adapter := NewAuth(auth.New(store, store, auth.NewLimiter(nil), true), origin)
 	adapter.now = func() time.Time { return responseTime }
 	h := NewHandler(Options{CheckReady: func(context.Context) error { return nil }, Auth: adapter})
 
