@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -183,11 +184,15 @@ func applyMigrations(t *testing.T, migrationURL string) {
 // both connection URLs because the service-role URL is needed for independent
 // observation connections and the migration-owner URL for privilege changes.
 type authSchema struct {
-	service  *Service
-	store    *Postgres
-	pool     *pgxpool.Pool
-	appURL   string
-	appRole  string
+	service *Service
+	store   *Postgres
+	pool    *pgxpool.Pool
+	appURL  string
+	appRole string
+	// label is the application_name every connection of this schema carries, so
+	// an observed lock waiter can be attributed to this test instead of any
+	// session that happens to wait on an advisory lock in the database.
+	label    string
 	ownerURL string
 }
 
@@ -200,6 +205,15 @@ func newAuthSchema(t *testing.T, registrationOpen bool) authSchema {
 	if err != nil || parsed.User == nil {
 		t.Fatal("invalid test service URL")
 	}
+	// Every connection of this test carries its own short application name derived
+	// from the test name, so pg_stat_activity and pg_locks rows can be attributed to
+	// this test's backends rather than to an unrelated session in the same database.
+	sum := sha256.Sum256([]byte(t.Name()))
+	label := fmt.Sprintf("tp_it_%x", sum[:4])
+	query := parsed.Query()
+	query.Set("application_name", label)
+	parsed.RawQuery = query.Encode()
+	appURL = parsed.String()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	pool, err := database.Open(ctx, appURL)
@@ -214,6 +228,7 @@ func newAuthSchema(t *testing.T, registrationOpen bool) authSchema {
 		pool:     pool,
 		appURL:   appURL,
 		appRole:  parsed.User.Username(),
+		label:    label,
 		ownerURL: ownerURL,
 	}
 }
@@ -279,32 +294,146 @@ func waitForLockedStatement(t *testing.T, ctx context.Context, observer *pgx.Con
 	}
 }
 
-// waitForAdvisoryLockWait waits until at least want backends other than observer
-// are blocked acquiring a PostgreSQL advisory lock. Registration waiting on
-// pg_advisory_xact_lock reports wait_event_type 'Lock' with an advisory wait
-// event, so the competition itself is observed from server state and no sleep
-// decides the order.
-func waitForAdvisoryLockWait(t *testing.T, ctx context.Context, observer *pgx.Conn, want int) {
+// registrationLockPids returns the pids of this test's backends that currently hold
+// or wait for the registration advisory lock. The lookup is restricted to the
+// current database, the fixed two-integer registration key (classid 17017, objid 1,
+// objsubid 2 for the two-integer form) and the application name this test's
+// connections carry, so an unrelated session that happens to take an advisory lock
+// in the same database can never be counted.
+func registrationLockPids(t *testing.T, ctx context.Context, observer *pgx.Conn, label string, granted bool) []int32 {
+	t.Helper()
+	rows, err := observer.Query(ctx, `SELECT l.pid
+FROM pg_locks l
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'advisory'
+  AND l.objsubid = 2
+  AND l.classid::bigint = $1
+  AND l.objid::bigint = $2
+  AND l.granted = $3
+  AND a.datname = current_database()
+  AND a.application_name = $4
+ORDER BY l.pid`, int64(registrationLockClass), int64(registrationLockObject), granted, label)
+	if err != nil {
+		t.Fatal(database.SafeError("read registration lock state", err))
+	}
+	defer rows.Close()
+	var pids []int32
+	for rows.Next() {
+		var pid int32
+		if err := rows.Scan(&pid); err != nil {
+			t.Fatal(database.SafeError("scan registration lock state", err))
+		}
+		pids = append(pids, pid)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(database.SafeError("read registration lock state", err))
+	}
+	return pids
+}
+
+// waitForRegistrationLockWaiters waits until at least want backends of this test are
+// queued on the registration advisory lock and returns their pids. pg_locks joined
+// to pg_stat_activity is the only source: the competition is read from server state
+// instead of being assumed from a sleep.
+func waitForRegistrationLockWaiters(t *testing.T, ctx context.Context, observer *pgx.Conn, label string, want int) []int32 {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		var waiting int
-		err := observer.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-WHERE wait_event_type = 'Lock' AND wait_event LIKE 'advisory%' AND pid <> pg_backend_pid()`).Scan(&waiting)
-		if err != nil {
-			t.Fatal(database.SafeError("read advisory lock wait", err))
-		}
-		if waiting >= want {
-			return
+		if pids := registrationLockPids(t, ctx, observer, label, false); len(pids) >= want {
+			return pids
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d of %d backends waited on the registration advisory lock", waiting, want)
+			pids := registrationLockPids(t, ctx, observer, label, false)
+			t.Fatalf("%d of %d backends of this test waited on the registration advisory lock", len(pids), want)
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatal(database.SafeError("wait for advisory lock", ctx.Err()))
+			t.Fatal(database.SafeError("wait for registration lock", ctx.Err()))
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+// assertWaitingOnLockStatement proves the observed waiting backend is blocked in the
+// advisory lock statement itself rather than in a later statement of the same
+// transaction, so a reported failure can be attributed to the lock stage.
+func assertWaitingOnLockStatement(t *testing.T, ctx context.Context, observer *pgx.Conn, pid int32) {
+	t.Helper()
+	var query string
+	if err := observer.QueryRow(ctx, "SELECT query FROM pg_stat_activity WHERE pid = $1", pid).Scan(&query); err != nil {
+		t.Fatal(database.SafeError("read waiting statement", err))
+	}
+	if !strings.Contains(query, "pg_advisory_xact_lock") {
+		t.Fatalf("waiting backend %d runs %q, want the registration lock statement", pid, query)
+	}
+}
+
+// pausingRegistrationTx runs the real registration transaction through inner but
+// stops it after the first session write, before the transaction commits or rolls
+// back. A test releases it with nil to commit or with an error to roll back, so a
+// competing registration observes the outcome of another real registration
+// transaction, not of a transaction that only holds the lock.
+type pausingRegistrationTx struct {
+	inner TxRunner
+	// written is closed once the paused transaction has written the account, its
+	// personal workspace, the owner membership and the first session.
+	written chan struct{}
+	// outcome carries exactly one decision: nil commits, any error rolls back.
+	outcome chan error
+	// claimed records whether the pause was already taken, so the registrations a
+	// test starts afterwards pass through instead of blocking forever.
+	claimed atomic.Bool
+}
+
+// newPausingRegistrationTx wraps inner so the first registration it runs stops after
+// the session write and waits for the test's decision.
+func newPausingRegistrationTx(inner TxRunner) *pausingRegistrationTx {
+	return &pausingRegistrationTx{inner: inner, written: make(chan struct{}), outcome: make(chan error, 1)}
+}
+
+// InTx implements TxRunner on the real transaction runner.
+func (p *pausingRegistrationTx) InTx(ctx context.Context, fn func(context.Context, RegistrationStore) error) error {
+	return p.inner.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
+		return fn(ctx, &pausingRegistrationStore{RegistrationStore: tx, gate: p})
+	})
+}
+
+// pausingRegistrationStore is the transaction-bound store with the one extra pause.
+type pausingRegistrationStore struct {
+	RegistrationStore
+	gate *pausingRegistrationTx
+}
+
+// CreateSession writes the real session row and then, for the first registration
+// only, pauses until the test decides the transaction outcome.
+func (s *pausingRegistrationStore) CreateSession(ctx context.Context, userID ID, tokenHash []byte) (time.Time, error) {
+	expiresAt, err := s.RegistrationStore.CreateSession(ctx, userID, tokenHash)
+	if err != nil {
+		return expiresAt, err
+	}
+	if !s.gate.claimed.CompareAndSwap(false, true) {
+		return expiresAt, nil
+	}
+	close(s.gate.written)
+	select {
+	case outcome := <-s.gate.outcome:
+		return expiresAt, outcome
+	case <-ctx.Done():
+		return expiresAt, ctx.Err()
+	}
+}
+
+// waitForPausedRegistration waits until the wrapped registration transaction has
+// written all four rows and is stopped before its commit, so a test never guesses
+// that timing from a sleep.
+func waitForPausedRegistration(t *testing.T, ctx context.Context, gate *pausingRegistrationTx) {
+	t.Helper()
+	select {
+	case <-gate.written:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the first registration never reached its pre-commit pause")
+	case <-ctx.Done():
+		t.Fatal(database.SafeError("wait for paused registration", ctx.Err()))
 	}
 }
 
@@ -932,55 +1061,73 @@ func TestRegisterClosedFirstUserThenRejected(t *testing.T) {
 }
 
 // TestRegisterClosedConcurrentFirstRegistration proves the advisory lock decides
-// the empty-database case: the lock is held by a competing transaction, every
-// registration below is observed waiting on it in pg_stat_activity, and after the
-// lock is released exactly one of them commits a complete account while the rest
-// fail with the closed error, not with an email conflict.
+// the empty-database case from the outcome of a real registration transaction: the
+// first registration writes its account, personal workspace, owner membership and
+// first session and is then stopped before its commit, the competitors are observed
+// queued on the registration advisory lock in pg_locks, and after the first one
+// commits exactly one registration exists while the others fail with the closed
+// error, not with an email conflict.
 func TestRegisterClosedConcurrentFirstRegistration(t *testing.T) {
 	schema := newAuthSchema(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	observer := openAppConn(t, ctx, schema.appURL)
 
-	const callers = 3
+	gate := newPausingRegistrationTx(schema.store)
+	// A failing assertion must not leave the paused registration blocked until the
+	// suite deadline: the cleanup releases it with a rollback.
+	t.Cleanup(func() {
+		select {
+		case gate.outcome <- errors.New("test cleanup rollback"):
+		default:
+		}
+	})
+	gated := New(schema.store, gate, NewLimiter(time.Now), false)
+	winner := make(chan error, 1)
+	go func() {
+		_, err := gated.Register(ctx, "race-winner@example.com", "synthetic-password", "127.0.1.1")
+		winner <- err
+	}()
+	waitForPausedRegistration(t, ctx, gate)
+
+	const competitors = 2
 	type outcome struct {
 		email string
 		err   error
 	}
-	results := make(chan outcome, callers)
+	results := make(chan outcome, competitors)
 	var wg sync.WaitGroup
-	// The competing transaction takes the same registration lock and holds it
-	// until it is released below, so every caller must reach the lock first.
-	err := schema.store.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
-		if err := tx.LockRegistration(ctx); err != nil {
-			return err
-		}
-		for i := range callers {
-			email := fmt.Sprintf("race%d@example.com", i)
-			ip := fmt.Sprintf("127.0.1.%d", i+1)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_, registerErr := schema.service.Register(ctx, email, "synthetic-password", ip)
-				results <- outcome{email: email, err: registerErr}
-			}()
-		}
-		waitForAdvisoryLockWait(t, ctx, observer, callers)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+	for i := range competitors {
+		email := fmt.Sprintf("race%d@example.com", i)
+		ip := fmt.Sprintf("127.0.1.%d", i+2)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, registerErr := schema.service.Register(ctx, email, "synthetic-password", ip)
+			results <- outcome{email: email, err: registerErr}
+		}()
+	}
+	// The first registration still holds the lock, so every competitor must be
+	// queued on that same lock before the outcome is decided.
+	waiting := waitForRegistrationLockWaiters(t, ctx, observer, schema.label, competitors)
+	for _, pid := range waiting {
+		assertWaitingOnLockStatement(t, ctx, observer, pid)
+	}
+	if held := registrationLockPids(t, ctx, observer, schema.label, true); len(held) == 0 {
+		t.Fatal("no backend of this test holds the registration lock while the competitors wait")
+	}
+	gate.outcome <- nil
+	if err := <-winner; err != nil {
+		t.Fatalf("the first registration failed: %v", err)
 	}
 	wg.Wait()
 	close(results)
 	succeeded := 0
-	var winner string
 	var refused []error
 	for result := range results {
 		switch {
 		case result.err == nil:
 			succeeded++
-			winner = result.email
 		case errors.Is(result.err, ErrRegistrationClosed):
 			refused = append(refused, result.err)
 			if errors.Is(result.err, ErrEmailUnavailable) {
@@ -990,10 +1137,10 @@ func TestRegisterClosedConcurrentFirstRegistration(t *testing.T) {
 			t.Fatalf("%s failed unexpectedly: %v", result.email, result.err)
 		}
 	}
-	if succeeded != 1 || len(refused) != callers-1 {
-		t.Fatalf("succeeded=%d refused=%d, want 1 and %d", succeeded, len(refused), callers-1)
+	if succeeded != 0 || len(refused) != competitors {
+		t.Fatalf("succeeded=%d refused=%d, want 0 and %d after a committed first user", succeeded, len(refused), competitors)
 	}
-	assertCompleteAccount(t, ctx, schema.pool, winner)
+	assertCompleteAccount(t, ctx, schema.pool, "race-winner@example.com")
 	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
 	if users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
 		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
@@ -1001,8 +1148,9 @@ func TestRegisterClosedConcurrentFirstRegistration(t *testing.T) {
 }
 
 // TestRegisterClosedWaiterSucceedsAfterRollback proves the waiter reads the lock
-// holder's outcome instead of assuming it: the holder rolls back, so the database
-// is still empty when the waiter acquires the lock and that waiter may register.
+// holder's outcome instead of assuming it: the first real registration writes all
+// four rows and is then rolled back, so the database is still empty when the waiter
+// acquires the lock and that waiter becomes the first user.
 func TestRegisterClosedWaiterSucceedsAfterRollback(t *testing.T) {
 	schema := newAuthSchema(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -1010,25 +1158,39 @@ func TestRegisterClosedWaiterSucceedsAfterRollback(t *testing.T) {
 	observer := openAppConn(t, ctx, schema.appURL)
 
 	rollback := errors.New("synthetic rollback")
+	gate := newPausingRegistrationTx(schema.store)
+	t.Cleanup(func() {
+		select {
+		case gate.outcome <- rollback:
+		default:
+		}
+	})
+	gated := New(schema.store, gate, NewLimiter(time.Now), false)
+	first := make(chan error, 1)
+	go func() {
+		_, err := gated.Register(ctx, "aborted@example.com", "synthetic-password", "127.0.2.1")
+		first <- err
+	}()
+	waitForPausedRegistration(t, ctx, gate)
+
 	waiter := make(chan error, 1)
 	var session Session
-	err := schema.store.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
-		if err := tx.LockRegistration(ctx); err != nil {
-			return err
-		}
-		go func() {
-			var registerErr error
-			session, registerErr = schema.service.Register(ctx, "waiter@example.com", "synthetic-password", "127.0.2.1")
-			waiter <- registerErr
-		}()
-		waitForAdvisoryLockWait(t, ctx, observer, 1)
-		return rollback
-	})
-	if !errors.Is(err, rollback) {
-		t.Fatalf("lock holder error = %v, want the injected rollback", err)
+	go func() {
+		var registerErr error
+		session, registerErr = schema.service.Register(ctx, "waiter@example.com", "synthetic-password", "127.0.2.2")
+		waiter <- registerErr
+	}()
+	waiting := waitForRegistrationLockWaiters(t, ctx, observer, schema.label, 1)
+	for _, pid := range waiting {
+		assertWaitingOnLockStatement(t, ctx, observer, pid)
+	}
+	// The holder rolls back, so the waiter must still see an empty database.
+	gate.outcome <- rollback
+	if err := <-first; !errors.Is(err, rollback) {
+		t.Fatalf("first registration error = %v, want the injected rollback", err)
 	}
 	if waiterErr := <-waiter; waiterErr != nil {
-		t.Fatalf("the waiter failed although the lock holder rolled back: %v", waiterErr)
+		t.Fatalf("the waiter failed although the first registration rolled back: %v", waiterErr)
 	}
 	if session.User.Email != "waiter@example.com" {
 		t.Fatalf("waiter session = %+v", session)
@@ -1096,30 +1258,56 @@ func TestRegisterRollsBackAtEveryStage(t *testing.T) {
 	}
 }
 
-// TestRegisterClosedLockFailureIsNotClosed proves a broken lock statement is a
-// safe dependency failure: it must not be reported as a closed registration and
-// must not leave rows behind. The lock statement is made unavailable by revoking
-// EXECUTE on pg_advisory_xact_lock from the service role.
+// TestRegisterClosedLockFailureIsNotClosed proves a failed registration lock
+// acquisition is a safe dependency failure: it must not be reported as a closed
+// registration and must not leave rows behind. The failure is real server state, not
+// a removed privilege: another connection holds the registration advisory lock in an
+// open transaction, the registration is observed queued on that exact lock in
+// pg_locks, and its own context is then cancelled so the wait fails at the lock
+// statement.
 func TestRegisterClosedLockFailureIsNotClosed(t *testing.T) {
 	schema := newAuthSchema(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	owner, err := pgx.Connect(ctx, schema.ownerURL)
+	observer := openAppConn(t, ctx, schema.appURL)
+
+	// The blocking holder commits nothing: it only takes the registration lock in an
+	// open transaction, so the registration below cannot acquire it. Closing the
+	// connection at cleanup would abort it as well, so no rollback is deferred here.
+	holder := openAppConn(t, ctx, schema.appURL)
+	tx, err := holder.Begin(ctx)
 	if err != nil {
-		t.Fatal(database.SafeError("owner connect", err))
+		t.Fatal(database.SafeError("holder begin", err))
 	}
-	defer func() {
-		if err := owner.Close(context.Background()); err != nil {
-			t.Error(database.SafeError("owner close", err))
-		}
+	if _, err := tx.Exec(ctx, lockRegistrationQuery, registrationLockClass, registrationLockObject); err != nil {
+		t.Fatal(database.SafeError("holder lock", err))
+	}
+	held := registrationLockPids(t, ctx, observer, schema.label, true)
+	if len(held) == 0 {
+		t.Fatal("the holder does not appear as a granted registration lock owner")
+	}
+
+	// A dedicated context lets the test cancel exactly this registration attempt.
+	registerCtx, cancelRegister := context.WithCancel(ctx)
+	defer cancelRegister()
+	results := make(chan error, 1)
+	go func() {
+		_, registerErr := schema.service.Register(registerCtx, "blocked@example.com", "synthetic-password", "127.0.0.5")
+		results <- registerErr
 	}()
-	roleID := pgx.Identifier{schema.appRole}.Sanitize()
-	if _, err := owner.Exec(ctx, "REVOKE EXECUTE ON FUNCTION pg_advisory_xact_lock(int4, int4) FROM "+roleID); err != nil {
-		t.Fatal(database.SafeError("revoke lock function", err))
+	waiting := waitForRegistrationLockWaiters(t, ctx, observer, schema.label, 1)
+	for _, pid := range waiting {
+		assertWaitingOnLockStatement(t, ctx, observer, pid)
 	}
-	_, err = schema.service.Register(ctx, "blocked@example.com", "synthetic-password", "127.0.0.5")
+	// Only now that the lock wait is observed does the attempt get cancelled, so the
+	// failure provably comes from acquiring the lock, not from a later statement.
+	cancelRegister()
+	err = <-results
 	if err == nil {
 		t.Fatal("registration succeeded without the registration lock")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want the cancelled lock wait", err)
 	}
 	if errors.Is(err, ErrRegistrationClosed) || errors.Is(err, ErrEmailUnavailable) {
 		t.Fatalf("a lock failure was reported as %v", err)
@@ -1129,5 +1317,8 @@ func TestRegisterClosedLockFailureIsNotClosed(t *testing.T) {
 	}
 	if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 0 || workspaces != 0 || memberships != 0 || sessions != 0 {
 		t.Fatalf("a lock failure left rows: %d/%d/%d/%d", users, workspaces, memberships, sessions)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(database.SafeError("holder rollback", err))
 	}
 }
