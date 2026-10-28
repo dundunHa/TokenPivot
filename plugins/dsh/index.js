@@ -55,5 +55,6 @@ export function apply(ctx, config) {
     })
   })
 
-  ctx.effect(() => () => { void collector.stop() })
+  // Returning the promise lets the host wait (if it does) before a reloaded instance starts writing.
+  ctx.effect(() => () => collector.stop())
 }

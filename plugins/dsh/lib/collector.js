@@ -19,6 +19,9 @@ export function ingestionEndpoint(serverUrl) {
   } catch {
     return null
   }
+  // Credentials in the URL would make fetch throw on every attempt (endless back-off) and keep a
+  // secret in memory outside the token field.
+  if (url.username || url.password) return null
   const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) return null
   url.pathname = url.pathname.replace(/\/+$/, '') + INGESTION_PATH
@@ -65,11 +68,16 @@ export class Collector {
     this.ready = null
   }
 
-  /** Load persisted events and try to send anything left over from a previous run (补报). */
+  /**
+   * Load persisted events and try to send anything left over from a previous run (补报).
+   * A failed load is not fatal: new events are still queued in memory, and every later persist
+   * retries the load first (FileQueue never overwrites a file it could not read).
+   */
   start() {
-    this.ready = this.queue.load().then(() => {
-      if (this.queue.size > 0) this.schedule(0)
-    })
+    this.ready = this.queue.load().then(
+      () => { if (this.queue.size > 0) this.schedule(0) },
+      (error) => { this.logger?.warn?.(`cannot load queue (${error?.code ?? error?.message ?? error}); will retry on next write`) },
+    )
     return this.ready
   }
 
@@ -89,9 +97,10 @@ export class Collector {
     }
     if (!usageEvent) return
     await this.ready
+    if (this.stopped) return
     if (this.queue.enqueue(usageEvent)) {
-      await this.queue.persist()
       this.schedule(this.flushDelayMs)
+      await this.queue.persist() // may reject (disk); the event stays in memory and the next write retries
     }
   }
 
@@ -122,11 +131,13 @@ export class Collector {
     return outcome
   }
 
+  /** Resolves once no request is in flight and the last write is on disk, so a reloaded instance can take over. */
   async stop() {
     this.stopped = true
     if (this.timer) this.clearTimer(this.timer)
     this.timer = null
     await this.ready?.catch(() => {})
+    await this.uploader.stop()
     await this.queue.writing.catch(() => {})
   }
 }

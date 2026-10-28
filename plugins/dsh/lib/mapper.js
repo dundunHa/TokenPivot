@@ -9,14 +9,18 @@
  */
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const CONTROL_RE = /[\u0000-\u001f\u007f]/
+// OpenAPI provider/model/source_event_id: no C0/C1 control chars; provider/model also no leading or
+// trailing Unicode whitespace (the exact set in docs/openapi/openapi.yaml, incl. U+0085 that trim() keeps).
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/
+const WS = '\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000'
+const EDGE_WS_RE = new RegExp(`^[${WS}]|[${WS}]$`)
 const encoder = new TextEncoder()
 
 const byteLength = (s) => encoder.encode(s).length
 
 /** provider/model: 1–128 UTF-8 bytes, no leading/trailing whitespace, no control chars. */
 function validName(value) {
-  return typeof value === 'string' && value.length > 0 && value === value.trim()
+  return typeof value === 'string' && value.length > 0 && !EDGE_WS_RE.test(value)
     && !CONTROL_RE.test(value) && byteLength(value) <= 128
 }
 
@@ -29,9 +33,13 @@ const known = (value) => ({ value, quality: 'known' })
 const MISSING = Object.freeze({ value: null, quality: 'missing' })
 
 /**
- * DSH TokenUsage → TokenPivot usage.
- * DSH inputTokens EXCLUDES cache reads/writes (local survey: totalTokens == input+output+cacheRead+cacheWrite
- * in 23468/23760 messages, the rest have no cache fields), while TokenPivot's input_tokens includes them.
+ * DSH TokenUsage → TokenPivot usage (TokenPivot input_tokens INCLUDES cache reads/writes).
+ *
+ * Whether DSH's inputTokens includes cache depends on the provider route (T-043 survey,
+ * docs/research/2026-10-28-dsh-platform-capabilities.md): most routes exclude it
+ * (totalTokens == input + output + cacheRead + cacheWrite), an openrouter route includes it and
+ * sends no totalTokens. DSH's own totalTokens decides which; without a usable totalTokens the input
+ * is reported `estimated` and total is left for the server to derive (it then becomes estimated too).
  * Returns null when no usable usage exists (event is skipped, never reported as zero).
  */
 export function mapUsage(u) {
@@ -41,21 +49,32 @@ export function mapUsage(u) {
   for (const k of ['cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'totalTokens']) {
     if (has(k) && !isCount(u[k])) return null
   }
-  const cacheRead = has('cacheReadTokens') ? u.cacheReadTokens : 0
-  const cacheWrite = has('cacheWriteTokens') ? u.cacheWriteTokens : 0
-  const input = u.inputTokens + cacheRead + cacheWrite
+  const cache = (has('cacheReadTokens') ? u.cacheReadTokens : 0) + (has('cacheWriteTokens') ? u.cacheWriteTokens : 0)
   const output = u.outputTokens
-  const total = input + output
-  if (!Number.isSafeInteger(total)) return null
-  // DSH's own total must agree with our reconstruction; if it does not, we cannot tell which side is
-  // wrong, so total is reported missing rather than guessed.
-  const totalAgrees = !has('totalTokens') || u.totalTokens === total
+  const exclusive = u.inputTokens + cache
+  const inclusive = u.inputTokens
+  const dshTotal = has('totalTokens') ? u.totalTokens : undefined
+
+  let input
+  let total = MISSING // missing → server derives input + output with the matching quality
+  if (dshTotal === exclusive + output || (cache === 0 && dshTotal === undefined)) {
+    input = known(exclusive) // no cache: both readings coincide, input is exact
+    if (dshTotal !== undefined) total = known(dshTotal)
+  } else if (dshTotal === inclusive + output && cache <= inclusive) {
+    input = known(inclusive)
+    total = known(dshTotal)
+  } else {
+    // Cannot tell which reading applies. A cache larger than inputTokens rules out "inclusive".
+    input = { value: cache <= inclusive ? inclusive : exclusive, quality: 'estimated' }
+    if (dshTotal !== undefined) total = { value: dshTotal, quality: 'estimated' }
+  }
+  if (!Number.isSafeInteger(input.value + output)) return null
   // reasoning is a subset of output; an inconsistent value is reported missing, not clamped.
   const reasoningOk = has('reasoningTokens') && u.reasoningTokens <= output
   return {
-    input_tokens: known(input),
+    input_tokens: input,
     output_tokens: known(output),
-    total_tokens: totalAgrees ? known(total) : MISSING,
+    total_tokens: total,
     cache_read_tokens: has('cacheReadTokens') ? known(u.cacheReadTokens) : MISSING,
     cache_write_tokens: has('cacheWriteTokens') ? known(u.cacheWriteTokens) : MISSING,
     reasoning_tokens: reasoningOk ? known(u.reasoningTokens) : MISSING,

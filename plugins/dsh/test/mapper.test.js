@@ -68,10 +68,30 @@ test('real zero stays known zero', () => {
   assert.deepEqual(u.total_tokens, { value: 0, quality: 'known' })
 })
 
-test('DSH total that disagrees with input+output is reported missing', () => {
+test('DSH total that matches neither reading: input and total estimated (server will not derive a known total)', () => {
   const u = mapUsage({ inputTokens: 10, outputTokens: 2, totalTokens: 99 })
+  assert.deepEqual(u.input_tokens, { value: 10, quality: 'estimated' })
+  assert.deepEqual(u.total_tokens, { value: 99, quality: 'estimated' })
+})
+
+test('route whose inputTokens already includes cache (totalTokens == input + output)', () => {
+  const u = mapUsage({ inputTokens: 1000, outputTokens: 10, cacheReadTokens: 900, totalTokens: 1010 })
+  assert.deepEqual(u.input_tokens, { value: 1000, quality: 'known' })
+  assert.deepEqual(u.total_tokens, { value: 1010, quality: 'known' })
+})
+
+test('cache present but no totalTokens (openrouter sample): input estimated, total left for server', () => {
+  const u = mapUsage({ inputTokens: 325555, outputTokens: 193, cacheReadTokens: 325504 })
+  assert.deepEqual(u.input_tokens, { value: 325555, quality: 'estimated' })
   assert.deepEqual(u.total_tokens, { value: null, quality: 'missing' })
-  assert.deepEqual(u.input_tokens, { value: 10, quality: 'known' })
+  // cache larger than inputTokens rules out the inclusive reading
+  assert.equal(mapUsage({ inputTokens: 5, outputTokens: 1, cacheReadTokens: 50 }).input_tokens.value, 55)
+})
+
+test('no cache and no totalTokens: input known, total left for server to derive', () => {
+  const u = mapUsage({ inputTokens: 7, outputTokens: 3 })
+  assert.deepEqual(u.input_tokens, { value: 7, quality: 'known' })
+  assert.deepEqual(u.total_tokens, { value: null, quality: 'missing' })
 })
 
 test('reasoning: reported when present and consistent, missing otherwise', () => {
@@ -112,6 +132,12 @@ test('invalid provider/model skips the event', () => {
   assert.equal(mapSessionEvent(session, bad), null)
   bad.data.message = { ...bad.data.message, source: { kind: 'model', provider: 'p', model: 'x'.repeat(129) } }
   assert.equal(mapSessionEvent(session, bad), null)
+  for (const provider of ['p\u0085', 'a\u0090b', '\u3000p', 'p\u00a0']) {
+    bad.data.message = { ...bad.data.message, source: { kind: 'model', provider, model: 'm' } }
+    assert.equal(mapSessionEvent(session, bad), null, JSON.stringify(provider))
+  }
+  bad.data.message = { ...bad.data.message, source: { kind: 'model', provider: '路由 a', model: 'm' } }
+  assert.notEqual(mapSessionEvent(session, bad), null)
 })
 
 test('resolveProject: longest prefix on directory boundary, invalid ids ignored', () => {

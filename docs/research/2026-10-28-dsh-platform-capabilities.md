@@ -2,16 +2,16 @@
 
 日期：2026-10-28。对象：DeepSeek Harness（DSH）0.2.1-rc.3，会话格式 v4。PI 部分不在本次范围，留给 T-047。
 
-证据来源：本机 `~/.dsh/sessions/<cwd-slug>/<id>/session.v4.jsonl.zstd` 日志统计（1102 个会话文件、23783 条 assistant 消息），以及 DSH host 的 inspect 接口（`Event.listEvents`、`Service.listService`）返回的事件签名与类型声明。
+证据来源：本机 `~/.dsh/sessions/<cwd-slug>/<id>/session.v4.jsonl.zstd` 日志统计（2026-10-28 复核：1107 个会话文件、57186 条 `assistant/message`，含 fork 复制的重复行；早先一次 1102 文件 / 23783 条的统计口径不同，数字以本次为准），以及 DSH host 的 inspect 接口（`Event.listEvents`、`Service.listService`）返回的事件签名与类型声明。
 
 ## 结论速览
 
 | 问题 | 结论 | 证据 |
 |---|---|---|
 | 能否拿到请求级最终用量 | 能。`assistant/message` 的 `data.usage`、`compaction/summary` 的 `data.usage` | 类型 `TokenUsage { inputTokens; outputTokens; totalTokens?; cacheReadTokens?; cacheWriteTokens?; reasoningTokens? }` |
-| `inputTokens` 是否含缓存 | **不含**。TokenPivot 的 input 要加回 cacheRead 与 cacheWrite | 23468 条 `totalTokens == input+output+cacheRead+cacheWrite`；其余 292 条没有缓存字段，`totalTokens == input+output` |
-| 推理 token | 本机样本从未出现 `reasoningTokens`，推理计入 output；上报为缺失 | 全量统计 0 次出现 |
-| 缓存字段 | 视 provider 而定，可能只有 read、只有 write、都有或都没有 | 键组合：{cacheRead} 20040、{cacheRead,cacheWrite} 3132、{cacheWrite} 401、都没有 187 |
+| `inputTokens` 是否含缓存 | **随 provider 路由而定**。绝大多数路由不含（TokenPivot 的 input 要加回 cacheRead 与 cacheWrite）；`openrouter` 路由含缓存且不给 totalTokens | 有 usage 的 57153 条中 57047 条 `totalTokens == input+output+cacheRead+cacheWrite`（其中 535 条无缓存字段、389 条缓存字段为 0，两种读法相同）；其余 106 条全部来自 `openrouter/~deepseek/deepseek-flash-latest`，没有 totalTokens，且 cacheRead 略小于 inputTokens（如 input 325555、cacheRead 325504），说明 input 已含缓存 |
+| 推理 token | 本机样本从未出现 `reasoningTokens`；推理是否计入 outputTokens 没有可核对的样本，按“计入”处理，reasoning 上报为缺失 | 57153 条 0 次出现 |
+| 缓存字段 | 视 provider 而定，可能只有 read、只有 write、都有或都没有 | 早先统计的键组合：{cacheRead}、{cacheRead,cacheWrite}、{cacheWrite}、都没有，四种都出现 |
 | 请求完成时间 | 事件 `time`（毫秒 epoch，提交时刻）≈ 请求完成时刻 | 事件结构 `{type, seq, time, data}` |
 | 稳定事件 ID | `data.message.id`（UUID）。fork/seed 出的会话复制父事件时 id 不变 | 跨文件重复 1758 个 id，时间、用量、模型全部一致；同文件内重复 0 |
 | compaction 的 ID | `data.compactionId`，只在单个会话内唯一，需加会话 id 前缀 | 类型声明 |
@@ -19,11 +19,13 @@
 | 请求状态 / 耗时 | 拿不到。成功的 `assistant/message` 没有状态与耗时字段；上报 null | 类型声明 |
 | 失败调用 | `assistant/attempt`（失败的尝试，如 TIMEOUT）没有 usage，失败请求的消耗无法得知 | 类型声明与样本 |
 | 无用量的模型调用 | `session/title-llm-request`、`web/deepseek-search-llm-request` 没有 usage，无法采集 | 样本 |
-| 无 usage 的 assistant 消息 | 极少（全量 23 条），多为中断；跳过，不当 0 上报 | 统计 |
+| 无 usage 的 assistant 消息 | 极少（57186 条中 33 条），多为中断；跳过，不当 0 上报 | 统计 |
 | 插件拿事件的方式 | host 事件 `'session/event'(session, event)`：提交后触发、不等待监听者；监听者出错只记日志 | `Event.listEvents` |
 | 会话工作目录 | `session.header.cwd`（可选） | `SessionHeader` 类型 |
 
 ## 对插件的约束
+
+0. input 的读法由 DSH 自己的 totalTokens 判定：等于 `input+output+缓存` → input 取加回缓存后的值（known）；等于 `input+output` 且缓存不超过 input → input 取原值（known）；没有 totalTokens 但有缓存、或两种都对不上 → input 记 `estimated`（缓存大于 input 时取加回缓存的值，否则取原值），total 同样记 estimated 或交给服务端推导。
 
 1. 只采集 `assistant/message` 与 `compaction/summary`；其余模型调用不可采集，看板上这部分用量缺失属已知限制。
 2. 用 `message.id` 作事件 ID 可以天然消除 fork 带来的重复；compaction 用 `<session id>:<compactionId>`。
@@ -34,4 +36,5 @@
 ## 未核实
 
 - 未在已安装状态下实测 `session/event` 对 fork 种子事件是否触发（插件按用户决定不安装）；第 3 条依据为类型说明，不是实测。
-- `reasoningTokens` 在支持推理计数的 provider 上是否会出现：本机没有样本。
+- `reasoningTokens` 在支持推理计数的 provider 上是否会出现、outputTokens 是否已含推理：本机没有样本。
+- openrouter 之外是否还有“input 含缓存”的路由：本机只见到这一个。

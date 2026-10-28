@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { mkdtemp, readFile, readdir } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, stat, mkdir, rename, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { FileQueue } from '../lib/queue.js'
@@ -67,6 +67,7 @@ test('ingestionEndpoint: https or loopback http only', () => {
   assert.equal(ingestionEndpoint('http://127.0.0.1:8080'), 'http://127.0.0.1:8080/api/v1/ingestion/events')
   assert.equal(ingestionEndpoint(''), null)
   assert.equal(ingestionEndpoint('not a url'), null)
+  assert.equal(ingestionEndpoint('https://u:p@tp.example.com'), null)
 })
 
 test('parseRetryAfter handles seconds and HTTP date', () => {
@@ -100,7 +101,8 @@ test('terminal results dequeue into dead letter without usage payload', async ()
   assert.deepEqual(dead.map((d) => [d.source_event_id, d.outcome, d.code]), [
     ['dsh:msg:1', 'conflict', null], ['dsh:msg:2', 'rejected', 'PROJECT_INVALID'], ['dsh:msg:3', 'expired', null],
   ])
-  assert.ok(!JSON.stringify(dead).includes('input_tokens'))
+  // the frozen body is kept for manual re-submission; it carries numbers and ids only
+  assert.deepEqual(dead[1].event, ev(2))
   await s.close()
 })
 
@@ -152,6 +154,54 @@ test('server down entirely: connection refused keeps events', async () => {
   assert.equal(queue.size, 1)
 })
 
+test('400 / 403 / 415 pause without dropping anything', async () => {
+  for (const code of [400, 403, 415]) {
+    const s = await server(() => ({ status: code }))
+    const { dir, queue, up } = await uploader(s.endpoint, [1, 2, 3].map(ev))
+    assert.equal((await up.flush()).state, 'paused', String(code))
+    assert.equal(queue.size, 3)
+    assert.equal(s.calls.length, 1)
+    assert.ok(!(await readdir(dir)).includes('dead-letter.jsonl'))
+    await s.close()
+  }
+})
+
+test('paused upload resumes by itself once the token changes', async () => {
+  let token = 'tpk_old'
+  const s = await server((body, req) => (req.headers.authorization === 'Bearer tpk_old' ? { status: 401 } : allAs('accepted')(body)))
+  const { queue, up } = await uploader(s.endpoint, [ev(1)], { getToken: () => token })
+  assert.equal((await up.flush()).state, 'paused')
+  assert.equal((await up.flush()).state, 'paused')
+  token = 'tpk_new'
+  assert.equal((await up.flush()).state, 'idle')
+  assert.equal(queue.size, 0)
+  await s.close()
+})
+
+test('FUTURE_EVENT (local clock ahead) is retried with the same body, not dead-lettered', async () => {
+  let n = 0
+  const s = await server((body) => (++n === 1
+    ? { status: 200, json: { request_id: 'r', results: [{ index: 0, status: 'rejected', error: { code: 'FUTURE_EVENT' } }] } }
+    : allAs('accepted')(body)))
+  const { dir, queue, up } = await uploader(s.endpoint, [ev(1)])
+  assert.equal((await up.flush()).state, 'backoff')
+  assert.equal(queue.size, 1)
+  assert.equal((await up.flush()).state, 'idle')
+  assert.deepEqual(s.calls[0].body, s.calls[1].body)
+  assert.ok(!(await readdir(dir)).includes('dead-letter.jsonl'))
+  await s.close()
+})
+
+test('429 honours Retry-After even beyond the back-off cap', async () => {
+  const s = await server(() => ({ status: 429, headers: { 'retry-after': '900' } }))
+  const { queue, up } = await uploader(s.endpoint, [ev(1)], { maxDelayMs: 60_000 })
+  const out = await up.flush()
+  assert.equal(out.state, 'backoff')
+  assert.equal(out.delayMs, 900_000)
+  assert.equal(queue.size, 1)
+  await s.close()
+})
+
 test('401 pauses uploads until resume()', async () => {
   let status = 401
   const s = await server((body) => (status === 401 ? { status: 401 } : allAs('accepted')(body)))
@@ -167,7 +217,7 @@ test('401 pauses uploads until resume()', async () => {
   await s.close()
 })
 
-test('413 halves the batch; a lone item that still fails is dead-lettered', async () => {
+test('413 halves the batch; a lone item that still fails is dead-lettered with its body', async () => {
   const s = await server((body) => {
     if (body.events.some((e) => e.source_event_id === 'dsh:msg:3')) return { status: 413 }
     return allAs('accepted')(body)
@@ -180,6 +230,8 @@ test('413 halves the batch; a lone item that still fails is dead-lettered', asyn
   const dead = await readFile(path.join(dir, 'dead-letter.jsonl'), 'utf8')
   assert.match(dead, /dsh:msg:3.*http_413/)
   assert.ok(!dead.includes('dsh:msg:4'))
+  // after the split, the remaining events keep the smaller batch size until the queue empties
+  assert.ok(s.calls.slice(2).every((c) => c.body.events.length <= 2))
   await s.close()
 })
 
@@ -198,6 +250,7 @@ test('no endpoint or no token: nothing sent, events kept', async () => {
   const b = await uploader('http://127.0.0.1:9/x', [ev(1)], { getToken: () => undefined })
   assert.equal((await b.up.flush()).state, 'disabled')
   assert.equal(queue.size, 1)
+  assert.equal(b.queue.size, 1)
 })
 
 test('queue survives restart, dedupes ids, drops oldest beyond cap; file has no token', async () => {
@@ -212,8 +265,100 @@ test('queue survives restart, dedupes ids, drops oldest beyond cap; file has no 
   await q2.load()
   assert.deepEqual(q2.peek(10).map((e) => e.source_event_id), ['dsh:msg:2', 'dsh:msg:3', 'dsh:msg:4'])
   const files = await readdir(dir)
-  assert.deepEqual(files, ['queue.json'])
-  assert.ok(!(await readFile(path.join(dir, 'queue.json'), 'utf8')).includes('tpk_'))
+  assert.deepEqual(files, ['queue.json']) // no tmp files left behind
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(path.join(dir, 'queue.json'))).mode & 0o777, 0o600)
+  }
+})
+
+test('concurrent persist calls serialize and the file holds the latest state', async () => {
+  const dir = await tmp()
+  const q = new FileQueue({ dir })
+  await q.load()
+  const writes = []
+  for (let i = 0; i < 20; i++) { q.enqueue(ev(i)); writes.push(q.persist()) }
+  q.remove(['dsh:msg:0'])
+  writes.push(q.persist())
+  await Promise.all(writes)
+  const saved = JSON.parse(await readFile(path.join(dir, 'queue.json'), 'utf8'))
+  assert.equal(saved.items.length, 19)
+  assert.deepEqual(await readdir(dir), ['queue.json'])
+})
+
+test('unreadable queue file: events still queue in memory, the file is never clobbered, later load merges', async () => {
+  const dir = await tmp()
+  const q0 = new FileQueue({ dir })
+  await q0.load()
+  q0.enqueue(ev(1))
+  await q0.persist()
+  // make queue.json unreadable as a file by swapping a directory in its place
+  await rename(path.join(dir, 'queue.json'), path.join(dir, 'saved.json'))
+  await mkdir(path.join(dir, 'queue.json'))
+  const q = new FileQueue({ dir, logger: logs() })
+  await assert.rejects(q.load())
+  q.enqueue(ev(2))
+  await assert.rejects(q.persist())
+  assert.equal(q.size, 1)
+  // directory becomes readable again: next persist loads first, keeps both events
+  await rename(path.join(dir, 'queue.json'), path.join(dir, 'blocker'))
+  await rename(path.join(dir, 'saved.json'), path.join(dir, 'queue.json'))
+  await q.persist()
+  assert.deepEqual(q.peek(10).map((e) => e.source_event_id), ['dsh:msg:1', 'dsh:msg:2'])
+  const saved = JSON.parse(await readFile(path.join(dir, 'queue.json'), 'utf8'))
+  assert.equal(saved.items.length, 2)
+})
+
+test('collector.stop() waits for the in-flight upload and sends nothing afterwards', async () => {
+  let release
+  const gate = new Promise((r) => { release = r })
+  let inFlight = 0
+  const srv = http.createServer((req, res) => {
+    let raw = ''
+    req.on('data', (c) => { raw += c })
+    req.on('end', async () => {
+      inFlight += 1
+      await gate
+      const body = JSON.parse(raw)
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ request_id: 'r', results: body.events.map((_, index) => ({ index, status: 'accepted' })) }))
+    })
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const endpoint = ingestionEndpoint(`http://127.0.0.1:${srv.address().port}`)
+  const dir = await tmp()
+  const c = new Collector({
+    stateDir: dir, endpoint, getToken: () => TOKEN, logger: logs(),
+    uploaderOptions: { batchSize: 1 },
+    setTimer: () => 1, clearTimer: () => {},
+  })
+  await c.start()
+  for (const n of [1, 2, 3]) c.queue.enqueue(ev(n))
+  await c.queue.persist()
+  const flushing = c.flush()
+  while (inFlight === 0) await new Promise((r) => setTimeout(r, 5))
+  let stopped = false
+  const stopping = c.stop().then(() => { stopped = true })
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(stopped, false) // still waiting for the request in flight
+  release()
+  await stopping
+  assert.equal((await flushing).state, 'stopped')
+  assert.equal(inFlight, 1) // no further batch after stop
+  const saved = JSON.parse(await readFile(path.join(dir, 'queue.json'), 'utf8'))
+  assert.deepEqual(saved.items.map((e) => e.source_event_id), ['dsh:msg:2', 'dsh:msg:3'])
+  await new Promise((r) => srv.close(r))
+})
+
+test('collector keeps the earliest wake-up when schedule() is called again with a later delay', async () => {
+  const timers = []
+  const c = new Collector({
+    stateDir: await tmp(), endpoint: null, getToken: () => undefined, logger: logs(),
+    setTimer: (fn, ms) => { timers.push(ms); return timers.length }, clearTimer: () => {},
+  })
+  c.schedule(1000)
+  c.schedule(5000)
+  c.schedule(10)
+  assert.deepEqual(timers, [1000, 10])
 })
 
 test('corrupt queue file is moved aside, not fatal', async () => {

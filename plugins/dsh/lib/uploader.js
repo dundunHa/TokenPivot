@@ -4,11 +4,16 @@
  * Result handling (docs/openapi/openapi.yaml):
  *   accepted / duplicate                  → dequeue
  *   conflict / expired / rejected         → dequeue + dead letter (resending the same body cannot change the outcome)
+ *   rejected + FUTURE_EVENT               → keep, back off: the server has zero clock-skew tolerance, so a
+ *                                           local clock slightly ahead is fixed by simply waiting
  *   retryable, missing result             → keep, back off
- *   HTTP 400 / 413 with >1 item           → halve the batch and retry (isolates the offending item)
- *   HTTP 400 / 413 with 1 item            → dequeue + dead letter
- *   HTTP 401 / 403 / 415                  → pause (credential or plugin defect; retrying would not help)
- *   HTTP 429 / 5xx / network / timeout    → keep, back off (honours Retry-After)
+ *   HTTP 413 with >1 item                 → halve the batch and retry (isolates the oversized item)
+ *   HTTP 413 with 1 item                  → dequeue + dead letter
+ *   HTTP 400 / 401 / 403 / 415            → pause. Whole-batch 400 is about the request as a whole
+ *                                           (envelope, unknown top-level field, plugin/server mismatch),
+ *                                           never about one item, so splitting would only drop events.
+ *                                           Resumes automatically when the configured token changes.
+ *   HTTP 429 / other 4xx·5xx / network    → keep, back off (honours Retry-After, even beyond maxDelayMs)
  * The bearer token is never logged or persisted.
  */
 
@@ -57,13 +62,28 @@ export class Uploader {
     this.now = now
     this.failures = 0
     this.paused = false
+    this.pausedToken = undefined
+    this.stopped = false
     this.running = null
   }
 
-  /** Clear a pause (e.g. after the token was changed). */
+  /** Clear a pause (also happens automatically when the token changes). */
   resume() {
     this.paused = false
+    this.pausedToken = undefined
     this.failures = 0
+  }
+
+  /** Stop after the in-flight request; returns when the current run is over. */
+  async stop() {
+    this.stopped = true
+    await this.running?.catch(() => {})
+  }
+
+  pause(token) {
+    this.paused = true
+    this.pausedToken = token
+    return { state: 'paused' }
   }
 
   backoff(retryAfterMs) {
@@ -71,7 +91,8 @@ export class Uploader {
     const exp = Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** Math.min(this.failures - 1, 20))
     // Full jitter keeps many plugin instances from retrying in lock-step after an outage.
     const jittered = Math.round(exp / 2 + this.random() * (exp / 2))
-    const delayMs = Math.min(this.maxDelayMs, Math.max(jittered, retryAfterMs ?? 0))
+    // The server's Retry-After wins even when it exceeds our own cap.
+    const delayMs = Math.max(jittered, retryAfterMs ?? 0)
     return { state: 'backoff', delayMs }
   }
 
@@ -97,15 +118,23 @@ export class Uploader {
   }
 
   async drain() {
-    if (this.paused) return { state: 'paused' }
+    if (this.stopped) return { state: 'stopped' }
     const token = this.getToken()
+    if (this.paused) {
+      if (token === this.pausedToken) return { state: 'paused' }
+      this.resume()
+    }
     if (!this.endpoint || !token) return { state: 'disabled' }
 
     while (this.queue.size > 0) {
+      if (this.stopped) return { state: 'stopped' }
       const batch = this.nextBatch()
       const outcome = await this.send(batch, token)
       if (outcome.state !== 'continue') return outcome
     }
+    // Only an empty queue restores full batches; after a 413 split the rest keeps the smaller size.
+    this.limit = this.batchSize
+    this.failures = 0
     return { state: 'idle' }
   }
 
@@ -144,21 +173,20 @@ export class Uploader {
     // Drain the body so the connection can be reused; content is not logged.
     await response.text().catch(() => {})
 
-    if (status === 401 || status === 403 || status === 415) {
-      this.paused = true
-      this.logger?.warn?.(`upload paused: HTTP ${status}; check the TokenPivot credential/plugin version`)
-      return { state: 'paused' }
+    if (status === 400 || status === 401 || status === 403 || status === 415) {
+      this.logger?.warn?.(`upload paused: HTTP ${status}; check the TokenPivot credential and plugin/server version (events stay queued)`)
+      return this.pause(token)
     }
-    if (status === 400 || status === 413) {
+    if (status === 413) {
       if (batch.length > 1) {
         this.limit = Math.max(1, Math.floor(batch.length / 2))
         return { state: 'continue' }
       }
-      const id = batch[0].source_event_id
-      this.queue.remove([id])
+      const item = batch[0]
+      this.queue.remove([item.source_event_id])
       await this.queue.persist()
-      await this.queue.deadLetter([{ source_event_id: id, outcome: `http_${status}` }])
-      this.logger?.warn?.(`event dropped after HTTP ${status}`)
+      await this.queue.deadLetter([{ source_event_id: item.source_event_id, outcome: 'http_413', code: null, event: item }])
+      this.logger?.warn?.('event dropped after HTTP 413 (single event exceeds the body limit)')
       return { state: 'continue' }
     }
     this.logger?.warn?.(`upload HTTP ${status}; ${this.queue.size} event(s) kept for retry`)
@@ -178,11 +206,11 @@ export class Uploader {
       const r = byIndex.get(index)
       if (r && DEQUEUE.has(r.status)) {
         remove.push(item.source_event_id)
-      } else if (r && TERMINAL.has(r.status)) {
+      } else if (r && TERMINAL.has(r.status) && r.error?.code !== 'FUTURE_EVENT') {
         remove.push(item.source_event_id)
-        dead.push({ source_event_id: item.source_event_id, outcome: r.status, code: r.error?.code ?? null })
+        dead.push({ source_event_id: item.source_event_id, outcome: r.status, code: r.error?.code ?? null, event: item })
       } else {
-        retry += 1 // retryable, unknown status, or result missing: keeping it is the safe side
+        retry += 1 // retryable, FUTURE_EVENT, unknown status or missing result: keeping it is the safe side
       }
     })
     this.queue.remove(remove)
@@ -192,7 +220,6 @@ export class Uploader {
 
     if (retry > 0) return this.backoff()
     this.failures = 0
-    this.limit = this.batchSize
     return { state: 'continue' }
   }
 }
