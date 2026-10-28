@@ -64,12 +64,13 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 | `TOKENPIVOT_DATABASE_URL` | 服务必填，PostgreSQL URL，明确 host、database、user、sslmode |
 | `TOKENPIVOT_MIGRATION_DATABASE_URL` | 独立迁移账号，必填；不会回退到服务 URL |
 | `TOKENPIVOT_WEB_ORIGIN` | 服务必填，唯一可信浏览器 origin，如 `http://127.0.0.1:5173`；一个 http(s) origin，不含用户信息、路径、查询、片段或尾斜杠，scheme/host 规范化为小写并省略默认端口。`https` 用于生产；`http` 只允许 `localhost`、`127.0.0.1`、`::1` 回环地址，非回环 http 在启动时直接失败 |
+| `TOKENPIVOT_REGISTRATION_OPEN` | 注册开关，默认 `false`（未设置等同关闭）；只接受精确的 `true`/`false`，空值、`TRUE`、` yes `、`1` 等其他写法使启动失败，错误只指出变量名和允许值、不回显输入。启动时读取一次，不热加载。关闭时只有**空库的首个用户**可以注册，此后所有注册返回 `403 REGISTRATION_CLOSED`；开放时不受此限制 |
 
 哪个进程需要哪些变量（各变量之间没有回退关系）：
 
 | 进程 | 需要的变量 |
 |---|---|
-| Go 服务（`make dev-go`、`bin/tokenpivot-api`、`bin/tokenpivot`） | 服务连接 `TOKENPIVOT_DATABASE_URL`、可信 origin `TOKENPIVOT_WEB_ORIGIN`，可选监听地址 `TOKENPIVOT_HTTP_ADDR` |
+| Go 服务（`make dev-go`、`bin/tokenpivot-api`、`bin/tokenpivot`） | 服务连接 `TOKENPIVOT_DATABASE_URL`、可信 origin `TOKENPIVOT_WEB_ORIGIN`，可选监听地址 `TOKENPIVOT_HTTP_ADDR` 与注册开关 `TOKENPIVOT_REGISTRATION_OPEN`（省略即关闭） |
 | 独立迁移（`bin/tokenpivot-migrate`） | 只需 `TOKENPIVOT_MIGRATION_DATABASE_URL`；不要同时向服务进程注入迁移账号 |
 | Vite 开发服务（`make dev-web`） | 只需可选的公开上游地址 `TOKENPIVOT_DEV_API_TARGET`，不接收任何连接信息 |
 | 集成测试（`make test-integration`） | `TOKENPIVOT_TEST_DATABASE_URL` 与 `TOKENPIVOT_TEST_APP_DATABASE_URL` |
@@ -96,7 +97,8 @@ postgres://tokenpivot_owner@127.0.0.1:5432/tokenpivot_local?sslmode=disable&sear
 ```
 
 ```sh
-# 终端一：注入服务连接（最小权限的服务角色）与可信 Web origin
+# 终端一：注入服务连接（最小权限的服务角色）与可信 Web origin；
+# 注册开关可省略，省略即关闭（只有空库的首个用户能注册），需要公开注册时加 TOKENPIVOT_REGISTRATION_OPEN=true
 TOKENPIVOT_HTTP_ADDR=127.0.0.1:8080 TOKENPIVOT_WEB_ORIGIN=http://127.0.0.1:5173 make dev-go
 ```
 
@@ -175,7 +177,8 @@ stderr 输出 slog JSON；数据库错误只包含安全阶段/类别，不输�
 - 注册、登录、登出等写请求要求恰好一个 `Origin` 且与 `TOKENPIVOT_WEB_ORIGIN` 完全相等，否则 403 且不写库；`GET /api/v1/auth/session` 不要求 Origin。
 - 四个端点的所有响应都带 `Cache-Control: no-store`。限流是单进程内存固定窗口：每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次；IP 只取 `RemoteAddr`，不信任任何转发头，多实例不共享计数。
 - 采集端点尚未实现（属后续任务），其接口规则已冻结为只认 `Authorization: Bearer`：即使同时携带有效 Cookie 也不回退浏览器身份。
-- 注册用户还不会自动获得个人空间（属 T-019），本任务不宣称端到端注册流程可用。
+- 注册开关 `TOKENPIVOT_REGISTRATION_OPEN` 默认关闭。关闭时只有**空库的首个用户**可以注册，该用户同时获得展示名固定为 `Personal` 的个人空间和 `owner` 成员关系；此后所有注册一律 `403 REGISTRATION_CLOSED`（已占用和未占用的邮箱响应完全相同，不下发 Cookie，不写库），直到部署方显式改为 `true`。开放时重复邮箱仍是 `409 EMAIL_UNAVAILABLE`。空库判定与首个用户写入在同一 `READ COMMITTED` 事务内、在事务级排他 advisory lock 之后进行，所以空库上的并发首注册只会成功一个；开放模式跳过锁与空库查询。
+- 一次成功的注册在同一事务内写入四部分：`users` 行、该用户的 `Personal` 个人空间、这条空间的 `owner` 成员关系、首个 `sessions` 行；任一步失败整体回滚，不会留下只有用户没有空间或没有会话的半套数据。Argon2id 与令牌生成在事务外、限流之后完成，不在事务持有期间执行。
 
 ## 验证
 
@@ -214,7 +217,7 @@ make test-integration
 
 该目标先构建前端（联合标签需要真实 `web/dist`），再执行 `GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -count=1 -p 1 -v ./...`。`-count=1` 避免测试缓存掩盖本次库状态，`-p 1` 保持包级串行；它是有数据库写入的显式操作，**不包含在 `make check` 里**。缺变量时会看到 `explicit integration database variables required` 并非零，此刻不会接触数据库。
 
-覆盖单连接初始化/重复迁移/撤销重上、同连接锁与 SQL、事务回滚、争锁/取消/杀进程恢复、最小权限、服务信号退出和真实 TCP 断连恢复，以及 00002 四张基础表的列与默认值、索引、无外键/CHECK/触发器/RLS、`tokenpivot_app` 只有 SELECT/INSERT/UPDATE 权限、唯一性范围（含归档后 key 仍被占用、大小写按字节判等）、同 source 多凭证轮换与撤销、00005 的 `users`/`sessions` 列与索引、权限与唯一性、注册事务回滚、过期与已撤销会话、并发续期与登出竞争、`UpTo(2)`/`DownTo(1)` 回退重上。测试专用 TCP 转发器阻断服务连接，不停止数据库、不终止未知会话。Unix 子进程信号测试不覆盖 Windows 服务管理。
+覆盖单连接初始化/重复迁移/撤销重上、同连接锁与 SQL、事务回滚、争锁/取消/杀进程恢复、最小权限、服务信号退出和真实 TCP 断连恢复，以及 00002 四张基础表的列与默认值、索引、无外键/CHECK/触发器/RLS、`tokenpivot_app` 只有 SELECT/INSERT/UPDATE 权限、唯一性范围（含归档后 key 仍被占用、大小写按字节判等）、同 source 多凭证轮换与撤销、00005 的 `users`/`sessions` 列与索引、权限与唯一性、注册事务回滚、过期与已撤销会话、并发续期与登出竞争、`UpTo(2)`/`DownTo(1)` 回退重上；注册侧另有开放/关闭两种开关、关闭且空库的首个账号写入四张表、空库并发首注册在 advisory lock 上等待后只有一个成功、等待者在前者回滚后补位或在提交后被拒、对 user/workspace/membership/session 四个阶段逐个撤销 INSERT 权限的事务回滚与恢复后重试。测试专用 TCP 转发器阻断服务连接，不停止数据库、不终止未知会话。Unix 子进程信号测试不覆盖 Windows 服务管理。
 
 
 ## 前端开发与内嵌构建

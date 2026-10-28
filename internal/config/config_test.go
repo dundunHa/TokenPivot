@@ -6,6 +6,90 @@ import (
 	"testing"
 )
 
+// setLoadableEnv provides the smallest valid environment, so a test can vary one
+// variable at a time.
+func setLoadableEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("TOKENPIVOT_HTTP_ADDR", "127.0.0.1:8080")
+	t.Setenv("TOKENPIVOT_DATABASE_URL", "synthetic-sensitive-marker")
+	t.Setenv("TOKENPIVOT_WEB_ORIGIN", "http://127.0.0.1:5173")
+}
+
+// TestRegistrationOpenDefault covers the deployment default: an unset variable
+// keeps public registration closed.
+func TestRegistrationOpenDefault(t *testing.T) {
+	setLoadableEnv(t)
+	t.Setenv("TOKENPIVOT_REGISTRATION_OPEN", "")
+	if err := os.Unsetenv("TOKENPIVOT_REGISTRATION_OPEN"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RegistrationOpen {
+		t.Fatal("registration is open without the variable being set")
+	}
+}
+
+// TestRegistrationOpenAccepted pins the two accepted spellings.
+func TestRegistrationOpenAccepted(t *testing.T) {
+	for value, want := range map[string]bool{"true": true, "false": false} {
+		t.Run(value, func(t *testing.T) {
+			setLoadableEnv(t)
+			t.Setenv("TOKENPIVOT_REGISTRATION_OPEN", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("accepted value failed: %v", err)
+			}
+			if cfg.RegistrationOpen != want {
+				t.Fatalf("RegistrationOpen = %t, want %t", cfg.RegistrationOpen, want)
+			}
+		})
+	}
+}
+
+// TestRegistrationOpenRejected pins the strict spellings and proves the failure
+// names the variable and its allowed values without echoing what was supplied.
+func TestRegistrationOpenRejected(t *testing.T) {
+	for name, value := range map[string]string{
+		"empty":             "",
+		"blank":             " ",
+		"surrounding space": " true ",
+		"uppercase":         "TRUE",
+		"title case":        "True",
+		"numeric":           "1",
+		"yes":               "yes",
+		"off":               "off",
+		"true with suffix":  "true1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			setLoadableEnv(t)
+			t.Setenv("TOKENPIVOT_REGISTRATION_OPEN", value)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("value %q was accepted", value)
+			}
+			message := err.Error()
+			if !strings.Contains(message, "TOKENPIVOT_REGISTRATION_OPEN") {
+				t.Fatalf("error does not name the variable: %v", err)
+			}
+			if !strings.Contains(message, `"true"`) || !strings.Contains(message, `"false"`) {
+				t.Fatalf("error does not list the allowed values: %v", err)
+			}
+			if strings.Contains(message, "synthetic-sensitive-marker") {
+				t.Fatalf("error echoed another variable's value: %v", err)
+			}
+			// A whitespace-only value cannot be searched for meaningfully (the
+			// message itself contains spaces), so it is only checked above for
+			// being refused.
+			if strings.TrimSpace(value) != "" && strings.Contains(message, value) {
+				t.Fatalf("error echoed the rejected value %q: %v", value, err)
+			}
+		})
+	}
+}
+
 func TestLoadDefault(t *testing.T) {
 	t.Setenv("TOKENPIVOT_DATABASE_URL", "synthetic-sensitive-marker")
 	t.Setenv("TOKENPIVOT_WEB_ORIGIN", "http://127.0.0.1:5173")

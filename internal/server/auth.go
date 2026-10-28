@@ -273,6 +273,10 @@ func writeServiceError(ctx context.Context, w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request is not acceptable")
 	case errors.Is(err, auth.ErrEmailUnavailable):
 		writeError(w, http.StatusConflict, "EMAIL_UNAVAILABLE", "email is already registered")
+	case errors.Is(err, auth.ErrRegistrationClosed):
+		// Decided before any account write, so an occupied and a free email get
+		// this same response and neither reveals whether the email exists.
+		writeError(w, http.StatusForbidden, "REGISTRATION_CLOSED", "registration is closed")
 	case errors.Is(err, auth.ErrInvalidCredentials):
 		writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "email or password is incorrect")
 	case errors.Is(err, auth.ErrUnauthenticated):

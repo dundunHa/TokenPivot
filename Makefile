@@ -5,7 +5,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help dev-go dev-web build-go build-web build format-check check test-integration
+.PHONY: help dev-go dev-web build-go build-web build format-check check test-integration test-plugin-dsh
 
 help:
 	@echo "TokenPivot 可用目标（默认目标，只打印清单，不做其他事）："
@@ -18,6 +18,7 @@ help:
 	@echo "  make format-check      gofmt 列出未格式化文件即失败，再跑前端 prettier --check"
 	@echo "  make check             全套普通检查（不需要 PostgreSQL）"
 	@echo "  make test-integration  构建前端后跑 uiembed,integration 测试（需要专用 PostgreSQL 与两个 TEST 变量）"
+	@echo "  make test-plugin-dsh   跑 DSH 用量插件测试（node --test，本地模拟服务端）"
 	@echo ""
 	@echo "Go 命令一律使用 GOTOOLCHAIN=local 与 -mod=readonly；目标之间不自动安装依赖。"
 
@@ -84,3 +85,7 @@ test-integration:
 	@$(MAKE) --no-print-directory build-web
 	@echo "==> [2/2] uiembed,integration 联合标签测试"
 	GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -count=1 -p 1 -v ./...
+
+# DSH 用量插件（plugins/dsh）：纯 Node 测试，不需要 npm install、PostgreSQL 或 DSH。
+test-plugin-dsh:
+	cd plugins/dsh && node --test test/

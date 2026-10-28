@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dundunHa/TokenPivot/internal/database"
+	"github.com/dundunHa/TokenPivot/internal/workspaces"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,6 +29,21 @@ WHERE sessions.token_hash = $1
   AND sessions.expires_at > now()
 RETURNING users.id, users.email, sessions.expires_at`
 	revokeSessionQuery = `UPDATE sessions SET revoked_at = COALESCE(revoked_at, now()) WHERE token_hash = $1`
+	// lockRegistrationQuery blocks until this transaction holds the exclusive
+	// transactional registration lock. PostgreSQL releases it when the
+	// transaction commits or rolls back, so it needs no unlock statement.
+	lockRegistrationQuery = `SELECT pg_advisory_xact_lock($1::int4, $2::int4)`
+	hasUsersQuery         = `SELECT EXISTS (SELECT 1 FROM users)`
+)
+
+// The registration lock key is two fixed 32-bit integers, matching PostgreSQL's
+// two-integer advisory lock space, and never a string hash that could collide.
+// It is a package constant rather than configuration: two deployments sharing a
+// database must contend on the same key. The key is taken; a future version that
+// replaces it must keep older versions from both accepting an empty database.
+const (
+	registrationLockClass  int32 = 17017
+	registrationLockObject int32 = 1
 )
 
 // querier is the subset shared by a pool and an open transaction. It keeps every
@@ -53,12 +69,15 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 	return &Postgres{pool: pool, sqlStore: &sqlStore{q: pool}}
 }
 
-// InTx runs fn inside one transaction. The store passed to fn is bound to that
-// transaction, so any user, session or future workspace write it performs
-// commits or rolls back as one unit. A nil function result commits; any error
-// rolls back and is returned as the caller supplied it.
-func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, Store) error) error {
-	tx, err := p.pool.Begin(ctx)
+// InTx runs fn inside one explicit READ COMMITTED transaction. The store passed
+// to fn is bound to that transaction, so the account, personal workspace, owner
+// membership and first session it writes commit or roll back as one unit. The
+// isolation level is spelled out because the closed-registration path relies on
+// READ COMMITTED: the statements after a lock wait take a fresh snapshot and see
+// the user that the previous lock holder committed. A nil function result
+// commits; any error rolls back and is returned as the caller supplied it.
+func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, RegistrationStore) error) error {
+	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return safeStoreError("auth begin", err)
 	}
@@ -67,13 +86,63 @@ func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, Store) err
 		// is expected and deliberately ignored.
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
-	if err := fn(ctx, &sqlStore{q: tx}); err != nil {
+	if err := fn(ctx, &registrationTxStore{sqlStore: &sqlStore{q: tx}, workspaces: workspaces.NewTx(tx)}); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return safeStoreError("auth commit", err)
 	}
 	return nil
+}
+
+// registrationTxStore is the transaction-bound registration store. It answers the
+// account and session statements through the shared sqlStore on this transaction
+// and reaches personal workspace creation through the workspaces transaction
+// adapter, so the order and the SQL of that step stay owned by internal/workspaces.
+type registrationTxStore struct {
+	*sqlStore
+	workspaces *workspaces.Tx
+}
+
+// CreateUser inserts the account and returns the identity the database assigned.
+func (s *registrationTxStore) CreateUser(ctx context.Context, email, passwordHash string) (User, error) {
+	var user User
+	var id ID
+	if err := s.q.QueryRow(ctx, createUserQuery, email, passwordHash).Scan(&id, &user.Email); err != nil {
+		return User{}, mapUserConflict(err)
+	}
+	user.ID = id
+	return user, nil
+}
+
+// CreatePersonal creates the user's initial personal workspace and owner
+// membership in this same transaction. The returned workspace is not part of the
+// registration response, so it is dropped here instead of being exposed.
+func (s *registrationTxStore) CreatePersonal(ctx context.Context, userID ID) error {
+	if _, err := s.workspaces.CreatePersonal(ctx, workspaces.ID{Bytes: userID, Valid: true}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// LockRegistration takes the exclusive transactional registration lock and holds
+// it until this transaction ends.
+func (s *registrationTxStore) LockRegistration(ctx context.Context) error {
+	if _, err := s.q.Exec(ctx, lockRegistrationQuery, registrationLockClass, registrationLockObject); err != nil {
+		return safeStoreError("auth registration lock", err)
+	}
+	return nil
+}
+
+// HasUsers reports whether any account exists. On READ COMMITTED every statement
+// takes a fresh snapshot, so after waiting on the registration lock this query
+// sees the user committed by the previous lock holder.
+func (s *registrationTxStore) HasUsers(ctx context.Context) (bool, error) {
+	var exists bool
+	if err := s.q.QueryRow(ctx, hasUsersQuery).Scan(&exists); err != nil {
+		return false, safeStoreError("auth registration state", err)
+	}
+	return exists, nil
 }
 
 // UserCredential returns the account of a normalized email. A miss is not an
@@ -90,23 +159,6 @@ func (s *sqlStore) UserCredential(ctx context.Context, email string) (Credential
 	}
 	credential.User.ID = id
 	return credential, true, nil
-}
-
-// CreateUserWithSession inserts the account and its first session in the
-// caller's transaction. The email unique index arbitrates concurrent
-// registration; only its conflict becomes ErrEmailUnavailable.
-func (s *sqlStore) CreateUserWithSession(ctx context.Context, email, passwordHash string, tokenHash []byte) (IssuedSession, error) {
-	var user User
-	var id ID
-	if err := s.q.QueryRow(ctx, createUserQuery, email, passwordHash).Scan(&id, &user.Email); err != nil {
-		return IssuedSession{}, mapUserConflict(err)
-	}
-	user.ID = id
-	expiresAt, err := s.insertSession(ctx, id, tokenHash)
-	if err != nil {
-		return IssuedSession{}, err
-	}
-	return IssuedSession{User: user, ExpiresAt: expiresAt}, nil
 }
 
 // CreateSession issues one additional session for an existing account.
