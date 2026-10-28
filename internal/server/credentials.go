@@ -205,8 +205,7 @@ func (c *Credentials) requireOwner(w http.ResponseWriter, r *http.Request) (cred
 // membershipUserID converts the authenticated browser identity into the UUID
 // form the membership lookup uses. It takes the value from the session only.
 func membershipUserID(user auth.User) workspaces.ID {
-	id := workspaces.ID{Bytes: user.ID, Valid: true}
-	return id
+	return workspaces.ID{Bytes: user.ID, Valid: true}
 }
 
 // pathID parses one UUID path parameter. A malformed value is rejected as an
