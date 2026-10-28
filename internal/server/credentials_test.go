@@ -769,31 +769,34 @@ func TestCredentialLostResponseIsRecoveredFromListThenRevoked(t *testing.T) {
 	if issued.Code != http.StatusCreated {
 		t.Fatalf("issue status = %d: %s", issued.Code, issued.Body.String())
 	}
-	body := decodeIssued(t, issued)
+	// Only the one-time token may be kept from the response: the credential ID
+	// has to come from the list, exactly like an owner whose response was lost.
+	token := decodeIssued(t, issued).Token
 
 	// The response is now "lost": only the list may locate the credential.
 	list := decodeList(t, fixture.do(t, http.MethodGet, fixture.collectionPath(), ""))
-	if len(list.Credentials) != 1 || list.Credentials[0].CredentialID != body.CredentialID || list.Credentials[0].RevokedAt != nil {
+	if len(list.Credentials) != 1 || list.Credentials[0].CredentialID == "" || list.Credentials[0].RevokedAt != nil {
 		t.Fatalf("list after a lost response = %+v", list)
 	}
-	if _, err := fixture.service.Authenticate(context.Background(), body.Token); err != nil {
+	recoveredID := list.Credentials[0].CredentialID
+	if _, err := fixture.service.Authenticate(context.Background(), token); err != nil {
 		t.Fatalf("issued token does not authenticate: %v", err)
 	}
 
-	revoked := fixture.do(t, http.MethodPost, fixture.revokePath(body.CredentialID), "")
+	revoked := fixture.do(t, http.MethodPost, fixture.revokePath(recoveredID), "")
 	if revoked.Code != http.StatusNoContent || revoked.Body.Len() != 0 {
 		t.Fatalf("revoke status/body = %d %q", revoked.Code, revoked.Body.String())
 	}
 	after := decodeList(t, fixture.do(t, http.MethodGet, fixture.collectionPath(), ""))
-	if len(after.Credentials) != 1 || after.Credentials[0].RevokedAt == nil {
+	if len(after.Credentials) != 1 || after.Credentials[0].CredentialID != recoveredID || after.Credentials[0].RevokedAt == nil {
 		t.Fatalf("list after revoke = %+v", after)
 	}
-	if _, err := fixture.service.Authenticate(context.Background(), body.Token); !errors.Is(err, credentials.ErrUnauthenticated) {
+	if _, err := fixture.service.Authenticate(context.Background(), token); !errors.Is(err, credentials.ErrUnauthenticated) {
 		t.Fatalf("revoked token authenticate error = %v", err)
 	}
 	// Repeated revocation keeps the first stamp and returns the same 204.
 	firstStamp := *after.Credentials[0].RevokedAt
-	again := fixture.do(t, http.MethodPost, fixture.revokePath(body.CredentialID), "")
+	again := fixture.do(t, http.MethodPost, fixture.revokePath(recoveredID), "")
 	if again.Code != http.StatusNoContent {
 		t.Fatalf("repeated revoke status = %d", again.Code)
 	}
@@ -814,23 +817,36 @@ func TestCredentialRotateLostResponseIsRecoveredFromListThenRevoked(t *testing.T
 	if rotated.Code != http.StatusCreated {
 		t.Fatalf("rotate status = %d: %s", rotated.Code, rotated.Body.String())
 	}
-	body := decodeIssued(t, rotated)
+	// Only the one-time token may be kept from the response: the new credential
+	// ID has to come from the list, exactly like an owner whose response was lost.
+	token := decodeIssued(t, rotated).Token
 
 	// The rotate response is now "lost": the list must locate the new credential.
 	list := decodeList(t, fixture.do(t, http.MethodGet, fixture.collectionPath(), ""))
 	if len(list.Credentials) != 2 {
 		t.Fatalf("list after a lost rotation = %+v", list)
 	}
+	// Exactly one item is not the known old credential: that is the new ID.
+	newIDs := make([]string, 0, 1)
 	revokedByID := make(map[string]*string, len(list.Credentials))
 	for _, item := range list.Credentials {
 		revokedByID[item.CredentialID] = item.RevokedAt
+		if item.CredentialID != active.ID.String() {
+			newIDs = append(newIDs, item.CredentialID)
+		}
 	}
-	rotatedRevokedAt, found := revokedByID[body.CredentialID]
-	if !found {
-		t.Fatalf("list is missing the rotated credential %s", body.CredentialID)
+	if len(newIDs) != 1 {
+		t.Fatalf("list has %d unknown credentials, want 1: %+v", len(newIDs), list)
 	}
-	if rotatedRevokedAt != nil {
-		t.Fatalf("rotated credential already revoked: %v", *rotatedRevokedAt)
+	newID := newIDs[0]
+	if newID == "" {
+		t.Fatal("the rotated credential lists without an id")
+	}
+	if revokedAt := revokedByID[newID]; revokedAt != nil {
+		t.Fatalf("rotated credential already revoked: %v", *revokedAt)
+	}
+	if revokedAt := revokedByID[active.ID.String()]; revokedAt != nil {
+		t.Fatalf("rotation revoked the old credential: %v", *revokedAt)
 	}
 	// seedCredential returns a copy, so the old row is read from the store.
 	oldRow, ok := fixture.store.storedCredential(active.ID)
@@ -840,31 +856,37 @@ func TestCredentialRotateLostResponseIsRecoveredFromListThenRevoked(t *testing.T
 	if oldRow.credential.RevokedAt != nil {
 		t.Fatal("rotation changed the old credential revocation state")
 	}
-	if _, err := fixture.service.Authenticate(context.Background(), body.Token); err != nil {
+	if _, err := fixture.service.Authenticate(context.Background(), token); err != nil {
 		t.Fatalf("rotated token does not authenticate: %v", err)
 	}
 
 	// Revoke only the new credential found through the list.
-	if w := fixture.do(t, http.MethodPost, fixture.revokePath(body.CredentialID), ""); w.Code != http.StatusNoContent {
+	if w := fixture.do(t, http.MethodPost, fixture.revokePath(newID), ""); w.Code != http.StatusNoContent {
 		t.Fatalf("revoke status = %d: %s", w.Code, w.Body.String())
 	}
 	after := decodeList(t, fixture.do(t, http.MethodGet, fixture.collectionPath(), ""))
 	if len(after.Credentials) != 2 {
 		t.Fatalf("list after revoke = %+v", after)
 	}
+	afterByID := make(map[string]*string, len(after.Credentials))
 	for _, item := range after.Credentials {
-		switch item.CredentialID {
-		case body.CredentialID:
-			if item.RevokedAt == nil {
-				t.Fatal("revoked rotated credential still lists as active")
-			}
-		case active.ID.String():
-			if item.RevokedAt != nil {
-				t.Fatal("revoking the rotated credential changed the old one")
-			}
-		}
+		afterByID[item.CredentialID] = item.RevokedAt
 	}
-	if _, err := fixture.service.Authenticate(context.Background(), body.Token); !errors.Is(err, credentials.ErrUnauthenticated) {
+	newRevokedAt, found := afterByID[newID]
+	if !found {
+		t.Fatalf("list after revoke is missing the rotated credential %s", newID)
+	}
+	if newRevokedAt == nil {
+		t.Fatal("revoked rotated credential still lists as active")
+	}
+	oldRevokedAt, found := afterByID[active.ID.String()]
+	if !found {
+		t.Fatalf("list after revoke is missing the old credential %s", active.ID)
+	}
+	if oldRevokedAt != nil {
+		t.Fatalf("revoking the rotated credential changed the old one: %v", *oldRevokedAt)
+	}
+	if _, err := fixture.service.Authenticate(context.Background(), token); !errors.Is(err, credentials.ErrUnauthenticated) {
 		t.Fatalf("revoked rotated token authenticate error = %v", err)
 	}
 }
