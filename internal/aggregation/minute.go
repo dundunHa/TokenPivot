@@ -153,19 +153,15 @@ func ApplyRequest(ctx context.Context, tx pgx.Tx, in MinuteInput) error {
 		{"cache_write_tokens", in.CacheWrite},
 		{"reasoning_tokens", in.Reasoning},
 	}
-	deltas := make([]increments, len(metrics))
-	for i, entry := range metrics {
-		delta, err := entry.metric.increments()
-		if err != nil {
-			return fmt.Errorf("%w: %s", err, entry.name)
-		}
-		deltas[i] = delta
-	}
 	args := []any{
 		in.WorkspaceID, bucketStart(in.OccurredAt), in.SourceID, in.ProjectID,
 		in.Provider, in.Model, int64(1),
 	}
-	for _, delta := range deltas {
+	for _, entry := range metrics {
+		delta, err := entry.metric.increments()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, entry.name)
+		}
 		args = append(args, delta.value, delta.known, delta.estimated, delta.missing)
 	}
 	if _, err := tx.Exec(ctx, minuteUpsert, args...); err != nil {

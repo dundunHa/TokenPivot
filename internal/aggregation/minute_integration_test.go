@@ -112,54 +112,21 @@ func newEnv(t *testing.T) *env {
 	if db != strings.TrimPrefix(urls[0].Path, "/") || role != urls[0].User.Username() || super || createRole {
 		t.Fatal("unsafe test migration role")
 	}
-	app, err := pgx.Connect(ctx, values[1])
-	if err != nil {
-		t.Fatal(database.SafeError("service role connect", err))
-	}
-	var appRole string
-	var unsafe bool
-	err = app.QueryRow(ctx, "SELECT current_user, rolsuper OR rolcreaterole OR rolcreatedb OR has_database_privilege(current_user,current_database(),'CREATE') FROM pg_roles WHERE rolname=current_user").Scan(&appRole, &unsafe)
-	if err != nil {
-		if closeErr := app.Close(ctx); closeErr != nil {
-			t.Error("close app failed")
-		}
-		t.Fatal(database.SafeError("service role identity", err))
-	}
-	if unsafe || appRole != urls[1].User.Username() {
-		if closeErr := app.Close(ctx); closeErr != nil {
-			t.Error("close app failed")
-		}
-		t.Fatal("unsafe test service role")
-	}
-	// The released migrations grant table privileges to the fixed tokenpivot_app
-	// role, so the service test account must be that role or inherit it.
-	var appPrivileges bool
-	err = app.QueryRow(ctx, "SELECT pg_has_role(current_user, 'tokenpivot_app', 'USAGE')").Scan(&appPrivileges)
-	if err != nil {
-		_ = app.Close(ctx)
-		t.Fatal(database.SafeError("service role privileges", err))
-	}
-	if !appPrivileges {
-		_ = app.Close(ctx)
-		t.Fatal("test service role must have tokenpivot_app privileges")
-	}
+	appRole := verifyAppRole(t, ctx, values[1], urls[1].User.Username())
 	// NULLS NOT DISTINCT needs PostgreSQL 15 or newer. A lower server would silently
 	// change the uniqueness rule, so stop instead of weakening it.
 	var serverVersion string
 	var versionNumber int
 	if err := owner.QueryRow(ctx, "SELECT current_setting('server_version'), current_setting('server_version_num')::int").Scan(&serverVersion, &versionNumber); err != nil {
-		_ = app.Close(ctx)
 		t.Fatal(database.SafeError("server version", err))
 	}
 	if versionNumber < 150000 {
-		_ = app.Close(ctx)
 		t.Fatalf("server_version=%s does not support the NULLS NOT DISTINCT uniqueness this schema requires", serverVersion)
 	}
 	t.Logf("server_version=%s server_version_num=%d", serverVersion, versionNumber)
 	schema := "t012_" + hex.EncodeToString(randomBytes(t, 6))
 	quoted := pgx.Identifier{schema}.Sanitize()
 	if _, err := owner.Exec(ctx, "CREATE SCHEMA "+quoted); err != nil {
-		_ = app.Close(ctx)
 		t.Fatal(database.SafeError("create owned schema", err))
 	}
 	// Registered right after CREATE SCHEMA succeeds so a later failure still tries a
@@ -178,13 +145,9 @@ func newEnv(t *testing.T) *env {
 		}
 	})
 	if _, err := owner.Exec(ctx, "GRANT USAGE ON SCHEMA "+quoted+" TO "+pgx.Identifier{appRole}.Sanitize()); err != nil {
-		_ = app.Close(ctx)
 		t.Fatal(database.SafeError("grant usage", err))
 	}
 	t.Logf("owned schema=%s database=%s migrator=%s app=%s", schema, db, role, appRole)
-	if err := app.Close(context.Background()); err != nil {
-		t.Error(database.SafeError("app close", err))
-	}
 	for i, u := range urls {
 		q := u.Query()
 		q.Set("search_path", schema)
@@ -210,6 +173,40 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(database.SafeError("grant detail probe", err))
 	}
 	return &env{ownerURL: values[0], appURL: values[1], schema: schema}
+}
+
+// verifyAppRole connects as the service test role and returns its name after
+// checking it is the expected, unprivileged role that inherits tokenpivot_app.
+// The connection is closed before returning.
+func verifyAppRole(t *testing.T, ctx context.Context, appURL, wantRole string) string {
+	t.Helper()
+	app, err := pgx.Connect(ctx, appURL)
+	if err != nil {
+		t.Fatal(database.SafeError("service role connect", err))
+	}
+	defer func() {
+		if err := app.Close(context.Background()); err != nil {
+			t.Error(database.SafeError("app close", err))
+		}
+	}()
+	var appRole string
+	var unsafe bool
+	if err := app.QueryRow(ctx, "SELECT current_user, rolsuper OR rolcreaterole OR rolcreatedb OR has_database_privilege(current_user,current_database(),'CREATE') FROM pg_roles WHERE rolname=current_user").Scan(&appRole, &unsafe); err != nil {
+		t.Fatal(database.SafeError("service role identity", err))
+	}
+	if unsafe || appRole != wantRole {
+		t.Fatal("unsafe test service role")
+	}
+	// The released migrations grant table privileges to the fixed tokenpivot_app
+	// role, so the service test account must be that role or inherit it.
+	var appPrivileges bool
+	if err := app.QueryRow(ctx, "SELECT pg_has_role(current_user, 'tokenpivot_app', 'USAGE')").Scan(&appPrivileges); err != nil {
+		t.Fatal(database.SafeError("service role privileges", err))
+	}
+	if !appPrivileges {
+		t.Fatal("test service role must have tokenpivot_app privileges")
+	}
+	return appRole
 }
 
 // applyMigrations runs every released migration inside the pinned schema on one
@@ -279,24 +276,15 @@ func newID(t *testing.T) pgtype.UUID {
 	return id
 }
 
-// requestInput builds one valid request-level input with six known zeros.
+// minuteInput builds one valid request-level input with six known zeros under a
+// fresh workspace and source; its occurred_at carries sub-second digits.
 func minuteInput(t *testing.T) MinuteInput {
 	t.Helper()
-	zero := int64(0)
-	return MinuteInput{
-		WorkspaceID: newID(t),
-		SourceID:    newID(t),
-		Provider:    "synthetic-provider",
-		Model:       "synthetic-model",
-		OccurredAt:  time.Date(2026, 10, 27, 12, 34, 30, 123456000, time.UTC),
-		Level:       LevelRequest,
-		Input:       Metric{Value: &zero, Quality: QualityKnown},
-		Output:      Metric{Value: &zero, Quality: QualityKnown},
-		Total:       Metric{Value: &zero, Quality: QualityKnown},
-		CacheRead:   Metric{Value: &zero, Quality: QualityKnown},
-		CacheWrite:  Metric{Value: &zero, Quality: QualityKnown},
-		Reasoning:   Metric{Value: &zero, Quality: QualityKnown},
-	}
+	in := requestInput()
+	in.WorkspaceID = newID(t)
+	in.SourceID = newID(t)
+	in.OccurredAt = time.Date(2026, 10, 27, 12, 34, 30, 123456000, time.UTC)
+	return in
 }
 
 // knownMetric returns a known metric with the given value; it is a fresh pointer so
@@ -372,6 +360,40 @@ func countBuckets(t *testing.T, ctx context.Context, conn *pgx.Conn, workspaceID
 		t.Fatal(database.SafeError("count minute buckets", err))
 	}
 	return count
+}
+
+// countDetails returns how many detail probe rows exist for one workspace.
+func countDetails(t *testing.T, ctx context.Context, conn *pgx.Conn, workspaceID pgtype.UUID) int {
+	t.Helper()
+	var count int
+	if err := conn.QueryRow(ctx, "SELECT count(*)::int FROM aggregation_detail_probe WHERE workspace_id=$1", workspaceID).Scan(&count); err != nil {
+		t.Fatal(database.SafeError("count detail probes", err))
+	}
+	return count
+}
+
+// requireNothingWritten asserts a workspace has neither a detail row nor a minute
+// bucket, which is what every rolled back or rejected event must leave behind.
+func requireNothingWritten(t *testing.T, ctx context.Context, conn *pgx.Conn, workspaceID pgtype.UUID, situation string) {
+	t.Helper()
+	if detail, minute := countDetails(t, ctx, conn, workspaceID), countBuckets(t, ctx, conn, workspaceID); detail != 0 || minute != 0 {
+		t.Fatalf("%s left detail=%d minute=%d want 0 and 0", situation, detail, minute)
+	}
+}
+
+// beginWithProbe begins a transaction on conn and inserts the event's detail
+// probe row, the first step of the intended T-011 call order.
+func beginWithProbe(t *testing.T, ctx context.Context, conn *pgx.Conn, in MinuteInput, eventID string) pgx.Tx {
+	t.Helper()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(database.SafeError("begin", err))
+	}
+	inserted, err := insertProbe(ctx, tx, in.WorkspaceID, in.SourceID, eventID)
+	if err != nil || !inserted {
+		t.Fatal("detail probe insert failed")
+	}
+	return tx
 }
 
 // requireSanitized asserts a returned error keeps no SQL, parameter, driver detail
@@ -566,12 +588,11 @@ func TestApplyRequestTransactionPattern(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	owner := openConn(t, ctx, e.ownerURL, "owner")
-	appURL := e.appURL
 
 	t.Run("commit visibility", func(t *testing.T) {
 		in := minuteInput(t)
-		connA := openConn(t, ctx, appURL, "A")
-		observer := openConn(t, ctx, appURL, "observer")
+		connA := openConn(t, ctx, e.appURL, "A")
+		observer := openConn(t, ctx, e.appURL, "observer")
 		tx, err := connA.Begin(ctx)
 		if err != nil {
 			t.Fatal(database.SafeError("begin A", err))
@@ -588,27 +609,16 @@ func TestApplyRequestTransactionPattern(t *testing.T) {
 		if err := ApplyRequest(ctx, tx, in); err != nil {
 			t.Fatal(err)
 		}
-		var visible int
-		if err := observer.QueryRow(ctx, "SELECT count(*)::int FROM usage_minute_stats WHERE workspace_id=$1", in.WorkspaceID).Scan(&visible); err != nil {
-			t.Fatal(database.SafeError("uncommitted visibility", err))
-		}
-		if visible != 0 {
+		if visible := countBuckets(t, ctx, observer, in.WorkspaceID); visible != 0 {
 			t.Fatalf("uncommitted minute rows=%d want=0", visible)
 		}
-		var detailVisible int
-		if err := observer.QueryRow(ctx, "SELECT count(*)::int FROM aggregation_detail_probe WHERE workspace_id=$1", in.WorkspaceID).Scan(&detailVisible); err != nil {
-			t.Fatal(database.SafeError("uncommitted detail visibility", err))
-		}
-		if detailVisible != 0 {
+		if detailVisible := countDetails(t, ctx, observer, in.WorkspaceID); detailVisible != 0 {
 			t.Fatalf("uncommitted detail rows=%d want=0", detailVisible)
 		}
 		if err := tx.Commit(ctx); err != nil {
 			t.Fatal(database.SafeError("commit A", err))
 		}
-		if err := observer.QueryRow(ctx, "SELECT count(*)::int FROM aggregation_detail_probe WHERE workspace_id=$1", in.WorkspaceID).Scan(&detailVisible); err != nil {
-			t.Fatal(database.SafeError("committed detail visibility", err))
-		}
-		if detailVisible != 1 {
+		if detailVisible := countDetails(t, ctx, observer, in.WorkspaceID); detailVisible != 1 {
 			t.Fatalf("committed detail rows=%d want=1", detailVisible)
 		}
 		row := readBucket(t, ctx, observer, in)
@@ -619,35 +629,22 @@ func TestApplyRequestTransactionPattern(t *testing.T) {
 
 	t.Run("rollback leaves nothing", func(t *testing.T) {
 		in := minuteInput(t)
-		conn := openConn(t, ctx, appURL, "rollback")
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			t.Fatal(database.SafeError("begin", err))
-		}
-		inserted, err := insertProbe(ctx, tx, in.WorkspaceID, in.SourceID, "synthetic-rollback")
-		if err != nil || !inserted {
-			t.Fatal("detail probe insert failed")
-		}
+		conn := openConn(t, ctx, e.appURL, "rollback")
+		tx := beginWithProbe(t, ctx, conn, in, "synthetic-rollback")
 		if err := ApplyRequest(ctx, tx, in); err != nil {
 			t.Fatal(err)
 		}
 		if err := tx.Rollback(ctx); err != nil {
 			t.Fatal(database.SafeError("rollback", err))
 		}
-		var detail, minute int
-		if err := owner.QueryRow(ctx, "SELECT (SELECT count(*)::int FROM aggregation_detail_probe WHERE workspace_id=$1), (SELECT count(*)::int FROM usage_minute_stats WHERE workspace_id=$1)", in.WorkspaceID).Scan(&detail, &minute); err != nil {
-			t.Fatal(database.SafeError("rollback visibility", err))
-		}
-		if detail != 0 || minute != 0 {
-			t.Fatalf("after rollback detail=%d minute=%d want 0 and 0", detail, minute)
-		}
+		requireNothingWritten(t, ctx, owner, in.WorkspaceID, "rollback")
 	})
 
 	t.Run("same identity conflict does not increment", func(t *testing.T) {
 		in := minuteInput(t)
 		const eventID = "synthetic-same-identity"
-		connA := openConn(t, ctx, appURL, "A")
-		connB := openConn(t, ctx, appURL, "B")
+		connA := openConn(t, ctx, e.appURL, "A")
+		connB := openConn(t, ctx, e.appURL, "B")
 		txA, err := connA.Begin(ctx)
 		if err != nil {
 			t.Fatal(database.SafeError("begin A", err))
@@ -722,17 +719,17 @@ func TestApplyRequestTransactionPattern(t *testing.T) {
 		const events = 8
 		conns := make([]*pgx.Conn, events)
 		for i := range conns {
-			conns[i] = openConn(t, ctx, appURL, fmt.Sprintf("contender-%d", i))
+			conns[i] = openConn(t, ctx, e.appURL, fmt.Sprintf("contender-%d", i))
 		}
 		inputs := make([]MinuteInput, events)
 		for i := range inputs {
 			inputs[i] = in
 			inputs[i].Input = knownMetric(int64(10 + i))
-			inputs[i].Output = knownMetric(int64(1))
+			inputs[i].Output = knownMetric(1)
 			inputs[i].Total = knownMetric(int64(11 + i))
 			inputs[i].CacheRead = missingMetric()
 			inputs[i].CacheWrite = missingMetric()
-			inputs[i].Reasoning = knownMetric(int64(2))
+			inputs[i].Reasoning = knownMetric(2)
 		}
 		type result struct {
 			index int
@@ -1033,35 +1030,22 @@ func TestApplyRequestFailures(t *testing.T) {
 	t.Run("non request level", func(t *testing.T) {
 		in := minuteInput(t)
 		in.Level = LevelSummary
-		tx, err := app.Begin(ctx)
-		if err != nil {
-			t.Fatal(database.SafeError("begin", err))
-		}
-		inserted, err := insertProbe(ctx, tx, in.WorkspaceID, in.SourceID, "synthetic-summary")
-		if err != nil || !inserted {
-			t.Fatal("detail probe insert failed")
-		}
+		tx := beginWithProbe(t, ctx, app, in, "synthetic-summary")
 		if err := ApplyRequest(ctx, tx, in); !errors.Is(err, ErrNonRequestLevel) {
 			t.Fatalf("error=%v want ErrNonRequestLevel", err)
 		}
 		if err := tx.Rollback(ctx); err != nil {
 			t.Fatal(database.SafeError("rollback", err))
 		}
-		var detail, minute int
-		if err := owner.QueryRow(ctx, "SELECT (SELECT count(*)::int FROM aggregation_detail_probe WHERE workspace_id=$1), (SELECT count(*)::int FROM usage_minute_stats WHERE workspace_id=$1)", in.WorkspaceID).Scan(&detail, &minute); err != nil {
-			t.Fatal(database.SafeError("summary visibility", err))
-		}
-		if detail != 0 || minute != 0 {
-			t.Fatalf("summary input left detail=%d minute=%d", detail, minute)
-		}
+		requireNothingWritten(t, ctx, owner, in.WorkspaceID, "summary input")
 	})
 
 	t.Run("invalid metric representation", func(t *testing.T) {
 		cases := map[string]func(*MinuteInput){
 			"known without value":     func(in *MinuteInput) { in.Output = Metric{Quality: QualityKnown} },
 			"estimated without value": func(in *MinuteInput) { in.Total = Metric{Quality: QualityEstimated} },
-			"missing with value":      func(in *MinuteInput) { in.CacheRead = Metric{Value: pointerTo(int64(0)), Quality: QualityMissing} },
-			"unknown quality":         func(in *MinuteInput) { in.Reasoning = Metric{Value: pointerTo(int64(1)), Quality: "synthetic-quality"} },
+			"missing with value":      func(in *MinuteInput) { in.CacheRead = Metric{Value: value(0), Quality: QualityMissing} },
+			"unknown quality":         func(in *MinuteInput) { in.Reasoning = Metric{Value: value(1), Quality: "synthetic-quality"} },
 		}
 		for name, mutate := range cases {
 			in := minuteInput(t)
@@ -1077,17 +1061,10 @@ func TestApplyRequestFailures(t *testing.T) {
 
 	t.Run("cancellation", func(t *testing.T) {
 		in := minuteInput(t)
-		tx, err := app.Begin(ctx)
-		if err != nil {
-			t.Fatal(database.SafeError("begin", err))
-		}
-		inserted, err := insertProbe(ctx, tx, in.WorkspaceID, in.SourceID, "synthetic-cancel")
-		if err != nil || !inserted {
-			t.Fatal("detail probe insert failed")
-		}
+		tx := beginWithProbe(t, ctx, app, in, "synthetic-cancel")
 		canceled, stop := context.WithCancel(ctx)
 		stop()
-		err = ApplyRequest(canceled, tx, in)
+		err := ApplyRequest(canceled, tx, in)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancellation error=%v want context.Canceled", err)
 		}
@@ -1096,13 +1073,7 @@ func TestApplyRequestFailures(t *testing.T) {
 		if rollbackErr := tx.Rollback(context.Background()); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) && !errors.Is(rollbackErr, pgconn.ErrConnClosed) {
 			t.Fatal(database.SafeError("rollback after cancel", rollbackErr))
 		}
-		var detail, minute int
-		if err := owner.QueryRow(ctx, "SELECT (SELECT count(*)::int FROM aggregation_detail_probe WHERE workspace_id=$1), (SELECT count(*)::int FROM usage_minute_stats WHERE workspace_id=$1)", in.WorkspaceID).Scan(&detail, &minute); err != nil {
-			t.Fatal(database.SafeError("cancel visibility", err))
-		}
-		if detail != 0 || minute != 0 {
-			t.Fatalf("canceled write left detail=%d minute=%d", detail, minute)
-		}
+		requireNothingWritten(t, ctx, owner, in.WorkspaceID, "canceled write")
 	})
 
 	t.Run("bigint overflow rolls back", func(t *testing.T) {
@@ -1115,15 +1086,8 @@ func TestApplyRequestFailures(t *testing.T) {
 		}
 		over := in
 		over.Input = knownMetric(1)
-		tx, err := app.Begin(ctx)
-		if err != nil {
-			t.Fatal(database.SafeError("begin", err))
-		}
-		inserted, err := insertProbe(ctx, tx, over.WorkspaceID, over.SourceID, "synthetic-overflow")
-		if err != nil || !inserted {
-			t.Fatal("detail probe insert failed")
-		}
-		err = ApplyRequest(ctx, tx, over)
+		tx := beginWithProbe(t, ctx, app, over, "synthetic-overflow")
+		err := ApplyRequest(ctx, tx, over)
 		if err == nil {
 			t.Fatal("overflow succeeded instead of failing")
 		}
@@ -1144,9 +1108,4 @@ func TestApplyRequestFailures(t *testing.T) {
 		}
 		t.Log("overflow error was sanitized and the existing bucket kept its value")
 	})
-}
-
-// pointerTo returns a pointer to a copy of value.
-func pointerTo[T any](value T) *T {
-	return &value
 }

@@ -30,19 +30,20 @@ func requestInput() MinuteInput {
 	}
 }
 
-// minuteBuckets pins the UTC minute start rule: the same instant expressed in any
-// Location or fixed offset yields one bucket, and the second/nanosecond part never
-// changes it while the next minute does.
+// TestMinuteBuckets pins the UTC minute start rule: the same instant expressed in
+// any Location or fixed offset yields one bucket, and the second/nanosecond part
+// never changes it while the next minute does.
 func TestMinuteBuckets(t *testing.T) {
 	instant := time.Date(2026, 10, 27, 12, 34, 30, 500, time.UTC)
+	want := time.Date(2026, 10, 27, 12, 34, 0, 0, time.UTC)
 	locations := map[string]time.Time{
-		"utc":               instant,
-		"fixed west offset": instant.In(time.FixedZone("synthetic-west", -7*60*60)),
-		"fixed east offset": instant.In(time.FixedZone("synthetic-east", 9*60*60)),
-		"named zone":        instant.In(time.FixedZone("synthetic-named", 5*60*60+30*60)),
+		"utc":                    instant,
+		"fixed west offset":      instant.In(time.FixedZone("synthetic-west", -7*60*60)),
+		"fixed east offset":      instant.In(time.FixedZone("synthetic-east", 9*60*60)),
+		"fixed half-hour offset": instant.In(time.FixedZone("synthetic-named", 5*60*60+30*60)),
 	}
 	for name, at := range locations {
-		if got, want := bucketStart(at), time.Date(2026, 10, 27, 12, 34, 0, 0, time.UTC); !got.Equal(want) || got.Location() != time.UTC {
+		if got := bucketStart(at); !got.Equal(want) || got.Location() != time.UTC {
 			t.Fatalf("%s bucket=%s want=%s in UTC", name, got, want)
 		}
 	}
@@ -81,7 +82,17 @@ func TestRejectedInputs(t *testing.T) {
 		}
 	}
 
-	metrics := []string{"input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"}
+	metrics := []struct {
+		name string
+		set  func(*MinuteInput, Metric)
+	}{
+		{"input_tokens", func(in *MinuteInput, m Metric) { in.Input = m }},
+		{"output_tokens", func(in *MinuteInput, m Metric) { in.Output = m }},
+		{"total_tokens", func(in *MinuteInput, m Metric) { in.Total = m }},
+		{"cache_read_tokens", func(in *MinuteInput, m Metric) { in.CacheRead = m }},
+		{"cache_write_tokens", func(in *MinuteInput, m Metric) { in.CacheWrite = m }},
+		{"reasoning_tokens", func(in *MinuteInput, m Metric) { in.Reasoning = m }},
+	}
 	invalids := []struct {
 		name   string
 		metric Metric
@@ -93,24 +104,16 @@ func TestRejectedInputs(t *testing.T) {
 		{"empty quality", Metric{Value: value(1)}},
 		{"unknown quality", Metric{Value: value(1), Quality: "synthetic-quality"}},
 	}
-	for _, metricName := range metrics {
+	for _, metric := range metrics {
 		for _, invalid := range invalids {
 			in := requestInput()
-			set := map[string]func(*MinuteInput, Metric){
-				"input_tokens":       func(in *MinuteInput, m Metric) { in.Input = m },
-				"output_tokens":      func(in *MinuteInput, m Metric) { in.Output = m },
-				"total_tokens":       func(in *MinuteInput, m Metric) { in.Total = m },
-				"cache_read_tokens":  func(in *MinuteInput, m Metric) { in.CacheRead = m },
-				"cache_write_tokens": func(in *MinuteInput, m Metric) { in.CacheWrite = m },
-				"reasoning_tokens":   func(in *MinuteInput, m Metric) { in.Reasoning = m },
-			}[metricName]
-			set(&in, invalid.metric)
+			metric.set(&in, invalid.metric)
 			err := ApplyRequest(context.Background(), nil, in)
 			if !errors.Is(err, ErrInvalidMetric) {
-				t.Fatalf("%s %s error=%v want ErrInvalidMetric", metricName, invalid.name, err)
+				t.Fatalf("%s %s error=%v want ErrInvalidMetric", metric.name, invalid.name, err)
 			}
-			if !strings.Contains(err.Error(), metricName) {
-				t.Fatalf("%s %s error=%q does not name the metric", metricName, invalid.name, err)
+			if !strings.Contains(err.Error(), metric.name) {
+				t.Fatalf("%s %s error=%q does not name the metric", metric.name, invalid.name, err)
 			}
 		}
 	}
@@ -149,8 +152,7 @@ func TestIncrements(t *testing.T) {
 	in.CacheRead = Metric{Value: value(60), Quality: QualityKnown}
 	in.CacheWrite = Metric{Quality: QualityMissing}
 	in.Reasoning = Metric{Quality: QualityMissing}
-	total := int64(0)
-	misses := int64(0)
+	var total, misses int64
 	for _, metric := range []Metric{in.Input, in.Output, in.Total, in.CacheRead, in.CacheWrite, in.Reasoning} {
 		delta, err := metric.increments()
 		if err != nil {
@@ -172,15 +174,4 @@ func TestIncrements(t *testing.T) {
 	if misses != 2 {
 		t.Fatalf("missing metrics=%d want=2", misses)
 	}
-	if valueOf(in.Total) != 120 || valueOf(in.Input)+valueOf(in.Output) != 120 {
-		t.Fatal("test fixture is inconsistent with the documented subset example")
-	}
-}
-
-// valueOf reports a metric's value or -1 when it is missing.
-func valueOf(metric Metric) int64 {
-	if metric.Value == nil {
-		return -1
-	}
-	return *metric.Value
 }
