@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/dundunHa/TokenPivot/internal/aggregation"
 	"github.com/dundunHa/TokenPivot/internal/credentials"
+	"github.com/jackc/pgx/v5"
 )
 
 // fixedNow is the frozen time base of every unit test: 2026-10-27T14:00:00Z, the
@@ -65,11 +67,11 @@ func (c *fakeClock) now() time.Time {
 	return c.times[index]
 }
 
-// fakeEvent is one stored detail row as the fake store keeps it.
+// fakeEvent is one stored detail row as the fake store keeps it: exactly the two
+// comparison columns the service reads back.
 type fakeEvent struct {
 	version string
 	hash    []byte
-	content storedEvent
 }
 
 // fakeStore is an in-memory stand-in that mirrors only the SQL semantics the
@@ -83,6 +85,15 @@ type fakeStore struct {
 	touched  int
 	// failure injects one error per named step.
 	failure map[string]error
+	// onStep runs after a step has been recorded, so a test can cancel a context
+	// or move the clock at one exact point of the frozen per-item order.
+	onStep func(step string)
+	// rollbackFailure is returned by Rollback, modelling a connection that could
+	// not discard the transaction.
+	rollbackFailure error
+	// commitWaitsForContext makes Commit block until the context ends and then
+	// return its error, modelling a commit that hits the request deadline.
+	commitWaitsForContext bool
 	// insertResult overrides the insert outcome when set: -1 keeps the mapped
 	// behavior, 0 reports "identity exists", 1 reports "inserted".
 	insertResult int
@@ -102,8 +113,12 @@ func newFakeStore() *fakeStore {
 
 func (f *fakeStore) record(step string) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, step)
+	hook := f.onStep
+	f.mu.Unlock()
+	if hook != nil {
+		hook(step)
+	}
 }
 
 func (f *fakeStore) called(step string) int {
@@ -178,13 +193,13 @@ func (t *fakeTx) InsertEvent(ctx context.Context, event storedEvent) (bool, erro
 		return false, nil
 	}
 	if t.store.insertResult == 1 {
-		t.store.events[event.SourceEventID] = fakeEvent{version: event.NormalizationVersion, hash: event.PayloadHash, content: event}
+		t.store.events[event.SourceEventID] = fakeEvent{version: event.NormalizationVersion, hash: event.PayloadHash}
 		return true, nil
 	}
 	if _, exists := t.store.events[event.SourceEventID]; exists {
 		return false, nil
 	}
-	t.store.events[event.SourceEventID] = fakeEvent{version: event.NormalizationVersion, hash: event.PayloadHash, content: event}
+	t.store.events[event.SourceEventID] = fakeEvent{version: event.NormalizationVersion, hash: event.PayloadHash}
 	return true, nil
 }
 
@@ -202,10 +217,7 @@ func (t *fakeTx) ExistingEvent(ctx context.Context, workspaceID, sourceID creden
 	if !ok {
 		return storedEvent{}, false, nil
 	}
-	existing := row.content
-	existing.NormalizationVersion = row.version
-	existing.PayloadHash = row.hash
-	return existing, true, nil
+	return storedEvent{NormalizationVersion: row.version, PayloadHash: row.hash}, true, nil
 }
 
 func (t *fakeTx) ApplyMinute(ctx context.Context, input aggregation.MinuteInput) error {
@@ -221,6 +233,11 @@ func (t *fakeTx) ApplyMinute(ctx context.Context, input aggregation.MinuteInput)
 
 func (t *fakeTx) Commit(ctx context.Context) error {
 	t.store.record("commit")
+	if t.store.commitWaitsForContext {
+		<-ctx.Done()
+		t.done = true
+		return ctx.Err()
+	}
 	t.done = true
 	return t.failure("commit")
 }
@@ -228,7 +245,12 @@ func (t *fakeTx) Commit(ctx context.Context) error {
 func (t *fakeTx) Rollback(ctx context.Context) error {
 	t.store.record("rollback")
 	t.done = true
-	return nil
+	// A dead context models a rollback that could not run at all, so a regression
+	// back to the request context is visible instead of silent.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return t.store.rollbackFailure
 }
 
 // fakeAuthenticator resolves one fixed identity for the accepted token. Any other
@@ -237,10 +259,13 @@ type fakeAuthenticator struct {
 	token   string
 	failure error
 	calls   int
+	// deadline is the budget the handler handed to authentication.
+	deadline time.Time
 }
 
 func (a *fakeAuthenticator) Authenticate(ctx context.Context, token string) (credentials.Credential, error) {
 	a.calls++
+	a.deadline, _ = ctx.Deadline()
 	if a.failure != nil {
 		return credentials.Credential{}, a.failure
 	}
@@ -1308,3 +1333,247 @@ func TestDeadlineExhaustionFillsRemainingItems(t *testing.T) {
 		t.Fatalf("commits=%d want=1", commits)
 	}
 }
+
+func TestDeadlineOutranksPreDecodedRejection(t *testing.T) {
+	environment := newTestEnvironment(t)
+	service := New(environment.store, environment.auth, nil)
+	items := []item{
+		{event: mustDecodeEvent(t, validEventJSON("req-order-1", fixedNow))},
+		// A permanently invalid position after the cancellation point: without the
+		// budget check first it would be reported as rejected forever.
+		{rejection: invalidItem("synthetic: not a JSON object")},
+		{event: mustDecodeEvent(t, validEventJSON("req-order-3", fixedNow))},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	environment.store.onStep = func(step string) {
+		if step == "commit" {
+			cancel()
+		}
+	}
+	results := service.process(ctx, credentials.Credential{WorkspaceID: syntheticWorkspace, SourceID: syntheticSource}, items)
+	if results[0].status != statusAccepted {
+		t.Fatalf("first=%+v want accepted", results[0])
+	}
+	for i := 1; i < len(results); i++ {
+		if results[i].status != statusRetryable || results[i].code != codeDeadlineExceeded {
+			t.Fatalf("result %d=%+v want retryable/DEADLINE_EXCEEDED", i, results[i])
+		}
+	}
+}
+
+func TestCommitDeadlineIsDeadlineNotInternal(t *testing.T) {
+	t.Run("commit blocks until the budget ends", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		environment.store.commitWaitsForContext = true
+		service := New(environment.store, environment.auth, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		items := []item{{event: mustDecodeEvent(t, validEventJSON("req-commit-deadline", fixedNow))}}
+		results := service.process(ctx, credentials.Credential{WorkspaceID: syntheticWorkspace, SourceID: syntheticSource}, items)
+		if len(results) != 1 {
+			t.Fatalf("results=%d want=1", len(results))
+		}
+		if results[0].status != statusRetryable || results[0].code != codeDeadlineExceeded {
+			t.Fatalf("result=%+v want retryable/DEADLINE_EXCEEDED", results[0])
+		}
+		if commits := environment.store.called("commit"); commits != 1 {
+			t.Fatalf("commits=%d want=1", commits)
+		}
+		if rollbacks := environment.store.called("rollback"); rollbacks != 1 {
+			t.Fatalf("rollbacks=%d want=1", rollbacks)
+		}
+	})
+
+	t.Run("commit fails while the budget is already gone", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		environment.store.failure["commit"] = errors.New("synthetic: driver detail")
+		service := New(environment.store, environment.auth, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		environment.store.onStep = func(step string) {
+			if step == "commit" {
+				cancel()
+			}
+		}
+		items := []item{{event: mustDecodeEvent(t, validEventJSON("req-commit-canceled", fixedNow))}}
+		results := service.process(ctx, credentials.Credential{WorkspaceID: syntheticWorkspace, SourceID: syntheticSource}, items)
+		if results[0].status != statusRetryable || results[0].code != codeDeadlineExceeded {
+			t.Fatalf("result=%+v want retryable/DEADLINE_EXCEEDED", results[0])
+		}
+		if strings.Contains(environment.logs.String(), "driver detail") {
+			t.Fatal("logs leaked the driver message")
+		}
+	})
+}
+
+func TestRollbackFailureIsLoggedWithoutDriverDetail(t *testing.T) {
+	const marker = "synthetic-sensitive-marker"
+	environment := newTestEnvironment(t)
+	environment.store.failure["insert"] = errors.New("synthetic: driver detail")
+	environment.store.rollbackFailure = errors.New("synthetic-rollback-failure: connection lost " + marker)
+	body := decodeResults(t, environment.send(t, encodedBatch(t,
+		validEventJSON("req-rollback", fixedNow),
+	)), 1)
+	requireStatuses(t, body, statusRetryable)
+	requireCodes(t, body, codeUnavailable)
+	if rollbacks := environment.store.called("rollback"); rollbacks != 1 {
+		t.Fatalf("rollbacks=%d want=1", rollbacks)
+	}
+	logs := environment.logs.String()
+	if strings.Contains(logs, marker) {
+		t.Fatalf("rollback log leaked the driver detail: %s", logs)
+	}
+	if !strings.Contains(logs, "ingestion rollback") {
+		t.Fatalf("missing the sanitized rollback stage log: %s", logs)
+	}
+}
+
+func TestRollbackUsesItsOwnBoundedContext(t *testing.T) {
+	// A canceled request still rolls the item back, with a fresh budget that is
+	// independent of the request but still bounded.
+	environment := newTestEnvironment(t)
+	environment.store.failure["insert"] = errors.New("synthetic: driver detail")
+	ctx, cancel := context.WithCancel(context.Background())
+	environment.store.onStep = func(step string) {
+		if step == "insert" {
+			cancel()
+		}
+	}
+	recorder := &contextRecordingStore{inner: environment.store}
+	results := New(recorder, environment.auth, nil).process(ctx, credentials.Credential{
+		WorkspaceID: syntheticWorkspace, SourceID: syntheticSource,
+	}, []item{{event: mustDecodeEvent(t, validEventJSON("req-rollback-ctx", fixedNow))}})
+	if len(results) != 1 || results[0].status != statusRetryable {
+		t.Fatalf("results=%+v want one retryable result", results)
+	}
+	if recorder.rollbackErr != nil {
+		t.Fatalf("rollback context error=%v want a live dedicated context", recorder.rollbackErr)
+	}
+	if !recorder.rollbackDeadlinePresent {
+		t.Fatal("rollback context had no deadline")
+	}
+	if remaining := time.Until(recorder.rollbackDeadline); remaining > rollbackBudget {
+		t.Fatalf("rollback deadline is %s away, want at most %s", remaining, rollbackBudget)
+	}
+}
+
+// contextRecordingStore wraps a store and records the context the service hands to
+// Rollback, so the dedicated rollback budget can be observed.
+type contextRecordingStore struct {
+	inner                   *fakeStore
+	rollbackErr             error
+	rollbackDeadline        time.Time
+	rollbackDeadlinePresent bool
+}
+
+func (s *contextRecordingStore) BeginItem(ctx context.Context) (itemTx, error) {
+	tx, err := s.inner.BeginItem(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &contextRecordingTx{inner: tx.(*fakeTx), recorder: s}, nil
+}
+
+func (s *contextRecordingStore) TouchSource(ctx context.Context, workspaceID, sourceID credentials.ID) error {
+	return s.inner.TouchSource(ctx, workspaceID, sourceID)
+}
+
+// contextRecordingTx records the rollback context of one item transaction.
+type contextRecordingTx struct {
+	inner    *fakeTx
+	recorder *contextRecordingStore
+}
+
+func (t *contextRecordingTx) Now(ctx context.Context) (time.Time, error) {
+	return t.inner.Now(ctx)
+}
+
+func (t *contextRecordingTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
+	return t.inner.ProjectExists(ctx, workspaceID, projectID)
+}
+
+func (t *contextRecordingTx) InsertEvent(ctx context.Context, event storedEvent) (bool, error) {
+	return t.inner.InsertEvent(ctx, event)
+}
+
+func (t *contextRecordingTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
+	return t.inner.ExistingEvent(ctx, workspaceID, sourceID, sourceEventID)
+}
+
+func (t *contextRecordingTx) ApplyMinute(ctx context.Context, input aggregation.MinuteInput) error {
+	return t.inner.ApplyMinute(ctx, input)
+}
+
+func (t *contextRecordingTx) Commit(ctx context.Context) error { return t.inner.Commit(ctx) }
+
+func (t *contextRecordingTx) Rollback(ctx context.Context) error {
+	t.recorder.rollbackErr = ctx.Err()
+	t.recorder.rollbackDeadline, t.recorder.rollbackDeadlinePresent = ctx.Deadline()
+	return t.inner.Rollback(ctx)
+}
+
+func TestHandlerBudgetStartsAtEntry(t *testing.T) {
+	environment := newTestEnvironment(t)
+	request := httptest.NewRequest(http.MethodPost, ingestionPath, strings.NewReader(encodedBatch(t, validEventJSON("req-budget", fixedNow))))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+environment.auth.token)
+	entered := time.Now()
+	recorder := httptest.NewRecorder()
+	environment.handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// Authentication runs under the same deadline, and that deadline is the
+	// handler entry plus the budget: it is not restarted after the body read.
+	window := environment.auth.deadline.Sub(entered)
+	if window < processingBudget || window > processingBudget+time.Second {
+		t.Fatalf("authentication deadline is %s after entry, want about the %s budget", window, processingBudget)
+	}
+}
+
+// deadlineReader fails the body read the way a connection-level read deadline does.
+type deadlineReader struct{}
+
+func (deadlineReader) Read([]byte) (int, error) { return 0, os.ErrDeadlineExceeded }
+
+func TestBodyReadDeadlineIsRetryableNotInvalidArgument(t *testing.T) {
+	environment := newTestEnvironment(t)
+	request := httptest.NewRequest(http.MethodPost, ingestionPath, deadlineReader{})
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+environment.auth.token)
+	recorder := httptest.NewRecorder()
+	environment.handler.ServeHTTP(recorder, request)
+	decodeBatchError(t, recorder, http.StatusServiceUnavailable, "UNAVAILABLE")
+	if sequence := environment.store.sequence(); sequence != "" {
+		t.Fatalf("store calls=%q want none", sequence)
+	}
+}
+
+func TestPostgresTransactionErrorsAreSanitized(t *testing.T) {
+	const marker = "synthetic-sensitive-marker"
+	failing := failingTx{err: errors.New("driver detail " + marker)}
+	tx := &postgresTx{tx: failing}
+
+	commitErr := tx.Commit(context.Background())
+	if commitErr == nil {
+		t.Fatal("commit error was dropped")
+	}
+	rollbackErr := tx.Rollback(context.Background())
+	if rollbackErr == nil {
+		t.Fatal("rollback error was dropped")
+	}
+	for _, err := range []error{commitErr, rollbackErr} {
+		if strings.Contains(err.Error(), marker) || strings.Contains(err.Error(), "driver detail") {
+			t.Fatalf("sanitized error leaked driver detail: %q", err)
+		}
+	}
+}
+
+// failingTx satisfies pgx.Tx through the embedded interface and only implements the
+// two lifecycle calls this test exercises.
+type failingTx struct {
+	pgx.Tx
+	err error
+}
+
+func (t failingTx) Commit(context.Context) error   { return t.err }
+func (t failingTx) Rollback(context.Context) error { return t.err }

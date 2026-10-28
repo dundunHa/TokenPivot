@@ -41,6 +41,10 @@ const (
 	maxBodyBytes = 1 << 20
 	// processingBudget bounds one request from the moment the handler starts.
 	processingBudget = 8 * time.Second
+	// rollbackBudget bounds the rollback that releases an item connection. It is
+	// deliberately not the request context: a canceled request must still get the
+	// connection back, and the rollback must not hang on a dead network.
+	rollbackBudget = 2 * time.Second
 )
 
 // Per-item result statuses. The first four never carry an error code; the last
@@ -219,12 +223,15 @@ func (s *Service) process(ctx context.Context, credential credentials.Credential
 	results := make([]result, len(items))
 	accepted := false
 	for i := range items {
-		if items[i].rejection != nil {
-			results[i] = rejectedResult(items[i].rejection.code, items[i].rejection.message)
-			continue
-		}
+		// The budget is checked before any pre-decoded verdict: once the request
+		// is over, an unstarted position is retryable even when its content is
+		// permanently invalid, because the client never got a real decision.
 		if ctx.Err() != nil {
 			results[i] = stoppedResult()
+			continue
+		}
+		if items[i].rejection != nil {
+			results[i] = rejectedResult(items[i].rejection.code, items[i].rejection.message)
 			continue
 		}
 		if items[i].event == nil {
@@ -259,10 +266,14 @@ func (s *Service) processItem(ctx context.Context, credential credentials.Creden
 		if committed {
 			return
 		}
-		// The request context may already be canceled; the rollback must still run
-		// and release the connection.
-		if rollbackErr := tx.Rollback(context.Background()); rollbackErr != nil {
-			s.logger.Warn("item rollback failed", "stage", "ingestion item", "err", rollbackErr)
+		// The request context may already be canceled, so the rollback uses its own
+		// short-lived budget: independent of the request, but still bounded so a
+		// dead network cannot hold the connection forever.
+		rollbackCtx, cancelRollback := context.WithTimeout(context.WithoutCancel(ctx), rollbackBudget)
+		defer cancelRollback()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil {
+			// The driver message is never logged: only the sanitized class survives.
+			s.logger.Warn("item rollback failed", "stage", "ingestion item", "err", database.SafeError("ingestion rollback", rollbackErr))
 		}
 	}()
 
@@ -335,7 +346,11 @@ func (s *Service) processItem(ctx context.Context, credential credentials.Creden
 	}
 	if err := tx.Commit(ctx); err != nil {
 		// A commit error may mean the result is unknown: never report accepted and
-		// never claim the row was rolled back.
+		// never claim the row was rolled back. When the budget ran out, that is the
+		// honest code; otherwise the failure is a general internal error.
+		if ctx.Err() != nil {
+			return retryableResult(ctx, ctx.Err())
+		}
 		return retryableResult(ctx, transient(codeInternal, err))
 	}
 	committed = true
@@ -413,16 +428,19 @@ func retryableResult(ctx context.Context, err error) result {
 	return result{status: statusRetryable, code: code, message: retryMessage(code)}
 }
 
-// retryCode picks the documented retryable code for a failure.
+// retryCode picks the documented retryable code for a failure. An exhausted
+// request budget outranks every specific failure class: the client only learns
+// that the item must be retried, so DEADLINE_EXCEEDED is the honest code even when
+// the underlying statement failed for another reason.
 func retryCode(ctx context.Context, err error) string {
+	if ctx.Err() != nil {
+		return codeDeadlineExceeded
+	}
 	var failure *transientError
 	if errors.As(err, &failure) {
 		return failure.code
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return codeDeadlineExceeded
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return codeDeadlineExceeded
 	}
 	return codeUnavailable
