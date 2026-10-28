@@ -29,6 +29,10 @@ type authFakeStore struct {
 	// calls counts the methods reached, so a rejected request can be proven to
 	// have stopped before any store access.
 	calls map[string]int
+	// now is the store clock; nil means time.Now. A test drives it separately
+	// from the HTTP clock to model a response that is written after the database
+	// already assigned the expiry.
+	now func() time.Time
 }
 
 type fakeSession struct {
@@ -47,6 +51,15 @@ type authStoreFailures struct {
 
 func newAuthFakeStore() *authFakeStore {
 	return &authFakeStore{users: make(map[string]auth.Credential), sessions: make(map[string]fakeSession), calls: make(map[string]int)}
+}
+
+// clock reads the store clock, so a test can hold the database time still while
+// the response time moves on.
+func (f *authFakeStore) clock() time.Time {
+	if f.now != nil {
+		return f.now()
+	}
+	return time.Now()
 }
 
 // record counts one store call.
@@ -110,7 +123,7 @@ func (f *authFakeStore) CreateUserWithSession(ctx context.Context, email, passwo
 	}
 	user := auth.User{ID: f.identifier(), Email: email}
 	f.users[email] = auth.Credential{User: user, PasswordHash: passwordHash}
-	expiresAt := time.Now().UTC().Add(auth.SessionLifetime).Truncate(time.Second)
+	expiresAt := f.clock().UTC().Add(auth.SessionLifetime).Truncate(time.Second)
 	f.sessions[string(tokenHash)] = fakeSession{userID: user.ID, expiresAt: expiresAt}
 	return auth.IssuedSession{User: user, ExpiresAt: expiresAt}, nil
 }
@@ -118,7 +131,7 @@ func (f *authFakeStore) CreateUserWithSession(ctx context.Context, email, passwo
 func (f *authFakeStore) CreateSession(ctx context.Context, userID auth.ID, tokenHash []byte) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	expiresAt := time.Now().UTC().Add(auth.SessionLifetime).Truncate(time.Second)
+	expiresAt := f.clock().UTC().Add(auth.SessionLifetime).Truncate(time.Second)
 	f.sessions[string(tokenHash)] = fakeSession{userID: userID, expiresAt: expiresAt}
 	return expiresAt, nil
 }
@@ -131,11 +144,18 @@ func (f *authFakeStore) AuthenticateSession(ctx context.Context, tokenHash []byt
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	session, ok := f.sessions[string(tokenHash)]
-	if !ok || session.revoked || !session.expiresAt.After(time.Now()) {
+	if !ok || session.revoked || !session.expiresAt.After(f.clock()) {
 		return auth.IssuedSession{}, false, nil
 	}
-	// Renewal extends the stored expiry, so a test observes a strictly later time.
-	session.expiresAt = session.expiresAt.Add(auth.SessionLifetime)
+	// Renewal restarts the window from the store clock, mirroring the single
+	// UPDATE ... now() + 30 days statement. The fake keeps whole seconds because
+	// the cookie date has second precision, and a renewal never reports an
+	// unchanged expiry, so a test always observes a strictly later time.
+	renewed := f.clock().UTC().Add(auth.SessionLifetime).Truncate(time.Second)
+	if !renewed.After(session.expiresAt) {
+		renewed = session.expiresAt.Add(time.Second)
+	}
+	session.expiresAt = renewed
 	f.sessions[string(tokenHash)] = session
 	for _, credential := range f.users {
 		if credential.User.ID == session.userID {
@@ -540,6 +560,27 @@ func TestAuthBodyValidation(t *testing.T) {
 		"empty body":         {"application/json", "", http.StatusBadRequest},
 		"invalid email":      {"application/json", `{"email":"synthetic.example.com","password":"synthetic-password"}`, http.StatusBadRequest},
 		"short password":     {"application/json", `{"email":"synthetic@example.com","password":"short"}`, http.StatusBadRequest},
+		// encoding/json matches struct keys case-insensitively, so these bodies
+		// would otherwise bind to Email/Password. Only the exact spellings count.
+		"uppercase email key":    {"application/json", `{"EMAIL":"synthetic@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"uppercase password key": {"application/json", `{"email":"synthetic@example.com","PASSWORD":"synthetic-password"}`, http.StatusBadRequest},
+		"mixed case duplicate":   {"application/json", `{"email":"synthetic@example.com","EMAIL":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"escaped duplicate key":  {"application/json", `{"email":"synthetic@example.com","\u0065mail":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"escaped key alone":      {"application/json", `{"\u0065mail":"synthetic@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"missing password":       {"application/json", `{"email":"synthetic@example.com"}`, http.StatusBadRequest},
+		"missing email":          {"application/json", `{"password":"synthetic-password"}`, http.StatusBadRequest},
+		"both empty":             {"application/json", `{}`, http.StatusBadRequest},
+		"non-string email":       {"application/json", `{"email":42,"password":"synthetic-password"}`, http.StatusBadRequest},
+		"object password":        {"application/json", `{"email":"synthetic@example.com","password":{"value":"synthetic-password"}}`, http.StatusBadRequest},
+		"nested object":          {"application/json", `{"email":{"value":"synthetic@example.com"},"password":"synthetic-password"}`, http.StatusBadRequest},
+		"whitespace padded key":  {"application/json", `{" email":"synthetic@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"single quotation marks": {"application/json", `{'email':'synthetic@example.com','password':'synthetic-password'}`, http.StatusBadRequest},
+		"two objects":            {"application/json", `{"email":"synthetic@example.com","password":"synthetic-password"}{"email":"other@example.com","password":"synthetic-password"}`, http.StatusBadRequest},
+		"null body":              {"application/json", `null`, http.StatusBadRequest},
+		"number body":            {"application/json", `1`, http.StatusBadRequest},
+		"string body":            {"application/json", `"synthetic"`, http.StatusBadRequest},
+		"unterminated object":    {"application/json", `{"email":"synthetic@example.com","password":"synthetic-password"`, http.StatusBadRequest},
+		"key without value":      {"application/json", `{"email":"synthetic@example.com","password"}`, http.StatusBadRequest},
 	} {
 		t.Run(name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, registerPath, strings.NewReader(tt.body))
@@ -557,6 +598,67 @@ func TestAuthBodyValidation(t *testing.T) {
 			}
 			if strings.Contains(w.Body.String(), "synthetic-password") {
 				t.Fatal("response echoed the password")
+			}
+		})
+	}
+}
+
+// TestAuthBodyAcceptsOnlyExactKeySpelling pins the strict key rule from both
+// sides: JSON formatting and field order are free, but a differently cased,
+// escaped or padded key name is an unknown field and never reaches storage.
+func TestAuthBodyAcceptsOnlyExactKeySpelling(t *testing.T) {
+	for name, body := range map[string]string{
+		"canonical":          `{"email":"synthetic@example.com","password":"synthetic-password"}`,
+		"field order":        `{"password":"synthetic-password","email":"synthetic@example.com"}`,
+		"formatted":          "{\n  \"email\": \"synthetic@example.com\",\n  \"password\": \"synthetic-password\"\n}\n",
+		"escaped value only": `{"email":"synthetic@example.com","password":"synthetic-\u0070assword"}`,
+	} {
+		t.Run("accepted "+name, func(t *testing.T) {
+			_, store, h := authHandler(t)
+			req := httptest.NewRequest(http.MethodPost, registerPath, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Origin", testOrigin)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201: %s", w.Code, w.Body.String())
+			}
+			if calls := store.callCount("CreateUserWithSession"); calls != 1 {
+				t.Fatalf("storage calls = %d, want 1", calls)
+			}
+		})
+	}
+	for name, body := range map[string]string{
+		"uppercase email":        `{"EMAIL":"synthetic@example.com","password":"synthetic-password"}`,
+		"uppercase password":     `{"email":"synthetic@example.com","PASSWORD":"synthetic-password"}`,
+		"title case":             `{"Email":"synthetic@example.com","Password":"synthetic-password"}`,
+		"escaped email key":      `{"\u0065mail":"synthetic@example.com","password":"synthetic-password"}`,
+		"mixed case duplicate":   `{"email":"synthetic@example.com","EMAIL":"other@example.com","password":"synthetic-password"}`,
+		"escaped duplicate":      `{"email":"synthetic@example.com","\u0065mail":"other@example.com","password":"synthetic-password"}`,
+		"padded key":             `{" email":"synthetic@example.com","password":"synthetic-password"}`,
+		"padded password key":    `{"email":"synthetic@example.com","password ":"synthetic-password"}`,
+		"extra field alongside":  `{"email":"synthetic@example.com","password":"synthetic-password","EMAIL":"other@example.com"}`,
+		"user id field":          `{"email":"synthetic@example.com","password":"synthetic-password","user_id":"synthetic-forged"}`,
+		"only password supplied": `{"password":"synthetic-password"}`,
+	} {
+		t.Run("rejected "+name, func(t *testing.T) {
+			_, store, h := authHandler(t)
+			req := httptest.NewRequest(http.MethodPost, registerPath, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Origin", testOrigin)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+			}
+			if got := w.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control = %q", got)
+			}
+			if len(w.Result().Cookies()) != 0 {
+				t.Fatal("a rejected body set a session cookie")
+			}
+			if calls := store.callCount("CreateUserWithSession"); calls != 0 {
+				t.Fatalf("a rejected body reached storage %d times", calls)
 			}
 		})
 	}

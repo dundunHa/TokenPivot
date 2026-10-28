@@ -17,6 +17,10 @@ import (
 type Auth struct {
 	Service *auth.Service
 	Origin  config.Origin
+	// now reads the current time for the cookie Max-Age; nil means time.Now. It
+	// is unexported and set only by tests, which pin the gap between the database
+	// expiry and the response without sleeping.
+	now func() time.Time
 }
 
 // cache-control for every authentication response: a cached session response
@@ -113,26 +117,52 @@ func (a *Auth) RequireSession(next http.Handler) http.Handler {
 			writeServiceError(r.Context(), w, err)
 			return
 		}
-		setSessionCookie(w, a.Origin, session)
+		a.setSessionCookie(w, session)
 		ctx := context.WithValue(r.Context(), sessionContextKey{}, sessionIdentity{user: session.User, expiresAt: session.ExpiresAt})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 // setSessionCookie writes the sliding session cookie: host-scoped, HttpOnly,
-// SameSite=Lax, Secure on https, with the expiry the database returned and the
-// fixed session lifetime as Max-Age.
-func setSessionCookie(w http.ResponseWriter, origin config.Origin, session auth.Session) {
+// SameSite=Lax, Secure on https, with the expiry the database returned and a
+// Max-Age equal to the seconds left until that expiry, so a slow response or a
+// clock difference can never claim a longer life than the stored session has.
+func (a *Auth) setSessionCookie(w http.ResponseWriter, session auth.Session) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    session.Token,
 		Path:     "/",
 		Expires:  session.ExpiresAt,
-		MaxAge:   int(auth.SessionLifetime.Seconds()),
+		MaxAge:   sessionCookieMaxAge(session.ExpiresAt, a.clock()),
 		HttpOnly: true,
-		Secure:   origin.Secure(),
+		Secure:   a.Origin.Secure(),
 		SameSite: http.SameSiteLaxMode,
 	})
+}
+
+// clock reads the clock the cookie Max-Age is measured against.
+func (a *Auth) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
+}
+
+// sessionCookieMaxAge converts the database expiry into whole seconds, rounded up
+// so a sub-second response delay does not shorten a fresh 30-day window (2592000
+// seconds). A non-positive remaining time means the expiry already passed: the
+// cookie then carries no Max-Age and its past Expires removes it, which is the
+// only safe reading of an expiry that is not in the future.
+func sessionCookieMaxAge(expiresAt, now time.Time) int {
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	seconds := remaining / time.Second
+	if remaining%time.Second != 0 {
+		seconds++
+	}
+	return int(seconds)
 }
 
 // clearSessionCookie removes the cookie with the same name, path and Secure

@@ -23,9 +23,14 @@ func TestRequireOriginRejectsWriteRequests(t *testing.T) {
 		"blank":            {"   "},
 		"null":             {"null"},
 		"multiple":         {testOrigin, testOrigin},
+		"padded leading":   {" " + testOrigin},
+		"padded trailing":  {testOrigin + " "},
+		"padded both":      {"\t" + testOrigin + " "},
 		"other scheme":     {"https://127.0.0.1:5173"},
 		"other host":       {"http://localhost:5173"},
+		"other loopback":   {"http://127.0.0.2:5173"},
 		"other port":       {"http://127.0.0.1:5174"},
+		"port omitted":     {"http://127.0.0.1"},
 		"with path":        {testOrigin + "/path"},
 		"with trailing":    {testOrigin + "/"},
 		"subdomain":        {"http://api.127.0.0.1:5173"},
@@ -144,6 +149,86 @@ func TestCookieSecureFollowsOrigin(t *testing.T) {
 				t.Fatalf("cookie has a Domain attribute: %q", cookie.Domain)
 			}
 		})
+	}
+}
+
+// TestSessionCookieMaxAgeFollowsDatabaseExpiry proves the cookie Max-Age is the
+// whole number of seconds left until the stored expiry, not a fixed lifetime: a
+// fresh 30-day session still reports 2592000, a delayed response reports the
+// remaining time, and an expiry that already passed is not extended.
+func TestSessionCookieMaxAgeFollowsDatabaseExpiry(t *testing.T) {
+	expiry := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name string
+		now  time.Time
+		want int
+	}{
+		{"fresh session", expiry.Add(-auth.SessionLifetime), int(auth.SessionLifetime.Seconds())},
+		{"one second late", expiry.Add(-auth.SessionLifetime + time.Second), int(auth.SessionLifetime.Seconds()) - 1},
+		{"sub-second delay rounds up", expiry.Add(-auth.SessionLifetime + time.Millisecond), int(auth.SessionLifetime.Seconds())},
+		{"mid lifetime", expiry.Add(-7 * time.Minute), 420},
+		{"expired", expiry.Add(time.Second), 0},
+		{"exactly at expiry", expiry, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sessionCookieMaxAge(expiry, tt.now); got != tt.want {
+				t.Fatalf("Max-Age = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSessionCookieMaxAgeUsesDatabaseExpiryThroughHTTP drives the same rule
+// through a real request with injected clocks. The database assigns the expiry
+// when it renews; the response is written later, so the cookie must advertise
+// what is left at response time instead of a fixed 30 days.
+func TestSessionCookieMaxAgeUsesDatabaseExpiryThroughHTTP(t *testing.T) {
+	databaseTime := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	responseTime := databaseTime
+	store := newAuthFakeStore()
+	store.now = func() time.Time { return databaseTime }
+	origin, err := config.ParseOrigin(testOrigin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAuth(auth.New(store, store, auth.NewLimiter(nil)), origin)
+	adapter.now = func() time.Time { return responseTime }
+	h := NewHandler(Options{CheckReady: func(context.Context) error { return nil }, Auth: adapter})
+
+	register := doAuthRequest(t, h, http.MethodPost, registerPath, `{"email":"synthetic@example.com","password":"synthetic-password"}`)
+	cookie := sessionCookie(t, register)
+	if want := int(auth.SessionLifetime.Seconds()); cookie.MaxAge != want {
+		t.Fatalf("fresh session Max-Age = %d, want %d", cookie.MaxAge, want)
+	}
+	if _, ok := store.sessionExpiry(cookie.Value); !ok {
+		t.Fatal("session was not stored")
+	}
+
+	// The renewal happens at database time; the response leaves 30 seconds later.
+	databaseTime = databaseTime.Add(5 * time.Minute)
+	responseTime = databaseTime.Add(30 * time.Second)
+	req := httptest.NewRequest(http.MethodGet, sessionPath, nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie.Value})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	renewed := sessionCookie(t, w)
+	if want := int(auth.SessionLifetime.Seconds()) - 30; renewed.MaxAge != want {
+		t.Fatalf("delayed response Max-Age = %d, want %d", renewed.MaxAge, want)
+	}
+	storedExpiry, ok := store.sessionExpiry(cookie.Value)
+	if !ok || !renewed.Expires.Equal(storedExpiry) {
+		t.Fatalf("cookie Expires %s differs from the stored expiry %s", renewed.Expires, storedExpiry)
+	}
+
+	// A response written after the stored expiry gets no positive lifetime.
+	responseTime = storedExpiry.Add(time.Second)
+	delayed := httptest.NewRecorder()
+	h.ServeHTTP(delayed, req)
+	if got := sessionCookie(t, delayed).MaxAge; got > 0 {
+		t.Fatalf("expired session cookie Max-Age = %d, want no positive lifetime", got)
 	}
 }
 

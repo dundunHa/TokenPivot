@@ -189,7 +189,9 @@ func (s *Service) Login(ctx context.Context, email, password, remoteIP string) (
 	}
 	if !found {
 		// Pay the same derivation cost as a real account, then fail identically.
-		if _, err := VerifyPassword(dummyPasswordHash(), password); err != nil {
+		// dummyPasswordHash is a constant encoding, so this verification is the
+		// only derivation the unknown-email branch performs.
+		if _, err := VerifyPassword(dummyPasswordHash, password); err != nil {
 			return Session{}, fmt.Errorf("auth: dummy password verification: %w", err)
 		}
 		return Session{}, ErrInvalidCredentials

@@ -129,3 +129,48 @@ func TestLimiterLazyExpiry(t *testing.T) {
 		t.Fatalf("entries = %d, want only the two live keys", len(l.entries))
 	}
 }
+
+// TestLimiterPrunesExpiredKeysOfOtherCallers proves a counting request removes
+// windows of keys it does not touch: the old email and IP entries disappear
+// without ever being visited again, so a long-running process cannot accumulate
+// dead keys and no background goroutine is needed.
+func TestLimiterPrunesExpiredKeysOfOtherCallers(t *testing.T) {
+	clock := newFakeClock()
+	l := NewLimiter(clock.Now)
+	for i := range limiterEmailLimit {
+		if _, ok := l.Take("stale@example.com", "10.0.0.1"); !ok {
+			t.Fatalf("stale attempt %d limited", i+1)
+		}
+	}
+	countEntries := func() int {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return len(l.entries)
+	}
+	if got := countEntries(); got != 2 {
+		t.Fatalf("entries = %d, want the two keys of one email and one IP", got)
+	}
+	// A different email from a different IP is a brand new pair. Its own counting
+	// request must sweep the now expired stale keys it never sees again.
+	clock.Advance(limiterWindow)
+	if _, ok := l.Take("fresh@example.com", "10.0.0.2"); !ok {
+		t.Fatal("fresh attempt limited")
+	}
+	l.mu.Lock()
+	_, staleEmail := l.entries[limiterEmailPrefix+"stale@example.com"]
+	_, staleIP := l.entries[limiterIPPrefix+"10.0.0.1"]
+	_, freshEmail := l.entries[limiterEmailPrefix+"fresh@example.com"]
+	_, freshIP := l.entries[limiterIPPrefix+"10.0.0.2"]
+	total := len(l.entries)
+	l.mu.Unlock()
+	if staleEmail || staleIP {
+		t.Fatal("expired keys of other callers survived a counting request")
+	}
+	if !freshEmail || !freshIP || total != 2 {
+		t.Fatalf("fresh keys = %t/%t total = %d, want the two live keys", freshEmail, freshIP, total)
+	}
+	// The pruned keys are usable again as fresh windows, not limited by stale state.
+	if _, ok := l.Take("stale@example.com", "10.0.0.1"); !ok {
+		t.Fatal("a pruned key stayed limited")
+	}
+}
