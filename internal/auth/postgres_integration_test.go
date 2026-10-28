@@ -183,6 +183,15 @@ func applyMigrations(t *testing.T, migrationURL string) {
 // schema.
 func newPostgresAuth(t *testing.T) (*Service, *Postgres, *pgxpool.Pool) {
 	t.Helper()
+	service, store, pool, _ := newPostgresAuthWithURL(t)
+	return service, store, pool
+}
+
+// newPostgresAuthWithURL additionally returns the service-role connection URL, so
+// a race test can open independent connections and hold or observe a row lock
+// without depending on how many pooled connections happen to be free.
+func newPostgresAuthWithURL(t *testing.T) (*Service, *Postgres, *pgxpool.Pool, string) {
+	t.Helper()
 	_, appURL := integrationSchema(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -192,8 +201,60 @@ func newPostgresAuth(t *testing.T) (*Service, *Postgres, *pgxpool.Pool) {
 	}
 	t.Cleanup(pool.Close)
 	store := NewPostgres(pool)
-	return New(store, store, NewLimiter(time.Now)), store, pool
+	return New(store, store, NewLimiter(time.Now)), store, pool, appURL
 }
+
+// openAppConn opens one independent service-role connection pinned to the test
+// schema. A race test observes lock waits from it, so the observation connection
+// is never the one that blocks.
+func openAppConn(t *testing.T, ctx context.Context, appURL string) *pgx.Conn {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, appURL)
+	if err != nil {
+		t.Fatal(database.SafeError("open test connection", err))
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Error(database.SafeError("close test connection", err))
+		}
+	})
+	return conn
+}
+
+// waitForLockedStatement waits until a backend other than observer is blocked on
+// a row lock while running a statement matching pattern. It polls pg_stat_activity
+// with a deadline, so the race order is asserted from observable server state
+// instead of being assumed from a sleep.
+func waitForLockedStatement(t *testing.T, ctx context.Context, observer *pgx.Conn, pattern string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var waiting int
+		err := observer.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1 AND pid <> pg_backend_pid()", pattern).Scan(&waiting)
+		if err != nil {
+			t.Fatal(database.SafeError("read lock wait", err))
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no statement matching %q waited on a row lock", pattern)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(database.SafeError("wait for lock", ctx.Err()))
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// Statement patterns identify the statement that is expected to wait. The renewal
+// and the logout both mention revoked_at, so each pattern matches only the clause
+// that starts that statement.
+const (
+	renewStatementPattern  = `%SET expires_at = now() + interval%`
+	logoutStatementPattern = `%SET revoked_at = COALESCE%`
+)
 
 // sqlDigest returns the raw digest the service stores for a token.
 func sqlDigest(token string) []byte {
@@ -257,35 +318,56 @@ func TestRegisterAgainstPostgres(t *testing.T) {
 	}
 }
 
+// TestConcurrentRegistrationCreatesOneAccount proves uk_users_email really
+// arbitrates a race: eight transactions insert the same normalized email at the
+// same time, exactly one commits and the other seven fail with
+// ErrEmailUnavailable.
+//
+// The service limiter allows only five attempts per email in ten minutes, so
+// driving Service.Register here could never observe the index under load. This
+// drives the transaction store directly, which is the layer the unique index
+// protects; the encoding is derived once and every token digest is distinct, so
+// the email is the only possible conflict.
 func TestConcurrentRegistrationCreatesOneAccount(t *testing.T) {
-	service, _, pool := newPostgresAuth(t)
+	_, store, pool := newPostgresAuth(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	encoding, err := HashPassword("synthetic-password")
+	if err != nil {
+		t.Fatal(err)
+	}
 	const callers = 8
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	succeeded, conflicts := 0, 0
-	for range callers {
+	succeeded := 0
+	var conflicts, unexpected []error
+	for i := range callers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Each caller uses a distinct IP so only the unique index arbitrates.
-			if _, err := service.Register(ctx, "postgres@example.com", "synthetic-password", fmt.Sprintf("10.1.0.%d", callers)); err != nil {
-				mu.Lock()
-				if errors.Is(err, ErrEmailUnavailable) {
-					conflicts++
-				}
-				mu.Unlock()
-				return
-			}
+			digest := sha256.Sum256([]byte(fmt.Sprintf("tps_concurrent_registration_%d", i)))
+			err := store.InTx(ctx, func(ctx context.Context, tx Store) error {
+				_, err := tx.CreateUserWithSession(ctx, "postgres@example.com", encoding, digest[:])
+				return err
+			})
 			mu.Lock()
-			succeeded++
-			mu.Unlock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, ErrEmailUnavailable):
+				conflicts = append(conflicts, err)
+			default:
+				unexpected = append(unexpected, err)
+			}
 		}()
 	}
 	wg.Wait()
-	if succeeded != 1 || conflicts != callers-1 {
-		t.Fatalf("succeeded=%d conflicts=%d, want 1 and %d", succeeded, conflicts, callers-1)
+	if len(unexpected) != 0 {
+		t.Fatalf("unexpected registration errors: %v", unexpected)
+	}
+	if succeeded != 1 || len(conflicts) != callers-1 {
+		t.Fatalf("succeeded=%d conflicts=%d, want 1 and %d", succeeded, len(conflicts), callers-1)
 	}
 	var users, sessions int
 	if err := pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM users), (SELECT count(*) FROM sessions)").Scan(&users, &sessions); err != nil {
@@ -512,28 +594,113 @@ func TestConcurrentSessionsRenewIndependently(t *testing.T) {
 	}
 }
 
+// TestLogoutRaceAfterCommitRejectsRenewal covers the second race order: logout
+// commits first, so a renewal that was already waiting on the row lock re-reads
+// the row, sees revoked_at and reports unauthenticated.
 func TestLogoutRaceAfterCommitRejectsRenewal(t *testing.T) {
-	service, store, pool := newPostgresAuth(t)
+	service, store, pool, appURL := newPostgresAuthWithURL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	session, err := service.Register(ctx, "postgres@example.com", "synthetic-password", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A renewal already handed to the database may commit, but once logout has
-	// committed no later request may renew the same session.
-	if err := service.Logout(ctx, session.Token); err != nil {
+	digest := sqlDigest(session.Token)
+	observer := openAppConn(t, ctx, appURL)
+
+	// The logout runs the real revoke inside a transaction and holds the row lock.
+	// The renewal is driven on the pool, so it waits on that lock; the wait is
+	// confirmed from pg_stat_activity before the logout commits.
+	renewDone := make(chan error, 1)
+	err = store.InTx(ctx, func(ctx context.Context, tx Store) error {
+		if err := tx.RevokeSession(ctx, digest); err != nil {
+			return err
+		}
+		go func() {
+			_, err := service.Session(ctx, session.Token)
+			renewDone <- err
+		}()
+		waitForLockedStatement(t, ctx, observer, renewStatementPattern)
+		return nil
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := store.AuthenticateSession(ctx, sqlDigest(session.Token)); err != nil || found {
-		t.Fatalf("post-logout renewal found=%t err=%v", found, err)
+	// Logout committed first, so the waiting renewal must find no live row.
+	if renewErr := <-renewDone; !errors.Is(renewErr, ErrUnauthenticated) {
+		t.Fatalf("a renewal that waited for the logout returned %v", renewErr)
 	}
-	expiresAt, revokedAt, found := loadSession(t, ctx, pool, sqlDigest(session.Token))
+
+	expiresAt, revokedAt, found := loadSession(t, ctx, pool, digest)
 	if !found || revokedAt == nil {
 		t.Fatal("session row missing after logout")
 	}
 	if !expiresAt.After(time.Now()) {
 		t.Fatal("logout unexpectedly expired the row instead of revoking it")
+	}
+	// No later request may renew the same session either.
+	if _, err := service.Session(ctx, session.Token); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("post-logout renewal error = %v", err)
+	}
+}
+
+// TestLogoutRaceAfterCommittedRenewalAllowsInflightRequest covers the first race
+// order: the renewal commits first, so that in-flight request succeeds with its
+// new expiry. The logout that was waiting on the row lock then revokes the row,
+// and every request after the logout commit fails.
+func TestLogoutRaceAfterCommittedRenewalAllowsInflightRequest(t *testing.T) {
+	service, store, pool, appURL := newPostgresAuthWithURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	session, err := service.Register(ctx, "postgres@example.com", "synthetic-password", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sqlDigest(session.Token)
+	before, _, found := loadSession(t, ctx, pool, digest)
+	if !found {
+		t.Fatal("session row missing after registration")
+	}
+	observer := openAppConn(t, ctx, appURL)
+
+	// The in-flight renewal runs the real conditional update inside a transaction
+	// and holds the row lock until it commits. A logout arriving now waits.
+	logoutDone := make(chan error, 1)
+	var renewed IssuedSession
+	err = store.InTx(ctx, func(ctx context.Context, tx Store) error {
+		issued, found, err := tx.AuthenticateSession(ctx, digest)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return errors.New("the in-flight renewal did not find the live session")
+		}
+		renewed = issued
+		go func() { logoutDone <- service.Logout(ctx, session.Token) }()
+		waitForLockedStatement(t, ctx, observer, logoutStatementPattern)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !renewed.ExpiresAt.After(before) {
+		t.Fatalf("in-flight renewal expiry %s is not later than %s", renewed.ExpiresAt, before)
+	}
+	// The renewal committed first, so the waiting logout completes afterwards.
+	if err := <-logoutDone; err != nil {
+		t.Fatal(database.SafeError("logout after renewal", err))
+	}
+
+	stored, revokedAt, found := loadSession(t, ctx, pool, digest)
+	if !found || revokedAt == nil {
+		t.Fatal("session row missing after the logout")
+	}
+	if !stored.Equal(renewed.ExpiresAt) {
+		t.Fatalf("stored expiry %s differs from the committed renewal %s", stored, renewed.ExpiresAt)
+	}
+	// Once logout has committed, a new request must fail.
+	if _, err := service.Session(ctx, session.Token); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("post-logout renewal error = %v", err)
 	}
 }
 

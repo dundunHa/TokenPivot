@@ -19,8 +19,10 @@ const (
 )
 
 // Limiter is a single-process fixed-window attempt counter with an injectable
-// clock. It never starts a goroutine: expired entries are replaced when the same
-// key is next seen, so multi-instance deployments do not share counts.
+// clock. It never starts a goroutine: expired entries are cleaned lazily inside a
+// counting request under the same mutex that guards the map, so keys that are
+// never seen again still disappear and multi-instance deployments do not share
+// counts.
 type Limiter struct {
 	mu         sync.Mutex
 	now        func() time.Time
@@ -53,12 +55,14 @@ func NewLimiter(now func() time.Time) *Limiter {
 // Take checks the email and remote-IP windows and, when neither is exhausted,
 // consumes one attempt from both inside the same critical section. This makes
 // check and increment inseparable, so concurrent callers cannot all pass before
-// any of them counts. A limited call consumes nothing and reports the time left
-// in the exhausted window.
+// any of them counts. Expired entries are pruned in the same critical section, so
+// a key that is never seen again still leaves the map. A limited call consumes
+// nothing and reports the time left in the exhausted window.
 func (l *Limiter) Take(email, ip string) (time.Duration, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
+	l.pruneExpired(now)
 	emailEntry := l.current(limiterEmailPrefix+email, now)
 	ipEntry := l.current(limiterIPPrefix+ip, now)
 	var retryAfter time.Duration
@@ -81,11 +85,22 @@ func (l *Limiter) Take(email, ip string) (time.Duration, bool) {
 	return 0, true
 }
 
-// current returns the live window for a key, replacing an expired one. The
-// replacement is only stored once the caller records an attempt.
+// pruneExpired drops every window that has ended. It runs only inside a counting
+// request and under the limiter mutex, so the map cannot grow forever with keys
+// that are no longer used and no background goroutine is needed.
+func (l *Limiter) pruneExpired(now time.Time) {
+	for key, e := range l.entries {
+		if now.Sub(e.start) >= l.window {
+			delete(l.entries, key)
+		}
+	}
+}
+
+// current returns the live window for a key. pruneExpired has already removed
+// every ended window in this request, so a missing key starts now.
 func (l *Limiter) current(key string, now time.Time) entry {
 	e, ok := l.entries[key]
-	if !ok || now.Sub(e.start) >= l.window {
+	if !ok {
 		return entry{start: now}
 	}
 	return e

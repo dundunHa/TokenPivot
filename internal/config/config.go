@@ -109,18 +109,23 @@ func ParseOrigin(value string) (Origin, error) {
 }
 
 // OriginHeaderMatches reports whether a request's single Origin header equals
-// the trusted origin exactly, comparing scheme, host and port.
+// the trusted origin exactly, comparing scheme, host and port. The value is never
+// trimmed: surrounding whitespace is part of the value a proxy sees, so a padded
+// header must not be accepted.
 func OriginHeaderMatches(origin Origin, headerValues []string) bool {
-	return len(headerValues) == 1 && strings.EqualFold(strings.TrimSpace(headerValues[0]), origin.String())
+	return len(headerValues) == 1 && strings.EqualFold(headerValues[0], origin.String())
 }
 
-// isLoopbackHost accepts only explicit loopback development hosts.
+// isLoopbackHost accepts only the three named development loopback hosts. The
+// rest of the 127.0.0.0/8 range and every other loopback address (127.0.0.2,
+// ::2, ...) are not development origins and are refused; an equivalent spelling
+// of the same address, such as the expanded form of ::1, still means that host.
 func isLoopbackHost(hostname string) bool {
 	if hostname == "localhost" {
 		return true
 	}
 	ip := net.ParseIP(hostname)
-	return ip != nil && ip.IsLoopback()
+	return ip != nil && (ip.Equal(net.IPv4(127, 0, 0, 1)) || ip.Equal(net.IPv6loopback))
 }
 
 // MigrationConfig contains only the independent migration connection setting.

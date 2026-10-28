@@ -65,7 +65,7 @@ func (a *Auth) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(r.Context(), w, err)
 		return
 	}
-	setSessionCookie(w, a.Origin, session)
+	a.setSessionCookie(w, session)
 	writeJSON(w, http.StatusCreated, newSessionResponse(session))
 }
 
@@ -81,7 +81,7 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(r.Context(), w, err)
 		return
 	}
-	setSessionCookie(w, a.Origin, session)
+	a.setSessionCookie(w, session)
 	writeJSON(w, http.StatusOK, newSessionResponse(session))
 }
 
@@ -134,78 +134,102 @@ func readAuthRequest(w http.ResponseWriter, r *http.Request) (authRequest, bool)
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body must be valid UTF-8")
 		return authRequest{}, false
 	}
-	if err := rejectDuplicateKeys(body); err != nil {
+	request, err := decodeAuthRequest(body)
+	switch {
+	case errors.Is(err, errAuthBodyShape):
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body must be one JSON object without duplicate keys or trailing content")
 		return authRequest{}, false
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	var request authRequest
-	if err := decoder.Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body must be one JSON object with email and password")
+	case err != nil:
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body must be one JSON object with exactly the email and password string fields")
 		return authRequest{}, false
 	}
 	return request, true
 }
 
-// rejectDuplicateKeys walks the whole JSON value once and fails on a repeated
-// key in the same object, so a proxy and this service can never read different
-// credentials from one body. It also rejects trailing content.
-func rejectDuplicateKeys(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := scanJSONValue(decoder); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return errors.New("auth body: trailing content")
-	}
-	return nil
-}
+// Strict body errors. They stay distinct so the response can name the documented
+// cause, while neither ever repeats a request value.
+var (
+	// errAuthBodyShape reports a body that is not exactly one JSON object, has a
+	// duplicated key in that object, or carries trailing content.
+	errAuthBodyShape = errors.New("auth body: not one JSON object without duplicate keys or trailing content")
+	// errAuthBodyFields reports an object whose fields are not exactly the two
+	// known keys with string values.
+	errAuthBodyFields = errors.New("auth body: fields must be exactly email and password strings")
+)
 
-// scanJSONValue consumes exactly one JSON value and checks object keys.
-func scanJSONValue(decoder *json.Decoder) error {
+// decodeAuthRequest parses the authentication body without relying on struct
+// field matching. encoding/json matches object keys case-insensitively, so
+// "EMAIL" would bind to Email and a body carrying both "email" and "EMAIL" would
+// be ambiguous. This parser accepts only the exact key literals "email" and
+// "password": a differently cased, escaped (`"\u0065mail"`) or otherwise different
+// key is an unknown field, and the same key twice is a duplicate.
+func decodeAuthRequest(body []byte) (authRequest, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	token, err := decoder.Token()
 	if err != nil {
-		return err
+		return authRequest{}, errAuthBodyShape
 	}
-	delimiter, ok := token.(json.Delim)
-	if !ok {
-		return nil
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return authRequest{}, errAuthBodyShape
 	}
-	switch delimiter {
-	case '{':
-		seen := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return errors.New("auth body: object key is not a string")
-			}
-			if _, duplicate := seen[key]; duplicate {
-				return errors.New("auth body: duplicate object key")
-			}
-			seen[key] = struct{}{}
-			if err := scanJSONValue(decoder); err != nil {
-				return err
-			}
+	var request authRequest
+	seen := make(map[string]struct{}, 2)
+	for decoder.More() {
+		before := decoder.InputOffset()
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return authRequest{}, errAuthBodyShape
 		}
-		_, err := decoder.Token()
-		return err
-	case '[':
-		for decoder.More() {
-			if err := scanJSONValue(decoder); err != nil {
-				return err
-			}
+		key, ok := keyToken.(string)
+		if !ok {
+			return authRequest{}, errAuthBodyShape
 		}
-		_, err := decoder.Token()
-		return err
-	default:
-		return errors.New("auth body: unexpected delimiter")
+		// The raw literal, not the decoded key, decides acceptance: only these two
+		// exact spellings are known fields.
+		switch rawKeyLiteral(body[before:decoder.InputOffset()]) {
+		case `"email"`, `"password"`:
+		default:
+			return authRequest{}, errAuthBodyFields
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return authRequest{}, errAuthBodyShape
+		}
+		seen[key] = struct{}{}
+		valueToken, err := decoder.Token()
+		if err != nil {
+			return authRequest{}, errAuthBodyShape
+		}
+		value, ok := valueToken.(string)
+		if !ok {
+			return authRequest{}, errAuthBodyFields
+		}
+		if key == "email" {
+			request.Email = value
+		} else {
+			request.Password = value
+		}
 	}
+	if _, err := decoder.Token(); err != nil {
+		return authRequest{}, errAuthBodyShape
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return authRequest{}, errAuthBodyShape
+	}
+	if len(seen) != 2 {
+		return authRequest{}, errAuthBodyFields
+	}
+	return request, nil
+}
+
+// rawKeyLiteral returns the JSON string literal at the end of one token segment.
+// The segment starts right after the previous token, so it may hold whitespace
+// and the separating comma before the literal.
+func rawKeyLiteral(segment []byte) string {
+	start := bytes.IndexByte(segment, '"')
+	if start < 0 {
+		return ""
+	}
+	return string(segment[start:])
 }
 
 // isJSONContentType accepts application/json with optional parameters such as a

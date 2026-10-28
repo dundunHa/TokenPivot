@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -9,7 +8,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -67,13 +65,25 @@ func deriveKey(password string, salt []byte, memory, iterations uint32, parallel
 	return argon2.IDKey([]byte(password), salt, iterations, memory, parallelism, keyLength)
 }
 
-// dummyPasswordHash returns an encoding of a fixed, publicly known value that is
-// not any account's password. Login verifies against it when the email is
-// unknown so both branches pay exactly one derivation and take comparable time.
-var dummyPasswordHash = sync.OnceValue(func() string {
-	salt := bytes.Repeat([]byte{0x2a}, argonSaltLength)
-	return encodeHash(salt, deriveKey("tokenpivot-dummy-password", salt, argonMemory, argonIterations, argonParallelism, argonKeyLength))
-})
+// dummyPasswordHash is a precomputed Argon2id encoding of a fixed, publicly known
+// value that is not any account's password. Login verifies against it when the
+// email is unknown so both branches pay exactly one derivation and take
+// comparable time; because the encoding is a constant, the unknown-email branch
+// derives only during that single verification and never while building it.
+//
+// Parameters and shape match HashPassword: m=19456, t=2, p=1, v=19, a 16-byte
+// salt and a 32-byte key, in the canonical six-part encoding. The salt decodes to
+// the ASCII bytes "tokenpivot-dummy"; regenerating it is a deliberate change that
+// TestDummyPasswordHashIsPrecomputedAndFixed pins.
+const dummyPasswordHash = "$argon2id$v=19$m=19456,t=2,p=1$dG9rZW5waXZvdC1kdW1teQ$gupD8SM36KGNDefu5FFdqMOmmdE06Zo0pr35tTcIGDo"
+
+// The dummy inputs are fixed and public on purpose: they identify no account.
+// A test recomputes the encoding from them, proving the constant above is that
+// precomputation rather than an ad-hoc value.
+const (
+	dummyPassword = "tokenpivot-dummy-password"
+	dummySalt     = "tokenpivot-dummy" // exactly 16 ASCII bytes
+)
 
 func encodeHash(salt, key []byte) string {
 	encoding := base64.RawStdEncoding

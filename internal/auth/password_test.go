@@ -104,22 +104,38 @@ func TestVerifyPasswordRejectsMalformedEncoding(t *testing.T) {
 	}
 }
 
-func TestDummyPasswordHashIsStableAndUnrelated(t *testing.T) {
-	first := dummyPasswordHash()
-	second := dummyPasswordHash()
-	if first != second {
-		t.Fatal("dummy hash was recomputed with a new salt")
+// TestDummyPasswordHashIsPrecomputedAndFixed pins the dummy encoding: it must be
+// a constant with production parameters, verifiable with the documented dummy
+// password, and exactly reproducible from the documented salt and password. Since
+// the login path reads this constant and never builds it, an unknown-email login
+// pays exactly one Argon2id derivation, the same as a wrong password.
+func TestDummyPasswordHashIsPrecomputedAndFixed(t *testing.T) {
+	params, err := parseHash(dummyPasswordHash)
+	if err != nil {
+		t.Fatalf("dummy encoding does not parse: %v", err)
 	}
-	params, err := parseHash(first)
+	if params.memory != argonMemory || params.iterations != argonIterations || params.parallelism != argonParallelism {
+		t.Fatalf("dummy parameters = m=%d,t=%d,p=%d", params.memory, params.iterations, params.parallelism)
+	}
+	if len(params.salt) != argonSaltLength || len(params.key) != int(argonKeyLength) {
+		t.Fatalf("dummy salt/key length = %d/%d", len(params.salt), len(params.key))
+	}
+	ok, err := VerifyPassword(dummyPasswordHash, dummyPassword)
+	if err != nil || !ok {
+		t.Fatalf("dummy encoding is not verifiable: ok=%t err=%v", ok, err)
+	}
+	want := encodeHash([]byte(dummySalt), deriveKey(dummyPassword, []byte(dummySalt), argonMemory, argonIterations, argonParallelism, argonKeyLength))
+	if dummyPasswordHash != want {
+		t.Fatalf("dummy encoding is not the documented precomputation")
+	}
+	// The dummy encoding must not belong to any real account: a real registration
+	// never produces this salt.
+	registered, err := HashPassword(dummyPassword)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if params.memory != argonMemory || params.iterations != argonIterations || params.parallelism != argonParallelism {
-		t.Fatal("dummy hash does not use production parameters")
-	}
-	ok, err := VerifyPassword(first, "tokenpivot-dummy-password")
-	if err != nil || !ok {
-		t.Fatal("dummy hash is not verifiable")
+	if registered == dummyPasswordHash {
+		t.Fatal("a fresh registration reproduced the dummy encoding")
 	}
 }
 
