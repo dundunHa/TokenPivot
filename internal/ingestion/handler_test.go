@@ -100,6 +100,13 @@ type fakeStore struct {
 	// vanish makes ExistingEvent report no row even though the insert reported a
 	// conflict.
 	vanish bool
+	// rollbackWaitsForContext makes Rollback block until its own context ends, so a
+	// test can prove the rollback deadline is capped without a sleep.
+	rollbackWaitsForContext bool
+	// rollbackDeadline and rollbackWaited record what the rollback context looked
+	// like when it ended.
+	rollbackDeadline time.Time
+	rollbackWaited   time.Duration
 }
 
 func newFakeStore() *fakeStore {
@@ -245,6 +252,18 @@ func (t *fakeTx) Commit(ctx context.Context) error {
 func (t *fakeTx) Rollback(ctx context.Context) error {
 	t.store.record("rollback")
 	t.done = true
+	if t.store.rollbackWaitsForContext {
+		deadline, hasDeadline := ctx.Deadline()
+		started := time.Now()
+		<-ctx.Done()
+		t.store.mu.Lock()
+		if hasDeadline {
+			t.store.rollbackDeadline = deadline
+		}
+		t.store.rollbackWaited = time.Since(started)
+		t.store.mu.Unlock()
+		return ctx.Err()
+	}
 	// A dead context models a rollback that could not run at all, so a regression
 	// back to the request context is visible instead of silent.
 	if err := ctx.Err(); err != nil {
@@ -1453,6 +1472,116 @@ func TestRollbackUsesItsOwnBoundedContext(t *testing.T) {
 	}
 	if remaining := time.Until(recorder.rollbackDeadline); remaining > rollbackBudget {
 		t.Fatalf("rollback deadline is %s away, want at most %s", remaining, rollbackBudget)
+	}
+}
+
+// TestSlowRollbackStaysInsideTheRequestBudget drives the real handler with a fake
+// rollback that only ends when its own context does. The budget is injected through
+// the request context, so the same arithmetic as the frozen 8 seconds is exercised
+// without waiting 8 real seconds: item work must stop one reserve early, the
+// rollback must be capped at the request end rather than at its own 2 second
+// budget, and every position must still come back as a result.
+func TestSlowRollbackStaysInsideTheRequestBudget(t *testing.T) {
+	const budget = 300 * time.Millisecond
+	environment := newTestEnvironment(t)
+	environment.store.failure["insert"] = errors.New("synthetic: driver detail")
+	environment.store.rollbackWaitsForContext = true
+
+	request := httptest.NewRequest(http.MethodPost, ingestionPath, strings.NewReader(encodedBatch(t,
+		validEventJSON("req-slow-rollback-1", fixedNow),
+		validEventJSON("req-slow-rollback-2", fixedNow),
+	)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+environment.auth.token)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	request = request.WithContext(ctx)
+
+	recorder := httptest.NewRecorder()
+	started := time.Now()
+	environment.handler.ServeHTTP(recorder, request)
+	elapsed := time.Since(started)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// The slack is scheduling tolerance for the test goroutine, not extra budget:
+	// without the reserve the handler would wait the full 2 second rollback budget
+	// here and miss this bound by an order of magnitude.
+	if elapsed > budget+budget/2 {
+		t.Fatalf("handler took %s, want about the injected %s budget", elapsed, budget)
+	}
+	body := decodeResults(t, recorder, 2)
+	requireStatuses(t, body, statusRetryable, statusRetryable)
+	// The first item failed its insert while the item budget was still live, so it
+	// reports the real failure class; the second never started and is a deadline.
+	requireCodes(t, body, codeUnavailable, codeDeadlineExceeded)
+
+	requestEnd, hasEnd := ctx.Deadline()
+	if !hasEnd {
+		t.Fatal("the injected request deadline disappeared")
+	}
+	environment.store.mu.Lock()
+	rollbackDeadline, rollbackWaited := environment.store.rollbackDeadline, environment.store.rollbackWaited
+	environment.store.mu.Unlock()
+	if rollbackDeadline.IsZero() {
+		t.Fatal("the rollback ran without a deadline")
+	}
+	if rollbackDeadline.After(requestEnd) {
+		t.Fatalf("rollback deadline %s is past the request end %s", rollbackDeadline, requestEnd)
+	}
+	if rollbackWaited == 0 {
+		t.Fatal("the slow rollback did not wait on its context")
+	}
+	if rollbackWaited > rollbackBudget {
+		t.Fatalf("rollback waited %s, want at most the %s rollback budget", rollbackWaited, rollbackBudget)
+	}
+	if commits := environment.store.called("commit"); commits != 0 {
+		t.Fatalf("commits=%d want=0", commits)
+	}
+}
+
+// TestResponseReserveKeepsRollbackInsideTheFrozenBudget pins the arithmetic of the
+// production budget: per-item work ends one second early, and a rollback that
+// starts at that point still ends no later than the documented 8 seconds.
+func TestResponseReserveKeepsRollbackInsideTheFrozenBudget(t *testing.T) {
+	entry := time.Now()
+	requestEnd := entry.Add(processingBudget)
+	requestCtx, cancel := context.WithDeadline(context.Background(), requestEnd)
+	defer cancel()
+
+	itemCtx, cancelItems, wantEnd := withResponseReserve(requestCtx)
+	defer cancelItems()
+	if !wantEnd.Equal(requestEnd) {
+		t.Fatalf("request end=%s want %s", wantEnd, requestEnd)
+	}
+	itemEnd, ok := itemCtx.Deadline()
+	if !ok {
+		t.Fatal("the item budget has no deadline")
+	}
+	if want := requestEnd.Add(-responseReserve); !itemEnd.Equal(want) {
+		t.Fatalf("item deadline=%s want %s (request end minus the %s reserve)", itemEnd, want, responseReserve)
+	}
+
+	// A rollback that starts exactly at the item deadline must be capped by the
+	// request end, not extended by its own 2 second budget.
+	if got := rollbackDeadline(requestEnd, itemEnd); !got.Equal(requestEnd) {
+		t.Fatalf("slow rollback deadline=%s want the request end %s", got, requestEnd)
+	}
+	// An early rollback keeps its own short budget instead.
+	early := entry.Add(time.Second)
+	if got := rollbackDeadline(requestEnd, early); !got.Equal(early.Add(rollbackBudget)) {
+		t.Fatalf("early rollback deadline=%s want %s", got, early.Add(rollbackBudget))
+	}
+	// Without a request deadline nothing is reserved and the rollback is only
+	// bounded by its own budget.
+	bareItemCtx, cancelBare, noEnd := withResponseReserve(context.Background())
+	cancelBare()
+	if !noEnd.IsZero() {
+		t.Fatalf("request end=%s want none for a context without a deadline", noEnd)
+	}
+	if _, ok := bareItemCtx.Deadline(); ok {
+		t.Fatal("an unreserved context gained a deadline")
 	}
 }
 

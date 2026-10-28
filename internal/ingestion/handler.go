@@ -194,6 +194,9 @@ func readBody(w http.ResponseWriter, r *http.Request, deadline time.Time) ([]byt
 	// The read deadline belongs to the connection, not to the request context, so
 	// it is set explicitly. A writer without deadline support (a test recorder)
 	// keeps reading normally; the request context still bounds the work after it.
+	// The error is deliberately ignored: under http.Server this call is supported,
+	// and if it ever failed, the per-item deadline check in the service still
+	// bounds the request, so no extra branch is worth its own code path here.
 	_ = http.NewResponseController(w).SetReadDeadline(deadline)
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {

@@ -51,18 +51,11 @@ SET last_received_at = GREATEST(coalesce(last_received_at, clock_timestamp()), c
 WHERE workspace_id = $1 AND id = $2`
 )
 
-// serverClock reads one server time sample. It exists as a named type so a test
-// can substitute a clock without touching the production path.
-type serverClock func(ctx context.Context, tx pgx.Tx) (time.Time, error)
-
 // Postgres implements the ingestion store on the caller-owned pool. Errors leaving
 // this type carry fixed text only: SQL, driver messages, event content and the
 // connection string are never part of an error string.
 type Postgres struct {
 	pool *pgxpool.Pool
-	// clock is nil in production: the database clock is always the source of
-	// truth. Only integration tests set it, to move time across a lock wait.
-	clock serverClock
 }
 
 // NewPostgres returns the ingestion store on the service pool.
@@ -77,7 +70,7 @@ func (p *Postgres) BeginItem(ctx context.Context) (itemTx, error) {
 	if err != nil {
 		return nil, database.SafeError("ingestion begin", err)
 	}
-	return &postgresTx{tx: tx, clock: p.clock}, nil
+	return &postgresTx{tx: tx}, nil
 }
 
 // TouchSource advances sources.last_received_at for one authenticated workspace and
@@ -92,21 +85,12 @@ func (p *Postgres) TouchSource(ctx context.Context, workspaceID, sourceID creden
 // postgresTx is the per-item transaction wrapper. Each method runs one statement in
 // the caller's transaction and never commits on its own.
 type postgresTx struct {
-	tx    pgx.Tx
-	clock serverClock
+	tx pgx.Tx
 }
 
 // Now reads the server time from the database. It is a statement, not a
 // transaction-start constant, so a wait on a lock is visible to the next sample.
-// Production always uses clock_timestamp(); only a test supplies another source.
 func (t *postgresTx) Now(ctx context.Context) (time.Time, error) {
-	if t.clock != nil {
-		now, err := t.clock(ctx, t.tx)
-		if err != nil {
-			return time.Time{}, database.SafeError("ingestion server time", err)
-		}
-		return now, nil
-	}
 	var now time.Time
 	if err := t.tx.QueryRow(ctx, nowQuery).Scan(&now); err != nil {
 		return time.Time{}, database.SafeError("ingestion server time", err)
