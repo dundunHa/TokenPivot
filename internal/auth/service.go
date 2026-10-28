@@ -287,15 +287,12 @@ func tokenDigest(token string) ([]byte, error) {
 	if !strings.HasPrefix(token, sessionTokenPrefix) {
 		return nil, ErrUnauthenticated
 	}
-	sum := sha256.Sum256([]byte(token))
-	return sum[:], nil
+	return sessionTokenHash(token), nil
 }
 
+// sessionTokenHash returns the raw 32-byte SHA-256 digest of a token already
+// known to carry the session prefix, such as one built by newSessionToken.
 func sessionTokenHash(token string) []byte {
-	hash, err := tokenDigest(token)
-	if err != nil {
-		// Only tokens built by newSessionToken reach this path.
-		panic("auth: generated session token lacks its prefix")
-	}
-	return hash
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
 }

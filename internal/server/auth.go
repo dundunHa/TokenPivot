@@ -239,19 +239,12 @@ func newSessionResponse(session auth.Session) sessionResponse {
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(body); err != nil {
-		return
-	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // writeError writes the shared error envelope.
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, errorEnvelope{Error: errorBody{Code: code, Message: message}})
-}
-
-// isUnauthenticated reports a definitely unusable session token.
-func isUnauthenticated(err error) bool {
-	return errors.Is(err, auth.ErrUnauthenticated)
 }
 
 // writeServiceError maps a business error to its HTTP status and code without

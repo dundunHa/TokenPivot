@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -103,7 +104,7 @@ func (a *Auth) RequireSession(next http.Handler) http.Handler {
 		}
 		session, err := a.Service.Session(r.Context(), cookie.Value)
 		if err != nil {
-			if isUnauthenticated(err) {
+			if errors.Is(err, auth.ErrUnauthenticated) {
 				// The token is definitely not usable, so clearing it is safe here.
 				clearSessionCookie(w, a.Origin)
 				writeError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "authentication required")
