@@ -855,7 +855,7 @@ paths:
                     source_id: 018f3c5e-2b3c-7d4e-9f0a-1b2c3d4e5f60
                     revoked_at: null
         '400':
-          description: '`INVALID_ARGUMENT`：`workspaceID` 或 `sourceID` 不是合法 UUID。不访问数据库。'
+          description: '`INVALID_ARGUMENT`：`workspaceID` 或 `sourceID` 不是合法 UUID。不读取、不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -908,6 +908,8 @@ paths:
                   message: credential resource not found
         '500':
           $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/CredentialUnavailable'
     post:
       tags:
         - credentials
@@ -916,9 +918,9 @@ paths:
       description: |
         owner 为路径 `sourceID` 签发一个绑定该 workspace 与 source 的新凭证，`201` 返回凭证 ID、固定归属和**一次性明文令牌** `token`（`tpk_` + 随机串）。数据库只保存完整令牌的 SHA-256 摘要，不保存明文；响应之后无法再取回该明文。
 
-        请求体必须为空：`workspace_id`、`source_id`、`role`、凭证 TTL 等字段都不被接受，出现任何内容即 `400 INVALID_ARGUMENT` 且不写库。归属只取自路径与数据库行，客户端不能指定。
+        请求体必须为空：`workspace_id`、`source_id`、`role`、凭证 TTL 等字段都不被接受，出现任何内容即 `400 INVALID_ARGUMENT` 且不创建凭证。归属只取自路径与数据库行，客户端不能指定。
 
-        写操作必须携带与可信 Web origin 完全一致的 `Origin`。准入顺序固定为 **`Origin` → 会话 → owner（含 `workspaceID` 解析）→ 请求体为空 → `sourceID` 解析 → 数据库**：`Origin` 缺失或不等时在会话检查之前就返回 `403`，因此同时缺 Cookie 又缺 `Origin` 的请求得到 `403` 而非 `401`；归属校验全部通过后才写库，任一失败都不写。签发**不是幂等操作**：响应丢失后重试可能留下多个有效凭证，此时用列表取得多余凭证的 ID 再撤销。
+        写操作必须携带与可信 Web origin 完全一致的 `Origin`。准入顺序固定为 **`Origin` → 会话 → owner（含 `workspaceID` 解析）→ 请求体为空 → `sourceID` 解析 → 数据库**：`Origin` 缺失或不等时在会话检查之前就返回 `403`，因此同时缺 Cookie 又缺 `Origin` 的请求得到 `403` 而非 `401`；归属校验全部通过后才创建凭证，任一失败都不创建。签发**不是幂等操作**：响应丢失后重试可能留下多个有效凭证，此时用列表取得多余凭证的 ID 再撤销。
       security:
         - cookieAuth: []
       parameters:
@@ -939,7 +941,7 @@ paths:
                 source_id: 018f3c5e-2b3c-7d4e-9f0a-1b2c3d4e5f60
                 token: tpk_SYNTHETICONLYNOTAREALTOKEN
         '400':
-          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不写库。'
+          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -972,7 +974,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：`Origin` 缺失、为 `null`、多值或不等于可信 origin，或会话用户不是该 workspace 的 owner。不写库。'
+          description: '`PERMISSION_DENIED`：`Origin` 缺失、为 `null`、多值或不等于可信 origin，或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -999,6 +1001,8 @@ paths:
                   message: credential resource not found
         '500':
           $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/CredentialUnavailable'
   /api/v1/workspaces/{workspaceID}/credentials/{credentialID}/rotate:
     parameters:
       - $ref: '#/components/parameters/WorkspaceID'
@@ -1013,7 +1017,7 @@ paths:
 
         旧凭证**保持原有撤销状态**：轮换不撤销、不复活旧凭证，因此轮换后旧令牌仍可用，直到 owner 显式调用撤销。已撤销的旧凭证也能作为轮换来源。
 
-        请求体必须为空。写操作必须携带可信 `Origin`，准入顺序与签发相同（`Origin` → 会话 → owner → 请求体 → `credentialID` 解析 → 数据库），任一失败都不写库。与签发一样，轮换不是幂等操作，并发轮换会各自创建独立有效凭证，这是明确行为，不做隐形去重。
+        请求体必须为空。写操作必须携带可信 `Origin`，准入顺序与签发相同（`Origin` → 会话 → owner → 请求体 → `credentialID` 解析 → 数据库），任一失败都不创建凭证。与签发一样，轮换不是幂等操作，并发轮换会各自创建独立有效凭证，这是明确行为，不做隐形去重。
       security:
         - cookieAuth: []
       parameters:
@@ -1034,7 +1038,7 @@ paths:
                 source_id: 018f3c5e-2b3c-7d4e-9f0a-1b2c3d4e5f60
                 token: tpk_SYNTHETICONLYNOTAREALTOKEN
         '400':
-          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不写库。'
+          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1060,7 +1064,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：`Origin` 不合法或会话用户不是该 workspace 的 owner。不写库。'
+          description: '`PERMISSION_DENIED`：`Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1087,6 +1091,8 @@ paths:
                   message: credential resource not found
         '500':
           $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/CredentialUnavailable'
   /api/v1/workspaces/{workspaceID}/credentials/{credentialID}/revoke:
     parameters:
       - $ref: '#/components/parameters/WorkspaceID'
@@ -1115,7 +1121,7 @@ paths:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
         '400':
-          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不写库。'
+          description: '`INVALID_ARGUMENT`：请求体非空，或路径参数不是合法 UUID。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1141,7 +1147,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：`Origin` 不合法或会话用户不是该 workspace 的 owner。不写库。'
+          description: '`PERMISSION_DENIED`：`Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1168,6 +1174,8 @@ paths:
                   message: credential resource not found
         '500':
           $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/CredentialUnavailable'
 
 components:
   securitySchemes:
@@ -1323,6 +1331,19 @@ components:
             error:
               code: INTERNAL
               message: internal error
+    CredentialUnavailable:
+      description: '`UNAVAILABLE`：会话存储等依赖不可用，请求在读取或创建凭证之前就停止。不得据此判定请求未认证或凭证已撤销、已创建；按原请求重试。写操作的 `Origin` 先于会话校验，因此 `Origin` 不合法时仍得到 `403` 而不是本码。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CredentialError'
+          example:
+            error:
+              code: UNAVAILABLE
+              message: service is unavailable
     AuthUnavailable:
       description: '`UNAVAILABLE`：数据库等依赖不可用。不得据此宣称会话已撤销或账号已创建；按原请求重试。'
       headers:
@@ -2052,6 +2073,7 @@ components:
                 - PERMISSION_DENIED
                 - NOT_FOUND
                 - INTERNAL
+                - UNAVAILABLE
               description: '程序分支依据。新增值属向后兼容变更，客户端必须忽略未知值而不是崩溃。'
             message:
               type: string
@@ -2067,6 +2089,7 @@ components:
         | `PERMISSION_DENIED` | 403 | 写操作 `Origin` 不合法，或会话用户不是该 workspace 的 owner |
         | `NOT_FOUND` | 404 | source/credential 不存在或不属于路径 workspace |
         | `INTERNAL` | 500 | 数据库等服务端故障；不假装成功 |
+        | `UNAVAILABLE` | 503 | 会话存储等依赖不可用；请求在读取或创建凭证前停止 |
 
         所有响应都带 `Cache-Control: no-store`。插件令牌 `tpk_` 不能用于这些端点：管理 API 只认浏览器会话 Cookie。
 
