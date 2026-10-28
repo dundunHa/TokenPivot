@@ -1,0 +1,158 @@
+package auth
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestArgon2idEncoding pins the encoded algorithm, version and parameters so the
+// migration file, the documentation and the code cannot drift apart.
+func TestArgon2idEncoding(t *testing.T) {
+	encoded, err := HashPassword("synthetic-correct-horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
+		t.Fatalf("unexpected encoding shape: %q", encoded)
+	}
+	if parts[2] != "v=19" {
+		t.Fatalf("version = %q, want v=19", parts[2])
+	}
+	if parts[3] != "m=19456,t=2,p=1" {
+		t.Fatalf("parameters = %q, want m=19456,t=2,p=1", parts[3])
+	}
+	params, err := parseHash(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(params.salt) != 16 {
+		t.Fatalf("salt length = %d, want 16", len(params.salt))
+	}
+	if len(params.key) != 32 {
+		t.Fatalf("key length = %d, want 32", len(params.key))
+	}
+	if strings.Contains(encoded, "synthetic-correct-horse") {
+		t.Fatal("encoding contains the password")
+	}
+}
+
+func TestHashPasswordUsesFreshSalt(t *testing.T) {
+	first, err := HashPassword("synthetic-same-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := HashPassword("synthetic-same-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("identical passwords produced identical encodings")
+	}
+}
+
+func TestVerifyPassword(t *testing.T) {
+	encoded, err := HashPassword("synthetic-correct-horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := VerifyPassword(encoded, "synthetic-correct-horse")
+	if err != nil || !ok {
+		t.Fatalf("correct password rejected: ok=%t err=%v", ok, err)
+	}
+	ok, err = VerifyPassword(encoded, "synthetic-correct-horse ")
+	if err != nil || ok {
+		t.Fatalf("wrong password accepted or errored: ok=%t err=%v", ok, err)
+	}
+	// Passwords are never trimmed or normalized before hashing.
+	ok, err = VerifyPassword(encoded, " Synthetic-Correct-Horse")
+	if err != nil || ok {
+		t.Fatalf("altered case or whitespace accepted: ok=%t err=%v", ok, err)
+	}
+}
+
+func TestVerifyPasswordRejectsMalformedEncoding(t *testing.T) {
+	valid, err := HashPassword("synthetic-correct-horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, encoded := range map[string]string{
+		"empty":            "",
+		"no prefix":        strings.TrimPrefix(valid, "$"),
+		"wrong algorithm":  strings.Replace(valid, "argon2id", "argon2i", 1),
+		"wrong version":    strings.Replace(valid, "v=19", "v=16", 1),
+		"missing parts":    "$argon2id$v=19$m=19456,t=2,p=1",
+		"extra part":       valid + "$extra",
+		"bad salt":         strings.Replace(valid, valid[strings.LastIndex(valid, "$")+1:], "!!!", 1),
+		"memory too high":  strings.Replace(valid, "m=19456", "m=99999999", 1),
+		"iterations zero":  strings.Replace(valid, "t=2", "t=0", 1),
+		"parallelism zero": strings.Replace(valid, "p=1", "p=0", 1),
+		"short key":        strings.Replace(valid, valid[strings.LastIndex(valid, "$")+1:], "AAAA", 1),
+		"non-numeric":      strings.Replace(valid, "m=19456", "m=+19456", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			ok, err := VerifyPassword(encoded, "synthetic-correct-horse")
+			if !errors.Is(err, ErrInvalidHash) {
+				t.Fatalf("err = %v, want ErrInvalidHash", err)
+			}
+			if ok {
+				t.Fatal("malformed encoding accepted a password")
+			}
+		})
+	}
+}
+
+// TestDummyPasswordHashIsPrecomputedAndFixed pins the dummy encoding: it must be
+// a constant with production parameters, verifiable with the documented dummy
+// password, and exactly reproducible from the documented salt and password. Since
+// the login path reads this constant and never builds it, an unknown-email login
+// pays exactly one Argon2id derivation, the same as a wrong password.
+func TestDummyPasswordHashIsPrecomputedAndFixed(t *testing.T) {
+	params, err := parseHash(dummyPasswordHash)
+	if err != nil {
+		t.Fatalf("dummy encoding does not parse: %v", err)
+	}
+	if params.memory != argonMemory || params.iterations != argonIterations || params.parallelism != argonParallelism {
+		t.Fatalf("dummy parameters = m=%d,t=%d,p=%d", params.memory, params.iterations, params.parallelism)
+	}
+	if len(params.salt) != argonSaltLength || len(params.key) != int(argonKeyLength) {
+		t.Fatalf("dummy salt/key length = %d/%d", len(params.salt), len(params.key))
+	}
+	ok, err := VerifyPassword(dummyPasswordHash, dummyPassword)
+	if err != nil || !ok {
+		t.Fatalf("dummy encoding is not verifiable: ok=%t err=%v", ok, err)
+	}
+	want := encodeHash([]byte(dummySalt), deriveKey(dummyPassword, []byte(dummySalt), argonMemory, argonIterations, argonParallelism, argonKeyLength))
+	if dummyPasswordHash != want {
+		t.Fatalf("dummy encoding is not the documented precomputation")
+	}
+	// The dummy encoding must not belong to any real account: a real registration
+	// never produces this salt.
+	registered, err := HashPassword(dummyPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered == dummyPasswordHash {
+		t.Fatal("a fresh registration reproduced the dummy encoding")
+	}
+}
+
+// TestPasswordHashingDuration records the measured Argon2id cost so a release
+// can see the real number; the parameters stay fixed regardless of the result.
+func TestPasswordHashingDuration(t *testing.T) {
+	start := time.Now()
+	encoded, err := HashPassword("synthetic-duration-measurement")
+	hashDuration := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start = time.Now()
+	ok, err := VerifyPassword(encoded, "synthetic-duration-measurement")
+	verifyDuration := time.Since(start)
+	if err != nil || !ok {
+		t.Fatalf("verification failed: ok=%t err=%v", ok, err)
+	}
+	t.Logf("argon2id m=%d,t=%d,p=%d hash=%s verify=%s", argonMemory, argonIterations, argonParallelism, hashDuration, verifyDuration)
+}

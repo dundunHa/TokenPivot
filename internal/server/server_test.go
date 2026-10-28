@@ -13,7 +13,7 @@ import (
 )
 
 func TestHandler(t *testing.T) {
-	srv := httptest.NewServer(NewHandler(func(context.Context) error { return nil }, nil))
+	srv := httptest.NewServer(NewHandler(Options{}))
 	defer srv.Close()
 	client := srv.Client()
 	client.Timeout = 3 * time.Second
@@ -65,7 +65,7 @@ func TestFrontendDispatch(t *testing.T) {
 		w.Header().Set("X-Frontend", "yes")
 		w.WriteHeader(http.StatusNoContent)
 	})
-	h := NewHandler(func(context.Context) error { return nil }, frontend)
+	h := NewHandler(Options{Frontend: frontend})
 	for _, method := range []string{"GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"} {
 		for _, path := range []string{"/api", "/api/", "/api/not-implemented", "/api?x=1", "/healthz", "/healthz/", "/healthz/unknown", "/readyz", "/readyz/", "/readyz/unknown"} {
 			t.Run(method+path, func(t *testing.T) {
@@ -142,7 +142,7 @@ func assertNotListening(t *testing.T, addr string) {
 
 func TestRunCancellation(t *testing.T) {
 	l := listen(t)
-	srv := &http.Server{Handler: NewHandler(func(context.Context) error { return nil }, nil)}
+	srv := &http.Server{Handler: NewHandler(Options{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -261,7 +261,7 @@ func TestRunServeFailure(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	err := Run(context.Background(), &http.Server{Handler: NewHandler(func(context.Context) error { return nil }, nil)}, l, time.Second)
+	err := Run(context.Background(), &http.Server{Handler: NewHandler(Options{})}, l, time.Second)
 	if !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Run error = %v, want closed listener", err)
 	}
@@ -269,7 +269,7 @@ func TestRunServeFailure(t *testing.T) {
 
 func TestRunExpectedServerClosed(t *testing.T) {
 	l := listen(t)
-	srv := &http.Server{Handler: NewHandler(func(context.Context) error { return nil }, nil)}
+	srv := &http.Server{Handler: NewHandler(Options{})}
 	if err := srv.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -282,16 +282,19 @@ func TestRunExpectedServerClosed(t *testing.T) {
 func TestReadinessFailures(t *testing.T) {
 	for _, timeout := range []bool{false, true} {
 		calls := 0
-		h := NewHandler(func(ctx context.Context) error {
-			calls++
-			if timeout {
-				<-ctx.Done()
-				return ctx.Err()
-			}
-			return errors.New("synthetic-sensitive-marker")
-		}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusNoContent)
-		}))
+		h := NewHandler(Options{
+			CheckReady: func(ctx context.Context) error {
+				calls++
+				if timeout {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return errors.New("synthetic-sensitive-marker")
+			},
+			Frontend: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}),
+		})
 		for _, method := range []string{"GET", "HEAD"} {
 			w := httptest.NewRecorder()
 			h.ServeHTTP(w, httptest.NewRequest(method, "/readyz", nil))

@@ -1,17 +1,18 @@
 openapi: 3.1.0
 info:
-  title: TokenPivot 用量采集接口
+  title: TokenPivot 用量采集与浏览器认证接口
   version: 'v1'
-  summary: 同步批量提交请求级用量事件的唯一格式依据（外部格式主版本 v1）
+  summary: 同步批量采集端点与浏览器账号会话接口的唯一格式依据（外部格式主版本 v1）
   description: |
     # 1. 范围与文档边界
 
-    本文冻结 TokenPivot 首版**同步批量采集**接口的格式：方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额，以及供查询任务复用的共同限额。
+    本文冻结 TokenPivot 首版两组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）与**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）。
 
-    - 本文只有一个采集端点。查询接口（筛选、分组、粒度、时区、游标、错误 schema）属 T-023，凭证签发/轮换/撤销属 T-010；两条路径都不在本文。
+    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点。查询接口（筛选、分组、粒度、时区、游标）属 T-023，凭证签发/轮换/撤销属 T-010，工作空间与成员管理属 T-019；这些路径都不在本文。
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
+    - 两组接口的认证互不替代：采集只认 `Authorization: Bearer` 且**不回退 Cookie**；浏览器认证只认会话 Cookie 并对写请求校验 Origin。同一请求同时携带两者时，各自按所属端点规则判定。
 
     # 2. 外部格式版本与规范化版本
 
@@ -36,12 +37,22 @@ info:
 
     # 4. 认证与身份
 
+    ## 4.1 采集端点（Bearer）
+
     - 只接受 `Authorization: Bearer <token>`。令牌由 T-010 签发，形如 `tpk_` + 随机串（随机部分长度由签发方决定，本文不解析其长度）。
     - 认证成功即确定固定的 `workspace_id` 与 `source_id`。**身份只从认证取得**：`workspace_id`、`source_id`、凭证 ID 一律不得出现在请求载荷中，出现即按未知字段拒绝（顶层整批 `400`，事件内该项 `INVALID_ARGUMENT`），不会因为“值对得上”而放行。
     - `received_at` 由服务端在首次接受事务内采样，客户端不得提交；出现即按未知字段拒绝。
     - 插件端点**不回退 Cookie**：即使同时携带有效浏览器 Cookie，也不会把请求改成浏览器用户身份；没有 Bearer、Bearer 无效或已撤销一律 `401 UNAUTHENTICATED`。
     - 已认证但没有采集权限返回 `403 PERMISSION_DENIED`，不自动重试。
     - 凭证的签发、轮换、撤销路径不写入本文（属 T-010 的接口文档追加）；轮换不改变 source，因此轮换后用新凭证重传同一请求仍按原身份判定。
+
+    ## 4.2 浏览器端点（会话 Cookie）
+
+    - 只认 `cookieAuth`（`tokenpivot_session`）。明文为 `tps_` + `crypto/rand.Text()`，数据库只存完整令牌的 SHA-256 原始 32 字节摘要；`tpk_` 插件令牌在这里不被接受，Bearer 头也不建立浏览器身份。
+    - 会话 30 天精确滑动：每次有效认证都用一条 `UPDATE ... FROM ... RETURNING` 续期并返回到期时间，无刷新阈值、无绝对截止；数据库返回 0 行即 `401 UNAUTHENTICATED`。四个端点的所有响应都带 `Cache-Control: no-store`。
+    - 写请求（注册、登录、登出）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。`GET /api/v1/auth/session` 是读请求，不要求 `Origin`。
+    - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。owner 与工作空间成员判断属 T-019，本文不定义。
+    - 注册与登录限流为单进程内存固定窗口（每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次），所有合法尝试都占额度、成功不返还；达到上限的请求不执行密码哈希或写库。
 
     # 5. 时间精度、180 天窗口与采样点
 
@@ -441,6 +452,8 @@ servers:
 tags:
   - name: ingestion
     description: '插件凭证认证的同步批量采集端点。只接受 `Authorization: Bearer`，不回退 Cookie。'
+  - name: browser-auth
+    description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出这些写操作必须携带与可信 Web origin 完全一致的 `Origin`。'
 
 paths:
   /api/v1/ingestion/events:
@@ -615,6 +628,198 @@ paths:
                           code:
                             const: UNAVAILABLE
 
+  /api/v1/auth/register:
+    post:
+      tags:
+        - browser-auth
+      operationId: registerBrowserAccount
+      summary: 直接注册账号并创建首个会话
+      description: |
+        用邮箱和密码直接创建账号，不需要邮箱验证。注册成功在**同一事务**内写入 `users` 与首个 `sessions` 行，然后返回 `201`、`{user, expires_at}` 和新的会话 Cookie，因此刚注册的用户无需再次输入密码。
+
+        **写请求必须携带 `Origin`**：恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等。缺失、空白、`null`、多值或不等一律 `403 PERMISSION_DENIED`，且不产生任何数据库写入。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。
+
+        **输入**：只接受 `application/json`；请求体上限 16 KiB；必须是一个 JSON 对象，含 `email` 与 `password` 两个字符串字段，拒绝未知字段、重复键、非法 UTF-8 与尾随内容。邮箱先 `TrimSpace` 再整体小写作为账号，长度 3–254 字节，恰好一个 `@` 且两侧非空，不含控制字符或空白；这不是完整 RFC 邮箱语法。密码为合法 UTF-8，8–64 个码点且不超过 256 字节，不 trim、不做 Unicode 规范化，哈希的是原始字节。
+
+        **限流**：与登录共享两个固定窗口——每个规范化邮箱 10 分钟 5 次、每个远端 IP 10 分钟 20 次。所有通过格式校验的尝试都占用额度，成功也不返还；超限直接 `429` 且不执行哈希或写库。
+
+        **注册不是幂等操作**：成功响应丢失后用同邮箱重试会得到 `409 EMAIL_UNAVAILABLE`，客户端应改用登录。直接注册的结果仍可能被用来探测邮箱是否已注册，本文不宣称注册可完全防枚举。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthRequest'
+      responses:
+        '201':
+          description: '账号与首个会话已创建；`Set-Cookie` 下发 `tokenpivot_session`。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        '400':
+          $ref: '#/components/responses/AuthInvalidArgument'
+        '403':
+          $ref: '#/components/responses/AuthPermissionDenied'
+        '409':
+          description: '`EMAIL_UNAVAILABLE`：该规范化邮箱已被占用。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthError'
+              example:
+                error:
+                  code: EMAIL_UNAVAILABLE
+                  message: email is already registered
+        '413':
+          $ref: '#/components/responses/AuthBodyTooLarge'
+        '415':
+          $ref: '#/components/responses/AuthUnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/AuthRateLimited'
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+  /api/v1/auth/login:
+    post:
+      tags:
+        - browser-auth
+      operationId: loginBrowserAccount
+      summary: 密码登录并换发新会话
+      description: |
+        校验密码后新建一个独立会话并返回 `200`、`{user, expires_at}` 和新 Cookie。每次登录都生成全新令牌，不复用请求里已有的 Cookie，避免会话固定；不撤销同一用户的其他会话。
+
+        Origin、输入、请求体限额和限流规则与注册完全相同。登录是读取账号后新建会话，不需要事务；丢响应后重试可能创建多个有效会话，这是允许的行为，服务端不保存明文令牌做重放缓存。
+
+        邮箱不存在与密码错误**执行相同成本的 Argon2id 校验**并统一返回 `401 INVALID_CREDENTIALS`，因此登录不直接暴露账号是否存在。数据库故障必须返回 `500` 或 `503`，不得伪装成凭证错误。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthRequest'
+      responses:
+        '200':
+          description: '登录成功；`Set-Cookie` 下发新的 `tokenpivot_session`。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        '400':
+          $ref: '#/components/responses/AuthInvalidArgument'
+        '401':
+          description: '`INVALID_CREDENTIALS`：邮箱不存在或密码错误，两者不可区分。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthError'
+              example:
+                error:
+                  code: INVALID_CREDENTIALS
+                  message: email or password is incorrect
+        '403':
+          $ref: '#/components/responses/AuthPermissionDenied'
+        '413':
+          $ref: '#/components/responses/AuthBodyTooLarge'
+        '415':
+          $ref: '#/components/responses/AuthUnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/AuthRateLimited'
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+  /api/v1/auth/session:
+    get:
+      tags:
+        - browser-auth
+      operationId: getBrowserSession
+      summary: 查询并续期当前会话
+      description: |
+        读取 `tokenpivot_session` Cookie，用**一条** `UPDATE ... FROM ... RETURNING` 同时验证会话并把它续期到 30 天后，返回 `{user, expires_at}` 并写回与新到期时间一致的 Cookie。
+
+        这是精确的 30 天滑动过期：每次有效请求都重新计算，不设刷新阈值，也没有独立的绝对截止时间。数据库返回 0 行即未认证。格式错误、不存在、已过期、已撤销统一返回 `401 UNAUTHENTICATED`，不泄露具体原因；明确无效时会清除 Cookie，而数据库故障**不得**被当作未认证，也不清 Cookie。
+
+        这是读请求，**不要求 `Origin`**；无 Cookie 或无效 Cookie 时代码提前拒绝，不访问数据库。所有受保护浏览器 API 共用同一会话认证与续期逻辑。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '会话有效，已续期；`Set-Cookie` 回写新的到期时间。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        '401':
+          description: '`UNAUTHENTICATED`：无 Cookie，或令牌格式错误、不存在、已过期、已撤销。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+  /api/v1/auth/logout:
+    post:
+      tags:
+        - browser-auth
+      operationId: logoutBrowserSession
+      summary: 撤销当前会话并清除 Cookie
+      description: |
+        按令牌摘要单条条件更新 `revoked_at = COALESCE(revoked_at, now())`，重复登出保留首次撤销时间并返回相同 `204`。无论请求是否携带有效会话，Origin 合法后都清 Cookie 并返回 `204`（空响应体）。
+
+        清除 Cookie 使用相同名称、`Path=/` 和 `Secure` 属性，`Max-Age=-1`、过期时间为 Unix epoch。数据库故障时不得宣称已撤销，也不返回成功。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      responses:
+        '204':
+          description: '会话已撤销（或本就无效）且 Cookie 已清除；无响应体。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Set-Cookie:
+              description: '清除 `tokenpivot_session`：`Max-Age=-1`、`Expires=Thu, 01 Jan 1970 00:00:00 GMT`、`Path=/`、`HttpOnly`、`SameSite=Lax`，`Secure` 与签发时一致。'
+              schema:
+                type: string
+        '403':
+          $ref: '#/components/responses/AuthPermissionDenied'
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -627,6 +832,137 @@ components:
         认证成功即固定 `workspace_id` 与 `source_id`，身份只从认证取得，请求载荷中不得出现它们。令牌只以**摘要**形式存储，算法为对完整令牌计算 SHA-256、存 32 字节摘要（与 T-010 计划 `docs/plans/2026-10-27-ingestion-credentials.md` 第 63 行的 `secret_hash` 一致；本文只引用该算法，不重新定义令牌格式）。明文只在签发/轮换响应中出现一次；本文不描述签发、轮换、撤销路径。
 
         请求只接受 `Authorization: Bearer <token>`；不回退 Cookie；没有该头、格式错误、已撤销统一返回 `401 UNAUTHENTICATED`，不泄露具体原因。
+
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: tokenpivot_session
+      description: |
+        浏览器会话 Cookie。明文令牌为 `tps_` + `crypto/rand.Text()`（随机部分长度由 Go 标准库决定，本文不硬编码它）；数据库只保存完整令牌的 SHA-256 原始 32 字节摘要，不保存明文、十六进制文本或额外 pepper。插件令牌 `tpk_` 与本 Cookie 互不接受。
+
+        Cookie 属性固定为：名称 `tokenpivot_session`、`Path=/`、**不设置 `Domain`**（因此是主机范围）、`HttpOnly`、`SameSite=Lax`。可信 Web origin 为 `https` 时 `Secure=true`；只有明确配置的回环开发 origin（`localhost`、`127.0.0.1`、`::1`）允许使用 `http`，此时 `Secure=false`；生产非回环 http origin 在启动时就被拒绝，不存在第二套 Cookie 配置。
+
+        签发和实际续期时写 `Expires=<数据库返回的 expires_at>`，`Max-Age` 固定为 2592000 秒（30 天）——因为每个签发或续期后的 `expires_at` 都由数据库取 `now() + interval '30 days'`，两者表达同一期限。会话为 30 天精确滑动过期，无绝对上限；过期行暂不清理，但不会通过认证。
+
+        Cookie 只用于浏览器端点。采集端点和任何后续 owner 管理路由都**不得**因此把插件请求改成浏览器身份；owner 判断由 T-019 提供，本文不定义。
+
+  parameters:
+    TrustedOrigin:
+      name: Origin
+      in: header
+      required: true
+      description: |
+        浏览器写请求的可信来源。必须恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等（host 与 scheme 比较不区分大小写，协议默认端口省略）。缺失、空白、`null`、多值列表或任何不等都返回 `403 PERMISSION_DENIED`，且不执行会话校验或数据库写入。服务端不从请求 `Host`、`Forwarded` 或 `X-Forwarded-Host` 建立信任。
+      schema:
+        type: string
+        pattern: '^https?://[^/?#@]+$'
+
+  headers:
+    NoStore:
+      description: '固定为 `no-store`。四个认证端点的所有成功与失败响应都带此头，缓存响应不能替代新的会话认证、撤销检查或续期。'
+      schema:
+        type: string
+        const: no-store
+    RetryAfter:
+      description: '距当前固定窗口结束的秒数，向上取整且不小于 1。'
+      schema:
+        type: integer
+        minimum: 1
+
+  responses:
+    AuthInvalidArgument:
+      description: '`INVALID_ARGUMENT`：请求体不是单个 JSON 对象、含未知字段/重复键/尾随内容/非法 UTF-8，或邮箱、密码不符合格式规则。消息不回显被拒绝的值。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthError'
+          example:
+            error:
+              code: INVALID_ARGUMENT
+              message: request is not acceptable
+    AuthPermissionDenied:
+      description: '`PERMISSION_DENIED`：写请求的 `Origin` 缺失、为 `null`、多值或与可信 origin 不相等。不产生任何写入。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthError'
+          example:
+            error:
+              code: PERMISSION_DENIED
+              message: request origin is not allowed
+    AuthBodyTooLarge:
+      description: '`BODY_TOO_LARGE`：请求体超过 16 KiB。整次请求被拒绝，不执行密码哈希或数据库写入。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthError'
+          example:
+            error:
+              code: BODY_TOO_LARGE
+              message: request body is too large
+    AuthUnsupportedMediaType:
+      description: '`UNSUPPORTED_MEDIA_TYPE`：`Content-Type` 不是 `application/json`（可带参数，如 charset）。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthError'
+          example:
+            error:
+              code: UNSUPPORTED_MEDIA_TYPE
+              message: content type must be application/json
+    AuthRateLimited:
+      description: '`RATE_LIMITED`：邮箱或远端 IP 的固定窗口已用尽。响应带 `Retry-After`；达到上限的请求不执行哈希或写库。限流是单进程内存计数，多实例不共享。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthError'
+          example:
+            error:
+              code: RATE_LIMITED
+              message: too many attempts; retry later
+    AuthInternal:
+      description: '`INTERNAL`：非预期的服务端故障。响应不含数据库消息、密码、令牌或摘要。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthError'
+          example:
+            error:
+              code: INTERNAL
+              message: internal error
+    AuthUnavailable:
+      description: '`UNAVAILABLE`：数据库等依赖不可用。不得据此宣称会话已撤销或账号已创建；按原请求重试。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthError'
+          example:
+            error:
+              code: UNAVAILABLE
+              message: service is unavailable
 
   schemas:
     IngestionBatchRequest:
@@ -1142,6 +1478,108 @@ components:
           maxLength: 128
           description: 安全的短原因标记，例如 `unknown_field`、`body_not_json`、`too_many_events`、`empty_events`；不包含 SQL 或堆栈。
       description: 单条字段/原因说明。仅供定位与展示，程序分支请用整批 `error.code`。
+
+    AuthRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          minLength: 3
+          maxLength: 254
+          description: |
+            账号邮箱。服务端先 `TrimSpace` 再整体小写，把它作为唯一存储和登录形式；长度按字节计 3–254，必须恰好一个 `@` 且两侧非空，不含控制字符或空白。这是产品账号格式，不声称实现完整 RFC 邮箱语法。
+          example: owner@example.com
+        password:
+          type: string
+          minLength: 8
+          maxLength: 256
+          description: |
+            密码。合法 UTF-8，8–64 个 Unicode 码点且不超过 256 字节；不 trim、不做 Unicode 规范化，哈希的是用户原始字节。响应、日志和错误都不包含它。
+          writeOnly: true
+      description: |
+        注册与登录共用同一请求格式。必须是单个 JSON 对象：未知字段、任何层级的重复键、非法 UTF-8 和尾随内容一律 `400 INVALID_ARGUMENT`；`user_id`、`role`、`workspace`、`email_verified_at`、会话参数等字段都不被接受。请求体上限 16 KiB（`413 BODY_TOO_LARGE`），媒体类型必须是 `application/json`（`415 UNSUPPORTED_MEDIA_TYPE`）。
+
+    AuthUser:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - email
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 账号的 UUID v7 身份，由数据库生成。浏览器 API 不会用它代替认证：服务端身份只从会话 Cookie 取得，handler 不读取请求体或路径里的用户 ID。
+        email:
+          type: string
+          description: 规范化后的账号邮箱（已 trim 并小写）。响应不回显密码、密码编码或任何令牌。
+      description: 当前会话对应的浏览器账号。
+
+    AuthSession:
+      type: object
+      additionalProperties: false
+      required:
+        - user
+        - expires_at
+      properties:
+        user:
+          $ref: '#/components/schemas/AuthUser'
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            会话到期时间，RFC 3339 格式（UTC，`Z` 结尾）。注册、登录、当前会话三个端点返回的值都等于数据库 `sessions.expires_at`，并与同响应的 Cookie `Expires` 一致。每次有效认证都会把它续到「当前数据库时间 + 30 天」。
+
+    AuthError:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_ARGUMENT
+                - INVALID_CREDENTIALS
+                - UNAUTHENTICATED
+                - EMAIL_UNAVAILABLE
+                - PERMISSION_DENIED
+                - BODY_TOO_LARGE
+                - UNSUPPORTED_MEDIA_TYPE
+                - RATE_LIMITED
+                - INTERNAL
+                - UNAVAILABLE
+              description: '程序分支依据。大写枚举值；新增值属向后兼容变更，客户端必须忽略未知值而不是崩溃。'
+            message:
+              type: string
+              description: 面向人的短说明。不含密码、会话令牌、`token_hash`、`password_hash`、数据库 URL 或 SQL。
+          description: 单一错误对象。
+      description: |
+        浏览器认证端点的统一错误体。与采集专用的 `BatchError` 是两个不同 schema，不互相替代；本文不新增请求 ID 系统。
+
+        | code | 状态码 |
+        |---|---|
+        | `INVALID_ARGUMENT` | 400 |
+        | `INVALID_CREDENTIALS` | 401 |
+        | `UNAUTHENTICATED` | 401 |
+        | `EMAIL_UNAVAILABLE` | 409 |
+        | `PERMISSION_DENIED` | 403 |
+        | `BODY_TOO_LARGE` | 413 |
+        | `UNSUPPORTED_MEDIA_TYPE` | 415 |
+        | `RATE_LIMITED` | 429 |
+        | `INTERNAL` | 500 |
+        | `UNAVAILABLE` | 503 |
 
   examples:
     MixedBatchRequest:
