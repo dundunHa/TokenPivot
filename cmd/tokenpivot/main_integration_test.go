@@ -35,7 +35,7 @@ func TestSignals(t *testing.T) {
 				t.Fatal(err)
 			}
 			cmd, logs := child(t, addr)
-			cmd.Env = append(cmd.Env, "TOKENPIVOT_DATABASE_URL="+appURL, "PGPASSFILE=/dev/null", "PGSERVICEFILE=/dev/null")
+			cmd.Env = append(cmd.Env, "TOKENPIVOT_DATABASE_URL="+appURL, "TOKENPIVOT_WEB_ORIGIN="+syntheticWebOrigin, "PGPASSFILE=/dev/null", "PGSERVICEFILE=/dev/null")
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -302,7 +302,7 @@ func TestDatabaseDisconnectRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd, logs := child(t, addr)
-	cmd.Env = append(cmd.Env, "TOKENPIVOT_DATABASE_URL="+u.String(), "PGPASSFILE=/dev/null", "PGSERVICEFILE=/dev/null")
+	cmd.Env = append(cmd.Env, "TOKENPIVOT_DATABASE_URL="+u.String(), "TOKENPIVOT_WEB_ORIGIN="+syntheticWebOrigin, "PGPASSFILE=/dev/null", "PGSERVICEFILE=/dev/null")
 	// The embedded service must not depend on a repository or dist working directory.
 	cmd.Dir = t.TempDir()
 	if err := cmd.Start(); err != nil {
@@ -532,7 +532,7 @@ func TestDatabaseStartupFailures(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cmd, logs := child(t, tt.addr)
-			cmd.Env = append(cmd.Env, "TOKENPIVOT_DATABASE_URL="+tt.value, "PGPASSFILE=/dev/null", "PGSERVICEFILE=/dev/null")
+			cmd.Env = append(cmd.Env, "TOKENPIVOT_DATABASE_URL="+tt.value, "TOKENPIVOT_WEB_ORIGIN="+syntheticWebOrigin, "PGPASSFILE=/dev/null", "PGSERVICEFILE=/dev/null")
 			start := time.Now()
 			err := cmd.Run()
 			if err == nil || cmd.ProcessState.ExitCode() != 1 {

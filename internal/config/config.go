@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -13,10 +14,13 @@ import (
 type Config struct {
 	HTTPAddr    string
 	DatabaseURL string
+	// WebOrigin is the single trusted browser origin. It decides Origin checks
+	// for write requests and whether the session cookie is Secure.
+	WebOrigin Origin
 }
 
-// Load reads TOKENPIVOT_HTTP_ADDR once and validates its host:port format.
-// Invalid values are never included in returned errors.
+// Load reads the service's environment once and validates it. Invalid values are
+// never included in returned errors.
 func Load() (Config, error) {
 	addr, ok := os.LookupEnv("TOKENPIVOT_HTTP_ADDR")
 	if !ok {
@@ -37,7 +41,86 @@ func Load() (Config, error) {
 	if strings.TrimSpace(databaseURL) == "" {
 		return Config{}, errors.New("TOKENPIVOT_DATABASE_URL is required")
 	}
-	return Config{HTTPAddr: addr, DatabaseURL: databaseURL}, nil
+	origin, err := ParseOrigin(os.Getenv("TOKENPIVOT_WEB_ORIGIN"))
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{HTTPAddr: addr, DatabaseURL: databaseURL, WebOrigin: origin}, nil
+}
+
+// Origin is one normalized trusted browser origin: a lowercase scheme and a
+// lowercase host with the scheme's default port omitted. It never carries user
+// information, a path, a query or a fragment.
+type Origin struct {
+	scheme string
+	host   string
+}
+
+// String returns the normalized origin, e.g. "http://127.0.0.1:5173".
+func (o Origin) String() string { return o.scheme + "://" + o.host }
+
+// Scheme returns the normalized scheme, either "http" or "https".
+func (o Origin) Scheme() string { return o.scheme }
+
+// Secure reports whether cookies for this origin must set the Secure attribute:
+// every https origin requires it, and loopback development http origins are the
+// only accepted exception.
+func (o Origin) Secure() bool { return o.scheme == "https" }
+
+// ParseOrigin validates and normalizes TOKENPIVOT_WEB_ORIGIN. Only one http(s)
+// origin is accepted; plain http is limited to loopback development hosts.
+// Returned errors name the variable but never echo its value.
+func ParseOrigin(value string) (Origin, error) {
+	if value == "" || strings.TrimSpace(value) != value {
+		return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN is required and must not have surrounding whitespace")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN must be one http(s) origin without user information, path, query or fragment")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN scheme must be http or https")
+	}
+	hostname := strings.ToLower(parsed.Hostname())
+	if hostname == "" || strings.HasSuffix(value, "/") {
+		return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN must include a host and no trailing slash")
+	}
+	port := parsed.Port()
+	if port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN port must be numeric from 1 to 65535")
+		}
+		if (scheme == "http" && number == 80) || (scheme == "https" && number == 443) {
+			port = ""
+		}
+	}
+	if scheme == "http" && !isLoopbackHost(hostname) {
+		return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN may use plain http only for localhost, 127.0.0.1 or ::1")
+	}
+	host := hostname
+	if port != "" {
+		host = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		host = "[" + hostname + "]"
+	}
+	return Origin{scheme: scheme, host: host}, nil
+}
+
+// OriginHeaderMatches reports whether a request's single Origin header equals
+// the trusted origin exactly, comparing scheme, host and port.
+func OriginHeaderMatches(origin Origin, headerValues []string) bool {
+	return len(headerValues) == 1 && strings.EqualFold(strings.TrimSpace(headerValues[0]), origin.String())
+}
+
+// isLoopbackHost accepts only explicit loopback development hosts.
+func isLoopbackHost(hostname string) bool {
+	if hostname == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(hostname)
+	return ip != nil && ip.IsLoopback()
 }
 
 // MigrationConfig contains only the independent migration connection setting.
