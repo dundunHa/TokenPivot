@@ -41,6 +41,15 @@ const (
 	maxBodyBytes = 1 << 20
 	// processingBudget bounds one request from the moment the handler starts.
 	processingBudget = 8 * time.Second
+	// responseReserve is held back from processingBudget for the rollback of a slow
+	// item and for writing the response. Per-item work therefore stops at
+	// 8s-responseReserve = 7s, which leaves a full second to roll back and answer
+	// inside the documented 8 seconds and well below the 10s server WriteTimeout.
+	responseReserve = time.Second
+	// reserveDivisor caps the reserve at half of the remaining budget, so a budget
+	// shorter than 2*responseReserve still keeps half its time for the items. With
+	// the frozen 8 second budget the cap that applies is responseReserve itself.
+	reserveDivisor = 2
 	// rollbackBudget bounds the rollback that releases an item connection. It is
 	// deliberately not the request context: a canceled request must still get the
 	// connection back, and the rollback must not hang on a dead network.
@@ -222,11 +231,15 @@ func (s *Service) Authenticate(ctx context.Context, token string) (credentials.C
 func (s *Service) process(ctx context.Context, credential credentials.Credential, items []item) []result {
 	results := make([]result, len(items))
 	accepted := false
+	// Per-item work stops responseReserve before the request budget ends, leaving
+	// that reserve for the rollback of a slow item and for writing the response.
+	itemCtx, cancelItems, requestEnd := withResponseReserve(ctx)
+	defer cancelItems()
 	for i := range items {
 		// The budget is checked before any pre-decoded verdict: once the request
 		// is over, an unstarted position is retryable even when its content is
 		// permanently invalid, because the client never got a real decision.
-		if ctx.Err() != nil {
+		if itemCtx.Err() != nil {
 			results[i] = stoppedResult()
 			continue
 		}
@@ -235,10 +248,10 @@ func (s *Service) process(ctx context.Context, credential credentials.Credential
 			continue
 		}
 		if items[i].event == nil {
-			results[i] = retryableResult(ctx, transient(codeInternal, errMissingEvent))
+			results[i] = retryableResult(itemCtx, transient(codeInternal, errMissingEvent))
 			continue
 		}
-		results[i] = s.processItem(ctx, credential, items[i].event)
+		results[i] = s.processItem(itemCtx, credential, items[i].event, requestEnd)
 		if results[i].status == statusAccepted {
 			accepted = true
 		}
@@ -246,17 +259,55 @@ func (s *Service) process(ctx context.Context, credential credentials.Credential
 	if accepted {
 		// The source stamp is maintenance only: accepted items stay accepted even
 		// when this single statement fails, and only one sanitized line is logged.
-		if err := s.store.TouchSource(ctx, credential.WorkspaceID, credential.SourceID); err != nil {
+		// It shares the item budget, so the reserve stays free for the response.
+		if err := s.store.TouchSource(itemCtx, credential.WorkspaceID, credential.SourceID); err != nil {
 			s.logger.Warn("source last_received_at update failed", "stage", "ingestion source", "err", database.SafeError("source last received", err))
 		}
 	}
 	return results
 }
 
+// withResponseReserve narrows ctx so per-item work ends responseReserve before the
+// request budget runs out, and reports the request end the rollback must respect. A
+// context without a deadline has nothing to reserve from and is returned unchanged.
+func withResponseReserve(ctx context.Context) (context.Context, context.CancelFunc, time.Time) {
+	requestEnd, ok := ctx.Deadline()
+	if !ok {
+		return ctx, func() {}, time.Time{}
+	}
+	itemCtx, cancel := context.WithDeadline(ctx, requestEnd.Add(-reserveFor(time.Until(requestEnd))))
+	return itemCtx, cancel, requestEnd
+}
+
+// reserveFor is the part of the remaining budget held back for the rollback and the
+// response write: responseReserve for the frozen 8 second budget, and at most half of
+// a shorter one, so even a shortened budget spends most of its time on the items
+// themselves.
+func reserveFor(remaining time.Duration) time.Duration {
+	if remaining <= 0 {
+		return 0
+	}
+	if half := remaining / reserveDivisor; half < responseReserve {
+		return half
+	}
+	return responseReserve
+}
+
+// rollbackDeadline bounds one rollback: rollbackBudget from now, but never past the
+// request end, so a slow rollback cannot carry the response beyond the documented
+// budget.
+func rollbackDeadline(requestEnd, now time.Time) time.Time {
+	end := now.Add(rollbackBudget)
+	if !requestEnd.IsZero() && end.After(requestEnd) {
+		return requestEnd
+	}
+	return end
+}
+
 // processItem runs the frozen per-item order inside one transaction:
 // window check, project ownership, insert, re-checked window, conflict
 // classification, minute increment, one more window check, commit.
-func (s *Service) processItem(ctx context.Context, credential credentials.Credential, e *event) result {
+func (s *Service) processItem(ctx context.Context, credential credentials.Credential, e *event, requestEnd time.Time) result {
 	tx, err := s.store.BeginItem(ctx)
 	if err != nil {
 		return retryableResult(ctx, err)
@@ -268,8 +319,10 @@ func (s *Service) processItem(ctx context.Context, credential credentials.Creden
 		}
 		// The request context may already be canceled, so the rollback uses its own
 		// short-lived budget: independent of the request, but still bounded so a
-		// dead network cannot hold the connection forever.
-		rollbackCtx, cancelRollback := context.WithTimeout(context.WithoutCancel(ctx), rollbackBudget)
+		// dead network cannot hold the connection forever. Its deadline never goes
+		// past the request end, so a slow rollback cannot push the response beyond
+		// the documented budget either.
+		rollbackCtx, cancelRollback := context.WithDeadline(context.WithoutCancel(ctx), rollbackDeadline(requestEnd, time.Now()))
 		defer cancelRollback()
 		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil {
 			// The driver message is never logged: only the sanitized class survives.

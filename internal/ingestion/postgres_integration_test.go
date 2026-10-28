@@ -661,7 +661,13 @@ func TestWindowBoundariesAgainstServerClock(t *testing.T) {
 		t.Fatalf("future event was stored %d times", count)
 	}
 
-	// Exactly on the lower bound is still accepted; one microsecond under is not.
+	// This checks the neighborhood of the lower bound, not the exact boundary: the
+	// accepted event sits two seconds inside the bound and the expired one two
+	// microseconds under it, so a small host/database clock difference cannot flip
+	// either verdict. Exact inclusivity (exactly on the bound is accepted, one
+	// microsecond under is expired) is covered by TestWindowBoundariesAreInclusive in
+	// handler_test.go, which controls the server clock exactly.
+	//
 	// The bound is derived from the database clock, because that is the clock the
 	// service compares against; a host-side now would be off by the host/database
 	// clock difference on a non-native instance.
@@ -1016,16 +1022,25 @@ WHERE workspace_id=$1 AND bucket_start=$2 AND source_id=$3
 	}
 }
 
+// lowerBoundBase is a scripted server time whose lower window bound
+// (base-retainedWindow) is inside one minute and at least one second away from the
+// minute end. A seed event one second later therefore shares the target's minute
+// bucket, which a raw time.Now() cannot guarantee: the target would fall into the
+// next minute whenever the wall clock happened to be in the last second of a minute.
+func lowerBoundBase() time.Time {
+	return time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+}
+
 // steppingClock returns scripted server times in order and repeats the last one. It
-// is only reachable through the test-only store field; the production path always
-// reads clock_timestamp().
+// is only reachable through the hookStore Now hook; the production path always reads
+// clock_timestamp().
 type steppingClock struct {
 	mu    sync.Mutex
 	times []time.Time
 	call  int
 }
 
-func (c *steppingClock) next(ctx context.Context, tx pgx.Tx) (time.Time, error) {
+func (c *steppingClock) next(context.Context) (time.Time, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.times) == 0 {
@@ -1143,11 +1158,14 @@ func TestLockWaitCrossesLowerBoundInsideInsert(t *testing.T) {
 	observer := e.probeConn(t)
 	logs := &syncBuffer{}
 	// The event sits exactly on the lower bound at T0 and one microsecond late at
-	// T1, which is the documented boundary example.
-	base := time.Now().UTC().Truncate(time.Microsecond)
+	// T1, which is the documented boundary example. Only Now is scripted; the
+	// transaction, the lock wait and the window re-checks stay real.
+	base := lowerBoundBase()
 	occurredAt := base.Add(-retainedWindow)
-	store := NewPostgres(pool)
-	store.clock = (&steppingClock{times: []time.Time{base, base.Add(time.Microsecond)}}).next
+	store := &hookStore{
+		inner: NewPostgres(pool),
+		now:   (&steppingClock{times: []time.Time{base, base.Add(time.Microsecond)}}).next,
+	}
 	service := New(store, &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, nil)))
 	credential := credentialFor(workspaceID, sourceID)
 	items := decodeOneBatch(t, encodedBatch(t, acceptedEventJSON("evt-lock-insert", occurredAt, projectID)))
@@ -1177,17 +1195,29 @@ func TestLockWaitCrossesLowerBoundInsideMinute(t *testing.T) {
 	projectID := e.seedProject(t, ctx, workspaceID, nil)
 	pool := e.pool(t)
 	observer := e.probeConn(t)
-	base := time.Now().UTC().Truncate(time.Microsecond)
+	// The seed event must land in the same minute bucket as the target and still be
+	// inside the window, so the target time is placed away from a minute end.
+	base := lowerBoundBase()
 	occurredAt := base.Add(-retainedWindow)
-	// The clock is only used from here on, so the seed batch used the real clock.
-	seed := e.service(t, pool, &syncBuffer{})
+	// The seed item runs on the same scripted clock, so neither its bucket nor its
+	// window depends on when the test happens to execute.
+	seed := New(&hookStore{
+		inner: NewPostgres(pool),
+		now:   (&steppingClock{times: []time.Time{base}}).next,
+	}, &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(&syncBuffer{}, nil)))
 	credential := credentialFor(workspaceID, sourceID)
 	results := runBatch(t, seed, credential, encodedBatch(t,
 		acceptedEventJSON("evt-lock-minute-seed", occurredAt.Add(time.Second), projectID)))
 	requireResultStatuses(t, results, statusAccepted)
+	seedAt := occurredAt.Add(time.Second)
+	if !seedAt.Truncate(time.Minute).Equal(occurredAt.Truncate(time.Minute)) {
+		t.Fatalf("seed %s and target %s are in different minute buckets", seedAt, occurredAt)
+	}
 
-	store := NewPostgres(pool)
-	store.clock = (&steppingClock{times: []time.Time{base, base, base.Add(time.Microsecond)}}).next
+	store := &hookStore{
+		inner: NewPostgres(pool),
+		now:   (&steppingClock{times: []time.Time{base, base, base.Add(time.Microsecond)}}).next,
+	}
 	logs := &syncBuffer{}
 	service := New(store, &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, nil)))
 	items := decodeOneBatch(t, encodedBatch(t, acceptedEventJSON("evt-lock-minute", occurredAt, projectID)))
@@ -1212,7 +1242,11 @@ func TestLockWaitCrossesLowerBoundInsideMinute(t *testing.T) {
 // hookStore wraps the real store and lets a test act at one exact point of the item
 // transaction, so a race is created by ordering and never by a sleep.
 type hookStore struct {
-	inner        store
+	inner store
+	// now overrides the server time sample. Every other call still goes to the
+	// real transaction, so the lock and the window re-check stay real while the
+	// clock is controlled.
+	now          func(ctx context.Context) (time.Time, error)
 	afterInsert  func(ctx context.Context, event storedEvent, inserted bool) error
 	beforeCommit func(ctx context.Context, tx itemTx) error
 }
@@ -1235,7 +1269,12 @@ type hookTx struct {
 	hooks *hookStore
 }
 
-func (t *hookTx) Now(ctx context.Context) (time.Time, error) { return t.inner.Now(ctx) }
+func (t *hookTx) Now(ctx context.Context) (time.Time, error) {
+	if t.hooks.now != nil {
+		return t.hooks.now(ctx)
+	}
+	return t.inner.Now(ctx)
+}
 
 func (t *hookTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
 	return t.inner.ProjectExists(ctx, workspaceID, projectID)
