@@ -9,7 +9,6 @@ import (
 	"github.com/dundunHa/TokenPivot/internal/credentials"
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,13 +38,10 @@ RETURNING 1` //nolint:lll // the SQL is written out column by column on purpose
 
 	// existingEventQuery reads the stored comparison basis by its identity in its
 	// own statement. Under Read Committed the INSERT snapshot cannot be assumed to
-	// see a row another transaction just committed. Every retained comparison column
-	// is read so a future normalization version can still be projected back.
-	existingEventQuery = `SELECT project_id, provider, model, occurred_at, normalization_version, payload_hash,
-    input_tokens, input_tokens_quality, output_tokens, output_tokens_quality,
-    total_tokens, total_tokens_quality, cache_read_tokens, cache_read_tokens_quality,
-    cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality,
-    status, duration_ms
+	// see a row another transaction just committed. Only the two comparison columns
+	// are read: the stored normalization version decides comparability, and the
+	// stored digest decides duplicate versus conflict.
+	existingEventQuery = `SELECT normalization_version, payload_hash
 FROM usage_events WHERE workspace_id = $1 AND source_id = $2 AND source_event_id = $3`
 
 	// touchSourceQuery moves the source stamp forward only. GREATEST keeps an older
@@ -55,11 +51,18 @@ SET last_received_at = GREATEST(coalesce(last_received_at, clock_timestamp()), c
 WHERE workspace_id = $1 AND id = $2`
 )
 
+// serverClock reads one server time sample. It exists as a named type so a test
+// can substitute a clock without touching the production path.
+type serverClock func(ctx context.Context, tx pgx.Tx) (time.Time, error)
+
 // Postgres implements the ingestion store on the caller-owned pool. Errors leaving
 // this type carry fixed text only: SQL, driver messages, event content and the
 // connection string are never part of an error string.
 type Postgres struct {
 	pool *pgxpool.Pool
+	// clock is nil in production: the database clock is always the source of
+	// truth. Only integration tests set it, to move time across a lock wait.
+	clock serverClock
 }
 
 // NewPostgres returns the ingestion store on the service pool.
@@ -74,7 +77,7 @@ func (p *Postgres) BeginItem(ctx context.Context) (itemTx, error) {
 	if err != nil {
 		return nil, database.SafeError("ingestion begin", err)
 	}
-	return &postgresTx{tx: tx}, nil
+	return &postgresTx{tx: tx, clock: p.clock}, nil
 }
 
 // TouchSource advances sources.last_received_at for one authenticated workspace and
@@ -89,12 +92,21 @@ func (p *Postgres) TouchSource(ctx context.Context, workspaceID, sourceID creden
 // postgresTx is the per-item transaction wrapper. Each method runs one statement in
 // the caller's transaction and never commits on its own.
 type postgresTx struct {
-	tx pgx.Tx
+	tx    pgx.Tx
+	clock serverClock
 }
 
 // Now reads the server time from the database. It is a statement, not a
 // transaction-start constant, so a wait on a lock is visible to the next sample.
+// Production always uses clock_timestamp(); only a test supplies another source.
 func (t *postgresTx) Now(ctx context.Context) (time.Time, error) {
+	if t.clock != nil {
+		now, err := t.clock(ctx, t.tx)
+		if err != nil {
+			return time.Time{}, database.SafeError("ingestion server time", err)
+		}
+		return now, nil
+	}
 	var now time.Time
 	if err := t.tx.QueryRow(ctx, nowQuery).Scan(&now); err != nil {
 		return time.Time{}, database.SafeError("ingestion server time", err)
@@ -133,21 +145,9 @@ func (t *postgresTx) InsertEvent(ctx context.Context, event storedEvent) (bool, 
 
 // ExistingEvent reads the stored comparison basis of one identity, if any.
 func (t *postgresTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
-	var (
-		existing   storedEvent
-		projectID  pgtype.UUID
-		status     *string
-		durationMS *int64
-		values     [6]*int64
-		qualities  [6]string
-	)
+	var existing storedEvent
 	err := t.tx.QueryRow(ctx, existingEventQuery, workspaceID, sourceID, sourceEventID).Scan(
-		&projectID, &existing.Provider, &existing.Model, &existing.OccurredAt,
 		&existing.NormalizationVersion, &existing.PayloadHash,
-		&values[0], &qualities[0], &values[1], &qualities[1],
-		&values[2], &qualities[2], &values[3], &qualities[3],
-		&values[4], &qualities[4], &values[5], &qualities[5],
-		&status, &durationMS,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return storedEvent{}, false, nil
@@ -155,28 +155,7 @@ func (t *postgresTx) ExistingEvent(ctx context.Context, workspaceID, sourceID cr
 	if err != nil {
 		return storedEvent{}, false, database.SafeError("ingestion existing event", err)
 	}
-	existing.ProjectID = projectID
-	existing.Status = status
-	existing.DurationMS = durationMS
-	existing.Usage = usageFromColumns(values, qualities)
 	return existing, true, nil
-}
-
-// usageFromColumns rebuilds the six metrics from their stored value and quality
-// columns. A quality outside the frozen vocabulary is impossible for a row this
-// release wrote and is caught by the projection caller.
-func usageFromColumns(values [6]*int64, qualities [6]string) usage {
-	metric := func(index int) aggregation.Metric {
-		return aggregation.Metric{Value: values[index], Quality: aggregation.Quality(qualities[index])}
-	}
-	return usage{
-		Input:      metric(0),
-		Output:     metric(1),
-		Total:      metric(2),
-		CacheRead:  metric(3),
-		CacheWrite: metric(4),
-		Reasoning:  metric(5),
-	}
 }
 
 // ApplyMinute writes the minute increment through the aggregation package, inside
@@ -185,19 +164,24 @@ func (t *postgresTx) ApplyMinute(ctx context.Context, input aggregation.MinuteIn
 	return aggregation.ApplyRequest(ctx, t.tx, input)
 }
 
-// Commit commits the item. Its error is reported as indeterminate by the caller.
+// Commit commits the item. Its error is reported as indeterminate by the caller
+// and is sanitized here, so no driver text can reach a log line or a response.
 func (t *postgresTx) Commit(ctx context.Context) error {
-	return t.tx.Commit(ctx)
+	if err := t.tx.Commit(ctx); err != nil {
+		return database.SafeError("ingestion commit", err)
+	}
+	return nil
 }
 
 // Rollback discards the item. A transaction the driver already finished reports
-// pgx.ErrTxClosed, which is not a failure worth surfacing.
+// pgx.ErrTxClosed, which is not a failure worth surfacing. Every other error is
+// sanitized for the same reason as Commit.
 func (t *postgresTx) Rollback(ctx context.Context) error {
 	err := t.tx.Rollback(ctx)
-	if errors.Is(err, pgx.ErrTxClosed) {
+	if err == nil || errors.Is(err, pgx.ErrTxClosed) {
 		return nil
 	}
-	return err
+	return database.SafeError("ingestion rollback", err)
 }
 
 // eventArgs lists the insert parameters in the column order of insertEventQuery.

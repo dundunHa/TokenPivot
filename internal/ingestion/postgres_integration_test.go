@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -661,8 +662,14 @@ func TestWindowBoundariesAgainstServerClock(t *testing.T) {
 	}
 
 	// Exactly on the lower bound is still accepted; one microsecond under is not.
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	edge := now.Add(-retainedWindow)
+	// The bound is derived from the database clock, because that is the clock the
+	// service compares against; a host-side now would be off by the host/database
+	// clock difference on a non-native instance.
+	var serverNow time.Time
+	if err := e.owner.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&serverNow); err != nil {
+		t.Fatal(database.SafeError("read server clock", err))
+	}
+	edge := serverNow.UTC().Truncate(time.Microsecond).Add(-retainedWindow)
 	results = runBatch(t, service, credential, encodedBatch(t,
 		acceptedEventJSON("evt-edge-inside", edge.Add(2*time.Second), pgtype.UUID{}),
 		acceptedEventJSON("evt-edge-under", edge.Add(-2*time.Microsecond), pgtype.UUID{}),
@@ -909,5 +916,582 @@ func requireResultCodes(t *testing.T, results []result, want ...string) {
 		if results[i].code != want[i] {
 			t.Fatalf("codes[%d]=%q want=%q (all: %+v)", i, results[i].code, want[i], results)
 		}
+	}
+}
+
+// probeConn opens one extra owner connection that is only used for observation and
+// for holding explicit locks, so a blocked item transaction never blocks the test's
+// own reads.
+func (e *integrationEnv) probeConn(t *testing.T) *pgx.Conn {
+	t.Helper()
+	conn, err := pgx.Connect(context.Background(), e.ownerURL)
+	if err != nil {
+		t.Fatal(database.SafeError("probe connect", err))
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Error(database.SafeError("probe close", err))
+		}
+	})
+	return conn
+}
+
+// waitForWaitingBackend waits until some backend is blocked on an ungranted lock.
+// The dedicated test database is exclusive to this run, so the blocked backend can
+// only be the item under test. No sleep is used to guess the schedule: the lock
+// itself serializes the two sides.
+func waitForWaitingBackend(t *testing.T, ctx context.Context, observer *pgx.Conn) int {
+	t.Helper()
+	deadline, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var pid int
+		err := observer.QueryRow(deadline, "SELECT pid FROM pg_locks WHERE NOT granted LIMIT 1").Scan(&pid)
+		if err == nil {
+			return pid
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(database.SafeError("observe waiting backend", err))
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.Done():
+			t.Fatal("no backend became blocked on the held lock")
+		}
+	}
+}
+
+// holdLock runs fn inside one owner transaction that is always rolled back, so a
+// test can create a real lock without committing any fixture row.
+func (e *integrationEnv) holdLock(t *testing.T, ctx context.Context, fn func(ctx context.Context, tx pgx.Tx)) func() {
+	t.Helper()
+	tx, err := e.owner.Begin(ctx)
+	if err != nil {
+		t.Fatal(database.SafeError("begin lock holder", err))
+	}
+	fn(ctx, tx)
+	once := sync.Once{}
+	release := func() {
+		once.Do(func() {
+			if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+				t.Error(database.SafeError("release lock holder", err))
+			}
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// holdIdentityLock inserts the target identity in an uncommitted transaction, so the
+// item's own INSERT has to wait on the unique identity key.
+func holdIdentityLock(t *testing.T, ctx context.Context, tx pgx.Tx, workspaceID, sourceID pgtype.UUID, sourceEventID string, at time.Time) {
+	t.Helper()
+	// Only the identity and the mandatory columns matter here; the content is
+	// obviously synthetic and is never committed.
+	_, err := tx.Exec(ctx, `INSERT INTO usage_events (
+    workspace_id, source_id, source_event_id, provider, model, occurred_at, received_at,
+    normalization_version, payload_hash,
+    input_tokens_quality, output_tokens_quality, total_tokens_quality,
+    cache_read_tokens_quality, cache_write_tokens_quality, reasoning_tokens_quality)
+VALUES ($1,$2,$3,'lock-holder','lock-holder',$4,$4,$5,'\x00'::bytea,
+    'missing','missing','missing','missing','missing','missing')`,
+		workspaceID, sourceID, sourceEventID, at, normalizationVersion)
+	if err != nil {
+		t.Fatal(database.SafeError("hold identity row", err))
+	}
+}
+
+// holdMinuteLock locks the bucket row the item's minute increment will update.
+func holdMinuteLock(t *testing.T, ctx context.Context, tx pgx.Tx, workspaceID, sourceID, projectID pgtype.UUID, provider, model string, occurredAt time.Time) {
+	t.Helper()
+	var found int
+	err := tx.QueryRow(ctx, `SELECT 1 FROM usage_minute_stats
+WHERE workspace_id=$1 AND bucket_start=$2 AND source_id=$3
+  AND project_id IS NOT DISTINCT FROM $4 AND provider=$5 AND model=$6 FOR UPDATE`,
+		workspaceID, occurredAt.UTC().Truncate(time.Minute), sourceID, projectID, provider, model).Scan(&found)
+	if err != nil {
+		t.Fatal(database.SafeError("hold minute row", err))
+	}
+}
+
+// steppingClock returns scripted server times in order and repeats the last one. It
+// is only reachable through the test-only store field; the production path always
+// reads clock_timestamp().
+type steppingClock struct {
+	mu    sync.Mutex
+	times []time.Time
+	call  int
+}
+
+func (c *steppingClock) next(ctx context.Context, tx pgx.Tx) (time.Time, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.times) == 0 {
+		return time.Time{}, errors.New("synthetic: empty clock")
+	}
+	index := c.call
+	if index >= len(c.times) {
+		index = len(c.times) - 1
+	}
+	c.call++
+	return c.times[index], nil
+}
+
+// startDetailBatch processes one batch on a goroutine, so a lock-based test can
+// assert the blocked state meanwhile. Only service.process runs there: the test's
+// assertions stay on the test goroutine.
+func startDetailBatch(service *Service, credential credentials.Credential, items []item) <-chan []result {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	done := make(chan []result, 1)
+	go func() {
+		defer cancel()
+		done <- service.process(ctx, credential, items)
+	}()
+	return done
+}
+
+// awaitDetailBatch waits for a started batch and fails the test on a hang.
+func awaitDetailBatch(t *testing.T, done <-chan []result) []result {
+	t.Helper()
+	select {
+	case results := <-done:
+		return results
+	case <-time.After(30 * time.Second):
+		t.Fatal("batch did not finish within 30s")
+		return nil
+	}
+}
+
+// TestAggregationFailureRollsBackTheWholeItem makes the real minute upsert fail on
+// the real database. The detail row and the minute increment must disappear
+// together, the neighbours must be unaffected and a retry of the same identity must
+// be accepted once the fault is removed.
+func TestAggregationFailureRollsBackTheWholeItem(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	// The constraint lives only in this test's schema and only bites this
+	// synthetic provider, so the real aggregation statement is what fails.
+	if _, err := e.owner.Exec(ctx, "ALTER TABLE usage_minute_stats ADD CONSTRAINT t011_aggregation_fail CHECK (provider <> 'aggregation-failure')"); err != nil {
+		t.Fatal(database.SafeError("add aggregation fault constraint", err))
+	}
+	failing := `{"source_event_id":"evt-agg-fail","project_id":"` + uuidText(projectID) + `","provider":"aggregation-failure","model":"example-model","occurred_at":"` + occurredAt.Format(microLayout) + `","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`
+	results := runBatch(t, service, credential, encodedBatch(t,
+		acceptedEventJSON("evt-agg-neighbour-1", occurredAt, projectID),
+		failing,
+		acceptedEventJSON("evt-agg-neighbour-2", occurredAt, projectID),
+	))
+	requireResultStatuses(t, results, statusAccepted, statusRetryable, statusAccepted)
+	requireResultCodes(t, results, "", codeUnavailable, "")
+
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-agg-fail"); count != 0 {
+		t.Fatalf("failed aggregation left %d detail rows", count)
+	}
+	if count := e.countBuckets(t, ctx, workspaceID, sourceID); count != 1 {
+		t.Fatalf("buckets=%d want=1 (only the healthy dimension set)", count)
+	}
+	healthy := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+	if healthy.eventCount != 2 {
+		t.Fatalf("healthy event_count=%d want=2", healthy.eventCount)
+	}
+	// While the fault is still present the same identity may simply be retried.
+	results = runBatch(t, service, credential, encodedBatch(t, failing))
+	requireResultStatuses(t, results, statusRetryable)
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-agg-fail"); count != 0 {
+		t.Fatalf("failed aggregation left %d detail rows on the second attempt", count)
+	}
+
+	// Remove the fault and retry the same identity: it is accepted exactly once and
+	// then counted exactly once.
+	if _, err := e.owner.Exec(ctx, "ALTER TABLE usage_minute_stats DROP CONSTRAINT t011_aggregation_fail"); err != nil {
+		t.Fatal(database.SafeError("drop aggregation fault constraint", err))
+	}
+	results = runBatch(t, service, credential, encodedBatch(t, failing))
+	requireResultStatuses(t, results, statusAccepted)
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-agg-fail"); count != 1 {
+		t.Fatalf("rows=%d want=1 after the retry", count)
+	}
+	failedBucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "aggregation-failure", "example-model", occurredAt)
+	if failedBucket.eventCount != 1 || failedBucket.sum[0] != 100 {
+		t.Fatalf("retried bucket=%+v want event_count=1 input=100", failedBucket)
+	}
+	// A retransmission of the now-stored event is a duplicate, never a second count.
+	results = runBatch(t, service, credential, encodedBatch(t, failing))
+	requireResultStatuses(t, results, statusDuplicate)
+	if bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "aggregation-failure", "example-model", occurredAt); bucket.eventCount != 1 {
+		t.Fatalf("event_count=%d want=1 after the duplicate", bucket.eventCount)
+	}
+}
+
+// TestLockWaitCrossesLowerBoundInsideInsert blocks the detail INSERT on the identity
+// key, then releases it with the injected clock past the lower bound. The item must
+// be expired and neither write may survive.
+func TestLockWaitCrossesLowerBoundInsideInsert(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	observer := e.probeConn(t)
+	logs := &syncBuffer{}
+	// The event sits exactly on the lower bound at T0 and one microsecond late at
+	// T1, which is the documented boundary example.
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	occurredAt := base.Add(-retainedWindow)
+	store := NewPostgres(pool)
+	store.clock = (&steppingClock{times: []time.Time{base, base.Add(time.Microsecond)}}).next
+	service := New(store, &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, nil)))
+	credential := credentialFor(workspaceID, sourceID)
+	items := decodeOneBatch(t, encodedBatch(t, acceptedEventJSON("evt-lock-insert", occurredAt, projectID)))
+
+	release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
+		holdIdentityLock(t, ctx, tx, workspaceID, sourceID, "evt-lock-insert", base)
+	})
+	done := startDetailBatch(service, credential, items)
+	waitForWaitingBackend(t, ctx, observer)
+	release()
+	results := awaitDetailBatch(t, done)
+	requireResultStatuses(t, results, statusExpired)
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-lock-insert"); count != 0 {
+		t.Fatalf("expired item left %d detail rows", count)
+	}
+	if count := e.countBuckets(t, ctx, workspaceID, sourceID); count != 0 {
+		t.Fatalf("expired item left %d minute buckets", count)
+	}
+}
+
+// TestLockWaitCrossesLowerBoundInsideMinute blocks the minute increment, then
+// releases it with the clock past the lower bound. Both writes must roll back.
+func TestLockWaitCrossesLowerBoundInsideMinute(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	observer := e.probeConn(t)
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	occurredAt := base.Add(-retainedWindow)
+	// The clock is only used from here on, so the seed batch used the real clock.
+	seed := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	results := runBatch(t, seed, credential, encodedBatch(t,
+		acceptedEventJSON("evt-lock-minute-seed", occurredAt.Add(time.Second), projectID)))
+	requireResultStatuses(t, results, statusAccepted)
+
+	store := NewPostgres(pool)
+	store.clock = (&steppingClock{times: []time.Time{base, base, base.Add(time.Microsecond)}}).next
+	logs := &syncBuffer{}
+	service := New(store, &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, nil)))
+	items := decodeOneBatch(t, encodedBatch(t, acceptedEventJSON("evt-lock-minute", occurredAt, projectID)))
+
+	release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
+		holdMinuteLock(t, ctx, tx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+	})
+	done := startDetailBatch(service, credential, items)
+	waitForWaitingBackend(t, ctx, observer)
+	release()
+	results = awaitDetailBatch(t, done)
+	requireResultStatuses(t, results, statusExpired)
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-lock-minute"); count != 0 {
+		t.Fatalf("expired item left %d detail rows", count)
+	}
+	bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+	if bucket.eventCount != 1 || bucket.sum[0] != 100 {
+		t.Fatalf("bucket=%+v want the unchanged seed event_count=1 input=100", bucket)
+	}
+}
+
+// hookStore wraps the real store and lets a test act at one exact point of the item
+// transaction, so a race is created by ordering and never by a sleep.
+type hookStore struct {
+	inner        store
+	afterInsert  func(ctx context.Context, event storedEvent, inserted bool) error
+	beforeCommit func(ctx context.Context, tx itemTx) error
+}
+
+func (s *hookStore) BeginItem(ctx context.Context) (itemTx, error) {
+	tx, err := s.inner.BeginItem(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &hookTx{inner: tx, hooks: s}, nil
+}
+
+func (s *hookStore) TouchSource(ctx context.Context, workspaceID, sourceID credentials.ID) error {
+	return s.inner.TouchSource(ctx, workspaceID, sourceID)
+}
+
+// hookTx delegates every statement and calls the optional hooks in between.
+type hookTx struct {
+	inner itemTx
+	hooks *hookStore
+}
+
+func (t *hookTx) Now(ctx context.Context) (time.Time, error) { return t.inner.Now(ctx) }
+
+func (t *hookTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
+	return t.inner.ProjectExists(ctx, workspaceID, projectID)
+}
+
+func (t *hookTx) InsertEvent(ctx context.Context, event storedEvent) (bool, error) {
+	inserted, err := t.inner.InsertEvent(ctx, event)
+	if err == nil && t.hooks.afterInsert != nil {
+		if hookErr := t.hooks.afterInsert(ctx, event, inserted); hookErr != nil {
+			return false, hookErr
+		}
+	}
+	return inserted, err
+}
+
+func (t *hookTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
+	return t.inner.ExistingEvent(ctx, workspaceID, sourceID, sourceEventID)
+}
+
+func (t *hookTx) ApplyMinute(ctx context.Context, input aggregation.MinuteInput) error {
+	return t.inner.ApplyMinute(ctx, input)
+}
+
+func (t *hookTx) Commit(ctx context.Context) error {
+	if t.hooks.beforeCommit != nil {
+		if err := t.hooks.beforeCommit(ctx, t.inner); err != nil {
+			return err
+		}
+	}
+	return t.inner.Commit(ctx)
+}
+
+func (t *hookTx) Rollback(ctx context.Context) error { return t.inner.Rollback(ctx) }
+
+// TestVanishedRowBetweenInsertAndReadIsRetryable deletes the stored row with
+// controlled SQL in the window between the conflicting INSERT and the comparison
+// SELECT. The item must be retryable, with no re-insert and no recount.
+func TestVanishedRowBetweenInsertAndReadIsRetryable(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	event := acceptedEventJSON("evt-vanish", occurredAt, projectID)
+	results := runBatch(t, e.service(t, pool, &syncBuffer{}), credential, encodedBatch(t, event))
+	requireResultStatuses(t, results, statusAccepted)
+
+	// The row is removed by the owner connection exactly between the two
+	// statements of the item transaction, which is the documented race.
+	deleting := &hookStore{inner: NewPostgres(pool)}
+	deleting.afterInsert = func(ctx context.Context, _ storedEvent, inserted bool) error {
+		if inserted {
+			t.Error("the second attempt must conflict, not insert")
+			return nil
+		}
+		if _, err := e.owner.Exec(ctx, "DELETE FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3",
+			workspaceID, sourceID, "evt-vanish"); err != nil {
+			return database.SafeError("delete stored row", err)
+		}
+		return nil
+	}
+	logs := &syncBuffer{}
+	service := New(deleting, &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, nil)))
+	results = runBatch(t, service, credential, encodedBatch(t, event))
+	requireResultStatuses(t, results, statusRetryable)
+	requireResultCodes(t, results, codeInternal)
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-vanish"); count != 0 {
+		t.Fatalf("rows=%d want=0: the item must not re-insert a vanished identity", count)
+	}
+	bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+	if bucket.eventCount != 1 {
+		t.Fatalf("event_count=%d want=1: the item must not recount", bucket.eventCount)
+	}
+}
+
+// TestRealCredentialRotationRevokeAndResend drives the whole path with the real
+// credential service: create, authenticate, ingest, rotate, resend, revoke.
+func TestRealCredentialRotationRevokeAndResend(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	credentialService := credentials.New(credentials.NewPostgres(pool))
+	service := New(NewPostgres(pool), credentialService, slog.New(slog.NewJSONHandler(&syncBuffer{}, nil)))
+	mux := http.NewServeMux()
+	NewHandler(service).Register(mux)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	event := acceptedEventJSON("evt-credential", occurredAt, projectID)
+
+	issued, err := credentialService.Issue(ctx, credentials.ID(workspaceID), credentials.ID(sourceID))
+	if err != nil {
+		t.Fatal(database.SafeError("issue credential", err))
+	}
+	post := func(token string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, ingestionPath, strings.NewReader(encodedBatch(t, event)))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+token)
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, request)
+		return recorder
+	}
+	var body itemResults
+	if err := json.Unmarshal(post(issued.Token).Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	requireStatuses(t, body, statusAccepted)
+
+	rotated, err := credentialService.Rotate(ctx, credentials.ID(workspaceID), issued.ID)
+	if err != nil {
+		t.Fatal(database.SafeError("rotate credential", err))
+	}
+	if rotated.Token == issued.Token {
+		t.Fatal("rotation returned the old token")
+	}
+	if err := json.Unmarshal(post(rotated.Token).Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode retransmission response: %v", err)
+	}
+	// The rotated credential keeps the same source, so the same identity is a
+	// duplicate: one row and one count.
+	requireStatuses(t, body, statusDuplicate)
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-credential"); count != 1 {
+		t.Fatalf("rows=%d want=1", count)
+	}
+	if bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt); bucket.eventCount != 1 {
+		t.Fatalf("event_count=%d want=1", bucket.eventCount)
+	}
+
+	if err := credentialService.Revoke(ctx, credentials.ID(workspaceID), rotated.ID); err != nil {
+		t.Fatal(database.SafeError("revoke credential", err))
+	}
+	recorder := post(rotated.Token)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked credential status=%d want=401 body=%s", recorder.Code, recorder.Body.String())
+	}
+	newEvent := acceptedEventJSON("evt-credential-revoked", occurredAt, projectID)
+	request := httptest.NewRequest(http.MethodPost, ingestionPath, strings.NewReader(encodedBatch(t, newEvent)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rotated.Token)
+	revokedRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(revokedRecorder, request)
+	if revokedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked credential status=%d want=401", revokedRecorder.Code)
+	}
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-credential-revoked"); count != 0 {
+		t.Fatalf("revoked credential wrote %d rows", count)
+	}
+	if count := e.countBuckets(t, ctx, workspaceID, sourceID); count != 1 {
+		t.Fatalf("buckets=%d want=1", count)
+	}
+}
+
+// TestCommitWithLostConnectionDoesNotDoubleCount destroys the item's backend
+// connection right before Commit, which is the testable form of an indeterminate
+// commit result: the server aborts the transaction. The retransmission must resolve
+// the identity without counting it twice.
+func TestCommitWithLostConnectionDoesNotDoubleCount(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	event := acceptedEventJSON("evt-commit-lost", occurredAt, projectID)
+
+	losing := &hookStore{inner: NewPostgres(pool)}
+	var closed bool
+	losing.beforeCommit = func(ctx context.Context, tx itemTx) error {
+		postgresItem, ok := tx.(*postgresTx)
+		if !ok {
+			return errors.New("synthetic: unexpected transaction type")
+		}
+		closed = true
+		// Closing the backend connection makes PostgreSQL abort the open
+		// transaction, so the commit cannot land and its result is unknowable to
+		// the client.
+		return postgresItem.tx.Conn().Close(ctx)
+	}
+	logs := &syncBuffer{}
+	service := New(losing, &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, nil)))
+	results := runBatch(t, service, credential, encodedBatch(t, event))
+	requireResultStatuses(t, results, statusRetryable)
+	if results[0].status == statusAccepted {
+		t.Fatal("a commit error must never be reported as accepted")
+	}
+	if !closed {
+		t.Fatal("the commit hook did not run")
+	}
+	if strings.Contains(logs.String(), "usage_events") || strings.Contains(logs.String(), "INSERT INTO") {
+		t.Fatalf("logs leaked SQL detail: %s", logs.String())
+	}
+
+	// The pool recovers a fresh connection and the retransmission resolves the same
+	// identity exactly once.
+	recovered := e.service(t, pool, &syncBuffer{})
+	results = runBatch(t, recovered, credential, encodedBatch(t, event))
+	if len(results) != 1 || (results[0].status != statusAccepted && results[0].status != statusDuplicate) {
+		t.Fatalf("retransmission=%+v want accepted or duplicate", results)
+	}
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-commit-lost"); count != 1 {
+		t.Fatalf("rows=%d want=1", count)
+	}
+	bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+	if bucket.eventCount != 1 || bucket.sum[0] != 100 {
+		t.Fatalf("bucket=%+v want exactly one count of 100", bucket)
+	}
+}
+
+// TestCommittedItemWithUnknownResultIsNotDoubleCounted covers the other half of the
+// indeterminate commit: the commit really lands on the server but the caller only
+// sees an error. The item must be retryable, and the retransmission must resolve the
+// identity without a second count.
+func TestCommittedItemWithUnknownResultIsNotDoubleCounted(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	event := acceptedEventJSON("evt-commit-landed", occurredAt, projectID)
+
+	// The hook commits the real transaction and then reports a failure, which is
+	// exactly the state where the client cannot tell accepted from not written.
+	uncertain := &hookStore{inner: NewPostgres(pool)}
+	uncertain.beforeCommit = func(ctx context.Context, tx itemTx) error {
+		postgresItem, ok := tx.(*postgresTx)
+		if !ok {
+			return errors.New("synthetic: unexpected transaction type")
+		}
+		if err := postgresItem.tx.Commit(ctx); err != nil {
+			return err
+		}
+		return errors.New("synthetic: commit acknowledgement lost")
+	}
+	logs := &syncBuffer{}
+	service := New(uncertain, &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, nil)))
+	results := runBatch(t, service, credential, encodedBatch(t, event))
+	requireResultStatuses(t, results, statusRetryable)
+	requireResultCodes(t, results, codeInternal)
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-commit-landed"); count != 1 {
+		t.Fatalf("rows=%d want=1: the commit did land on the server", count)
+	}
+
+	// The retransmission sees the committed row and answers duplicate: still one
+	// row and one count.
+	results = runBatch(t, e.service(t, pool, &syncBuffer{}), credential, encodedBatch(t, event))
+	requireResultStatuses(t, results, statusDuplicate)
+	if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-commit-landed"); count != 1 {
+		t.Fatalf("rows=%d want=1 after the retransmission", count)
+	}
+	bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+	if bucket.eventCount != 1 || bucket.sum[0] != 100 {
+		t.Fatalf("bucket=%+v want exactly one count of 100", bucket)
 	}
 }

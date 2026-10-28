@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -95,6 +97,11 @@ type batchErrorDetail struct {
 // result per input position.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
+	deadline := started.Add(processingBudget)
+	// The budget covers the whole request: authentication, body read, decoding and
+	// every item share these 8 seconds, so a slow client cannot buy extra time.
+	ctx, cancel := context.WithTimeout(r.Context(), processingBudget)
+	defer cancel()
 	requestID := newRequestID()
 	if !isJSONContentType(r.Header.Get("Content-Type")) {
 		writeBatchError(w, http.StatusUnsupportedMediaType, requestID, "UNSUPPORTED_MEDIA_TYPE", "content type must be application/json", nil)
@@ -106,18 +113,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeBatchError(w, http.StatusUnauthorized, requestID, "UNAUTHENTICATED", "bearer credential required", nil)
 		return
 	}
-	credential, err := h.Service.Authenticate(r.Context(), token)
+	// Every active (not revoked) credential has ingestion permission in this
+	// release, so 403 PERMISSION_DENIED is unreachable here by design.
+	credential, err := h.Service.Authenticate(ctx, token)
 	if err != nil {
 		if errors.Is(err, credentials.ErrUnauthenticated) {
 			writeBatchError(w, http.StatusUnauthorized, requestID, "UNAUTHENTICATED", "credential is invalid or revoked", nil)
 			return
 		}
-		h.Service.logger.ErrorContext(r.Context(), "ingestion authentication failed", "stage", "ingestion authenticate", "request_id", requestID, "err", database.SafeError("ingestion authenticate", err))
+		h.Service.logger.ErrorContext(ctx, "ingestion authentication failed", "stage", "ingestion authenticate", "request_id", requestID, "err", database.SafeError("ingestion authenticate", err))
 		writeBatchError(w, http.StatusServiceUnavailable, requestID, "UNAVAILABLE", "service is unavailable", nil)
 		return
 	}
-	body, err := readBody(w, r)
+	body, err := readBody(w, r, deadline)
 	if err != nil {
+		// A body that never arrived within the budget is not the client claiming an
+		// invalid document, so it is retryable rather than INVALID_ARGUMENT.
+		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			writeBatchError(w, http.StatusServiceUnavailable, requestID, "UNAVAILABLE", "service is unavailable", nil)
+			return
+		}
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeBatchError(w, http.StatusRequestEntityTooLarge, requestID, "BODY_TOO_LARGE", "request body exceeds 1 MiB", nil)
@@ -132,11 +147,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The 8 second budget starts at the handler entry, so body reading and
-	// decoding count against it. An exhausted budget leaves every unstarted item
-	// retryable; it never produces accepted.
-	ctx, cancel := context.WithTimeout(r.Context(), processingBudget-time.Since(started))
-	defer cancel()
+	// An exhausted budget leaves every unstarted item retryable; the service checks
+	// the deadline before it looks at any pre-decoded verdict.
 	results := h.Service.process(ctx, credential, items)
 
 	response := batchResponse{RequestID: requestID, Results: make([]itemResultResponse, len(results))}
@@ -175,16 +187,36 @@ func isJSONContentType(value string) bool {
 }
 
 // readBody reads the whole request body, refusing anything over 1 MiB without
-// buffering the excess, and requires valid UTF-8.
-func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+// buffering the excess, and requires valid UTF-8. Reading is bounded by the same
+// deadline as the rest of the request, so a stalled client cannot hold the handler
+// past its budget.
+func readBody(w http.ResponseWriter, r *http.Request, deadline time.Time) ([]byte, error) {
+	// The read deadline belongs to the connection, not to the request context, so
+	// it is set explicitly. A writer without deadline support (a test recorder)
+	// keeps reading normally; the request context still bounds the work after it.
+	_ = http.NewResponseController(w).SetReadDeadline(deadline)
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
+		if isReadTimeout(err) {
+			return nil, errors.Join(errors.New("ingestion: body read deadline exceeded"), context.DeadlineExceeded)
+		}
 		return nil, err
 	}
 	if !utf8.Valid(body) {
 		return nil, errors.New("ingestion: body is not valid UTF-8")
 	}
 	return body, nil
+}
+
+// isReadTimeout reports a connection-level read deadline, which the standard
+// library surfaces as net.Error or os.ErrDeadlineExceeded rather than as a context
+// error.
+func isReadTimeout(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 // newRequestID returns an opaque correlation id. It is not a business identity and
