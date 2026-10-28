@@ -285,6 +285,35 @@ func TestWorkspaceMemberships(t *testing.T) {
 		}
 	})
 
+	// effective privileges answers what the service connection may actually do
+	// after PUBLIC and inherited roles are folded in: information_schema only
+	// lists direct grants, so it cannot prove the absence of a wider path.
+	t.Run("effective privileges", func(t *testing.T) {
+		privileges := []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
+		row := app.QueryRow(ctx, `SELECT
+has_table_privilege(current_user, current_schema()||'.workspace_memberships', 'SELECT'),
+has_table_privilege(current_user, current_schema()||'.workspace_memberships', 'INSERT'),
+has_table_privilege(current_user, current_schema()||'.workspace_memberships', 'UPDATE'),
+has_table_privilege(current_user, current_schema()||'.workspace_memberships', 'DELETE'),
+has_table_privilege(current_user, current_schema()||'.workspace_memberships', 'TRUNCATE'),
+has_table_privilege(current_user, current_schema()||'.workspace_memberships', 'REFERENCES'),
+has_table_privilege(current_user, current_schema()||'.workspace_memberships', 'TRIGGER')`)
+		actual := make([]bool, len(privileges))
+		dest := make([]any, len(privileges))
+		for i := range actual {
+			dest[i] = &actual[i]
+		}
+		if err := row.Scan(dest...); err != nil {
+			t.Fatal(database.SafeError("effective privileges", err))
+		}
+		for i, name := range privileges {
+			want := name == "SELECT" || name == "INSERT"
+			if actual[i] != want {
+				t.Errorf("%s privilege on workspace_memberships=%t want %t", name, actual[i], want)
+			}
+		}
+	})
+
 	t.Run("permission denial", func(t *testing.T) {
 		for _, statement := range []string{
 			"DELETE FROM workspace_memberships",

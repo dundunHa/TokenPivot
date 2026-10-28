@@ -81,8 +81,9 @@ func (t *Tx) CreatePersonal(ctx context.Context, userID ID) (Workspace, error) {
 	return createPersonal(ctx, t, userID)
 }
 
-// LockUser locks the users row and reports whether it exists.
-func (t *Tx) LockUser(ctx context.Context, userID ID) (bool, error) {
+// lockUser locks the users row and reports whether it exists. It is unexported
+// so the fixed creation order stays the only way to reach it.
+func (t *Tx) lockUser(ctx context.Context, userID ID) (bool, error) {
 	var one int
 	err := t.q.QueryRow(ctx, lockUserQuery, userID).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -94,10 +95,10 @@ func (t *Tx) LockUser(ctx context.Context, userID ID) (bool, error) {
 	return true, nil
 }
 
-// PersonalWorkspace returns the workspace the user already owns, if any. This
+// personalWorkspace returns the workspace the user already owns, if any. This
 // only answers "current workspace" while every workspace is personal; it must be
 // re-examined before multiple workspaces per user exist.
-func (t *Tx) PersonalWorkspace(ctx context.Context, userID ID) (Workspace, bool, error) {
+func (t *Tx) personalWorkspace(ctx context.Context, userID ID) (Workspace, bool, error) {
 	var workspace Workspace
 	err := t.q.QueryRow(ctx, personalWorkspaceQuery, userID).Scan(&workspace.ID, &workspace.Name)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -109,8 +110,8 @@ func (t *Tx) PersonalWorkspace(ctx context.Context, userID ID) (Workspace, bool,
 	return workspace, true, nil
 }
 
-// InsertWorkspace stores one workspace; id and created_at use column defaults.
-func (t *Tx) InsertWorkspace(ctx context.Context, name string) (Workspace, error) {
+// insertWorkspace stores one workspace; id and created_at use column defaults.
+func (t *Tx) insertWorkspace(ctx context.Context, name string) (Workspace, error) {
 	var workspace Workspace
 	if err := t.q.QueryRow(ctx, insertWorkspaceQuery, name).Scan(&workspace.ID, &workspace.Name); err != nil {
 		return Workspace{}, database.SafeError("workspaces insert", err)
@@ -118,8 +119,8 @@ func (t *Tx) InsertWorkspace(ctx context.Context, name string) (Workspace, error
 	return workspace, nil
 }
 
-// InsertOwnerMembership stores the owner membership of a personal workspace.
-func (t *Tx) InsertOwnerMembership(ctx context.Context, workspaceID, userID ID) error {
+// insertOwnerMembership stores the owner membership of a personal workspace.
+func (t *Tx) insertOwnerMembership(ctx context.Context, workspaceID, userID ID) error {
 	if _, err := t.q.Exec(ctx, insertOwnerMembershipQuery, workspaceID, userID); err != nil {
 		return database.SafeError("workspaces membership insert", err)
 	}

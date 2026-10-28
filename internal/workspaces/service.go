@@ -56,18 +56,20 @@ type RoleStore interface {
 // createStore is the transaction-bound persistence surface of personal workspace
 // creation. Only a store bound to an open pgx.Tx can satisfy it, so creation can
 // never run on a pooled connection where the users row lock would be released
-// after a single statement.
+// after a single statement. Every step is unexported: callers outside this package
+// can only reach the fixed order through Tx.CreatePersonal, so no single step can
+// be run out of order.
 type createStore interface {
-	// LockUser locks the users row for the duration of the transaction and
+	// lockUser locks the users row for the duration of the transaction and
 	// reports whether it exists. This serialises creation per user.
-	LockUser(ctx context.Context, userID ID) (bool, error)
-	// PersonalWorkspace returns the initial workspace the user already owns, if
+	lockUser(ctx context.Context, userID ID) (bool, error)
+	// personalWorkspace returns the initial workspace the user already owns, if
 	// any, as the owner membership row records it.
-	PersonalWorkspace(ctx context.Context, userID ID) (Workspace, bool, error)
-	// InsertWorkspace stores one workspace and returns its database identity.
-	InsertWorkspace(ctx context.Context, name string) (Workspace, error)
-	// InsertOwnerMembership stores the owner membership of that workspace.
-	InsertOwnerMembership(ctx context.Context, workspaceID, userID ID) error
+	personalWorkspace(ctx context.Context, userID ID) (Workspace, bool, error)
+	// insertWorkspace stores one workspace and returns its database identity.
+	insertWorkspace(ctx context.Context, name string) (Workspace, error)
+	// insertOwnerMembership stores the owner membership of that workspace.
+	insertOwnerMembership(ctx context.Context, workspaceID, userID ID) error
 }
 
 // Service answers membership role questions on the caller-owned pool. T-010 and
@@ -108,25 +110,25 @@ func (s *Service) MembershipRole(ctx context.Context, userID, workspaceID ID) (R
 // creating a second workspace. It never commits, rolls back or retries; any error
 // means the caller must roll back the whole transaction.
 func createPersonal(ctx context.Context, store createStore, userID ID) (Workspace, error) {
-	exists, err := store.LockUser(ctx, userID)
+	exists, err := store.lockUser(ctx, userID)
 	if err != nil {
 		return Workspace{}, err
 	}
 	if !exists {
 		return Workspace{}, ErrUserNotFound
 	}
-	existing, found, err := store.PersonalWorkspace(ctx, userID)
+	existing, found, err := store.personalWorkspace(ctx, userID)
 	if err != nil {
 		return Workspace{}, err
 	}
 	if found {
 		return existing, nil
 	}
-	created, err := store.InsertWorkspace(ctx, personalName)
+	created, err := store.insertWorkspace(ctx, personalName)
 	if err != nil {
 		return Workspace{}, err
 	}
-	if err := store.InsertOwnerMembership(ctx, created.ID, userID); err != nil {
+	if err := store.insertOwnerMembership(ctx, created.ID, userID); err != nil {
 		return Workspace{}, err
 	}
 	return created, nil
