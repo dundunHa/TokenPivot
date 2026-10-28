@@ -349,6 +349,16 @@ func decodeList(t *testing.T, recorder *httptest.ResponseRecorder) credentialLis
 	return body
 }
 
+// decodeIssued reads the issue or rotate body.
+func decodeIssued(t *testing.T, recorder *httptest.ResponseRecorder) issuedBody {
+	t.Helper()
+	var body issuedBody
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("issued body is not JSON: %v: %s", err, recorder.Body.String())
+	}
+	return body
+}
+
 // credentialListBody mirrors the documented list response for assertions.
 type credentialListBody struct {
 	Credentials []struct {
@@ -420,10 +430,7 @@ func TestCredentialListReturnsMetadataOnly(t *testing.T) {
 	if issued.Code != http.StatusCreated {
 		t.Fatalf("issue status = %d: %s", issued.Code, issued.Body.String())
 	}
-	var issuedResponse issuedBody
-	if err := json.Unmarshal(issued.Body.Bytes(), &issuedResponse); err != nil {
-		t.Fatal(err)
-	}
+	issuedResponse := decodeIssued(t, issued)
 
 	w := fixture.do(t, http.MethodGet, fixture.collectionPath(), "")
 	if w.Code != http.StatusOK {
@@ -484,10 +491,7 @@ func TestCredentialIssueStoresOnlyDigest(t *testing.T) {
 	if got := w.Header().Get("Cache-Control"); got != noStoreValue {
 		t.Fatalf("Cache-Control = %q", got)
 	}
-	var body issuedBody
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("body is not JSON: %v: %s", err, w.Body.String())
-	}
+	body := decodeIssued(t, w)
 	if !strings.HasPrefix(body.Token, "tpk_") || len(body.Token) <= len("tpk_") {
 		t.Fatalf("token = %q", body.Token)
 	}
@@ -690,10 +694,7 @@ func TestCredentialLostResponseIsRecoveredFromListThenRevoked(t *testing.T) {
 	if issued.Code != http.StatusCreated {
 		t.Fatalf("issue status = %d: %s", issued.Code, issued.Body.String())
 	}
-	var body issuedBody
-	if err := json.Unmarshal(issued.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
+	body := decodeIssued(t, issued)
 
 	// The response is now "lost": only the list may locate the credential.
 	list := decodeList(t, fixture.do(t, http.MethodGet, fixture.collectionPath(), ""))
@@ -736,10 +737,7 @@ func TestCredentialRotateKeepsSourceAndOldState(t *testing.T) {
 	if rotate.Code != http.StatusCreated {
 		t.Fatalf("rotate status = %d: %s", rotate.Code, rotate.Body.String())
 	}
-	var rotated issuedBody
-	if err := json.Unmarshal(rotate.Body.Bytes(), &rotated); err != nil {
-		t.Fatal(err)
-	}
+	rotated := decodeIssued(t, rotate)
 	if rotated.CredentialID == active.ID.String() {
 		t.Fatal("rotation reused the old credential id")
 	}
@@ -779,10 +777,7 @@ func TestCredentialRotateKeepsSourceAndOldState(t *testing.T) {
 func TestCredentialManagementRejectsPluginToken(t *testing.T) {
 	fixture := newCredentialFixture(t)
 	issued := fixture.do(t, http.MethodPost, fixture.collectionPath(), "")
-	var body issuedBody
-	if err := json.Unmarshal(issued.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
+	body := decodeIssued(t, issued)
 
 	// Bearer only: no session, so the management API is unreachable.
 	bearer := httptest.NewRequest(http.MethodGet, fixture.collectionPath(), nil)
@@ -927,10 +922,7 @@ func TestCredentialIssueUsesSessionIdentityOnly(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
 	}
-	var body issuedBody
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
+	body := decodeIssued(t, w)
 	if body.WorkspaceID != fixture.workspaceID.String() || body.SourceID != fixture.sourceID.String() {
 		t.Fatalf("issue used a header or body identity: %+v", body)
 	}
