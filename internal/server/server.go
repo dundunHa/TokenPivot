@@ -33,11 +33,17 @@ type Options struct {
 	Frontend http.Handler
 	// Auth enables the browser authentication routes; nil leaves them absent.
 	Auth *Auth
+	// Credentials enables the owner-only credential management routes; nil
+	// leaves them absent. They also need Options.Auth for the session and
+	// Origin gates.
+	Credentials *Credentials
 }
 
 // NewHandler exposes liveness and bounded, uncached readiness, keeping API and
 // probe paths on the backend while optionally serving a frontend. Browser
-// authentication routes are registered only when Options.Auth is set.
+// authentication routes are registered only when Options.Auth is set, and the
+// owner-only credential routes only when both Options.Auth and
+// Options.Credentials are set.
 func NewHandler(options Options) http.Handler {
 	checkReady := options.CheckReady
 	if checkReady == nil {
@@ -67,6 +73,7 @@ func NewHandler(options Options) http.Handler {
 		}
 	})
 	options.Auth.routes(mux)
+	options.Credentials.routes(mux, options.Auth)
 	if options.Frontend == nil {
 		return mux
 	}
