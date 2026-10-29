@@ -8,7 +8,7 @@ info:
 
     本文冻结 TokenPivot 首版三组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）、**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）与 **owner 凭证管理**（列表、签发、轮换、撤销，以及会话、`Origin`、owner 准入与错误码）。
 
-    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。查询接口（筛选、分组、粒度、时区、游标）属 T-023，工作空间与成员管理属 T-019；这些路径都不在本文。
+    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
@@ -398,13 +398,13 @@ info:
 
     8 秒小于现有 HTTP 写期限 `internal/server/server.go` 中的 `WriteTimeout = 10 * time.Second`，用于尽量留下写逐项响应的时间；**它不是吞吐保证**。首版没有峰值、并发或吞吐量测，因此本文不写任何性能数字，也不承诺吞吐。
 
-    # 10. 查询侧共同限额（供 T-023 使用）
+    # 10. 查询侧共同限额（T-055 已采用）
 
-    T-023 在自己新增的查询路径中必须采用以下数值，不得另定一套：
+    T-055 的两个查询路径采用以下数值，后续查询路径不得另定一套：
 
     - 历史统计最多查 **13 个日历月**，且不得早于实际保留截点。
     - 统一左闭右开区间 `[start, end)`。带秒的历史范围**明确拒绝**，不静默对齐到整分钟。
-    - 每次趋势查询最多 **1000 个时间桶**。超过时返回稳定错误码 `TOO_MANY_POINTS`，并附允许上限与 T-023 支持的粒度中满足上限的**最细建议粒度**；没有可用粒度时提示缩短范围。**不得服务端静默改粒度。**
+    - 每次趋势查询最多 **1000 个时间桶**。超过时返回稳定错误码 `TOO_MANY_POINTS`，并附允许上限与比请求粒度更粗、满足上限的**最细建议粒度**（hour → day）；没有可用粒度时提示缩短范围。**不得服务端静默改粒度。**
     - 请求明细分页默认 **50**、最大 **200**；明细仍受 180 天实际数据保留限制，不能因为分钟统计可查 13 个月就承诺明细可查 13 个月。
     - 查询侧不定每秒请求数（RPS）与并发数：PRD 的并发查询量与性能环境尚未确认，未量测前写数字只会形成虚假保证。
 
@@ -457,6 +457,8 @@ tags:
     description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出这些写操作必须携带与可信 Web origin 完全一致的 `Origin`。'
   - name: credentials
     description: 'owner 管理接入凭证的端点。只认浏览器会话 Cookie 且要求 workspace owner；列表是读请求、不要求 `Origin`，签发、轮换、撤销三个写操作必须携带可信 `Origin`。插件令牌 `tpk_` 不能用于这些路径。'
+  - name: usage
+    description: '工作空间内的只读聚合查询（总量+趋势、分组排名）。只认浏览器会话 Cookie，workspace 的 owner 与 member 可读；都是 GET，不要求 `Origin`；所有响应（含认证失败）带 `Cache-Control: no-store`。'
 
 paths:
   /api/v1/ingestion/events:
@@ -1208,6 +1210,274 @@ paths:
         '503':
           $ref: '#/components/responses/CredentialUnavailable'
 
+  /api/v1/workspaces/{workspaceID}/usage/aggregate:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - usage
+      operationId: getUsageAggregate
+      summary: 查询总量与时间趋势
+      description: |
+        返回筛选后的总量 `totals` 与按 `granularity` 分桶的趋势 `points`。同一组 provider/model/project 筛选同时作用于两者；`totals` 与 `points` 来自同一条 SQL 语句的同一快照，因此 `totals` 等于各点之和。
+
+        **范围**：`[start, end)`，UTC instant。`start`/`end` 必须是带偏移且分钟对齐（秒与小数秒为 0）的 RFC 3339 时间，否则 `400 INVALID_ARGUMENT`；不做取整。省略 `end` 时使用本次请求只采样一次的服务端当前时刻 `as_of`（可带秒与小数秒，包含当前未完成分钟）；显式 `end` 不得晚于 `as_of`。`start` 早于保留截点返回 `400 OUTSIDE_RETENTION`，`start` 等于截点合法。保留截点 `retention_cutoff` 的算法见 `UsageRangeBase`。
+
+        **分桶**：`minute` 为 UTC 分钟；`hour` 的桶键是（本地年月日时, 该时刻的 UTC offset），本地小时或 offset 任一变化即换桶，所以重复小时不合并，半小时 offset 变化（如 `Australia/Lord_Howe`）会产生非整点边界；`day` 的桶键是本地年月日，23/25 小时的自然日各算一天。所有桶边界由服务端一次算出，`bucket_end` 是下一真实边界，不固定加 1 小时或 24 小时；响应的 `bucket_start`/`bucket_end` 是 UTC instant。被请求范围截断的首尾桶（以及 `end` 省略时包含的当前未完成桶）`partial=true`；换粒度不改变 `totals`。**不生成空桶、不零填充**。
+
+        **点数上限**：相交桶数超过 **1000** 返回 `400 TOO_MANY_POINTS`，`error.details` 为 `{max_points: 1000, suggested_granularity: hour|day|null}`（比请求粒度更粗、满足上限的最细粒度；`null` 表示只能缩短范围）。服务端不截断 points，也不静默改变粒度。
+
+        **数值**：所有聚合值与计数都是十进制字符串（`DecimalString`），超过 JavaScript 安全整数或 int64 也逐位准确；仅缺失的 `MetricStats.value` 为 `null`。单事件采集的 JSON integer 格式不受影响。
+
+        **授权**：先会话，再 workspace 成员角色（owner 与 member 可读），然后才校验参数与保留截点、执行查询。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UsageStart'
+        - $ref: '#/components/parameters/UsageEnd'
+        - $ref: '#/components/parameters/UsageTimezone'
+        - $ref: '#/components/parameters/UsageGranularity'
+        - $ref: '#/components/parameters/UsageProvider'
+        - $ref: '#/components/parameters/UsageModel'
+        - $ref: '#/components/parameters/UsageProject'
+      responses:
+        '200':
+          description: '筛选后的总量与趋势。无匹配行时 `totals.request_count="0"`、六指标 `value=null` 且计数为 `"0"`，`points=[]`。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageAggregateResponse'
+              example:
+                range:
+                  start: '2026-10-28T00:00:00Z'
+                  end: '2026-10-28T01:30:00.123456Z'
+                  as_of: '2026-10-28T01:30:00.123456Z'
+                  retention_cutoff: '2025-09-28T01:30:00Z'
+                  timezone: UTC
+                  granularity: hour
+                totals:
+                  request_count: '2'
+                  input_tokens: {value: '100', known_count: '1', estimated_count: '0', missing_count: '1'}
+                  output_tokens: {value: '20', known_count: '1', estimated_count: '0', missing_count: '1'}
+                  total_tokens: {value: '120', known_count: '1', estimated_count: '0', missing_count: '1'}
+                  cache_read_tokens: {value: '60', known_count: '1', estimated_count: '0', missing_count: '1'}
+                  cache_write_tokens: {value: null, known_count: '0', estimated_count: '0', missing_count: '2'}
+                  reasoning_tokens: {value: null, known_count: '0', estimated_count: '0', missing_count: '2'}
+                points:
+                  - bucket_start: '2026-10-28T01:00:00Z'
+                    bucket_end: '2026-10-28T02:00:00Z'
+                    partial: true
+                    stats:
+                      request_count: '2'
+                      input_tokens: {value: '100', known_count: '1', estimated_count: '0', missing_count: '1'}
+                      output_tokens: {value: '20', known_count: '1', estimated_count: '0', missing_count: '1'}
+                      total_tokens: {value: '120', known_count: '1', estimated_count: '0', missing_count: '1'}
+                      cache_read_tokens: {value: '60', known_count: '1', estimated_count: '0', missing_count: '1'}
+                      cache_write_tokens: {value: null, known_count: '0', estimated_count: '0', missing_count: '2'}
+                      reasoning_tokens: {value: null, known_count: '0', estimated_count: '0', missing_count: '2'}
+        '400':
+          description: '`INVALID_ARGUMENT`（参数、UUID、时区、范围、分钟对齐、筛选数量或游标非法）、`OUTSIDE_RETENTION`（start 早于当次保留截点，`details.retention_cutoff` 为该截点）或 `TOO_MANY_POINTS`（相交桶数超过 1000，`details` 含 `max_points` 与 `suggested_granularity`）。均不执行聚合 SQL。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: OUTSIDE_RETENTION
+                  message: start is before the retention cutoff
+                  details:
+                    retention_cutoff: '2025-09-28T01:30:00Z'
+        '401':
+          description: '`UNAUTHENTICATED`：无有效浏览器会话。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：会话有效但不是该 workspace 的成员。不返回数据，不执行聚合。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace membership required
+        '500':
+          description: '`INTERNAL`：成员查询、聚合 SQL、十进制格式化或未知角色等非预期故障。不返回伪空结果，响应不含 SQL 或数据库消息。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INTERNAL
+                  message: internal error
+        '503':
+          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，请求在查询前停止。按原请求重试。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAVAILABLE
+                  message: service is unavailable
+  /api/v1/workspaces/{workspaceID}/usage/rankings:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - usage
+      operationId: getUsageRankings
+      summary: 查询分组排名与“其他”
+      description: |
+        按 `project`、`provider` 或 `model` 分组并按 `total_tokens` 的可展示 sum 降序排名（值相同按稳定分组键升序；project 的 NULL 键排最后；provider/model 按 C 排序规则）。`model` 的分组键是 `(provider, model)`，同名模型跨供应商不合并。同一条 SQL 给出整体 `overall`、本页 `groups` 与本页之后全部剩余组的聚合 `other`。
+
+        范围、筛选、授权、保留截点、数值字符串规则与 `usage/aggregate` 相同。`limit` 默认 10、最大 50。展开“其他”时传上一响应的 `next_cursor` 并**重复原有全部查询参数**；游标只承载分页位置、原 `as_of` 与查询摘要，**不是授权凭据**——每页仍重新做会话、成员角色与当次保留截点检查（原 `start` 已早于新截点则 `400 OUTSIDE_RETENTION`）。参数与游标摘要不一致、游标格式非法一律 `400 INVALID_ARGUMENT`。
+
+        **分页一致性**：游标固定统计上界但不冻结分组值或排名；分钟数据被补报修改时，跨页可能重排，不承诺无重复/无遗漏。静态数据下严格无重复、无遗漏；需要最新首屏时重新请求第一页。
+
+        `share` 是该组 `total_tokens` 可展示 sum 除以 `overall.total_tokens` 可展示 sum 的浮点近似（0–1），分母为 0 或 null、或该组 `value` 为 null 时为 `null`。它不是账单比例，也不能用于反推精确 token。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UsageStart'
+        - $ref: '#/components/parameters/UsageEnd'
+        - $ref: '#/components/parameters/UsageGroupBy'
+        - $ref: '#/components/parameters/UsageLimit'
+        - $ref: '#/components/parameters/UsageCursor'
+        - $ref: '#/components/parameters/UsageProvider'
+        - $ref: '#/components/parameters/UsageModel'
+        - $ref: '#/components/parameters/UsageProject'
+      responses:
+        '200':
+          description: '分组排名。无匹配行时 `overall` 为零值统计，`groups=[]`，`other` 与 `next_cursor` 为 `null`。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageRankingsResponse'
+              example:
+                range:
+                  start: '2026-10-28T00:00:00Z'
+                  end: '2026-10-28T01:30:00.123456Z'
+                  as_of: '2026-10-28T01:30:00.123456Z'
+                  retention_cutoff: '2025-09-28T01:30:00Z'
+                group_by: model
+                overall:
+                  request_count: '2'
+                  input_tokens: {value: '100', known_count: '1', estimated_count: '0', missing_count: '1'}
+                  output_tokens: {value: '20', known_count: '1', estimated_count: '0', missing_count: '1'}
+                  total_tokens: {value: '120', known_count: '1', estimated_count: '0', missing_count: '1'}
+                  cache_read_tokens: {value: '60', known_count: '1', estimated_count: '0', missing_count: '1'}
+                  cache_write_tokens: {value: null, known_count: '0', estimated_count: '0', missing_count: '2'}
+                  reasoning_tokens: {value: null, known_count: '0', estimated_count: '0', missing_count: '2'}
+                groups:
+                  - key: {provider: example-provider, model: example-model}
+                    share: 1.0
+                    stats:
+                      request_count: '2'
+                      input_tokens: {value: '100', known_count: '1', estimated_count: '0', missing_count: '1'}
+                      output_tokens: {value: '20', known_count: '1', estimated_count: '0', missing_count: '1'}
+                      total_tokens: {value: '120', known_count: '1', estimated_count: '0', missing_count: '1'}
+                      cache_read_tokens: {value: '60', known_count: '1', estimated_count: '0', missing_count: '1'}
+                      cache_write_tokens: {value: null, known_count: '0', estimated_count: '0', missing_count: '2'}
+                      reasoning_tokens: {value: null, known_count: '0', estimated_count: '0', missing_count: '2'}
+                other: null
+                next_cursor: null
+        '400':
+          description: '`INVALID_ARGUMENT`（参数、UUID、范围、分钟对齐、筛选数量或游标非法）或 `OUTSIDE_RETENTION`（start 早于当次保留截点，含过期分页，`details.retention_cutoff` 为该截点）。均不执行聚合 SQL。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: OUTSIDE_RETENTION
+                  message: start is before the retention cutoff
+                  details:
+                    retention_cutoff: '2025-09-28T01:30:00Z'
+        '401':
+          description: '`UNAUTHENTICATED`：无有效浏览器会话。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：会话有效但不是该 workspace 的成员。不返回数据，不执行聚合。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace membership required
+        '500':
+          description: '`INTERNAL`：成员查询、聚合 SQL、十进制格式化或未知角色等非预期故障。不返回伪空结果，响应不含 SQL 或数据库消息。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INTERNAL
+                  message: internal error
+        '503':
+          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，请求在查询前停止。按原请求重试。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAVAILABLE
+                  message: service is unavailable
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1268,6 +1538,102 @@ components:
       schema:
         type: string
         format: uuid
+
+    UsageStart:
+      name: start
+      in: query
+      required: true
+      description: '范围起点（含）。带偏移且分钟对齐（秒、小数秒均为 0）的 RFC 3339 时刻，转为 UTC instant。早于当次保留截点返回 `400 OUTSIDE_RETENTION`。'
+      schema:
+        type: string
+        format: date-time
+    UsageEnd:
+      name: end
+      in: query
+      required: false
+      description: '范围终点（不含）。带偏移且分钟对齐的 RFC 3339 时刻，不得晚于服务端当前时刻。省略表示本次请求采样一次的 `as_of`（包含当前未完成分钟）。'
+      schema:
+        type: string
+        format: date-time
+    UsageTimezone:
+      name: timezone
+      in: query
+      required: true
+      description: 'IANA 时区名称（如 `UTC`、`America/Los_Angeles`、`Australia/Lord_Howe`），只决定小时/天桶；空串、`Local` 与固定偏移被拒绝。'
+      schema:
+        type: string
+        minLength: 1
+    UsageGranularity:
+      name: granularity
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: [minute, hour, day]
+    UsageProvider:
+      name: provider
+      in: query
+      required: false
+      description: '精确、区分大小写的 provider；可重复，同维 OR；去重后最多 50 个，空值拒绝。'
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+          minLength: 1
+    UsageModel:
+      name: model
+      in: query
+      required: false
+      description: '精确、区分大小写的 model；可重复，同维 OR；去重后最多 50 个，空值拒绝。'
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+          minLength: 1
+    UsageProject:
+      name: project
+      in: query
+      required: false
+      description: '项目 UUID 或字面量 `unassigned`（未归属）；可重复，同维 OR，可组合；去重后最多 50 个。其他 workspace 的项目 UUID 只得到本 workspace 内的空结果。'
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+          pattern: '^(unassigned|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
+    UsageGroupBy:
+      name: group_by
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: [project, provider, model]
+    UsageLimit:
+      name: limit
+      in: query
+      required: false
+      description: '每页组数，默认 10，最大 50；首页与后续页必须相同。'
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 10
+    UsageCursor:
+      name: cursor
+      in: query
+      required: false
+      description: '上一响应的 `next_cursor`（不透明 base64url）。须同时重复原筛选、`group_by`、`limit` 与时间参数。'
+      schema:
+        type: string
+        minLength: 1
 
   headers:
     NoStore:
@@ -2125,6 +2491,238 @@ components:
         | `UNAVAILABLE` | 503 | 会话存储等依赖不可用；请求在读取或创建凭证前停止 |
 
         所有响应都带 `Cache-Control: no-store`。插件令牌 `tpk_` 不能用于这些端点：管理 API 只认浏览器会话 Cookie。
+
+    DecimalString:
+      type: string
+      pattern: '^(0|[1-9][0-9]*)$'
+      description: '无符号规范十进制整数字符串：`0` 或首位 1–9；无前导零、小数点、指数或正负号。用字符串是为了超过 2^53-1 或 int64 的聚合值不被浏览器或 int64 舍入；不是 integer。'
+    UsageMetricStats:
+      type: object
+      additionalProperties: false
+      required: [value, known_count, estimated_count, missing_count]
+      properties:
+        value:
+          oneOf:
+            - $ref: '#/components/schemas/DecimalString'
+            - type: 'null'
+          description: 'known 与 estimated 值之和；known_count 与 estimated_count 都为 "0" 时为 null（缺失不等于零）。已知或估算的 0 返回 "0"，由计数区分。'
+        known_count:
+          $ref: '#/components/schemas/DecimalString'
+        estimated_count:
+          $ref: '#/components/schemas/DecimalString'
+        missing_count:
+          $ref: '#/components/schemas/DecimalString'
+    UsageStats:
+      type: object
+      additionalProperties: false
+      required: [request_count, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens]
+      description: 'request_count 是分钟表 event_count 之和（已接受的请求级最终事件数，全部 token 缺失的事件也计入）。total_tokens 直接汇总存储的 total，不由 input+output 重算；缓存与推理仅作独立子集返回，不加入 total。'
+      properties:
+        request_count:
+          $ref: '#/components/schemas/DecimalString'
+        input_tokens:
+          $ref: '#/components/schemas/UsageMetricStats'
+        output_tokens:
+          $ref: '#/components/schemas/UsageMetricStats'
+        total_tokens:
+          $ref: '#/components/schemas/UsageMetricStats'
+        cache_read_tokens:
+          $ref: '#/components/schemas/UsageMetricStats'
+        cache_write_tokens:
+          $ref: '#/components/schemas/UsageMetricStats'
+        reasoning_tokens:
+          $ref: '#/components/schemas/UsageMetricStats'
+    UsageRangeBase:
+      type: object
+      additionalProperties: false
+      required: [start, end, as_of, retention_cutoff]
+      properties:
+        start:
+          type: string
+          format: date-time
+          description: 'UTC（`Z`）RFC 3339。'
+        end:
+          type: string
+          format: date-time
+          description: '有效上界 effectiveEnd：显式 end，或省略时的 as_of。'
+        as_of:
+          type: string
+          format: date-time
+          description: '本次请求（或游标）采样的统计截点；end 省略时等于 end。'
+        retention_cutoff:
+          type: string
+          format: date-time
+          description: |
+            当次保留截点：当前 UTC 时刻向过去 13 个日历月，秒归零；原日在目标月不存在时统一取目标月下一月 1 日 00:00 UTC（截点单调不减）。例：2027-03-28T23:59:59Z 的截点是 2026-02-28T23:59:00Z；2027-03-29T00:00:00Z 起到 3 月末均为 2026-03-01T00:00:00Z。与展示 timezone 无关。
+    UsageAggregateRange:
+      type: object
+      additionalProperties: false
+      required: [start, end, as_of, retention_cutoff, timezone, granularity]
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        as_of:
+          type: string
+          format: date-time
+        retention_cutoff:
+          type: string
+          format: date-time
+        timezone:
+          type: string
+        granularity:
+          type: string
+          enum: [minute, hour, day]
+      description: '字段含义同 UsageRangeBase，另回传请求的 timezone 与 granularity。'
+    UsageAggregatePoint:
+      type: object
+      additionalProperties: false
+      required: [bucket_start, bucket_end, partial, stats]
+      properties:
+        bucket_start:
+          type: string
+          format: date-time
+        bucket_end:
+          type: string
+          format: date-time
+          description: '下一真实桶边界，不固定加 1 小时或 24 小时。'
+        partial:
+          type: boolean
+          description: '该桶被请求 start/effectiveEnd 截断；只表示时间覆盖，不表示指标质量。'
+        stats:
+          $ref: '#/components/schemas/UsageStats'
+    UsageAggregateResponse:
+      type: object
+      additionalProperties: false
+      required: [range, totals, points]
+      properties:
+        range:
+          $ref: '#/components/schemas/UsageAggregateRange'
+        totals:
+          $ref: '#/components/schemas/UsageStats'
+        points:
+          type: array
+          maxItems: 1000
+          description: '按 bucket_start 升序；只含有数据的桶，不零填充。'
+          items:
+            $ref: '#/components/schemas/UsageAggregatePoint'
+    UsageRankingKey:
+      type: object
+      description: 'project：{project_id: uuid|null}；provider：{provider}；model：{provider, model}。'
+      properties:
+        project_id:
+          type: [string, 'null']
+          format: uuid
+        provider:
+          type: string
+        model:
+          type: string
+    UsageRankingGroup:
+      type: object
+      additionalProperties: false
+      required: [key, share, stats]
+      properties:
+        key:
+          $ref: '#/components/schemas/UsageRankingKey'
+        share:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        stats:
+          $ref: '#/components/schemas/UsageStats'
+    UsageRankingOther:
+      type: object
+      additionalProperties: false
+      required: [share, stats]
+      properties:
+        share:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        stats:
+          $ref: '#/components/schemas/UsageStats'
+    UsageRankingsResponse:
+      type: object
+      additionalProperties: false
+      required: [range, group_by, overall, groups, other, next_cursor]
+      properties:
+        range:
+          $ref: '#/components/schemas/UsageRangeBase'
+        group_by:
+          type: string
+          enum: [project, provider, model]
+        overall:
+          $ref: '#/components/schemas/UsageStats'
+        groups:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/UsageRankingGroup'
+        other:
+          oneOf:
+            - $ref: '#/components/schemas/UsageRankingOther'
+            - type: 'null'
+          description: '本页之后全部剩余组的聚合；无剩余时为 null。'
+        next_cursor:
+          type: [string, 'null']
+          description: '不透明游标；无剩余组时为 null。不是授权凭据。'
+    UsageError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [INVALID_ARGUMENT, OUTSIDE_RETENTION, TOO_MANY_POINTS, UNAUTHENTICATED, PERMISSION_DENIED, INTERNAL, UNAVAILABLE]
+              description: '程序分支依据；客户端必须忽略未知值。'
+            message:
+              type: string
+              description: '面向人的短说明，不回显请求值、SQL 或数据库消息。'
+            details:
+              description: '仅 OUTSIDE_RETENTION 与 TOO_MANY_POINTS 带 details，其余错误不带该字段。'
+              oneOf:
+                - type: object
+                  title: OutsideRetentionDetails
+                  additionalProperties: false
+                  required: [retention_cutoff]
+                  properties:
+                    retention_cutoff:
+                      type: string
+                      format: date-time
+                - type: object
+                  title: TooManyPointsDetails
+                  additionalProperties: false
+                  required: [max_points, suggested_granularity]
+                  properties:
+                    max_points:
+                      type: integer
+                      const: 1000
+                    suggested_granularity:
+                      description: '比请求粒度更粗且满足上限的最细粒度；null 表示只能缩短范围。'
+                      oneOf:
+                        - type: string
+                          enum: [hour, day]
+                        - type: 'null'
+      description: |
+        聚合查询端点的错误体。
+
+        | code | 状态码 | 情况 |
+        |---|---|---|
+        | `INVALID_ARGUMENT` | 400 | 参数、UUID、时区、范围、分钟对齐、筛选数量或游标非法 |
+        | `OUTSIDE_RETENTION` | 400 | start 早于当次保留截点；details.retention_cutoff |
+        | `TOO_MANY_POINTS` | 400 | 趋势桶数超过 1000；details.max_points、details.suggested_granularity |
+        | `UNAUTHENTICATED` | 401 | 无有效会话 |
+        | `PERMISSION_DENIED` | 403 | 非 workspace 成员 |
+        | `INTERNAL` | 500 | 成员查询、SQL、格式化或未知角色故障 |
+        | `UNAVAILABLE` | 503 | 会话等认证依赖不可用 |
 
   examples:
     MixedBatchRequest:
