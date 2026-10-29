@@ -4,23 +4,22 @@ import { MemoryRouter, useLocation, useNavigationType } from "react-router";
 import { App } from "@/App";
 import { createAppQueryClient } from "@/features/auth/queries";
 
-// 测试专用探针组件与 renderApp 同文件，无需热更新。
-// eslint-disable-next-line react-refresh/only-export-components
-function LocationProbe() {
-  const location = useLocation();
-  const type = useNavigationType();
-  return (
-    <p data-testid="location">
-      {location.pathname}|{type}
-    </p>
-  );
-}
-
 /** 每个用例使用独立 QueryClient 与 MemoryRouter。 */
 export function renderApp(
   path: string,
   client: QueryClient = createAppQueryClient(),
 ) {
+  // 测试专用探针，定义在函数内，不作为模块导出组件。
+  function LocationProbe() {
+    const location = useLocation();
+    const type = useNavigationType();
+    return (
+      <p data-testid="location">
+        {location.pathname}|{type}
+      </p>
+    );
+  }
+
   render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { sessionKey } from "./queries";
 import { renderApp } from "@/test/render";
 import {
   deferred,
@@ -56,13 +57,16 @@ describe("routes", () => {
 
   it("does not request a session or redirect on /register", async () => {
     const gets = countSessionGets();
-    renderApp("/register");
+    const client = renderApp("/register");
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("注册");
     expect(
       screen.getByRole("link", { name: "登录" }).getAttribute("href"),
     ).toBe("/login");
     expect(screen.queryByText(/验证|重置|忘记/)).toBeNull();
-    await new Promise((r) => setTimeout(r, 20));
+    // 公开页不创建会话查询：缓存里没有该 key，因此不存在在途或待发请求。
+    expect(
+      client.getQueryCache().find({ queryKey: sessionKey }),
+    ).toBeUndefined();
     expect(gets.count).toBe(0);
     expect(location()).toBe("/register|POP");
   });
@@ -76,13 +80,20 @@ describe("routes", () => {
   });
 
   it("does not redirect public pages even with a live session", async () => {
+    let gets = 0;
     server.use(
-      http.get(SESSION, () =>
-        HttpResponse.json(sessionBody("a@example.com", FUTURE)),
-      ),
+      http.get(SESSION, () => {
+        gets += 1;
+        return HttpResponse.json(sessionBody("a@example.com", FUTURE));
+      }),
     );
-    renderApp("/login");
-    await new Promise((r) => setTimeout(r, 20));
+    const client = renderApp("/login");
+    expect(
+      client.getQueryCache().find({ queryKey: sessionKey }),
+    ).toBeUndefined();
+    expect(gets).toBe(0);
+    expect(screen.getByRole("heading", { name: "登录" })).toBeTruthy();
+    expect(screen.queryByText("a@example.com")).toBeNull();
     expect(location()).toBe("/login|POP");
   });
 });

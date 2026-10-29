@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef } from "react";
 import {
   QueryClient,
   queryOptions,
@@ -87,9 +87,9 @@ export function useAuthSession(): SessionView & {
   const writing = useIsMutating({ mutationKey: writeKey }) > 0;
   const data = query.data;
   const expiresAt = data ? expiresAtMs(data) : undefined;
-  const [expiredFor, setExpiredFor] = useState<number | undefined>(() =>
-    expiresAt !== undefined && expiresAt <= now() ? expiresAt : undefined,
-  );
+  // 到期只在渲染时对比当前时间判断；定时器与可见性回调只负责触发重渲染。
+  const [, rerender] = useReducer((n: number) => n + 1, 0);
+  const expired = expiresAt !== undefined && now() >= expiresAt;
   const refetchedFor = useRef<number | undefined>(undefined);
 
   useEffect(() => {
@@ -97,7 +97,7 @@ export function useAuthSession(): SessionView & {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const check = (): boolean => {
       if (now() < expiresAt) return false;
-      setExpiredFor(expiresAt);
+      rerender();
       if (!writing && refetchedFor.current !== expiresAt) {
         refetchedFor.current = expiresAt;
         void replaceSessionQuery(client);
@@ -131,8 +131,6 @@ export function useAuthSession(): SessionView & {
     return { ...base, status: query.isError ? "error" : "loading" };
   }
   if (query.isError) return { ...base, status: "error" };
-  if (expiredFor !== undefined && expiredFor === expiresAt) {
-    return { ...base, status: "checking" };
-  }
+  if (expired) return { ...base, status: "checking" };
   return { ...base, status: "ready", session: data };
 }
