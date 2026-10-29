@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import {
   act,
+  cleanup,
   fireEvent,
   render,
   screen,
@@ -8,6 +9,7 @@ import {
 } from "@testing-library/react";
 import {
   notifyManager,
+  QueryObserver,
   QueryClientProvider,
   type QueryClient,
 } from "@tanstack/react-query";
@@ -60,31 +62,44 @@ async function until(check: () => unknown) {
 interface Get {
   signal: AbortSignal;
   gate: ReturnType<typeof deferred<Response>>;
+  /** MSW 处理器在放行后真正返回时 resolve（服务端完成信号，与客户端是否已中止无关）。 */
+  done: Promise<void>;
 }
 
 /** 每个 GET session 请求都挂起，直到测试显式放行；记录其 AbortSignal。 */
 function deferredSessionGets() {
   const gets: Get[] = [];
   server.use(
-    http.get(SESSION, ({ request }) => {
+    http.get(SESSION, async ({ request }) => {
       const gate = deferred<Response>();
-      gets.push({ signal: request.signal, gate });
-      return gate.promise;
+      const finished = deferred();
+      gets.push({
+        signal: request.signal,
+        gate,
+        done: finished.promise,
+      });
+      const response = await gate.promise;
+      finished.resolve();
+      return response;
     }),
   );
   return gets;
 }
 
+/**
+ * 放行一个挂起的 GET，并等待服务端处理器确实返回（明确完成信号，不数轮询）。
+ * 中止后的客户端 fetch 已拒绝，不可能再收到该响应；
+ * “客户端 queryFn 忽略 AbortSignal”的迟到结果由 controlledSession 用例单独证明。
+ */
+async function release(get: Get | undefined, response: Response) {
+  if (!get) throw new Error("missing GET");
+  get.gate.resolve(response);
+  await get.done;
+}
+
 const ok = (email: string, expiresAt = FUTURE) =>
   HttpResponse.json(sessionBody(email, expiresAt));
 const anonymous = () => errorResponse(401, "UNAUTHENTICATED");
-
-/** 让已放行（含已被中止）的迟到响应走完 MSW/fetch 的宏任务链；无固定 sleep。 */
-async function flush() {
-  for (let i = 0; i < 10; i += 1) {
-    await new Promise((r) => setImmediate(r));
-  }
-}
 
 function seed(client: QueryClient, email: string, expiresAt = FUTURE) {
   // 无 observer 的种子查询需要 queryFn 才能被 refetchQueries 重新请求。
@@ -95,6 +110,71 @@ function seed(client: QueryClient, email: string, expiresAt = FUTURE) {
     user: { id: "u", email },
     expires_at: expiresAt,
   });
+}
+
+interface Call {
+  signal: AbortSignal;
+  gate: ReturnType<typeof deferred<AuthSession | null>>;
+  returned: Promise<AuthSession | null>;
+}
+
+/**
+ * 不走 HTTP、且忽略 AbortSignal 的 queryFn（独立边界）。
+ * release 在 queryFn 返回的 promise 上等待：React Query 的 retryer 在调用 queryFn
+ * 时先挂了处理器，测试后挂，按挂接顺序保证旧结果已被 React Query 处理完才继续。
+ */
+function controlledSession(client: QueryClient) {
+  const calls: Call[] = [];
+  client.setQueryDefaults(sessionKey, {
+    queryFn: ({ signal }) => {
+      const gate = deferred<AuthSession | null>();
+      const returned = (async () => gate.promise)();
+      calls.push({ signal, gate, returned });
+      return returned;
+    },
+  });
+  return calls;
+}
+
+async function releaseCall(call: Call | undefined, value: AuthSession | null) {
+  if (!call) throw new Error("missing call");
+  call.gate.resolve(value);
+  await call.returned;
+}
+
+const session = (email: string, expiresAt = FUTURE): AuthSession => ({
+  user: { id: "u", email },
+  expires_at: expiresAt,
+});
+
+/** 记录期间是否有任何 DOM 变更曾加入含该文本的节点（用于证明从未展示，而非仅最终隐藏）。 */
+function watchIdentity(text: string) {
+  let seen = false;
+  const scan = (records: MutationRecord[]) => {
+    for (const record of records) {
+      record.addedNodes.forEach((node) => {
+        if (node.textContent?.includes(text)) seen = true;
+      });
+      if (
+        record.type === "characterData" &&
+        record.target.textContent?.includes(text)
+      )
+        seen = true;
+    }
+  };
+  const observer = new MutationObserver(scan);
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+  return {
+    seen: () => {
+      scan(observer.takeRecords());
+      return seen;
+    },
+    stop: () => observer.disconnect(),
+  };
 }
 
 /** 直接驱动 mutation 的探针，使竞态用例能精确控制顺序。 */
@@ -203,8 +283,7 @@ describe("replacing an existing session query", () => {
     await b;
     expect(client.getQueryData(sessionKey)).toBeNull();
     // A 忽略 abort，迟到返回旧 200。
-    gets[0]?.gate.resolve(ok("old@example.com"));
-    await flush();
+    await release(gets[0], ok("old@example.com"));
     await a;
     expect(client.getQueryData(sessionKey)).toBeNull();
     expect(gets).toHaveLength(2);
@@ -219,12 +298,114 @@ describe("replacing an existing session query", () => {
     expect(gets[0]?.signal.aborted).toBe(true);
     gets[1]?.gate.resolve(anonymous());
     await b;
-    gets[0]?.gate.resolve(ok("late@example.com"));
-    await flush();
+    await release(gets[0], ok("late@example.com"));
     await screen.findByRole("heading", { name: "登录" });
     expect(client.getQueryData(sessionKey)).toBeNull();
     expect(gets).toHaveLength(2);
   });
+});
+
+/** 不渲染 App（它的观察者会换成真实 queryFn），只挂 mutation 驱动。 */
+function renderDriverOnly(client: QueryClient) {
+  const actionRef: { current: ((kind: string) => void) | undefined } = {
+    current: undefined,
+  };
+  render(
+    <QueryClientProvider client={client}>
+      <Driver actionRef={actionRef} />
+    </QueryClientProvider>,
+  );
+  return (kind: string) => act(() => actionRef.current?.(kind));
+}
+
+describe.each([
+  { name: "with a cached session", cached: true },
+  { name: "without a cache", cached: false },
+])("queryFn that ignores AbortSignal, $name", ({ cached }) => {
+  const unsubscribe: Array<() => void> = [];
+  afterEach(() => {
+    unsubscribe.splice(0).forEach((fn) => fn());
+  });
+
+  /**
+   * 发起首个会话查询，吞掉取消产生的拒绝。
+   * 无缓存时必须有观察者：refetchQueries 不会重新请求没有数据也没有观察者的查询。
+   */
+  const start = (client: QueryClient) => {
+    if (cached) {
+      return client
+        .refetchQueries({ queryKey: sessionKey })
+        .catch(() => undefined);
+    }
+    const observer = new QueryObserver(client, { queryKey: sessionKey });
+    unsubscribe.push(observer.subscribe(() => undefined));
+    return Promise.resolve();
+  };
+  const again = (client: QueryClient) =>
+    client.refetchQueries({ queryKey: sessionKey }).catch(() => undefined);
+
+  function setup() {
+    const client = createAppQueryClient();
+    // 先装 queryFn 默认值，再写缓存，否则已创建的 query 不会带上它。
+    const calls = controlledSession(client);
+    if (cached) client.setQueryData(sessionKey, session("old@example.com"));
+    return { client, calls };
+  }
+
+  it("replaceSessionQuery: an old result returning after the new one cannot overwrite it", async () => {
+    const { client, calls } = setup();
+    const a = start(client);
+    await waitFor(() => expect(calls).toHaveLength(1));
+    const b = replaceSessionQuery(client);
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[0]?.signal.aborted).toBe(true);
+    await releaseCall(calls[1], null);
+    await b;
+    expect(client.getQueryData(sessionKey)).toBeNull();
+    await releaseCall(calls[0], session("old@example.com"));
+    await a;
+    expect(client.getQueryData(sessionKey)).toBeNull();
+    expect(calls).toHaveLength(2);
+  });
+
+  it.each([
+    { kind: "login", url: LOGIN, status: 200 },
+    { kind: "register", url: REGISTER, status: 201 },
+    { kind: "logout", url: LOGOUT, status: 204 },
+  ])(
+    "$kind: old queries returning after the write cannot overwrite it",
+    async ({ kind, url, status }) => {
+      const post = deferred<Response>();
+      server.use(http.post(url, () => post.promise));
+      const { client, calls } = setup();
+      const drive = renderDriverOnly(client);
+      const a = start(client);
+      await waitFor(() => expect(calls).toHaveLength(1));
+      drive(kind);
+      await waitFor(() => expect(calls[0]?.signal.aborted).toBe(true));
+      const b = again(client);
+      await waitFor(() => expect(calls).toHaveLength(2));
+      post.resolve(
+        kind === "logout"
+          ? new HttpResponse(null, { status })
+          : HttpResponse.json(sessionBody("new@example.com", FUTURE), {
+              status,
+            }),
+      );
+      const expected = kind === "logout" ? null : "new@example.com";
+      await waitFor(() => {
+        const data = client.getQueryData<AuthSession | null>(sessionKey);
+        expect(data === null ? null : data?.user.email).toBe(expected);
+      });
+      expect(calls[1]?.signal.aborted).toBe(true);
+      await releaseCall(calls[0], session("old@example.com"));
+      await releaseCall(calls[1], session("older@example.com"));
+      await Promise.all([a, b]);
+      const data = client.getQueryData<AuthSession | null>(sessionKey);
+      expect(data === null ? null : data?.user.email).toBe(expected);
+      expect(calls).toHaveLength(2);
+    },
+  );
 });
 
 describe.each([
@@ -266,9 +447,8 @@ describe.each([
     );
     expect(gets[1]?.signal.aborted).toBe(true);
 
-    gets[0]?.gate.resolve(ok("old@example.com"));
-    gets[1]?.gate.resolve(ok("older@example.com"));
-    await flush();
+    await release(gets[0], ok("old@example.com"));
+    await release(gets[1], ok("older@example.com"));
     expect(client.getQueryData<AuthSession>(sessionKey)?.user.email).toBe(
       "new@example.com",
     );
@@ -305,9 +485,8 @@ describe("logout races with old session GETs", () => {
     await waitFor(() => expect(client.getQueryData(sessionKey)).toBeNull());
     expect(gets[1]?.signal.aborted).toBe(true);
 
-    gets[0]?.gate.resolve(ok("old@example.com"));
-    gets[1]?.gate.resolve(ok("old@example.com"));
-    await flush();
+    await release(gets[0], ok("old@example.com"));
+    await release(gets[1], ok("old@example.com"));
     expect(client.getQueryData(sessionKey)).toBeNull();
     await screen.findByRole("heading", { name: "登录" });
     expect(gets).toHaveLength(2);
@@ -443,16 +622,78 @@ describe("expires_at timer", () => {
     await until(() =>
       expect(screen.getByRole("button", { name: "正在退出…" })).toBeTruthy(),
     );
+    // POST 释放前：已经到期，身份必须隐藏，且仍然没有 GET。
     await advance(61_000);
+    expect(screen.queryByText("a@example.com")).toBeNull();
     expect(gets).toHaveLength(0);
     post.resolve(errorResponse(500, "INTERNAL"));
-    await act(flush);
+    await until(() =>
+      expect(screen.queryByRole("button", { name: "正在退出…" })).toBeNull(),
+    );
     await advance(0);
     await until(() => expect(gets).toHaveLength(1));
     expect(screen.queryByText("a@example.com")).toBeNull();
     gets[0]?.gate.resolve(ok("a@example.com", iso(DAY)));
     await until(() => screen.getByText("a@example.com"));
     expect(gets).toHaveLength(1);
+  });
+
+  it("never shows an expired session returned by the first GET", async () => {
+    const gets = deferredSessionGets();
+    renderApp("/");
+    const watch = watchIdentity("a@example.com");
+    await until(() => expect(gets).toHaveLength(1));
+    await release(gets[0], ok("a@example.com", iso(-5_000)));
+    await advance(0);
+    await until(() => expect(gets).toHaveLength(2));
+    expect(watch.seen()).toBe(false);
+    expect(screen.queryByText("a@example.com")).toBeNull();
+    await release(gets[1], ok("a@example.com", iso(DAY)));
+    await until(() => screen.getByText("a@example.com"));
+    expect(gets).toHaveLength(2);
+    watch.stop();
+  });
+
+  it("never shows an expired session written by setQueryData after mount", async () => {
+    const gets = deferredSessionGets();
+    const client = mount(DAY, "first@example.com");
+    expect(screen.getByText("first@example.com")).toBeTruthy();
+    const watch = watchIdentity("second@example.com");
+    await act(async () => {
+      client.setQueryData(sessionKey, session("second@example.com", iso(-1)));
+    });
+    expect(screen.queryByText("second@example.com")).toBeNull();
+    expect(screen.queryByText("first@example.com")).toBeNull();
+    await advance(0);
+    await until(() => expect(gets).toHaveLength(1));
+    expect(watch.seen()).toBe(false);
+    expect(screen.queryByText("second@example.com")).toBeNull();
+    watch.stop();
+  });
+
+  it("stops the old timer and visibility listener after the session changes", async () => {
+    const gets = deferredSessionGets();
+    const client = mount(60_000);
+    act(() => {
+      client.setQueryData(sessionKey, session("b@example.com", iso(DAY)));
+    });
+    await until(() => screen.getByText("b@example.com"));
+    await advance(61_000);
+    vi.setSystemTime(START + 61_000);
+    document.dispatchEvent(new Event("visibilitychange"));
+    await advance(0);
+    expect(gets).toHaveLength(0);
+    expect(screen.getByText("b@example.com")).toBeTruthy();
+  });
+
+  it("stops the timer and visibility listener after unmount", async () => {
+    const gets = deferredSessionGets();
+    mount(60_000);
+    cleanup();
+    vi.setSystemTime(START + 120_000);
+    document.dispatchEvent(new Event("visibilitychange"));
+    await advance(120_000);
+    expect(gets).toHaveLength(0);
   });
 
   it("a stale response after a successful logout cannot revive the identity", async () => {
