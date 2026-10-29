@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -449,149 +450,65 @@ func TestSourceArchiveRollsBackOnStepFailure(t *testing.T) {
 	}
 }
 
-// TestArchiveAndIssueRaceLeavesNoActiveCredential runs both lock orders against
-// the real service: the credential write first, and the archive first.
-func TestArchiveAndIssueRaceLeavesNoActiveCredential(t *testing.T) {
-	_, appURL := integrationSchema(t)
-	pool := newPool(t, appURL)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	workspaceID := insertWorkspace(t, ctx, pool, "synthetic-race")
-	sourceService := New(NewPostgres(pool))
-	credentialService := credentials.New(credentials.NewPostgres(pool))
-
-	// Order 1: the credential write holds the source row lock first. The archive
-	// waits, then revokes the freshly committed credential.
-	t.Run("issue first", func(t *testing.T) {
-		source, err := sourceService.Create(ctx, workspaceID, "dsh", "issue-first")
-		if err != nil {
-			t.Fatal(err)
-		}
-		holder, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := holder.Exec(ctx, "SELECT 1 FROM sources WHERE id=$1 AND workspace_id=$2 FOR UPDATE", source.ID, workspaceID); err != nil {
-			t.Fatal(err)
-		}
-		// The holder inserts its credential under the lock, as IssueActive does.
-		if _, err := holder.Exec(ctx, "INSERT INTO ingest_credentials (workspace_id, source_id, secret_hash) VALUES ($1,$2,$3)", workspaceID, source.ID, []byte(rand.Text()+rand.Text())); err != nil {
-			t.Fatal(err)
-		}
-		archiveDone := make(chan error, 1)
-		go func() { archiveDone <- sourceService.Archive(ctx, workspaceID, source.ID) }()
-		waitForLockWaiter(t, ctx, pool)
-		select {
-		case err := <-archiveDone:
-			t.Fatalf("archive finished while the credential transaction held the lock: %v", err)
-		case <-time.After(200 * time.Millisecond):
-		}
-		if err := holder.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if err := <-archiveDone; err != nil {
-			t.Fatal(err)
-		}
-		if got := countActive(t, ctx, pool, source.ID); got != 0 {
-			t.Fatalf("active credentials after archive=%d want 0", got)
-		}
-	})
-
-	// Order 2: the archive transaction holds the lock first. Issue and rotate
-	// wait, then see archived_at and insert nothing.
-	t.Run("archive first", func(t *testing.T) {
-		source, err := sourceService.Create(ctx, workspaceID, "dsh", "archive-first")
-		if err != nil {
-			t.Fatal(err)
-		}
-		existing := insertCredential(t, ctx, pool, workspaceID, source.ID, false)
-		holder, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := archive(ctx, &pgTx{tx: holder}, workspaceID, source.ID); err != nil {
-			t.Fatal(err)
-		}
-		type outcome struct{ err error }
-		issueDone, rotateDone := make(chan outcome, 1), make(chan outcome, 1)
-		go func() {
-			_, err := credentialService.Issue(ctx, workspaceID, source.ID)
-			issueDone <- outcome{err}
-		}()
-		go func() {
-			_, err := credentialService.Rotate(ctx, workspaceID, existing)
-			rotateDone <- outcome{err}
-		}()
-		waitForLockWaiter(t, ctx, pool)
-		select {
-		case result := <-issueDone:
-			t.Fatalf("issue finished while the archive held the lock: %v", result.err)
-		case <-time.After(200 * time.Millisecond):
-		}
-		if err := holder.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-		for name, done := range map[string]chan outcome{"issue": issueDone, "rotate": rotateDone} {
-			if result := <-done; !errors.Is(result.err, credentials.ErrSourceArchived) {
-				t.Fatalf("%s error=%v want ErrSourceArchived", name, result.err)
-			}
-		}
-		if got := countActive(t, ctx, pool, source.ID); got != 0 {
-			t.Fatalf("active credentials after archive=%d want 0", got)
-		}
-		var total int
-		if err := pool.QueryRow(ctx, "SELECT count(*) FROM ingest_credentials WHERE source_id=$1", source.ID).Scan(&total); err != nil || total != 1 {
-			t.Fatalf("credential rows=%d err=%v want 1 (nothing inserted)", total, err)
-		}
-	})
-
-	// Unordered stress: whatever interleaving happens, no active credential
-	// remains once the archive has returned.
-	t.Run("concurrent stress", func(t *testing.T) {
-		for round := 0; round < 10; round++ {
-			source, err := sourceService.Create(ctx, workspaceID, "dsh", fmt.Sprintf("stress-%d", round))
-			if err != nil {
-				t.Fatal(err)
-			}
-			start := make(chan struct{})
-			var wg sync.WaitGroup
-			for i := 0; i < 4; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					<-start
-					if _, err := credentialService.Issue(ctx, workspaceID, source.ID); err != nil && !errors.Is(err, credentials.ErrSourceArchived) {
-						t.Errorf("issue error=%v", err)
-					}
-				}()
-			}
-			archiveErr := make(chan error, 1)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				<-start
-				archiveErr <- sourceService.Archive(ctx, workspaceID, source.ID)
-			}()
-			close(start)
-			wg.Wait()
-			if err := <-archiveErr; err != nil {
-				t.Fatal(err)
-			}
-			if got := countActive(t, ctx, pool, source.ID); got != 0 {
-				t.Fatalf("round %d: active credentials after archive=%d want 0", round, got)
-			}
-		}
-	})
+// insertGate pauses a credential INSERT after the transaction has already taken
+// the source row lock. It is a test-side pgx query tracer on a dedicated pool, so
+// no production hook or exported API is involved: Issue and Rotate run unchanged
+// and simply stop between "lock the source" and "insert the credential".
+type insertGate struct {
+	armed   atomic.Bool
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
 }
 
-// waitForLockWaiter blocks until some backend is waiting on a row lock, so the
-// test knows the second transaction really queued behind the first.
-func waitForLockWaiter(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+func newInsertGate() *insertGate {
+	return &insertGate{reached: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (g *insertGate) arm() { g.armed.Store(true) }
+
+// open lets the paused INSERT continue; it is safe to call more than once.
+func (g *insertGate) open() { g.once.Do(func() { close(g.release) }) }
+
+func (g *insertGate) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, "INSERT INTO ingest_credentials") && g.armed.CompareAndSwap(true, false) {
+		g.reached <- struct{}{}
+		<-g.release
+	}
+	return ctx
+}
+
+func (g *insertGate) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// newGatedPool opens a service-role pool whose connections run the gate tracer.
+func newGatedPool(t *testing.T, value string, gate *insertGate) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(value)
+	if err != nil {
+		t.Fatal(database.SafeError("parse app URL", err))
+	}
+	config.MaxConns = 6
+	config.ConnConfig.Tracer = gate
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(database.SafeError("open gated pool", err))
+	}
+	t.Cleanup(pool.Close)
+	// Registered after the pool, so it runs first and never leaves a goroutine
+	// parked on the gate while the pool closes.
+	t.Cleanup(gate.open)
+	return pool
+}
+
+// waitForLockWaiter blocks until a backend running a statement that starts with
+// queryPrefix is waiting on a row lock, so the test knows that exact call is
+// queued behind the lock holder.
+func waitForLockWaiter(t *testing.T, ctx context.Context, pool *pgxpool.Pool, queryPrefix string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		var waiting int
-		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND wait_event IN ('transactionid','tuple')").Scan(&waiting); err != nil {
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE $1", queryPrefix+"%FOR UPDATE").Scan(&waiting); err != nil {
 			t.Fatal(database.SafeError("lock waiters", err))
 		}
 		if waiting > 0 {
@@ -599,5 +516,173 @@ func waitForLockWaiter(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("no backend queued behind the source row lock")
+	t.Fatalf("no backend running %q queued behind the source row lock", queryPrefix)
+}
+
+type issueOutcome struct {
+	issued credentials.IssuedCredential
+	err    error
+}
+
+// TestArchiveAndCredentialWriteLockOrders drives the four deterministic lock
+// orders with the real credentials.Service (Issue and Rotate) and the real source
+// archive: the credential write holds the source row lock first, or the archive
+// does. Each order waits until the second call is observably queued before the
+// lock is released.
+func TestArchiveAndCredentialWriteLockOrders(t *testing.T) {
+	_, appURL := integrationSchema(t)
+	plain := newPool(t, appURL)
+	gate := newInsertGate()
+	gated := newGatedPool(t, appURL, gate)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	workspaceID := insertWorkspace(t, ctx, plain, "synthetic-lock-orders")
+	sourceService := New(NewPostgres(plain))
+	plainCredentials := credentials.New(credentials.NewPostgres(plain))
+	gatedCredentials := credentials.New(credentials.NewPostgres(gated))
+
+	for _, op := range []string{"issue", "rotate"} {
+		for _, order := range []string{"credential first", "archive first"} {
+			t.Run(op+"/"+order, func(t *testing.T) {
+				source, err := sourceService.Create(ctx, workspaceID, "dsh", op+"-"+order)
+				if err != nil {
+					t.Fatal(err)
+				}
+				old, err := plainCredentials.Issue(ctx, workspaceID, source.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				call := func(service *credentials.Service) issueOutcome {
+					var out issueOutcome
+					if op == "issue" {
+						out.issued, out.err = service.Issue(ctx, workspaceID, source.ID)
+					} else {
+						out.issued, out.err = service.Rotate(ctx, workspaceID, old.ID)
+					}
+					return out
+				}
+				requireNoActive := func() {
+					if got := countActive(t, ctx, plain, source.ID); got != 0 {
+						t.Fatalf("active credentials after archive=%d want 0", got)
+					}
+				}
+				requireUnauthenticated := func(token string) {
+					if _, err := plainCredentials.Authenticate(ctx, token); !errors.Is(err, credentials.ErrUnauthenticated) {
+						t.Fatalf("authenticate after archive error=%v want ErrUnauthenticated", err)
+					}
+				}
+
+				if order == "credential first" {
+					// The credential call locks the source and pauses before its
+					// INSERT; the archive must queue on the same lock.
+					gate.arm()
+					written := make(chan issueOutcome, 1)
+					go func() { written <- call(gatedCredentials) }()
+					select {
+					case <-gate.reached:
+					case <-time.After(10 * time.Second):
+						t.Fatal("credential call never reached its INSERT")
+					}
+					archived := make(chan error, 1)
+					go func() { archived <- sourceService.Archive(ctx, workspaceID, source.ID) }()
+					waitForLockWaiter(t, ctx, plain, "SELECT 1 FROM sources")
+					select {
+					case err := <-archived:
+						t.Fatalf("archive finished while the credential write held the lock: %v", err)
+					case <-time.After(150 * time.Millisecond):
+					}
+					gate.open()
+					out := <-written
+					if out.err != nil {
+						t.Fatalf("%s error=%v want success (it locked first)", op, out.err)
+					}
+					if err := <-archived; err != nil {
+						t.Fatal(err)
+					}
+					// The credential that won the race is revoked by the archive.
+					requireNoActive()
+					requireUnauthenticated(out.issued.Token)
+					requireUnauthenticated(old.Token)
+					return
+				}
+
+				// Archive first: the archive steps run in an open transaction that
+				// keeps the lock; the credential call must queue on it.
+				holder, err := plain.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = holder.Rollback(context.WithoutCancel(ctx)) }()
+				if err := archive(ctx, &pgTx{tx: holder}, workspaceID, source.ID); err != nil {
+					t.Fatal(err)
+				}
+				written := make(chan issueOutcome, 1)
+				go func() { written <- call(plainCredentials) }()
+				waitForLockWaiter(t, ctx, plain, "SELECT archived_at FROM sources")
+				select {
+				case out := <-written:
+					t.Fatalf("%s finished while the archive held the lock: %v", op, out.err)
+				case <-time.After(150 * time.Millisecond):
+				}
+				if err := holder.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				out := <-written
+				if !errors.Is(out.err, credentials.ErrSourceArchived) {
+					t.Fatalf("%s error=%v want ErrSourceArchived", op, out.err)
+				}
+				requireNoActive()
+				var total int
+				if err := plain.QueryRow(ctx, "SELECT count(*) FROM ingest_credentials WHERE source_id=$1", source.ID).Scan(&total); err != nil || total != 1 {
+					t.Fatalf("credential rows=%d err=%v want 1 (nothing inserted)", total, err)
+				}
+				requireUnauthenticated(old.Token)
+			})
+		}
+	}
+}
+
+// TestArchiveAndIssueConcurrentStress adds unordered pressure on top of the
+// deterministic lock orders above; it does not replace them.
+func TestArchiveAndIssueConcurrentStress(t *testing.T) {
+	_, appURL := integrationSchema(t)
+	pool := newPool(t, appURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	workspaceID := insertWorkspace(t, ctx, pool, "synthetic-stress")
+	sourceService := New(NewPostgres(pool))
+	credentialService := credentials.New(credentials.NewPostgres(pool))
+	for round := 0; round < 10; round++ {
+		source, err := sourceService.Create(ctx, workspaceID, "dsh", fmt.Sprintf("stress-%d", round))
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if _, err := credentialService.Issue(ctx, workspaceID, source.ID); err != nil && !errors.Is(err, credentials.ErrSourceArchived) {
+					t.Errorf("issue error=%v", err)
+				}
+			}()
+		}
+		archiveErr := make(chan error, 1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			archiveErr <- sourceService.Archive(ctx, workspaceID, source.ID)
+		}()
+		close(start)
+		wg.Wait()
+		if err := <-archiveErr; err != nil {
+			t.Fatal(err)
+		}
+		if got := countActive(t, ctx, pool, source.ID); got != 0 {
+			t.Fatalf("round %d: active credentials after archive=%d want 0", round, got)
+		}
+	}
 }
