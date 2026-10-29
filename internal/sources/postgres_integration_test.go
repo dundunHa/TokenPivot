@@ -473,7 +473,11 @@ func (g *insertGate) open() { g.once.Do(func() { close(g.release) }) }
 func (g *insertGate) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
 	if strings.Contains(data.SQL, "INSERT INTO ingest_credentials") && g.armed.CompareAndSwap(true, false) {
 		g.reached <- struct{}{}
-		<-g.release
+		// A cancelled test context must not leave the connection parked here.
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+		}
 	}
 	return ctx
 }
@@ -532,18 +536,20 @@ type issueOutcome struct {
 func TestArchiveAndCredentialWriteLockOrders(t *testing.T) {
 	_, appURL := integrationSchema(t)
 	plain := newPool(t, appURL)
-	gate := newInsertGate()
-	gated := newGatedPool(t, appURL, gate)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	workspaceID := insertWorkspace(t, ctx, plain, "synthetic-lock-orders")
 	sourceService := New(NewPostgres(plain))
 	plainCredentials := credentials.New(credentials.NewPostgres(plain))
-	gatedCredentials := credentials.New(credentials.NewPostgres(gated))
 
 	for _, op := range []string{"issue", "rotate"} {
 		for _, order := range []string{"credential first", "archive first"} {
 			t.Run(op+"/"+order, func(t *testing.T) {
+				// Each scenario owns its gate, gated pool and service: the gate's
+				// release channel closes once, so sharing it would let a later
+				// scenario pass the pause point without ever holding the lock.
+				gate := newInsertGate()
+				gatedCredentials := credentials.New(credentials.NewPostgres(newGatedPool(t, appURL, gate)))
 				source, err := sourceService.Create(ctx, workspaceID, "dsh", op+"-"+order)
 				if err != nil {
 					t.Fatal(err)
