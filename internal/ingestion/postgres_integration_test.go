@@ -1537,10 +1537,17 @@ func TestCommittedItemWithUnknownResultIsNotDoubleCounted(t *testing.T) {
 	}
 }
 
+// richEventJSON is a valid event whose cache and reasoning metrics are non-empty
+// and whose qualities differ (known and estimated), with a status and a duration,
+// so history comparisons cover those columns and the minute quality counts.
+func richEventJSON(sourceEventID string, occurredAt time.Time, projectID pgtype.UUID) string {
+	return fmt.Sprintf(`{"source_event_id":%q,"project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":1000,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"cache_read_tokens":{"value":400,"quality":"known"},"reasoning_tokens":{"value":50,"quality":"known"}},"status":"success","duration_ms":1250}`,
+		sourceEventID, uuidText(projectID), occurredAt.UTC().Format(microLayout))
+}
+
 // historySnapshot renders every usage_events and usage_minute_stats row of the
-// workspace as one text line per row, covering ownership (workspace, source,
-// project), provider/model, the token values and aggregate sums, and the
-// timestamps, so a later snapshot can prove no row was rewritten or moved.
+// workspace as one complete JSON text line per row, so a later snapshot can prove
+// no column of any row was rewritten or moved.
 func (e *integrationEnv) historySnapshot(t *testing.T, ctx context.Context, workspaceID pgtype.UUID) (events, minutes []string) {
 	t.Helper()
 	read := func(query string) []string {
@@ -1562,8 +1569,12 @@ func (e *integrationEnv) historySnapshot(t *testing.T, ctx context.Context, work
 		}
 		return lines
 	}
-	events = read("SELECT concat_ws('|', source_event_id, workspace_id, source_id, coalesce(project_id::text,'-'), provider, model, occurred_at, received_at, coalesce(input_tokens::text,'-'), coalesce(output_tokens::text,'-'), coalesce(total_tokens::text,'-')) FROM usage_events WHERE workspace_id=$1 ORDER BY source_event_id")
-	minutes = read("SELECT concat_ws('|', bucket_start, workspace_id, source_id, coalesce(project_id::text,'-'), provider, model, event_count, input_tokens_sum, output_tokens_sum, total_tokens_sum) FROM usage_minute_stats WHERE workspace_id=$1 ORDER BY bucket_start, provider, model")
+	// to_jsonb of the whole row keeps every column, including ones added later,
+	// so no field can be forgotten: ids, ownership, all six metrics with their
+	// qualities, status, duration, hashes and timestamps for events, and every
+	// sum and known/estimated/missing count for the minute rows.
+	events = read("SELECT to_jsonb(e)::text FROM usage_events e WHERE e.workspace_id=$1 ORDER BY e.source_event_id")
+	minutes = read("SELECT to_jsonb(m)::text FROM usage_minute_stats m WHERE m.workspace_id=$1 ORDER BY m.bucket_start, m.provider, m.model")
 	return events, minutes
 }
 
@@ -1609,7 +1620,7 @@ func TestSourceArchiveKeepsHistoryAndInFlightRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireResultStatuses(t, runBatch(t, service, authenticated, encodedBatch(t, acceptedEventJSON("evt-before", occurredAt, projectID))), statusAccepted)
+	requireResultStatuses(t, runBatch(t, service, authenticated, encodedBatch(t, richEventJSON("evt-before", occurredAt, projectID))), statusAccepted)
 	eventsBefore, minutesBefore := e.historySnapshot(t, ctx, workspaceID)
 	if len(eventsBefore) != 1 || len(minutesBefore) != 1 {
 		t.Fatalf("seed history events=%d minutes=%d want 1 and 1", len(eventsBefore), len(minutesBefore))
@@ -1630,7 +1641,7 @@ func TestSourceArchiveKeepsHistoryAndInFlightRequest(t *testing.T) {
 	// The request authenticated before the archive finishes in a different
 	// minute, so the old bucket must stay untouched and a new one appears.
 	inflightAt := occurredAt.Add(-time.Hour)
-	requireResultStatuses(t, runBatch(t, service, authenticated, encodedBatch(t, acceptedEventJSON("evt-inflight", inflightAt, projectID))), statusAccepted)
+	requireResultStatuses(t, runBatch(t, service, authenticated, encodedBatch(t, richEventJSON("evt-inflight", inflightAt, projectID))), statusAccepted)
 	eventsAfter, minutesAfter := e.historySnapshot(t, ctx, workspaceID)
 	requireSubset(t, "events after in-flight", eventsBefore, eventsAfter, 1)
 	requireSubset(t, "minutes after in-flight", minutesBefore, minutesAfter, 1)
@@ -1662,7 +1673,7 @@ func TestProjectArchiveKeepsHistory(t *testing.T) {
 	service := e.service(t, pool, &syncBuffer{})
 	projectService := projects.New(projects.NewPostgres(pool))
 	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
-	requireResultStatuses(t, runBatch(t, service, credentialFor(workspaceID, sourceID), encodedBatch(t, acceptedEventJSON("evt-p1", occurredAt, projectID))), statusAccepted)
+	requireResultStatuses(t, runBatch(t, service, credentialFor(workspaceID, sourceID), encodedBatch(t, richEventJSON("evt-p1", occurredAt, projectID))), statusAccepted)
 	eventsBefore, minutesBefore := e.historySnapshot(t, ctx, workspaceID)
 	if len(eventsBefore) != 1 || len(minutesBefore) != 1 {
 		t.Fatalf("seed history events=%d minutes=%d want 1 and 1", len(eventsBefore), len(minutesBefore))
@@ -1680,7 +1691,7 @@ func TestProjectArchiveKeepsHistory(t *testing.T) {
 	requireSubset(t, "minutes after archive", minutesBefore, minutesMid, 0)
 
 	// An archived project still accepts events, bound to the same project id.
-	requireResultStatuses(t, runBatch(t, service, credentialFor(workspaceID, sourceID), encodedBatch(t, acceptedEventJSON("evt-p2", occurredAt.Add(-time.Hour), projectID))), statusAccepted)
+	requireResultStatuses(t, runBatch(t, service, credentialFor(workspaceID, sourceID), encodedBatch(t, richEventJSON("evt-p2", occurredAt.Add(-time.Hour), projectID))), statusAccepted)
 	eventsAfter, minutesAfter := e.historySnapshot(t, ctx, workspaceID)
 	requireSubset(t, "events after new event", eventsBefore, eventsAfter, 1)
 	requireSubset(t, "minutes after new event", minutesBefore, minutesAfter, 1)
