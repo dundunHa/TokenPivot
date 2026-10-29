@@ -500,37 +500,66 @@ func parseQuery(values url.Values) (query, error) {
 	return q, err
 }
 
-// parseMinute parses an RFC 3339 instant with an offset and requires whole
-// minutes; it never rounds.
+// parseMinute parses a strict RFC 3339 instant with an offset and requires
+// whole minutes; it never rounds.
 func parseMinute(value string) (time.Time, error) {
+	zero, ok := strictRFC3339(value)
+	if !ok || !zero {
+		return time.Time{}, ErrInvalidArgument
+	}
 	t, err := time.Parse(time.RFC3339, value)
 	if err != nil {
 		return time.Time{}, ErrInvalidArgument
 	}
 	t = t.UTC()
-	if t.Second() != 0 || t.Nanosecond() != 0 || !zeroFraction(value) {
+	if t.Second() != 0 || t.Nanosecond() != 0 {
 		return time.Time{}, ErrInvalidArgument
 	}
 	return t, nil
 }
 
-// zeroFraction reports whether every digit of the fractional second in an
-// already validated RFC 3339 text is 0. time.Parse keeps only nanoseconds, so
-// digits beyond the ninth would otherwise be dropped silently.
-func zeroFraction(value string) bool {
-	// "2006-01-02T15:04:05" is 19 bytes; a fraction starts right after it.
-	if len(value) <= 19 || (value[19] != '.' && value[19] != ',') {
+// strictRFC3339 checks the raw shape of value: YYYY-MM-DDTHH:MM:SS, an
+// optional "." fraction of any number of digits, then "Z" or a +/-HH:MM offset
+// (hour <= 23, minute <= 59). time.Parse is more lenient (one-digit hours,
+// comma fractions, offsets up to 24:59), and it drops digits past the ninth,
+// so the shape and the all-zero fraction are decided on the text itself.
+// Calendar validity is left to time.Parse.
+func strictRFC3339(value string) (zeroFraction, ok bool) {
+	digits := func(s string) bool {
+		for i := 0; i < len(s); i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
 		return true
 	}
-	for _, c := range value[20:] {
-		if c < '0' || c > '9' {
-			return true
-		}
-		if c != '0' {
-			return false
-		}
+	if len(value) < 20 || value[4] != '-' || value[7] != '-' || value[10] != 'T' || value[13] != ':' || value[16] != ':' ||
+		!digits(value[0:4]) || !digits(value[5:7]) || !digits(value[8:10]) ||
+		!digits(value[11:13]) || !digits(value[14:16]) || !digits(value[17:19]) {
+		return false, false
 	}
-	return true
+	rest := value[19:]
+	zeroFraction = true
+	if rest[0] == '.' {
+		n := 1
+		for n < len(rest) && rest[n] >= '0' && rest[n] <= '9' {
+			if rest[n] != '0' {
+				zeroFraction = false
+			}
+			n++
+		}
+		if n == 1 {
+			return false, false
+		}
+		rest = rest[n:]
+	}
+	switch {
+	case rest == "Z":
+		return zeroFraction, true
+	case len(rest) == 6 && (rest[0] == '+' || rest[0] == '-') && rest[3] == ':' && digits(rest[1:3]) && digits(rest[4:6]):
+		return zeroFraction, rest[1:3] <= "23" && rest[4:6] <= "59"
+	}
+	return false, false
 }
 
 func parseGranularity(values url.Values) (Granularity, error) {
