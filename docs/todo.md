@@ -1,53 +1,28 @@
 # TODO
 
-<!-- todo-meta: next-id=54 -->
+<!-- todo-meta: next-id=60 -->
 
 ## 里程碑一：采集打通
 
-- [ ] T-017 {running} {P1} **注册与开关：开放注册 / 自托管关闭公开注册** 开关默认关闭、空库允许首个注册（事务级锁保证并发仅一个成功）、拒绝返回 403 REGISTRATION_CLOSED；注册事务接入 CreatePersonal。单块实施。
-  - prd: docs/prd.md §2
-  - 决策: docs/decisions/0004-auth-and-workspace.md
-  - plan: docs/plans/2026-10-28-registration-switch.md
-  - 提交: dc504ce
-- [ ] T-011 {running} {P1} **批量采集接口实现** 认证、校验、每项独立事务；逐项返回 accepted/duplicate/conflict/expired，过期先于查重。尚未开工（无代码/分支）；前置 T-007/008/009/012 已完成，T-010 凭证内核已合入。
-  - 决策: docs/decisions/0002-ingestion-idempotency-and-batch.md
-  - 架构: docs/architecture.md
-  - plan: docs/plans/2026-10-27-batch-ingestion.md
 
 ## 里程碑二：能看数据
 
-- [ ] T-021 {P1} **项目管理、权限校验与跨空间隔离** 项目增删改仅 owner，member 只读；所有读写路径统一校验工作空间权限；含跨站写请求拦截与越权访问测试。
-  - 决策: docs/decisions/0004-auth-and-workspace.md
-- [ ] T-023 {P1} **查询接口格式定稿** 筛选、分组、粒度、时区参数；点数上限与粒度提示；查询限额。
+- [ ] T-055 {running} {P1} **聚合查询接口：格式定稿 + 趋势 + 汇总 + 排名** 已合入 main；完整 make check、integration 标签 vet 与衔接静态审查通过。按用户决定暂缓真实 PostgreSQL 集成与 EXPLAIN，验收未完成。
   - 架构: docs/architecture.md
-  - prd: docs/prd.md §5.1
-- [ ] T-024 {P1} **时间序列查询：分钟/小时/天** 按时区自然时段聚合（用 Go 标准时区库，夏令时只作测试用例）；返回实际范围与未完成分钟标记；含三种粒度一致、跨午夜、补报回填测试。
-  - 架构: docs/architecture.md
+  - prd: docs/prd.md
   - 决策: docs/decisions/0003-minute-aggregation-and-retention.md
-- [ ] T-025 {P1} **汇总指标：总量、输入、输出、请求数** 缓存/推理子集不重复累加；缺失与零值区分；只有汇总时不推算请求数。
-  - prd: docs/prd.md §7
-- [ ] T-026 {P1} **最近 60 秒滚动速率** 按精确时间从明细算，单位 tokens/min，同时返回数据新鲜度。
-  - prd: docs/prd.md §7
-- [ ] T-027 {P1} **分组排名与占比** 按 Provider/Model/Project 分组排序，长尾归为“其他”并可展开。
-  - prd: docs/prd.md §5.2
-- [ ] T-028 {P1} **请求明细分页查询** 仅请求级数据；状态与耗时有则显示；只有汇总的来源显示不可用。
-  - prd: docs/prd.md §5.4
-- [ ] T-032 {P1} **F·GEEK TERMINAL 设计变量与基础组件** 把 F 原型的配色、等宽字体、边线、状态色落成 Tailwind/CSS 变量；确认组件清单。
+  - plan: docs/plans/2026-10-29-aggregate-query-api.md
+  - 提交: b37a05d
+- [ ] T-057 {paused} {P1} **总览页：筛选栏 + 指标区 + 趋势图 + 排名** 用户要求停工，子代理已停止。共享基础改动未提交，保留于 milestone2-supervised-delivery-dev-e0a0 工作区；总览页面未开工，待新规划。
   - 视觉基准: docs/prototypes/dashboard-f.html
-  - prd: docs/prd.md §8
-- [ ] T-033 {P1} **登录注册页与工作空间切换** 登录、注册、验证邮箱、重置密码页面；工作空间切换器；切换后清空上一空间数据并忽略慢响应。
-  - prd: docs/prd.md §10
-- [ ] T-034 {P1} **全局筛选栏与 URL 状态** Provider/Model/Project 多选、时间范围、粒度、分组；非敏感条件存 URL；粒度被调整时明确提示。
-  - prd: docs/prd.md §5.1
-- [ ] T-035 {P1} **顶部指标区与数据状态提示** 总 Token、输入、输出、请求数、最近 60 秒；缺失/估算/延迟标记；显示最后更新时间。
-  - prd: docs/prd.md §5.2
-- [ ] T-036 {P1} **趋势主图** 输入/输出/总量面积图、未完成分钟标记、框选时间段联动明细。
-  - prd: docs/prd.md §5.2
-  - 视觉基准: docs/prototypes/dashboard-f.html
-- [ ] T-037 {P1} **来源排名与用量构成** 按项目/模型/供应商切换排序；字符条与占比；点击排名项直接筛选；“其他”可展开。
-  - prd: docs/prd.md §5.2
-- [ ] T-038 {P1} **请求明细面板** 日志流式列表、分页；来源不支持的字段显示不可用而非填零。
-  - prd: docs/prd.md §5.4
+  - prd: docs/prd.md
+  - plan: docs/plans/2026-10-29-overview-dashboard.md
+- [ ] T-058 {paused} {P2} **请求明细：60 秒速率 + 明细查询 + 明细面板** 用户要求停工并准备调整规划；本任务尚未开工，无实现改动。恢复前等待用户确认新范围。
+  - prd: docs/prd.md
+  - plan: docs/plans/2026-10-29-request-details-and-rate.md
+- [ ] T-059 {paused} {P1} **BF 部署：采集服务与仪表盘** 用户要求停工。容器三文件已提交子分支 30be360，未合入、镜像未构建成功；HTTP 配置和部署文档尚未开工，构建方案未改，bf 未变更。
+  - plan: docs/plans/2026-10-29-bf-docker-deployment.md
+  - 提交: 725061f
 
 ## 里程碑三：多人与运维
 
