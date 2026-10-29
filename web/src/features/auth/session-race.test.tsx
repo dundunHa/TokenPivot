@@ -688,8 +688,25 @@ describe("expires_at timer", () => {
 
   it("stops the timer and visibility listener after unmount", async () => {
     const gets = deferredSessionGets();
+    const addListener = vi.spyOn(document, "addEventListener");
+    const removeListener = vi.spyOn(document, "removeEventListener");
+    const setTimer = vi.spyOn(globalThis, "setTimeout");
+    const clearTimer = vi.spyOn(globalThis, "clearTimeout");
     mount(60_000);
+    // 只取本组件注册的 visibilitychange 监听与到期（60s）定时器，不依赖 Query 自身的定时器。
+    const listener = addListener.mock.calls.find(
+      ([type]) => type === "visibilitychange",
+    )?.[1];
+    const expiryIndex = setTimer.mock.calls.findIndex(
+      ([, delay]) => delay === 60_000,
+    );
+    expect(listener).toBeDefined();
+    expect(expiryIndex).toBeGreaterThanOrEqual(0);
+    const timerId = setTimer.mock.results[expiryIndex]?.value;
+    expect(timerId).toBeDefined();
     cleanup();
+    expect(removeListener).toHaveBeenCalledWith("visibilitychange", listener);
+    expect(clearTimer).toHaveBeenCalledWith(timerId);
     vi.setSystemTime(START + 120_000);
     document.dispatchEvent(new Event("visibilitychange"));
     await advance(120_000);
