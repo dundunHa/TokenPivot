@@ -1579,7 +1579,6 @@ components:
       explode: true
       schema:
         type: array
-        maxItems: 50
         items:
           type: string
           minLength: 1
@@ -1592,7 +1591,6 @@ components:
       explode: true
       schema:
         type: array
-        maxItems: 50
         items:
           type: string
           minLength: 1
@@ -1600,12 +1598,11 @@ components:
       name: project
       in: query
       required: false
-      description: '项目 UUID 或字面量 `unassigned`（未归属）；可重复，同维 OR，可组合；去重后最多 50 个。其他 workspace 的项目 UUID 只得到本 workspace 内的空结果。'
+      description: '项目 UUID 或字面量 `unassigned`（未归属）；可重复，同维 OR，可组合；UUID 按身份去重（大小写不同视为同一项目），`unassigned` 计一个，去重后最多 50 个。其他 workspace 的项目 UUID 只得到本 workspace 内的空结果。'
       style: form
       explode: true
       schema:
         type: array
-        maxItems: 50
         items:
           type: string
           pattern: '^(unassigned|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'

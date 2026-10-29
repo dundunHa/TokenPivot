@@ -356,3 +356,37 @@ func TestUsageRejectsNonGet(t *testing.T) {
 		t.Fatalf("status = %d", w.Code)
 	}
 }
+
+func TestWriteUsageErrorTooManyPointsMessage(t *testing.T) {
+	hour := usage.Hour
+	for name, tc := range map[string]struct {
+		suggested *usage.Granularity
+		message   string
+	}{
+		"no suggestion":   {nil, "time range has too many points; shorten the time range"},
+		"with suggestion": {&hour, "time range has too many points"},
+	} {
+		w := httptest.NewRecorder()
+		writeUsageError(httptest.NewRequest(http.MethodGet, "/", nil), w, &usage.TooManyPointsError{MaxPoints: 1000, Suggested: tc.suggested})
+		var body struct {
+			Error struct {
+				Code    string         `json:"code"`
+				Message string         `json:"message"`
+				Details map[string]any `json:"details"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if w.Code != http.StatusBadRequest || body.Error.Code != "TOO_MANY_POINTS" || body.Error.Message != tc.message {
+			t.Fatalf("%s: status %d body %s", name, w.Code, w.Body.String())
+		}
+		want := any(nil)
+		if tc.suggested != nil {
+			want = "hour"
+		}
+		if body.Error.Details["max_points"] != float64(1000) || body.Error.Details["suggested_granularity"] != want {
+			t.Fatalf("%s: details = %v", name, body.Error.Details)
+		}
+	}
+}
