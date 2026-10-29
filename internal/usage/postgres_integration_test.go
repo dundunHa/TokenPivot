@@ -354,6 +354,52 @@ func TestIntegrationQualityAndLargeNumbers(t *testing.T) {
 	}
 }
 
+// TestIntegrationCountsBeyondInt64 sums request_count and the known, estimated
+// and missing counts past int64 across rows that each hold a valid bigint, and
+// checks the decimal strings digit by digit in both Aggregate and Rankings.
+func TestIntegrationCountsBeyondInt64(t *testing.T) {
+	f := newFixture(t)
+	const max = int64(9223372036854775807)
+	var rows []row
+	for i := 0; i < 6; i++ {
+		r := rowAt(time.Duration(i)*time.Minute, "p", "m", projA, 0, 0, 0)
+		r.events, r.known, r.estimated, r.missing = max, 0, 0, 0
+		switch i / 2 {
+		case 0:
+			r.known = max
+		case 1:
+			r.estimated = max
+		default:
+			r.missing = max
+		}
+		rows = append(rows, r)
+	}
+	f.insert(t, rows...)
+	check := func(name string, raw RawStats) {
+		t.Helper()
+		s, err := convertStats(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const twice = "18446744073709551614"
+		m := s.TotalTokens
+		if s.RequestCount != "55340232221128654842" || m.KnownCount != twice || m.EstimatedCount != twice || m.MissingCount != twice {
+			t.Fatalf("%s: request=%s known=%s estimated=%s missing=%s", name, s.RequestCount, m.KnownCount, m.EstimatedCount, m.MissingCount)
+		}
+	}
+	agg, err := f.store.Aggregate(f.ctx, AggregateParams{WorkspaceID: ws, Start: base, End: base.Add(time.Hour), Buckets: buckets(base, base.Add(time.Hour))})
+	if err != nil || agg.Overall == nil {
+		t.Fatalf("aggregate rows=%+v err=%v", agg, err)
+	}
+	check("aggregate overall", *agg.Overall)
+	rk := rankings(t, f, GroupModel, 0, 1, Filter{})
+	if len(rk.Groups) != 1 {
+		t.Fatalf("groups = %s", keys(rk.Groups))
+	}
+	check("rankings overall", rk.Overall)
+	check("rankings group", rk.Groups[0].Stats)
+}
+
 func TestIntegrationAggregateEmptyAndHalfOpenRange(t *testing.T) {
 	f := newFixture(t)
 	f.insert(t, rowAt(0, "p", "m", projA, 1, 1, 2))
