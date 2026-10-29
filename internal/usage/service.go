@@ -275,8 +275,8 @@ func (s *Service) Aggregate(ctx context.Context, workspaceID pgtype.UUID, values
 		return nil, err
 	}
 	tz, err := single(values, "timezone")
-	if err != nil || tz == "" {
-		return nil, ErrInvalidArgument
+	if err != nil {
+		return nil, err
 	}
 	loc, err := loadLocation(tz)
 	if err != nil {
@@ -311,7 +311,7 @@ func (s *Service) Aggregate(ctx context.Context, workspaceID pgtype.UUID, values
 	}
 	response := &AggregateResponse{
 		Range: AggregateRange{
-			Start: formatTime(q.start), End: formatTime(end), AsOf: formatTime(effectiveAsOf(q, end, now)),
+			Start: formatTime(q.start), End: formatTime(end), AsOf: formatTime(now),
 			RetentionCutoff: formatTime(cutoff), Timezone: tz, Granularity: granularity,
 		},
 		Points: make([]Point, 0, len(rows.Points)),
@@ -334,15 +334,6 @@ func (s *Service) Aggregate(ctx context.Context, workspaceID pgtype.UUID, values
 	}
 	sort.SliceStable(response.Points, func(i, j int) bool { return response.Points[i].BucketStart < response.Points[j].BucketStart })
 	return response, nil
-}
-
-// effectiveAsOf is the sampled statistics cut-off: end itself when it was omitted,
-// otherwise the sampling instant.
-func effectiveAsOf(q query, end, now time.Time) time.Time {
-	if !q.endGiven {
-		return end
-	}
-	return now
 }
 
 // Rankings returns one page of grouped totals plus the overall aggregate and the
@@ -637,7 +628,7 @@ func parseUUID(value string) (pgtype.UUID, bool) {
 		return pgtype.UUID{}, false
 	}
 	raw, err := hex.DecodeString(value[0:8] + value[9:13] + value[14:18] + value[19:23] + value[24:])
-	if err != nil || len(raw) != 16 {
+	if err != nil {
 		return pgtype.UUID{}, false
 	}
 	id := pgtype.UUID{Valid: true}
