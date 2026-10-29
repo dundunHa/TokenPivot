@@ -2,7 +2,10 @@ package usage
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -866,3 +869,99 @@ func TestStoreFailuresAreNotHiddenAsEmpty(t *testing.T) {
 }
 
 func ptrStats(s RawStats) *RawStats { return &s }
+
+func TestMinuteBoundaryRejectsAnyNonZeroFractionDigit(t *testing.T) {
+	for _, field := range []string{"start", "end"} {
+		for _, bad := range []string{
+			"2026-10-28T00:00:00.0000000001Z", // 10th digit
+			"2026-10-28T00:00:00.00000000001Z",
+			"2026-10-28T00:00:00.000000000000001Z",
+			"2026-10-28T00:00:00.5Z",
+		} {
+			store := &fakeStore{}
+			s, _, _ := newTestService(store)
+			if _, err := s.Aggregate(context.Background(), testWorkspace, set(aggValues(), field, bad)); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("%s=%q error = %v, want ErrInvalidArgument", field, bad, err)
+			}
+			if store.aggregateCalls != 0 {
+				t.Fatalf("%s=%q reached the store", field, bad)
+			}
+		}
+	}
+	for _, ok := range []string{"2026-10-28T00:00:00.0Z", "2026-10-28T00:00:00.000000000000Z"} {
+		if _, err := parseMinute(ok); err != nil {
+			t.Fatalf("all-zero fraction %q rejected: %v", ok, err)
+		}
+	}
+}
+
+func TestProjectFilterIsDistinctByUUIDIdentity(t *testing.T) {
+	uuidAt := func(i int, upper bool) string {
+		s := fmt.Sprintf("018f3c5e-1a2b-7c3d-8e9f-%012x", i)
+		if upper {
+			s = strings.ToUpper(s)
+		}
+		return s
+	}
+	var ok []string
+	for i := 0; i < 50; i++ {
+		ok = append(ok, uuidAt(i, false), uuidAt(i, true))
+	}
+	store := &fakeStore{}
+	s, _, _ := newTestService(store)
+	if _, err := s.Aggregate(context.Background(), testWorkspace, set(aggValues(), "project", ok...)); err != nil {
+		t.Fatalf("50 distinct UUIDs with case variants must be accepted: %v", err)
+	}
+	if got := len(store.aggregate.Filter.Projects); got != 50 {
+		t.Fatalf("projects = %d, want 50", got)
+	}
+	// 51 truly distinct UUIDs, and 50 UUIDs plus unassigned, are rejected.
+	for name, list := range map[string][]string{
+		"51 UUIDs":            append(append([]string{}, ok...), uuidAt(50, false)),
+		"50 UUIDs unassigned": append(append([]string{}, ok...), "unassigned"),
+	} {
+		store := &fakeStore{}
+		s, _, _ := newTestService(store)
+		if _, err := s.Aggregate(context.Background(), testWorkspace, set(aggValues(), "project", list...)); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("%s error = %v", name, err)
+		}
+		if store.aggregateCalls != 0 {
+			t.Fatalf("%s reached the store", name)
+		}
+	}
+	// Equivalent filters share one digest, so a cursor survives case changes.
+	a, err := parseQuery(set(rankValues("limit", "1"), "project", uuidAt(1, false), uuidAt(2, false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := parseQuery(set(rankValues("limit", "1"), "project", uuidAt(2, true), uuidAt(1, true), uuidAt(1, false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queryDigest(testWorkspace, a, GroupModel, 1) != queryDigest(testWorkspace, b, GroupModel, 1) {
+		t.Fatal("equivalent project filters produced different digests")
+	}
+}
+
+func TestDecodeCursorRejectsTrailingData(t *testing.T) {
+	good := cursorPayload{Version: 1, Digest: strings.Repeat("a", 64), AsOf: 1, Offset: 1}
+	enc, err := encodeCursor(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeCursor(enc); err != nil {
+		t.Fatalf("valid cursor rejected: %v", err)
+	}
+	raw, _ := json.Marshal(good)
+	for name, tail := range map[string]string{
+		"closing brace":   "}",
+		"closing bracket": "]",
+		"second json":     "{}",
+		"garbage":         "xyz",
+	} {
+		text := base64.RawURLEncoding.EncodeToString(append(append([]byte{}, raw...), tail...))
+		if _, err := decodeCursor(text); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("%s: error = %v, want ErrInvalidArgument", name, err)
+		}
+	}
+}

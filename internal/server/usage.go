@@ -153,8 +153,12 @@ func writeUsageError(r *http.Request, w http.ResponseWriter, err error) {
 			Details: outsideRetentionDetails{RetentionCutoff: outside.Cutoff.UTC().Format(time.RFC3339Nano)},
 		}})
 	case errors.As(err, &tooMany):
+		message := "time range has too many points"
+		if tooMany.Suggested == nil {
+			message = "time range has too many points; shorten the time range"
+		}
 		writeJSON(w, http.StatusBadRequest, usageErrorEnvelope{Error: usageErrorBody{
-			Code: "TOO_MANY_POINTS", Message: "time range has too many points",
+			Code: "TOO_MANY_POINTS", Message: message,
 			Details: tooManyPointsDetails{MaxPoints: tooMany.MaxPoints, SuggestedGranularity: tooMany.Suggested},
 		}})
 	default:

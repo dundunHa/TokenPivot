@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/url"
 	"sort"
@@ -507,10 +508,29 @@ func parseMinute(value string) (time.Time, error) {
 		return time.Time{}, ErrInvalidArgument
 	}
 	t = t.UTC()
-	if t.Second() != 0 || t.Nanosecond() != 0 {
+	if t.Second() != 0 || t.Nanosecond() != 0 || !zeroFraction(value) {
 		return time.Time{}, ErrInvalidArgument
 	}
 	return t, nil
+}
+
+// zeroFraction reports whether every digit of the fractional second in an
+// already validated RFC 3339 text is 0. time.Parse keeps only nanoseconds, so
+// digits beyond the ninth would otherwise be dropped silently.
+func zeroFraction(value string) bool {
+	// "2006-01-02T15:04:05" is 19 bytes; a fraction starts right after it.
+	if len(value) <= 19 || (value[19] != '.' && value[19] != ',') {
+		return true
+	}
+	for _, c := range value[20:] {
+		if c < '0' || c > '9' {
+			return true
+		}
+		if c != '0' {
+			return false
+		}
+	}
+	return true
 }
 
 func parseGranularity(values url.Values) (Granularity, error) {
@@ -571,20 +591,22 @@ func loadLocation(name string) (*time.Location, error) {
 }
 
 // parseFilter collects the repeated filters: empty values are rejected, values
-// are de-duplicated, and each dimension keeps at most MaxFilterValues.
+// are de-duplicated, and each dimension keeps at most MaxFilterValues distinct
+// values; projects are distinct by parsed UUID, with unassigned counting as one.
 func parseFilter(values url.Values) (Filter, error) {
 	var f Filter
 	var err error
-	if f.Providers, err = distinctText(values["provider"]); err != nil {
-		return f, err
+	if f.Providers, err = distinctText(values["provider"]); err != nil || len(f.Providers) > MaxFilterValues {
+		return f, ErrInvalidArgument
 	}
-	if f.Models, err = distinctText(values["model"]); err != nil {
-		return f, err
+	if f.Models, err = distinctText(values["model"]); err != nil || len(f.Models) > MaxFilterValues {
+		return f, ErrInvalidArgument
 	}
 	projects, err := distinctText(values["project"])
 	if err != nil {
 		return f, err
 	}
+	seenID := make(map[[16]byte]bool, len(projects))
 	for _, p := range projects {
 		if p == "unassigned" {
 			f.Unassigned = true
@@ -594,7 +616,17 @@ func parseFilter(values url.Values) (Filter, error) {
 		if !ok {
 			return f, ErrInvalidArgument
 		}
-		f.Projects = append(f.Projects, id)
+		if !seenID[id.Bytes] {
+			seenID[id.Bytes] = true
+			f.Projects = append(f.Projects, id)
+		}
+	}
+	n := len(f.Projects)
+	if f.Unassigned {
+		n++
+	}
+	if n > MaxFilterValues {
+		return f, ErrInvalidArgument
 	}
 	sort.Slice(f.Projects, func(i, j int) bool { return f.Projects[i].String() < f.Projects[j].String() })
 	return f, nil
@@ -613,9 +645,6 @@ func distinctText(list []string) ([]string, error) {
 		if !seen[v] {
 			seen[v] = true
 			out = append(out, v)
-			if len(out) > MaxFilterValues {
-				return nil, ErrInvalidArgument
-			}
 		}
 	}
 	sort.Strings(out)
@@ -772,7 +801,7 @@ func decodeCursor(text string) (cursorPayload, error) {
 	}
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&p); err != nil || dec.More() || p.Version != cursorVersion || len(p.Digest) != sha256.Size*2 || p.Offset < 0 || p.Offset > 1<<30 {
+	if err := dec.Decode(&p); err != nil || dec.Decode(&struct{}{}) != io.EOF || p.Version != cursorVersion || len(p.Digest) != sha256.Size*2 || p.Offset < 0 || p.Offset > 1<<30 {
 		return cursorPayload{}, ErrInvalidArgument
 	}
 	return p, nil
