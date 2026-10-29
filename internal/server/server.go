@@ -38,6 +38,9 @@ type Options struct {
 	// leaves them absent. They also need Options.Auth for the session and
 	// Origin gates.
 	Credentials *Credentials
+	// Usage enables the read-only aggregate query routes for workspace members; nil
+	// leaves them absent. They also need Options.Auth for the session gate.
+	Usage *Usage
 	// Ingestion enables the Bearer-authenticated batch ingestion route; nil
 	// leaves it absent.
 	Ingestion *ingestion.Handler
@@ -47,7 +50,8 @@ type Options struct {
 // probe paths on the backend while optionally serving a frontend. Browser
 // authentication routes are registered only when Options.Auth is set, the
 // owner-only credential routes only when both Options.Auth and
-// Options.Credentials are set, and the batch ingestion route only when
+// Options.Credentials are set, the aggregate query routes only when both
+// Options.Auth and Options.Usage are set, and the batch ingestion route only when
 // Options.Ingestion is set.
 func NewHandler(options Options) http.Handler {
 	checkReady := options.CheckReady
@@ -79,6 +83,7 @@ func NewHandler(options Options) http.Handler {
 	})
 	options.Auth.routes(mux)
 	options.Credentials.routes(mux, options.Auth)
+	options.Usage.routes(mux, options.Auth)
 	options.Ingestion.Register(mux)
 	if options.Frontend == nil {
 		return mux
