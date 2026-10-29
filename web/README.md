@@ -1,6 +1,6 @@
 # TokenPivot 前端工程
 
-T-031 只提供工程占位页与同源接入，不提供业务 API、认证、登录、统计数据或产品视觉。
+T-056 在 T-031 的同源接入上提供 F 终端风格主题、`/login`、`/register` 与最小已认证页 `/`（当前用户邮箱、固定文案 `Personal`、登出）。不含仪表盘、统计数据、空间切换、邮箱验证或密码重置。
 
 > 仓库根的统一入口在 [根 README](../README.md) 与 [Makefile](../Makefile)：根说明有完整的工具前提、首次安装、命令表与最短双终端启动，Makefile 提供 `make build-web`、`make dev-web` 等组合目标。本页只保留前端专项细节，不重复第二套安装步骤。
 >
@@ -12,7 +12,7 @@ T-031 只提供工程占位页与同源接入，不提供业务 API、认证、�
 
 `@types/node` 仍为 **24.19.2**：它是编译时 API 类型包，与运行时 Node 26 主版本不一致，本任务不动依赖图，留待后续单独评估对齐。版本口径来源见 [T-052 工具链版本基线计划](../docs/plans/2026-10-27-toolchain-baseline.md)。
 
-以下从仓库根目录执行：
+以下从仓库根目录执行（`npm test` 需要 Node 26）：
 
 ```sh
 node --version
@@ -28,7 +28,7 @@ npm --prefix web run build
 
 这些 npm 脚本保持独立可用；根 Makefile 只是把它们组合成 `make build-web`（等同 `npm --prefix web run build`）等目标，不改变脚本语义。
 
-首次更新锁文件使用正常 `npm --prefix web install`；直接依赖固定版本，不使用 force 或 legacy-peer-deps 隐藏冲突。TypeScript strict 覆盖 src 与 Vite 配置，ESLint 负责 JS/TS 规则，Prettier 负责前端格式，Go 文件仅用 gofmt。测试使用 Node 原生 node:test 与真实 Vite/HTTP 上游，不使用 UI 自动化。
+首次更新锁文件使用正常 `npm --prefix web install`；直接依赖固定版本，不使用 force 或 legacy-peer-deps 隐藏冲突。TypeScript strict 覆盖 src 与 Vite 配置，ESLint 负责 JS/TS 规则，Prettier 负责前端格式，Go 文件仅用 gofmt。`npm test` 先运行 Node 原生 node:test（真实 Vite/HTTP 上游的代理测试），再运行 `vitest run`：jsdom + Testing Library 的代码级组件/页面测试，MSW 在 HTTP 边界模拟认证端点与延迟竞态；不使用 UI 自动化或真实浏览器。
 
 ## 开发同源代理
 
@@ -65,6 +65,13 @@ GOTOOLCHAIN=local go build -tags uiembed -o /tmp/tokenpivot-t031-ui ./cmd/tokenp
 
 所有静态成功响应均为 `Cache-Control: no-cache`，不设置 immutable；不承诺服务升级后旧页面仍能取回旧资源。生产页面与 API 必须同源，TLS 交由外层入口处理。本任务不支持子目录部署、CDN 配置或多版本资源保留。
 
+## 认证页面与会话边界
+
+- 路由：`/login`、`/register`、`/`；未知路径回退到 `/`。公开页进入时不请求会话、不因已有会话自动跳转；`/` 通过 `GET /api/v1/auth/session` 恢复身份，只有 `401 UNAUTHENTICATED` 才视为匿名，网络、5xx 或坏响应显示错误与手动重试。
+- 请求只发同源相对 `/api/v1/auth/*`（`credentials: 'same-origin'`），Origin 由浏览器产生。会话只在内存（TanStack Query 缓存），不写 localStorage、不做持久化缓存。
+- 邮箱原样提交（不 trim、不转小写、仅拒绝完全空串）；密码为 8–64 个码点且不超过 256 字节。服务端仍是唯一权威。
+- 到期：按 `expires_at` 定时（延迟限制在 2_147_483_647ms 内）并在页面重新可见时补查；到期先隐藏旧身份再重查。登录、注册、登出前后都会显式取消在途的会话查询，迟到的旧响应不会覆盖新状态。
+
 ## shadcn 与后续范围
 
 在 web 目录执行固定 CLI：
@@ -73,6 +80,6 @@ GOTOOLCHAIN=local go build -tags uiembed -o /tmp/tokenpivot-t031-ui ./cmd/tokenp
 npx shadcn@4.22.1 info --json
 ```
 
-[components.json](components.json) 与 [cn 工具](src/lib/utils.ts) 只准备接入，没有生成任何组件、安装图标包或选择 primitive 库。new-york、neutral 是可替换工程默认，不是产品视觉决定。T-032 添加首个组件前可以一次替换；T-033 才处理登录等认证页面。TanStack Query 等到首个服务端状态需求再引入，当前不预建请求框架。
+`src/components/ui/` 只含认证页实际使用的 Button、Input、Alert、Label、Field（来自 shadcn 生成源，导入改为现有 [cn 工具](src/lib/utils.ts) 与独立 Radix 包，单一深色主题，无 `dark:` 双主题）。仪表盘组件与空间切换（T-020）不在本任务范围。
 
 人工验收由用户自行打开开发页与内嵌页查看占位内容及 CSS 加载；不属于业务交互或视觉设计验收。
