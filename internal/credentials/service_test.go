@@ -17,6 +17,8 @@ type fakeStore struct {
 	mu sync.Mutex
 	// sources maps source id to owning workspace id.
 	sources map[[16]byte][16]byte
+	// archived marks archived source ids.
+	archived map[[16]byte]bool
 	// rows holds one stored credential per id, keyed by credential id.
 	rows map[[16]byte]storedCredential
 	// digests records every hash handed to Insert, in insertion order.
@@ -38,8 +40,9 @@ type storedCredential struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		sources: make(map[[16]byte][16]byte),
-		rows:    make(map[[16]byte]storedCredential),
+		sources:  make(map[[16]byte][16]byte),
+		archived: make(map[[16]byte]bool),
+		rows:     make(map[[16]byte]storedCredential),
 	}
 }
 
@@ -78,19 +81,6 @@ func (f *fakeStore) BySecretHash(ctx context.Context, secretHash []byte) (Creden
 	return Credential{}, false, nil
 }
 
-func (f *fakeStore) ByID(ctx context.Context, workspaceID, credentialID ID) (Credential, bool, error) {
-	if f.errByID != nil {
-		return Credential{}, false, f.errByID
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	row, ok := f.rows[credentialID.Bytes]
-	if !ok || row.credential.WorkspaceID.Bytes != workspaceID.Bytes {
-		return Credential{}, false, nil
-	}
-	return row.credential, true, nil
-}
-
 func (f *fakeStore) SourceExists(ctx context.Context, workspaceID, sourceID ID) (bool, error) {
 	if f.errSource != nil {
 		return false, f.errSource
@@ -101,17 +91,53 @@ func (f *fakeStore) SourceExists(ctx context.Context, workspaceID, sourceID ID) 
 	return ok && owner == workspaceID.Bytes, nil
 }
 
-func (f *fakeStore) Insert(ctx context.Context, workspaceID, sourceID ID, secretHash []byte) (Credential, error) {
-	if f.errInsert != nil {
-		return Credential{}, f.errInsert
+// IssueActive mirrors the transactional store: source check, archive check,
+// then insert, all under the fake's single mutex.
+func (f *fakeStore) IssueActive(ctx context.Context, workspaceID, sourceID ID, secretHash []byte) (Credential, error) {
+	if f.errSource != nil {
+		return Credential{}, f.errSource
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.issueLocked(workspaceID, sourceID, secretHash)
+}
+
+func (f *fakeStore) RotateActive(ctx context.Context, workspaceID, credentialID ID, secretHash []byte) (Credential, error) {
+	if f.errByID != nil {
+		return Credential{}, f.errByID
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.rows[credentialID.Bytes]
+	if !ok || row.credential.WorkspaceID.Bytes != workspaceID.Bytes {
+		return Credential{}, ErrNotFound
+	}
+	return f.issueLocked(row.credential.WorkspaceID, row.credential.SourceID, secretHash)
+}
+
+func (f *fakeStore) issueLocked(workspaceID, sourceID ID, secretHash []byte) (Credential, error) {
+	owner, ok := f.sources[sourceID.Bytes]
+	if !ok || owner != workspaceID.Bytes {
+		return Credential{}, ErrNotFound
+	}
+	if f.archived[sourceID.Bytes] {
+		return Credential{}, ErrSourceArchived
+	}
+	if f.errInsert != nil {
+		return Credential{}, f.errInsert
+	}
 	credential := Credential{ID: nextID(), WorkspaceID: workspaceID, SourceID: sourceID}
 	copied := append([]byte(nil), secretHash...)
 	f.digests = append(f.digests, copied)
 	f.rows[credential.ID.Bytes] = storedCredential{credential: credential, hash: copied}
 	return credential, nil
+}
+
+// archive marks a source archived, as the sources archive transaction would.
+func (f *fakeStore) archive(sourceID ID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.archived[sourceID.Bytes] = true
 }
 
 func (f *fakeStore) Revoke(ctx context.Context, workspaceID, credentialID ID) (bool, error) {
@@ -671,3 +697,105 @@ func TestRotateRequiresExistingCredential(t *testing.T) {
 }
 
 var _ store = (*fakeStore)(nil)
+
+func TestIssueAndRotateRejectArchivedSource(t *testing.T) {
+	ctx := context.Background()
+	service, fake, workspaceID, sourceID := newTestService(t)
+	old, err := service.Issue(ctx, workspaceID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.archive(sourceID)
+	before := fake.insertions()
+	if _, err := service.Issue(ctx, workspaceID, sourceID); !errors.Is(err, ErrSourceArchived) {
+		t.Fatalf("issue error=%v want ErrSourceArchived", err)
+	}
+	if _, err := service.Rotate(ctx, workspaceID, old.ID); !errors.Is(err, ErrSourceArchived) {
+		t.Fatalf("rotate error=%v want ErrSourceArchived", err)
+	}
+	if fake.insertions() != before {
+		t.Fatal("archived source still received a credential row")
+	}
+	// Foreign workspace stays not found, not archived.
+	if _, err := service.Rotate(ctx, testID(0x71), old.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign rotate error=%v want ErrNotFound", err)
+	}
+}
+
+// txFake records the call order of the transaction-bound steps.
+type txFake struct {
+	calls    []string
+	found    bool
+	archived bool
+	old      Credential
+	oldFound bool
+	failAt   string
+}
+
+func (t *txFake) step(name string) error {
+	t.calls = append(t.calls, name)
+	if t.failAt == name {
+		return errors.New("synthetic step failure")
+	}
+	return nil
+}
+
+func (t *txFake) lockSource(ctx context.Context, workspaceID, sourceID ID) (bool, bool, error) {
+	return t.found, t.archived, t.step("lock")
+}
+
+func (t *txFake) byID(ctx context.Context, workspaceID, credentialID ID) (Credential, bool, error) {
+	return t.old, t.oldFound, t.step("byID")
+}
+
+func (t *txFake) insert(ctx context.Context, workspaceID, sourceID ID, secretHash []byte) (Credential, error) {
+	return Credential{WorkspaceID: workspaceID, SourceID: sourceID}, t.step("insert")
+}
+
+func TestIssueActiveLocksBeforeInsert(t *testing.T) {
+	ctx := context.Background()
+	ws, src := testID(1), testID(2)
+	tx := &txFake{found: true}
+	if _, err := issueActive(ctx, tx, ws, src, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(tx.calls, ","); got != "lock,insert" {
+		t.Fatalf("order=%s want lock,insert", got)
+	}
+	for name, tx := range map[string]*txFake{"missing": {found: false}, "archived": {found: true, archived: true}} {
+		if _, err := issueActive(ctx, tx, ws, src, []byte{1}); err == nil {
+			t.Fatalf("%s: no error", name)
+		}
+		if strings.Contains(strings.Join(tx.calls, ","), "insert") {
+			t.Fatalf("%s: inserted", name)
+		}
+	}
+	failing := &txFake{found: true, failAt: "insert"}
+	if _, err := issueActive(ctx, failing, ws, src, []byte{1}); err == nil {
+		t.Fatal("insert failure was swallowed")
+	}
+}
+
+func TestRotateActiveLocksFixedSource(t *testing.T) {
+	ctx := context.Background()
+	ws := testID(1)
+	old := Credential{ID: testID(9), WorkspaceID: ws, SourceID: testID(5)}
+	tx := &txFake{found: true, old: old, oldFound: true}
+	got, err := rotateActive(ctx, tx, ws, old.ID, []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(tx.calls, ",") != "byID,lock,insert" {
+		t.Fatalf("order=%v", tx.calls)
+	}
+	if got.SourceID.Bytes != old.SourceID.Bytes || got.WorkspaceID.Bytes != ws.Bytes {
+		t.Fatal("rotate changed the fixed workspace or source")
+	}
+	missing := &txFake{}
+	if _, err := rotateActive(ctx, missing, ws, old.ID, []byte{1}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("error=%v want ErrNotFound", err)
+	}
+	if len(missing.calls) != 1 {
+		t.Fatal("missing credential continued past lookup")
+	}
+}
