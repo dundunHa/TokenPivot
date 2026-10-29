@@ -1,7 +1,8 @@
 // Package aggregation owns the additive per-minute usage statistics writer. It
 // never owns a transaction, a connection or a retry policy: the caller passes the
 // same pgx.Tx that inserted the detail event, so both writes commit or roll back
-// together.
+// together. It also owns RetentionCutoff, the single definition of the 13 calendar
+// month query and cleanup boundary; it reads and writes no data.
 package aggregation
 
 import (
