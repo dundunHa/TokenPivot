@@ -2,15 +2,12 @@ package server
 
 import (
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/dundunHa/TokenPivot/internal/auth"
 	"github.com/dundunHa/TokenPivot/internal/credentials"
 	"github.com/dundunHa/TokenPivot/internal/workspaces"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // Credentials bundles the owner-only credential management dependencies: the
@@ -74,12 +71,7 @@ func (c *Credentials) routes(mux *http.ServeMux, sessions *Auth) {
 	// one-time plaintext token, and a cached list would hide a revocation.
 	// Writes check the Origin and then the session, exactly like the browser
 	// authentication writes; the list is a read and skips only the Origin gate.
-	write := func(handler http.Handler) http.Handler {
-		return sessions.noStore(sessions.RequireOrigin(sessions.RequireSession(handler)))
-	}
-	read := func(handler http.Handler) http.Handler {
-		return sessions.noStore(sessions.RequireSession(handler))
-	}
+	write, read := sessions.writeRoute, sessions.readRoute
 	mux.Handle("GET "+credentialsCollectionPath, read(http.HandlerFunc(c.handleList)))
 	mux.Handle("POST "+credentialsCollectionPath, write(http.HandlerFunc(c.handleIssue)))
 	mux.Handle("POST "+credentialsRotatePath, write(http.HandlerFunc(c.handleRotate)))
@@ -176,67 +168,11 @@ func (c *Credentials) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// requireOwner resolves the path workspace and proves the session user is its
-// owner. Every rejection happens before any credential read or write. A
-// database failure is a real error, never a permission decision.
+// requireOwner proves the session user is the owner of the path workspace
+// through the shared gate. Every rejection happens before any credential read
+// or write.
 func (c *Credentials) requireOwner(w http.ResponseWriter, r *http.Request) (credentials.ID, bool) {
-	user, ok := UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "authentication required")
-		return credentials.ID{}, false
-	}
-	workspaceID, ok := pathID(w, r, "workspaceID")
-	if !ok {
-		return credentials.ID{}, false
-	}
-	role, found, err := c.Workspaces.MembershipRole(r.Context(), membershipUserID(user), workspaceID)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "credential request failed", "stage", "credentials owner", "err", err)
-		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
-		return credentials.ID{}, false
-	}
-	if !found || role != workspaces.RoleOwner {
-		writeError(w, http.StatusForbidden, "PERMISSION_DENIED", "workspace owner required")
-		return credentials.ID{}, false
-	}
-	return workspaceID, true
-}
-
-// membershipUserID converts the authenticated browser identity into the UUID
-// form the membership lookup uses. It takes the value from the session only.
-func membershipUserID(user auth.User) workspaces.ID {
-	return workspaces.ID{Bytes: user.ID, Valid: true}
-}
-
-// pathID parses one UUID path parameter. A malformed value is rejected as an
-// invalid argument rather than being passed to the database.
-func pathID(w http.ResponseWriter, r *http.Request, name string) (pgtype.UUID, bool) {
-	var id pgtype.UUID
-	if err := id.Scan(r.PathValue(name)); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "path parameter must be a UUID")
-		return pgtype.UUID{}, false
-	}
-	return id, true
-}
-
-// requireEmptyBody enforces the empty request body. Ownership and origin always
-// come from the session, the request path and the stored row, so a body is
-// never read as input: any content, including a workspace_id or source_id, is
-// rejected before the database is touched.
-func requireEmptyBody(w http.ResponseWriter, r *http.Request) bool {
-	if r.Body == nil {
-		return true
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body could not be read")
-		return false
-	}
-	if len(body) != 0 {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body must be empty")
-		return false
-	}
-	return true
+	return requireOwner(w, r, c.Workspaces)
 }
 
 // writeCredentialError maps a credential service error to its HTTP status
@@ -247,6 +183,8 @@ func writeCredentialError(r *http.Request, w http.ResponseWriter, err error) {
 		// A source or credential outside the path workspace is indistinguishable
 		// from a missing one, so no foreign resource is revealed.
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "credential resource not found")
+	case errors.Is(err, credentials.ErrSourceArchived):
+		writeError(w, http.StatusConflict, "CONFLICT", "source is archived")
 	case errors.Is(err, credentials.ErrUnauthenticated):
 		writeError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "authentication required")
 	default:
