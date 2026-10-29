@@ -25,6 +25,8 @@ import (
 	"github.com/dundunHa/TokenPivot/internal/aggregation"
 	"github.com/dundunHa/TokenPivot/internal/credentials"
 	"github.com/dundunHa/TokenPivot/internal/database"
+	"github.com/dundunHa/TokenPivot/internal/projects"
+	"github.com/dundunHa/TokenPivot/internal/sources"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1533,4 +1535,164 @@ func TestCommittedItemWithUnknownResultIsNotDoubleCounted(t *testing.T) {
 	if bucket.eventCount != 1 || bucket.sum[0] != 100 {
 		t.Fatalf("bucket=%+v want exactly one count of 100", bucket)
 	}
+}
+
+// richEventJSON is a valid event whose cache and reasoning metrics are non-empty
+// and whose qualities differ (known and estimated), with a status and a duration,
+// so history comparisons cover those columns and the minute quality counts.
+func richEventJSON(sourceEventID string, occurredAt time.Time, projectID pgtype.UUID) string {
+	return fmt.Sprintf(`{"source_event_id":%q,"project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":1000,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"cache_read_tokens":{"value":400,"quality":"known"},"reasoning_tokens":{"value":50,"quality":"known"}},"status":"success","duration_ms":1250}`,
+		sourceEventID, uuidText(projectID), occurredAt.UTC().Format(microLayout))
+}
+
+// historySnapshot renders every usage_events and usage_minute_stats row of the
+// workspace as one complete JSON text line per row, so a later snapshot can prove
+// no column of any row was rewritten or moved.
+func (e *integrationEnv) historySnapshot(t *testing.T, ctx context.Context, workspaceID pgtype.UUID) (events, minutes []string) {
+	t.Helper()
+	read := func(query string) []string {
+		rows, err := e.owner.Query(ctx, query, workspaceID)
+		if err != nil {
+			t.Fatal(database.SafeError("history snapshot", err))
+		}
+		defer rows.Close()
+		var lines []string
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatal(database.SafeError("history scan", err))
+			}
+			lines = append(lines, line)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(database.SafeError("history rows", err))
+		}
+		return lines
+	}
+	// to_jsonb of the whole row keeps every column, including ones added later,
+	// so no field can be forgotten: ids, ownership, all six metrics with their
+	// qualities, status, duration, hashes and timestamps for events, and every
+	// sum and known/estimated/missing count for the minute rows.
+	events = read("SELECT to_jsonb(e)::text FROM usage_events e WHERE e.workspace_id=$1 ORDER BY e.source_event_id")
+	minutes = read("SELECT to_jsonb(m)::text FROM usage_minute_stats m WHERE m.workspace_id=$1 ORDER BY m.bucket_start, m.provider, m.model")
+	return events, minutes
+}
+
+// requireSubset fails unless every line of before is still present, unchanged, in
+// after, and after has exactly extra additional lines.
+func requireSubset(t *testing.T, name string, before, after []string, extra int) {
+	t.Helper()
+	present := make(map[string]int, len(after))
+	for _, line := range after {
+		present[line]++
+	}
+	for _, line := range before {
+		if present[line] == 0 {
+			t.Fatalf("%s: a pre-existing row was changed or removed: %s", name, line)
+		}
+		present[line]--
+	}
+	if len(after) != len(before)+extra {
+		t.Fatalf("%s: rows %d -> %d want %d more", name, len(before), len(after), extra)
+	}
+}
+
+// TestSourceArchiveKeepsHistoryAndInFlightRequest authenticates a real token,
+// archives the source through the real sources.Service (which revokes the token)
+// and then finishes the request that was already authenticated: it still writes
+// history and moves last_received_at, while a fresh authentication with the same
+// token fails and every earlier event and minute row is unchanged.
+func TestSourceArchiveKeepsHistoryAndInFlightRequest(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	credentialService := credentials.New(credentials.NewPostgres(pool))
+	sourceService := sources.New(sources.NewPostgres(pool))
+	issued, err := credentialService.Issue(ctx, workspaceID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(NewPostgres(pool), credentialService, slog.New(slog.NewJSONHandler(&syncBuffer{}, nil)))
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	authenticated, err := credentialService.Authenticate(ctx, issued.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireResultStatuses(t, runBatch(t, service, authenticated, encodedBatch(t, richEventJSON("evt-before", occurredAt, projectID))), statusAccepted)
+	eventsBefore, minutesBefore := e.historySnapshot(t, ctx, workspaceID)
+	if len(eventsBefore) != 1 || len(minutesBefore) != 1 {
+		t.Fatalf("seed history events=%d minutes=%d want 1 and 1", len(eventsBefore), len(minutesBefore))
+	}
+
+	if err := sourceService.Archive(ctx, workspaceID, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	eventsMid, minutesMid := e.historySnapshot(t, ctx, workspaceID)
+	requireSubset(t, "events after archive", eventsBefore, eventsMid, 0)
+	requireSubset(t, "minutes after archive", minutesBefore, minutesMid, 0)
+	var credentialRows int
+	if err := e.owner.QueryRow(ctx, "SELECT count(*) FROM ingest_credentials WHERE workspace_id=$1 AND source_id=$2", workspaceID, sourceID).Scan(&credentialRows); err != nil || credentialRows != 1 {
+		t.Fatalf("credential rows=%d err=%v want 1 kept", credentialRows, err)
+	}
+	e.setLastReceivedAt(t, ctx, workspaceID, sourceID, time.Now().UTC().Add(-time.Hour))
+
+	// The request authenticated before the archive finishes in a different
+	// minute, so the old bucket must stay untouched and a new one appears.
+	inflightAt := occurredAt.Add(-time.Hour)
+	requireResultStatuses(t, runBatch(t, service, authenticated, encodedBatch(t, richEventJSON("evt-inflight", inflightAt, projectID))), statusAccepted)
+	eventsAfter, minutesAfter := e.historySnapshot(t, ctx, workspaceID)
+	requireSubset(t, "events after in-flight", eventsBefore, eventsAfter, 1)
+	requireSubset(t, "minutes after in-flight", minutesBefore, minutesAfter, 1)
+	if stamp := e.lastReceivedAt(t, ctx, workspaceID, sourceID); stamp == nil || time.Since(*stamp) > time.Minute {
+		t.Fatal("in-flight request did not update last_received_at")
+	}
+	var archived bool
+	if err := e.owner.QueryRow(ctx, "SELECT archived_at IS NOT NULL FROM sources WHERE id=$1 AND workspace_id=$2", sourceID, workspaceID).Scan(&archived); err != nil || !archived {
+		t.Fatal("ingestion reactivated the archived source")
+	}
+	var active int
+	if err := e.owner.QueryRow(ctx, "SELECT count(*) FROM ingest_credentials WHERE source_id=$1 AND revoked_at IS NULL", sourceID).Scan(&active); err != nil || active != 0 {
+		t.Fatalf("active credentials=%d err=%v", active, err)
+	}
+	if _, err := credentialService.Authenticate(ctx, issued.Token); !errors.Is(err, credentials.ErrUnauthenticated) {
+		t.Fatalf("new authentication error=%v want ErrUnauthenticated", err)
+	}
+}
+
+// TestProjectArchiveKeepsHistory archives a project that already has events and
+// minute stats through the real projects.Service: every earlier row is unchanged
+// and the archived project keeps receiving events.
+func TestProjectArchiveKeepsHistory(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	projectService := projects.New(projects.NewPostgres(pool))
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	requireResultStatuses(t, runBatch(t, service, credentialFor(workspaceID, sourceID), encodedBatch(t, richEventJSON("evt-p1", occurredAt, projectID))), statusAccepted)
+	eventsBefore, minutesBefore := e.historySnapshot(t, ctx, workspaceID)
+	if len(eventsBefore) != 1 || len(minutesBefore) != 1 {
+		t.Fatalf("seed history events=%d minutes=%d want 1 and 1", len(eventsBefore), len(minutesBefore))
+	}
+
+	if err := projectService.Archive(ctx, workspaceID, projectID); err != nil {
+		t.Fatal(err)
+	}
+	var archived bool
+	if err := e.owner.QueryRow(ctx, "SELECT archived_at IS NOT NULL FROM projects WHERE id=$1 AND workspace_id=$2", projectID, workspaceID).Scan(&archived); err != nil || !archived {
+		t.Fatal("project was not archived")
+	}
+	eventsMid, minutesMid := e.historySnapshot(t, ctx, workspaceID)
+	requireSubset(t, "events after archive", eventsBefore, eventsMid, 0)
+	requireSubset(t, "minutes after archive", minutesBefore, minutesMid, 0)
+
+	// An archived project still accepts events, bound to the same project id.
+	requireResultStatuses(t, runBatch(t, service, credentialFor(workspaceID, sourceID), encodedBatch(t, richEventJSON("evt-p2", occurredAt.Add(-time.Hour), projectID))), statusAccepted)
+	eventsAfter, minutesAfter := e.historySnapshot(t, ctx, workspaceID)
+	requireSubset(t, "events after new event", eventsBefore, eventsAfter, 1)
+	requireSubset(t, "minutes after new event", minutesBefore, minutesAfter, 1)
 }

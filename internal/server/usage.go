@@ -60,15 +60,12 @@ func (u *Usage) routes(mux *http.ServeMux, sessions *Auth) {
 	if u == nil || u.Service == nil || u.Workspaces == nil || sessions == nil || sessions.Service == nil {
 		return
 	}
-	read := func(handler http.HandlerFunc) http.Handler {
-		return sessions.noStore(sessions.RequireSession(handler))
-	}
-	mux.Handle("GET "+usageAggregatePath, read(u.handleAggregate))
-	mux.Handle("GET "+usageRankingsPath, read(u.handleRankings))
+	mux.Handle("GET "+usageAggregatePath, sessions.readRoute(http.HandlerFunc(u.handleAggregate)))
+	mux.Handle("GET "+usageRankingsPath, sessions.readRoute(http.HandlerFunc(u.handleRankings)))
 }
 
 func (u *Usage) handleAggregate(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := u.requireReader(w, r)
+	workspaceID, ok := requireMember(w, r, u.Workspaces)
 	if !ok {
 		return
 	}
@@ -85,7 +82,7 @@ func (u *Usage) handleAggregate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (u *Usage) handleRankings(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := u.requireReader(w, r)
+	workspaceID, ok := requireMember(w, r, u.Workspaces)
 	if !ok {
 		return
 	}
@@ -99,33 +96,6 @@ func (u *Usage) handleRankings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
-}
-
-// requireReader resolves the path workspace and proves the session user is an
-// owner or member. Every rejection happens before any query parameter is parsed or
-// any statement runs. A lookup failure, including an unknown stored role, is a
-// real error and never a permission decision or an empty result.
-func (u *Usage) requireReader(w http.ResponseWriter, r *http.Request) (workspaces.ID, bool) {
-	user, ok := UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "authentication required")
-		return workspaces.ID{}, false
-	}
-	workspaceID, ok := pathID(w, r, "workspaceID")
-	if !ok {
-		return workspaces.ID{}, false
-	}
-	role, found, err := u.Workspaces.MembershipRole(r.Context(), membershipUserID(user), workspaceID)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "usage request failed", "stage", "usage membership", "err", err)
-		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
-		return workspaces.ID{}, false
-	}
-	if !found || (role != workspaces.RoleOwner && role != workspaces.RoleMember) {
-		writeError(w, http.StatusForbidden, "PERMISSION_DENIED", "workspace membership required")
-		return workspaces.ID{}, false
-	}
-	return workspaceID, true
 }
 
 // usageQuery parses the raw query string strictly: malformed escapes and

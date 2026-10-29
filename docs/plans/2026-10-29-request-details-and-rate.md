@@ -1,6 +1,6 @@
 # T-058：请求明细、精确 60 秒速率与明细面板
 
-> 状态：**规划完成，待实施审批与前置就绪**。合并 T-026/T-028/T-038；前置 T-054、T-056。
+> 状态：**修订完成，待用户批准第 5 节公开接口及 T-057 共享导出；不授权实施**。合并 T-026/T-028/T-038；T-054、T-056 已合入，实施必须在 T-055 与 T-057 两个串行块合入后开始。
 > 日期：2026-10-29（按指定文件名）；仓库与外部资料核查于 2026-10-28。
 > 本文件只属于规划交付，不授权编码；保留既有 `ref prd: docs/prd.md`，TODO 与提交由主代理处理。
 
@@ -20,54 +20,38 @@
 - 不做 SSE、WebSocket、服务端推送、跨请求数据库快照或“绝不漏任何实时事件”的承诺。
 - 不做单请求生成速度、Prompt/回复、费用、延迟分位数、异常检测、CSV 导出。
 - 不实现数据源在线/离线探针，不把 `last_received_at` 或窗口内无事件解释为在线状态；数据源健康属其他任务。
-- 不重复实现 T-054 的项目/来源管理、T-055 的分钟聚合查询、T-056 的登录注册/空间切换/设计基础、T-057 的页面总览；不假定 T-055/T-057 已有接口。
+- 不重复实现 T-054 的项目/来源管理、T-055 的分钟聚合查询、T-056 的登录注册/设计基础、T-057 的当前空间/共享请求/页面总览；不做空间切换。T-058 串行消费 T-057 已合入能力，不建立平行基础。
 - 不新增数据库、消息队列、状态管理或测试框架依赖；本任务没有默认数据库迁移。
 
-## 2. 已核实的仓库事实
+## 2. 当前 HEAD 已核实事实
 
-以下是**现有路径**，不是拟新增设计：
+以下现有路径已经在主 checkout 核实，不是拟新增设计：
 
-- PRD 明细字段为请求时间、Provider、Model、Project、输入/输出/总 Token、状态、耗时、来源、用量完整性；状态和耗时仅在来源可提供时展示，汇总数据不得伪造请求：[docs/prd.md:117-121](../prd.md#L117-L121)。
-- 当前速率定义为最近滚动 60 秒的 Token 用量，历史补报回填发生时段，速率必须同时呈现新鲜度，缺失不等于零：[docs/prd.md:151-179](../prd.md#L151-L179)。
-- 明细和滚动 60 秒读取原始事件；查询统一 `[start,end)`，60 秒独立按精确时间查询：[docs/architecture.md:52-65](../architecture.md#L52-L65)。按接收时间清理意味着更老发生时段可能只剩部分明细，不能宣称完整：[docs/architecture.md:67-71](../architecture.md#L67-L71)。
-- 可见页面建议 5–10 秒轮询、隐藏页暂停；TanStack Query 管服务端状态，查询键包含 workspace：[docs/architecture.md:25-35](../architecture.md#L25-L35)。
-- `usage_events` 已真实存在：`occurred_at/received_at` 均非空，六类 Token 各有独立 quality，`status/duration_ms` 可空：[db/migrations/00003_usage_events.sql:6-33](../../db/migrations/00003_usage_events.sql#L6-L33)。因此状态、耗时、发生与接收时间、逐字段完整性都有真实存储依据；没有插件版本或原始报文字段。
-- 已有索引 `(workspace_id,occurred_at,id)` 正好对应明细排序键和发生时间范围；没有项目筛选或 workspace+received_at 组合索引：[db/migrations/00003_usage_events.sql:34-35](../../db/migrations/00003_usage_events.sql#L34-L35)。
-- `sources` 可提供 `platform/instance_key`，`projects` 可提供项目展示信息；`sources.last_received_at` 是 source 级维护值，不含 Provider/Model/Project 筛选：[docs/data-model.md:32-34](../data-model.md#L32-L34)。
-- `sources.last_received_at` 在已有接受项之后、事务外 best-effort 更新，失败只记日志：[internal/ingestion/service.go:251-263](../../internal/ingestion/service.go#L251-L263)。它适合做来源维护信息，不适合作为本任务“窗口内已计入事件”的唯一新鲜度证据。
-- 浏览器会话由 `Auth.RequireSession` 校验并放入 context：[internal/server/auth_middleware.go:97-123](../../internal/server/auth_middleware.go#L97-L123)。`workspaces.Service.MembershipRole` 已统一识别 owner/member，数据库错误不能当成非成员：[internal/workspaces/service.go:75-103](../../internal/workspaces/service.go#L75-L103)。
-- 现有只读凭证路由使用 `noStore(RequireSession(...))`，owner 校验在业务读取前完成；本任务复用形状但放宽为 owner/member 可读：[internal/server/credentials.go:65-87](../../internal/server/credentials.go#L65-L87)、[internal/server/credentials.go:179-203](../../internal/server/credentials.go#L179-L203)。
-- API 集中维护在 `docs/openapi/openapi.yaml`，当前明确尚未包含查询接口：[docs/openapi/openapi.yaml:1-15](../openapi/openapi.yaml#L1-L15)。采集格式已冻结 status/duration 的可空语义及单事件整数最大 `2^53-1`：[docs/openapi/openapi.yaml:1499-1527](../openapi/openapi.yaml#L1499-L1527)、[docs/openapi/openapi.yaml:1574-1631](../openapi/openapi.yaml#L1574-L1631)。
-- Go 入口显式装配服务，`server.Options` 注册各模块路由：[cmd/tokenpivot/main.go:42-58](../../cmd/tokenpivot/main.go#L42-L58)、[internal/server/server.go:28-52](../../internal/server/server.go#L28-L52)。
-- 前端目前只有占位 `App`，没有业务请求设施：[web/src/App.tsx:1-14](../../web/src/App.tsx#L1-L14)。`web/package.json` 尚未安装 TanStack Query，测试命令是现有 `node --test test/*.test.mjs`：[web/package.json:9-16](../../web/package.json#L9-L16)。
-- T-054 的实际范围是空间权限及项目/来源管理，不是通用查询包；T-056 是设计基础、认证页与空间切换；二者均仍在规划中：[docs/todo.md:10-16](../todo.md#L10-L16)。
+- 明细字段、60 秒发生时间口径、逐字段质量与保留边界继续沿用 [PRD:117-121](../prd.md#L117-L121)、[PRD:151-179](../prd.md#L151-L179) 和 [架构:52-71](../architecture.md#L52-L71)，不重开已确认产品决定。
+- `usage_events` 的 `occurred_at/received_at`、可空 `status/duration_ms`、六类 Token quality 及 `(workspace_id,occurred_at,id)` 索引真实存在：[00003_usage_events.sql:6-35](../../db/migrations/00003_usage_events.sql#L6-L35)。仍先复用索引，不预设迁移。
+- `sources.last_received_at` 是 source 级维护值，不是筛选后窗口新鲜度：[ingestion/service.go:251-263](../../internal/ingestion/service.go#L251-L263)。已确认的窗口内 `max(received_at)` 决策不变。
+- 会话、`requireMember` 与 owner/member 读取已存在：[auth_middleware.go:97-123](../../internal/server/auth_middleware.go#L97-L123)、[workspace_access.go:28-69](../../internal/server/workspace_access.go#L28-L69)、[workspaces/service.go:86-103](../../internal/workspaces/service.go#L86-L103)。
+- 项目列表和归属语义已由 T-054 合入；T-058 不需要项目管理实现：[projects.go:47-71](../../internal/server/projects.go#L47-L71)。
+- 会话响应没有 workspace ID，`Personal` 仍是 HomePage 常量：[auth.go:38-43](../../internal/server/auth.go#L38-L43)、[home-page.tsx:37-62](../../web/src/features/auth/pages/home-page.tsx#L37-L62)。T-058 必须等待 T-057 的真实身份来源。
+- 认证 `send` 私有且专用，退出只清会话：[auth/api.ts:11-18](../../web/src/features/auth/api.ts#L11-L18)、[auth/queries.ts:64-74](../../web/src/features/auth/queries.ts#L64-L74)。共享业务请求、401/403 和退出清理由 T-057 先行块交付。
+- 实际业务挂载点是 HomePage ready 分支；Query Provider 已装配：[home-page.tsx:37-62](../../web/src/features/auth/pages/home-page.tsx#L37-L62)、[main.tsx:9-18](../../web/src/main.tsx#L9-L18)。
+- Query 5.105.0、Router、Vitest/RTL/MSW/jsdom 已安装，`npm test` 已同时运行 Node 与 Vitest：[package.json:9-47](../../web/package.json#L9-L47)、[vite.config.ts:29-38](../../web/vite.config.ts#L29-L38)。本任务不新增测试框架或依赖。
+- T-055 的 foreign project UUID 是空结果，T-058 已确认 foreign UUID 为 400；两者保持各自既定行为，不在本计划统一。
 
 ## 3. 前置依赖与就绪检查
 
-### T-054：权限与管理数据就绪
+### 已满足：T-054/T-056
 
-实施前必须确认其 plan 已批准并合入，且实际代码仍提供：
+- 成员校验、项目归属、React Router、QueryClientProvider、认证会话与测试工具均已合入；本任务不重建。
+- T-056 明确不含 workspace 身份或空间切换，不能把固定 `Personal` 当成已满足。
 
-1. 浏览器会话用户到 `(user_id,workspace_id)` 成员角色的统一查询；owner/member 可读，非成员在查询前被拒绝。
-2. `projects`、`sources` 的 workspace 归属规则不改变；项目归档不回写历史事件。
-3. 当前 workspace 的获取方式及跨空间测试夹具可供浏览器面板使用。
+### 必须串行等待：T-055 → T-057 先行块 → T-057 页面块 → T-058
 
-本任务不另查一套成员表、不新增角色、不实现项目/来源管理端点。
-
-### T-056：前端基础就绪
-
-实施前必须确认其 plan 已批准并合入，并核对实际导出接口：
-
-1. 已装配 TanStack Query Provider、同源请求层、当前 workspace 身份、空间切换时取消/隔离旧请求的机制。
-2. 已有 F 风格设计变量、基础组件、减少动态效果的约定，以及面板实际挂载点。
-3. 固定 TanStack Query 版本并复核轮询/取消 API；本任务不修改 `web/package.json` 或锁文件。
-4. 提供 `workspaceID` 与面板属性接口。T-058 只声明 `workspaceID`、Provider/Model/Project 筛选和可选时间范围等输入，不假定 T-057 的全局筛选 store 已存在。
-
-### 共同就绪检查
-
-- 主代理确认 T-054/T-056 的实际路径与本计划第 8 节一致；若挂载点、请求层或类型路径不同，先修改 plan，再开工。
-- 在干净实施检出先跑 `make check`；专用 PostgreSQL 与 `TOKENPIVOT_TEST_DATABASE_URL`、`TOKENPIVOT_TEST_APP_DATABASE_URL` 就绪后再跑集成测试。两个变量只引用名字，不读取或输出其值。
-- 若 T-054/T-056 仍未合入、挂载点未知或 TanStack Query 未装配，本任务保持未就绪，不用临时请求框架或假数据绕过。
+1. T-055 合入后，T-057 先行块交付真实 current workspace、共享同源请求/错误、401/403、登录与退出业务缓存取消清理，以及总览选项来源。
+2. T-057 页面块交付 HomePage ready 分支的总览挂载与规范化 Provider/Model/Project 筛选；T-058 只消费这些输出，不读取或新建全局 store。
+3. `docs/openapi/openapi.yaml`、`internal/server/server.go`、`cmd/tokenpivot/main.go` 和 HomePage 在上述任务间串行移交；T-058 开工时主代理确认无其他未合入修改。
+4. 先在干净实施检出运行 `make check`。专用 PostgreSQL 与 `TOKENPIVOT_TEST_DATABASE_URL`、`TOKENPIVOT_TEST_APP_DATABASE_URL` 安全注入后再跑集成测试，只引用变量名。
+5. 任一前置缺失即停止，不用假 workspace、临时请求框架、Node 专用测试替代或假数据绕过。
 
 ## 4. 决策清单
 
@@ -85,7 +69,9 @@
 9. **新鲜度范围（用户已确认）**：只取当前 60 秒窗口内、符合筛选且已计入速率的事件之 `max(received_at)`；窗口无事件即为未知，不查询相同筛选下全部保留明细的最后接收时间。
 10. **默认明细交互（用户已确认）**：首屏默认最近 1 小时；可见最新页每 5 秒轮询，查看更早页时暂停明细自动刷新，返回最新页丢弃旧游标并重新查询；页面隐藏时暂停所有轮询。
 
-## 5. 接口设计（拟新增，先改 OpenAPI）
+## 5. 接口设计（拟新增，待用户批准，先改 OpenAPI）
+
+以下两个 GET 路径、响应 schema 及 T-057 共享导出均未在当前 HEAD 存在；用户批准后才可修改接口文档与代码。
 
 ### 5.1 共用准入、筛选和错误
 
@@ -217,14 +203,12 @@ GROUP BY p.as_of;
 
 ## 7. 面板数据流、刷新与错误
 
-1. `RequestLogPanel` 接收 `workspaceID`、规范化 Provider/Model/Project 筛选和可选时间范围；不直接读取或假设 T-057 store。筛选序列化集中在一个纯函数，API 请求、query key、cursor 重置共用同一份值。默认滚动范围与分页固定范围分开管理：默认最新页轮询始终省略 start/end，不把上次响应范围永久写回最新页请求；翻页使用 cursor 固定首页范围，返回最新页清空 cursor 和分页范围。用户显式选择的固定范围则始终保留。
-2. query key 至少包含 workspace、端点、全部筛选、start/end、cursor。改变 workspace/筛选/时间范围时清除 cursor 栈，使用新 key，不以旧 key 数据作为新筛选占位；queryFn 把 TanStack 提供的 AbortSignal 传给 fetch。
-3. 页面可见且位于最新页：速率与明细各以 5 秒 `refetchInterval` 刷新，`refetchIntervalInBackground=false`；恢复可见时立即重取。页面隐藏时速率与明细都停止轮询。页面可见但位于更早页：明细停止轮询，并禁用焦点恢复、网络重连等自动重取，只在用户翻页或返回最新页时查询；速率继续刷新，恢复可见时也只立即重取速率。具体查询选项在 T-056 固定版本后落实。返回最新页丢弃旧 cursor 与分页固定范围后重取。
-4. 这里“日志流式”是最新页到达新行时的视觉增量，不是 SSE，也不把多页拼成声称无缝的无限列表。动效遵守减少动态效果设置。
-5. 首次加载显示加载态；首次失败显示可重试错误，不渲染全零。已有成功数据的后续刷新失败时保留旧数据，但显著标“更新失败，数据截至该响应 end/as_of”，不得把旧值当当前值。
-6. 401/403 由 T-056 请求层统一处理；400 显示参数/链接失效并允许回到最新页；5xx/网络失败进入上述错误态。无事件、指标缺失、无新鲜度与请求失败是四种不同状态。
-7. 慢响应隔离由 key + AbortSignal 保证：旧 workspace/筛选响应即使后来完成，也只能进入旧 key，不得覆盖当前页面。组件卸载或参数变化不 setState。
-8. 旧响应比较使用服务端 `as_of/end`，不用浏览器本地时间判断数据是否当前；浏览器时钟只用于展示相对间隔。
+1. `RequestLogPanel` 从 T-057 页面接收真实 `workspaceID` 与规范化 Provider/Model/Project 筛选；不使用 URL workspace、全局 store 或第二份筛选状态。明细默认最近 1 小时和游标仍由面板本地管理，速率始终使用当前 60 秒；不继承总览趋势粒度。
+2. 共享 UI 的“未归属”选择在 T-058 API 适配层映射为 `unattributed`，不直接复用 T-055 的字面量 `unassigned`。Provider/Model 仍是独立维度，模型排名点击不会为明细伪造 Provider+Model 配对约束。
+3. 请求使用 T-057 共享同源请求函数与 AbortSignal；query key 包含 workspace、端点、全部筛选、start/end、cursor。筛选或时间范围改变时清空 cursor 栈，不用旧 key 数据占位。
+4. 可见最新页的明细与速率各 5 秒轮询；更早页停止明细所有自动重取而速率继续；隐藏页全部暂停；返回最新页丢弃旧游标并重取。沿用 QueryClient 已关闭的 focus/reconnect 默认行为，不新增第二套轮询器。
+5. 首次失败显示错误与重试，不显示全零；后续刷新失败保留并标记旧 `as_of/end`。401/403 使用 T-057 共享处理，退出后旧面板数据与在途请求均不得恢复；400 可回最新页，网络/5xx 不自动重试。
+6. “日志流式”只表示最新页新行的视觉增量，不是 SSE，不承诺跨页完整快照。旧响应是否可展示以服务端 `as_of/end` 判断，不用浏览器时钟推断新鲜度。
 
 ## 8. 精确文件范围
 
@@ -246,14 +230,14 @@ GROUP BY p.as_of;
 
 ### 前端
 
-- 拟新增 `web/src/features/requests/api.ts`：unknown 响应收窄、请求函数、AbortSignal、十进制聚合值处理。
-- 拟新增 `web/src/features/requests/model.ts`：筛选规范化、query key、cursor 状态、纯展示与轮询决策函数。
+- 拟新增 `web/src/features/requests/api.ts`：基于 T-057 共享请求函数做 unknown 收窄、`unattributed` 适配与十进制聚合值处理。
+- 拟新增 `web/src/features/requests/model.ts`：query key、cursor 状态、纯展示与轮询决策；不复制总览筛选解析。
 - 拟新增 `web/src/features/requests/useRequestLogs.ts`：TanStack Query 查询与刷新。
 - 拟新增 `web/src/features/requests/RequestLogPanel.tsx`：速率、新鲜度、明细、分页及错误/空态。
-- 拟新增 `web/test/request-details.test.mjs`：沿用 Node test；通过现有 Vite 模块加载能力测试纯 TS 模块、请求边界及 QueryClient/Observer 的慢响应行为，不引入 DOM 或浏览器自动化。
-- 挂载点暂记 `web/src/App.tsx` 为**待确认修改项**：若 T-056/T-057 最终提供别的页面入口，本任务只修改那个已确认入口，不并发改两个壳。
+- 拟新增就近 `*.test.ts(x)`：复用现有 Vitest + RTL + MSW，在 HTTP 边界验证请求、渲染、竞态、取消和轮询，不再设计 Node-only 面板测试。
+- 修改 `web/src/features/overview/OverviewPage.tsx`：把面板接入已合入总览并传递 workspace/筛选；若实际组合需要改 HomePage，只由本串行块局部修改，不新建路由或应用壳。
 
-`web/package.json`、`web/package-lock.json` 归 T-056；本任务不拥有、不新增依赖。若 T-056 已有等价 api/model/test 组织，沿用其目录并先更新本节，不能另建第二套请求层。
+`web/package.json`、`web/package-lock.json`、Vitest 配置与共享请求/认证清理由 T-057 对应块拥有；T-058 不修改、不新增依赖。
 
 ## 9. 有序实施步骤
 
@@ -261,8 +245,8 @@ GROUP BY p.as_of;
 2. 先修改 OpenAPI，冻结路径、筛选、游标、精度、错误和质量口径；主代理审阅后再写代码。
 3. 实现 requestdetails 纯类型/校验与 PostgreSQL 查询；先写固定 as_of 的 60 秒边界、相同时间游标和缺失/估算集成测试。
 4. 实现 HTTP 适配与装配，复用会话、membership、noStore 和安全错误；先完成跨空间拒绝与 owner/member 读取测试。
-5. 在 T-056 请求层上实现 api/model/hooks，再实现面板；不建立并行筛选状态，不修改依赖清单。
-6. 完成 Node 层慢响应、筛选重置、轮询停止、加载失败和字段不可用测试；不做 UI 自动化。
+5. 在 T-057 共享请求与身份上实现 api/model/hooks，再实现面板；不建立并行筛选状态，不修改依赖清单。
+6. 用现有 Vitest/RTL/MSW 完成慢响应、筛选重置、退出清理、轮询停止、加载失败和字段不可用测试；不做 UI 自动化。
 7. 在接近每日 10 万事件、180 天约 1800 万明细的规划量级或主代理批准的代表性数据量上 EXPLAIN；记录数据量与执行计划，不把结果写成未验证的生产 SLA。
 8. 跑第 10 节全部检查，只读 review 后由主代理按项目流程收尾。
 
@@ -276,12 +260,13 @@ GROUP BY p.as_of;
 4. **零/缺失/估算/溢出**：全 known 零得到 value="0"；无事件与全 missing 都是 null 但 UI 文案不同；known+estimated+missing 同时存在时和、三类计数与“含估算/部分覆盖”正确。两个接近 `2^53-1` 的事件求和仍由十进制字符串精确呈现。
 5. **相同时间稳定分页**：多条 occurred_at 完全相同时按 id DESC 且跨页无重复；limit+1 不泄露额外行，空页/末页 next_cursor 语义正确，非法或时间范围不匹配的 cursor 返回 400。推进时钟后仅携带 cursor 翻页仍成功且范围不变；显式范围与 cursor 按时间点比较；返回默认最新页重新生成最近一小时范围并能发现新事件，固定自定义范围不漂移。
 6. **并发新事件**：首页后插入头部新事件及与首页末行同 occurred_at 的事件，使用原 cursor 的下一页不重复已返回 id；再插入落入已越过位置的历史补报，分别验证重新查询后：首页排序范围内的补报可见，较深位置补报需重新翻到对应页，已离开默认范围的补报不保证可见、改为覆盖它的显式范围后可查到。不错误声称固定快照。
-7. **筛选一致**：Provider/Model 多选、Project UUID+unattributed 组合对明细和速率使用同一条件；foreign project UUID 在成员校验后统一 400，不能降为未归属或返回他空间数据。
+7. **筛选一致与字面量边界**：Provider/Model 多选、Project UUID+unattributed 组合对明细和速率使用同一条件；共享未归属选择只在 T-058 适配为 `unattributed`，不改 T-055 的 `unassigned`。foreign project UUID 在成员校验后统一 400，不能降为未归属、空结果或返回他空间数据。
 8. **跨空间拒绝**：owner/member 可读自己的 workspace；非成员访问路径 workspace 得到 403 且 store 未被调用；A 的会话不能读取 B 的明细或速率，join 也不能带出 B 的项目/来源名称。
 9. **字段不支持**：status/duration null、各 Token missing 均显示不可用；0 不显示不可用；project null 显示未归属；不存在插件版本等字段不编造。
 10. **加载失败**：首次 5xx/网络失败显示错误与重试、不显示全零；后续轮询失败保留但标记旧 as_of；401/403 走统一处理，400 可回最新页。
-11. **筛选过期响应**：A 筛选请求被延迟，切换 B 后让 A 最后返回；当前仍只显示 B，A 不覆盖 B，workspace 切换同样成立。cursor 被清空，AbortSignal 传到 fetch。
-12. **轮询与分页**：最新页可见时 5 秒刷新；页面隐藏时速率与明细都停止轮询；页面可见但位于更早页时停止明细的所有自动重取，速率仍可刷新。执行“更早页→隐藏→恢复可见”及网络重连测试，断言明细请求数不增加而速率恢复；返回最新页丢弃旧游标并重取。测试使用可控定时器/QueryObserver，不只测试纯轮询决策函数，不用 sleep 或 UI 自动化。
+11. **筛选过期响应与退出清理**：A 筛选请求被延迟，切换 B 后让 A 最后返回；当前仍只显示 B，cursor 被清空，AbortSignal 传到 fetch。以不同 workspaceID 属性做缓存隔离测试即可，不新增空间切换 UI；退出后迟到响应不能复活面板数据。
+12. **轮询与分页**：最新页可见时 5 秒刷新；页面隐藏时速率与明细都停止轮询；页面可见但位于更早页时停止明细的所有自动重取，速率仍可刷新。执行“更早页→隐藏→恢复可见”及网络重连测试，断言明细请求数不增加而速率恢复；返回最新页丢弃旧游标并重取。测试使用现有 Vitest 假计时器 + RTL/MSW 或 QueryObserver，不只测试纯决策函数，不用 sleep 或 UI 自动化。
+13. **共享基础复用**：current workspace、401/403 与退出清理由 T-057 测试先行证明，T-058 增加面板集成断言；依赖树没有新增测试框架、Router、Query 或第二请求层。
 
 ### 真实仓库检查命令
 
@@ -308,15 +293,16 @@ make test-integration
 
 **单块，不拆。** 两个端点共享筛选、质量和权限语义，面板同时消费它们，拆成并行后端/前端会增加接口协调与 OpenAPI 冲突。
 
-共享基础先行顺序固定：T-054 权限与归属 → T-056 请求层/页面基础 → 本任务 OpenAPI → Go 查询与 HTTP → 前端面板。T-055/T-057 不构成本任务接口前提；若主代理并行安排它们，OpenAPI、`App` 或最终页面挂载点由主代理串行收口，本任务不得各自创建竞争入口。依赖清单和锁文件始终归 T-056。
+共享基础先行顺序固定：T-054/T-056（已合入）→ T-055 → T-057 共享基础 → T-057 总览页面 → 本任务 OpenAPI → Go 查询与 HTTP → 前端面板。T-055 不是本任务的数据接口前提，但共享 OpenAPI、`server.go`、`main.go` 必须串行；T-057 是身份、请求和挂载的直接前提。T-058 唯一拥有其阶段的明细/速率 OpenAPI 与装配修改，页面块只局部接入已存在 OverviewPage/HomePage；不修改依赖清单、锁文件或 T-057 共享基础。
 
 ## 12. 风险、回退与未核实事项
 
 - **新鲜度口径边界**：已确认的窗口口径与速率数据一致，但窗口无事件时无法说明筛选来源最近是否还有历史数据到达；UI 必须显示未知，不能用在线文案掩盖。
 - **分页与补报风险**：keyset 不是跨请求快照；已明确可见性边界。如果产品要求严格固定快照，需要另行设计，不在本任务加长期事务或快照导出。
 - **筛选性能风险**：现有索引以 workspace+occurred_at 开头，高度选择性项目/模型筛选可能产生残余扫描；无真实执行计划前不承诺 P95，也不预建索引。
-- **依赖接口风险**：T-054/T-056 尚未实现，前端挂载点、请求层和当前 workspace API 未核实；这不影响规划完成，但实施前必须核对，若实际接口不同须先更新计划。
-- **测试能力未核实**：Node + Vite 加载纯 TS 与 TanStack QueryObserver 的组合需在 T-056 固定版本后验证；若不成立，沿用其已安装的测试设施调整测试实现，不为本任务新增第二套框架。
+- **公开接口批准**：第 5 节两个 GET 及响应格式仍为待用户批准；T-057 的 current workspace/共享导出未批准或未合入时，本任务不可实施。
+- **依赖串行风险**：T-055/T-057 的最终代码仍需在开工时核对；不得并行争写 OpenAPI、装配文件或页面入口。
+- **测试环境**：Vitest/RTL/MSW 已存在，但本面板的真实取消、假计时器和可见性组合仍须由本任务测试证明；失败时修实现或测试环境，不新增第二套框架。
 - **回退**：无数据迁移，回退由主代理撤销本任务实现提交并一起回退前端/API 产物；OpenAPI 同步回退。若后续因 EXPLAIN 新增迁移，回退另按该迁移评审，不在本计划预设 Down 删除线上索引。
 
 ## 13. 用户已确认的产品决策
@@ -337,4 +323,4 @@ make test-integration
 | `refetchInterval` 支持定时刷新，默认后台标签页暂停；采用 5 秒、不开 background，不需要 SSE | [TanStack Query Polling](https://tanstack.com/query/latest/docs/framework/react/guides/polling) | 2026-10-28 抓取；已核实当前 latest 文档，T-056 固定版本后须复核 |
 | queryFn 可消费 AbortSignal 并传给 fetch；采用 key 隔离 + 取消处理旧筛选/旧 workspace 慢响应 | [TanStack Query Cancellation](https://tanstack.com/query/latest/docs/framework/react/guides/query-cancellation) | 2026-10-28 抓取；已核实当前 latest 文档，实际组合待项目测试 |
 
-未核实：T-056 最终 TanStack Query 版本、代表性数据量下的执行计划与响应时间、Node/Vite 测试组合。它们均已列为实施前检查，未写成既定事实。
+本轮未新增外部查证；TanStack Query 5.105.0 已在当前 HEAD 固定。仍未核实：代表性数据量下的执行计划与响应时间、T-055/T-057 最终合入形态，以及本面板测试中的定时器/取消组合。它们均已列为实施前检查，未写成既定事实。

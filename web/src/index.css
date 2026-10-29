@@ -1,17 +1,65 @@
 @import "tailwindcss";
 
+/* F 极客终端原型（docs/prototypes/dashboard-f.html）的单一深色主题。 */
 :root {
-  --background: oklch(0.98 0 0);
-  --foreground: oklch(0.2 0 0);
+  --background: #0a0a0b;
+  --card: #0e0e10;
+  --foreground: #f4f1ea;
+  --muted-foreground: #a9a49a;
+  --subtle: #6e6a62;
+  --border: rgba(244, 241, 234, 0.11);
+  --divider: rgba(244, 241, 234, 0.055);
+  --primary: #e0a64b;
+  --primary-foreground: #0a0a0b;
+  --success: #8fbf7f;
+  --destructive: #d97b6b;
+  --accent: rgba(244, 241, 234, 0.07);
+  --accent-foreground: #f4f1ea;
+  --font-terminal:
+    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono",
+    monospace;
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-card: var(--card);
   --color-foreground: var(--foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-subtle: var(--subtle);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-divider: var(--divider);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-ring: var(--primary);
+  --color-success: var(--success);
+  --color-destructive: var(--destructive);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --font-sans: var(--font-terminal);
+  --font-mono: var(--font-terminal);
+  --radius-sm: 2px;
+  --radius-md: 3px;
+  --radius-lg: 3px;
 }
 
 @layer base {
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground font-mono antialiased;
+    font-variant-numeric: tabular-nums;
+    color-scheme: dark;
+  }
+
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-ring;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      transition: none !important;
+      animation: none !important;
+    }
   }
 }
