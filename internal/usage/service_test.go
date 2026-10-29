@@ -877,6 +877,17 @@ func TestMinuteBoundaryRejectsAnyNonZeroFractionDigit(t *testing.T) {
 			"2026-10-28T00:00:00.00000000001Z",
 			"2026-10-28T00:00:00.000000000000001Z",
 			"2026-10-28T00:00:00.5Z",
+			"2026-10-28T0:00:00.0000000001Z",  // one-digit hour, long fraction
+			"2026-10-28T0:00:00Z",             // one-digit hour
+			"2026-10-28T00:00:00,0000000001Z", // comma fraction, non-zero
+			"2026-10-28T00:00:00,0Z",          // comma fraction, all zero
+			"2026-10-28T00:00:00.Z",           // empty fraction
+			"2026-10-28T00:00:00+24:00",       // illegal offset hour
+			"2026-10-28T00:00:00+00:60",       // illegal offset minute
+			"2026-10-28T00:00:00.0000000001+08:00",
+			"2026-10-28t00:00:00Z",
+			"2026-10-28T00:00:00z",
+			"2026-10-28T00:00:00",
 		} {
 			store := &fakeStore{}
 			s, _, _ := newTestService(store)
@@ -888,10 +899,17 @@ func TestMinuteBoundaryRejectsAnyNonZeroFractionDigit(t *testing.T) {
 			}
 		}
 	}
-	for _, ok := range []string{"2026-10-28T00:00:00.0Z", "2026-10-28T00:00:00.000000000000Z"} {
+	for _, ok := range []string{
+		"2026-10-28T00:00:00.0Z", "2026-10-28T00:00:00.000000000000Z",
+		"2026-10-28T08:00:00.0000000000000+08:00", "2026-10-28T00:00:00-23:59",
+		"2026-10-28T05:30:00+05:30", "2024-02-29T00:00:00Z",
+	} {
 		if _, err := parseMinute(ok); err != nil {
-			t.Fatalf("all-zero fraction %q rejected: %v", ok, err)
+			t.Fatalf("valid minute %q rejected: %v", ok, err)
 		}
+	}
+	if _, err := parseMinute("2026-02-29T00:00:00Z"); err == nil {
+		t.Fatal("non-leap Feb 29 accepted")
 	}
 }
 
