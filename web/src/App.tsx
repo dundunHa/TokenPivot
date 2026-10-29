@@ -1,14 +1,15 @@
-import { cn } from "@/lib/utils";
+import { Navigate, Route, Routes } from "react-router";
+import { HomePage } from "@/features/auth/pages/home-page";
+import { LoginPage } from "@/features/auth/pages/login-page";
+import { RegisterPage } from "@/features/auth/pages/register-page";
 
 export function App() {
   return (
-    <main
-      className={cn(
-        "mx-auto flex min-h-screen max-w-3xl flex-col justify-center gap-4 p-8",
-      )}
-    >
-      <h1>TokenPivot</h1>
-      <p>工程占位页：前端接入已准备，业务功能尚未提供。</p>
-    </main>
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/register" element={<RegisterPage />} />
+      <Route path="/" element={<HomePage />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
 }
