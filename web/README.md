@@ -41,7 +41,7 @@ npm --prefix web run dev
 
 页面固定 `http://127.0.0.1:5173`，端口被占用就失败，不漂移端口。默认 Go 地址 `http://127.0.0.1:8080`。仅代理 `/api`、`/api?x=1`、`/api/...`，不代理 `/apix` 或 `/healthz`。健康检查直接访问 Go。
 
-需要覆盖上游时在启动 Vite 的进程设置 `TOKENPIVOT_DEV_API_TARGET`，值必须为没有凭证、路径、查询或片段的 HTTP(S) origin（允许末尾 `/`）；显式空值与无效值拒绝且错误不回显输入。不加载该变量的 dotenv 配置，不使用 VITE_ 前缀，不注入客户端产物。Go 地址仍通过已有 `TOKENPIVOT_HTTP_ADDR` 配置。
+需要覆盖上游时在启动 Vite 的进程设置 `TOKENPIVOT_DEV_API_TARGET`，值必须为没有凭证、路径、查询或片段的 HTTP(S) origin（允许末尾 `/`）；显式空值与无效值拒绝且错误不回显输入。不加载该变量的 dotenv 配置，不使用 VITE\_ 前缀，不注入客户端产物。Go 地址仍通过已有 `TOKENPIVOT_HTTP_ADDR` 配置。
 
 未来浏览器只请求相对 `/api/...`。代理不去前缀、不重写 Host/Origin/Cookie/Set-Cookie、不伪造认证头，也不打开 WebSocket。上游错误保留，连接失败不返回页面。开发无需 CORS；保留 Origin 不代表允许来源或会话认证已经完成。
 
