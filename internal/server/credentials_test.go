@@ -22,12 +22,13 @@ import (
 // SQL semantics the service relies on, plus call counters so a rejected request
 // can be proven to have stopped before persistence.
 type credentialFakeStore struct {
-	mu      sync.Mutex
-	sources map[[16]byte][16]byte // source id -> owning workspace id
-	rows    map[[16]byte]credentialRow
-	digests [][]byte
-	calls   map[string]int
-	failure struct {
+	mu       sync.Mutex
+	sources  map[[16]byte][16]byte // source id -> owning workspace id
+	archived map[[16]byte]bool     // archived source ids
+	rows     map[[16]byte]credentialRow
+	digests  [][]byte
+	calls    map[string]int
+	failure  struct {
 		list   error
 		source error
 		byID   error
@@ -44,9 +45,10 @@ type credentialRow struct {
 
 func newCredentialFakeStore() *credentialFakeStore {
 	return &credentialFakeStore{
-		sources: make(map[[16]byte][16]byte),
-		rows:    make(map[[16]byte]credentialRow),
-		calls:   make(map[string]int),
+		sources:  make(map[[16]byte][16]byte),
+		archived: make(map[[16]byte]bool),
+		rows:     make(map[[16]byte]credentialRow),
+		calls:    make(map[string]int),
 	}
 }
 
@@ -67,6 +69,11 @@ func (f *credentialFakeStore) callCount(name string) int {
 func (f *credentialFakeStore) identifier() credentials.ID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.nextCredentialID()
+}
+
+// nextCredentialID is identifier for callers that already hold the mutex.
+func (f *credentialFakeStore) nextCredentialID() credentials.ID {
 	var id [16]byte
 	f.nextID[15]++
 	if f.nextID[15] == 0 {
@@ -130,20 +137,6 @@ func (f *credentialFakeStore) BySecretHash(ctx context.Context, secretHash []byt
 	return credentials.Credential{}, false, nil
 }
 
-func (f *credentialFakeStore) ByID(ctx context.Context, workspaceID, credentialID credentials.ID) (credentials.Credential, bool, error) {
-	f.record("ByID")
-	if f.failure.byID != nil {
-		return credentials.Credential{}, false, f.failure.byID
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	row, ok := f.rows[credentialID.Bytes]
-	if !ok || row.credential.WorkspaceID.Bytes != workspaceID.Bytes {
-		return credentials.Credential{}, false, nil
-	}
-	return row.credential, true, nil
-}
-
 func (f *credentialFakeStore) SourceExists(ctx context.Context, workspaceID, sourceID credentials.ID) (bool, error) {
 	f.record("SourceExists")
 	if f.failure.source != nil {
@@ -155,14 +148,43 @@ func (f *credentialFakeStore) SourceExists(ctx context.Context, workspaceID, sou
 	return ok && owner == workspaceID.Bytes, nil
 }
 
-func (f *credentialFakeStore) Insert(ctx context.Context, workspaceID, sourceID credentials.ID, secretHash []byte) (credentials.Credential, error) {
-	f.record("Insert")
+func (f *credentialFakeStore) IssueActive(ctx context.Context, workspaceID, sourceID credentials.ID, secretHash []byte) (credentials.Credential, error) {
+	f.record("IssueActive")
+	if f.failure.source != nil {
+		return credentials.Credential{}, f.failure.source
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.insertLocked(workspaceID, sourceID, secretHash)
+}
+
+func (f *credentialFakeStore) RotateActive(ctx context.Context, workspaceID, credentialID credentials.ID, secretHash []byte) (credentials.Credential, error) {
+	f.record("RotateActive")
+	if f.failure.byID != nil {
+		return credentials.Credential{}, f.failure.byID
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.rows[credentialID.Bytes]
+	if !ok || row.credential.WorkspaceID.Bytes != workspaceID.Bytes {
+		return credentials.Credential{}, credentials.ErrNotFound
+	}
+	return f.insertLocked(row.credential.WorkspaceID, row.credential.SourceID, secretHash)
+}
+
+func (f *credentialFakeStore) insertLocked(workspaceID, sourceID credentials.ID, secretHash []byte) (credentials.Credential, error) {
+	owner, ok := f.sources[sourceID.Bytes]
+	if !ok || owner != workspaceID.Bytes {
+		return credentials.Credential{}, credentials.ErrNotFound
+	}
+	if f.archived[sourceID.Bytes] {
+		return credentials.Credential{}, credentials.ErrSourceArchived
+	}
 	if f.failure.insert != nil {
 		return credentials.Credential{}, f.failure.insert
 	}
-	credential := credentials.Credential{ID: f.identifier(), WorkspaceID: workspaceID, SourceID: sourceID}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.calls["Insert"]++
+	credential := credentials.Credential{ID: f.nextCredentialID(), WorkspaceID: workspaceID, SourceID: sourceID}
 	f.digests = append(f.digests, append([]byte(nil), secretHash...))
 	f.rows[credential.ID.Bytes] = credentialRow{credential: credential, hash: append([]byte(nil), secretHash...)}
 	return credential, nil

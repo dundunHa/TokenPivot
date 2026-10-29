@@ -30,6 +30,9 @@ var (
 	// ErrNotFound reports a source or credential that does not belong to the
 	// given workspace. It never distinguishes missing rows from foreign ones.
 	ErrNotFound = errors.New("credentials: not found")
+	// ErrSourceArchived reports an issue or rotate request for an archived
+	// source. No credential row is written in that case.
+	ErrSourceArchived = errors.New("credentials: source is archived")
 )
 
 // Credential is the ingest identity: its fixed ownership plus revocation state.
@@ -56,12 +59,18 @@ type store interface {
 	List(ctx context.Context, workspaceID, sourceID ID) ([]Credential, error)
 	// BySecretHash returns the credential with this digest, if any.
 	BySecretHash(ctx context.Context, secretHash []byte) (Credential, bool, error)
-	// ByID returns the credential when it belongs to the workspace, if any.
-	ByID(ctx context.Context, workspaceID, credentialID ID) (Credential, bool, error)
 	// SourceExists reports whether the source belongs to the workspace.
 	SourceExists(ctx context.Context, workspaceID, sourceID ID) (bool, error)
-	// Insert stores one new credential row and returns its database identity.
-	Insert(ctx context.Context, workspaceID, sourceID ID, secretHash []byte) (Credential, error)
+	// IssueActive stores one new credential for the source in one short
+	// transaction that first locks the source row. A source outside the
+	// workspace yields ErrNotFound and an archived one ErrSourceArchived; in both
+	// cases nothing is written.
+	IssueActive(ctx context.Context, workspaceID, sourceID ID, secretHash []byte) (Credential, error)
+	// RotateActive reads the old credential of the workspace, locks its fixed
+	// source row and stores a new credential for that same source, all in one
+	// transaction. A missing credential yields ErrNotFound and an archived source
+	// ErrSourceArchived.
+	RotateActive(ctx context.Context, workspaceID, credentialID ID, secretHash []byte) (Credential, error)
 	// Revoke stamps revoked_at once; false means no row matched.
 	Revoke(ctx context.Context, workspaceID, credentialID ID) (bool, error)
 }
@@ -124,31 +133,32 @@ func (s *Service) List(ctx context.Context, workspaceID, sourceID ID) ([]Credent
 	return s.store.List(ctx, workspaceID, sourceID)
 }
 
-// Issue creates a credential for an existing source of the workspace. A source
-// outside the workspace yields ErrNotFound and inserts no row.
+// Issue creates a credential for an active source of the workspace. A source
+// outside the workspace yields ErrNotFound, an archived source
+// ErrSourceArchived, and neither inserts a row. The store checks the source and
+// inserts under one source row lock, so an archive cannot interleave.
 func (s *Service) Issue(ctx context.Context, workspaceID, sourceID ID) (IssuedCredential, error) {
-	exists, err := s.store.SourceExists(ctx, workspaceID, sourceID)
+	token := newToken()
+	hash := secretHash(token)
+	credential, err := s.store.IssueActive(ctx, workspaceID, sourceID, hash[:])
 	if err != nil {
 		return IssuedCredential{}, err
 	}
-	if !exists {
-		return IssuedCredential{}, ErrNotFound
-	}
-	return s.issue(ctx, workspaceID, sourceID)
+	return IssuedCredential{Credential: credential, Token: token}, nil
 }
 
 // Rotate creates a new credential for the fixed workspace and source of an
 // existing credential, active or revoked. The old row is left untouched: it is
-// neither revived nor re-revoked, so both rows can be active at once.
+// neither revived nor re-revoked, so both rows can be active at once. The source
+// is never taken from the caller and must still be active.
 func (s *Service) Rotate(ctx context.Context, workspaceID, credentialID ID) (IssuedCredential, error) {
-	old, found, err := s.store.ByID(ctx, workspaceID, credentialID)
+	token := newToken()
+	hash := secretHash(token)
+	credential, err := s.store.RotateActive(ctx, workspaceID, credentialID, hash[:])
 	if err != nil {
 		return IssuedCredential{}, err
 	}
-	if !found {
-		return IssuedCredential{}, ErrNotFound
-	}
-	return s.issue(ctx, old.WorkspaceID, old.SourceID)
+	return IssuedCredential{Credential: credential, Token: token}, nil
 }
 
 // Revoke revokes one credential of the workspace. Revoking an already revoked
@@ -165,13 +175,44 @@ func (s *Service) Revoke(ctx context.Context, workspaceID, credentialID ID) erro
 	return nil
 }
 
-// issue generates a token and stores only its digest.
-func (s *Service) issue(ctx context.Context, workspaceID, sourceID ID) (IssuedCredential, error) {
-	token := newToken()
-	hash := secretHash(token)
-	credential, err := s.store.Insert(ctx, workspaceID, sourceID, hash[:])
+// issueTx is the transaction-bound surface of issuing and rotating. Only a store
+// bound to an open transaction satisfies it, so the source lock is held until
+// that transaction ends.
+type issueTx interface {
+	// lockSource locks the source row of the workspace (SELECT ... FOR UPDATE).
+	lockSource(ctx context.Context, workspaceID, sourceID ID) (found, archived bool, err error)
+	// byID reads one credential of the workspace.
+	byID(ctx context.Context, workspaceID, credentialID ID) (Credential, bool, error)
+	// insert stores one new credential row.
+	insert(ctx context.Context, workspaceID, sourceID ID, secretHash []byte) (Credential, error)
+}
+
+// issueActive runs the fixed issue order: lock the source, refuse a missing or
+// archived one, only then insert. The caller owns commit and rollback.
+func issueActive(ctx context.Context, tx issueTx, workspaceID, sourceID ID, secretHash []byte) (Credential, error) {
+	found, archived, err := tx.lockSource(ctx, workspaceID, sourceID)
 	if err != nil {
-		return IssuedCredential{}, err
+		return Credential{}, err
 	}
-	return IssuedCredential{Credential: credential, Token: token}, nil
+	if !found {
+		return Credential{}, ErrNotFound
+	}
+	if archived {
+		return Credential{}, ErrSourceArchived
+	}
+	return tx.insert(ctx, workspaceID, sourceID, secretHash)
+}
+
+// rotateActive runs the fixed rotate order: read the old credential, lock the
+// source it is fixed to, refuse an archived source, only then insert for that
+// same workspace and source.
+func rotateActive(ctx context.Context, tx issueTx, workspaceID, credentialID ID, secretHash []byte) (Credential, error) {
+	old, found, err := tx.byID(ctx, workspaceID, credentialID)
+	if err != nil {
+		return Credential{}, err
+	}
+	if !found {
+		return Credential{}, ErrNotFound
+	}
+	return issueActive(ctx, tx, old.WorkspaceID, old.SourceID, secretHash)
 }

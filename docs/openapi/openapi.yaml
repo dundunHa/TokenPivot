@@ -457,6 +457,10 @@ tags:
     description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出这些写操作必须携带与可信 Web origin 完全一致的 `Origin`。'
   - name: credentials
     description: 'owner 管理接入凭证的端点。只认浏览器会话 Cookie 且要求 workspace owner；列表是读请求、不要求 `Origin`，签发、轮换、撤销三个写操作必须携带可信 `Origin`。插件令牌 `tpk_` 不能用于这些路径。'
+  - name: projects
+    description: 'workspace 内项目管理端点。owner 可创建、修改、归档，member 只读；写操作必须携带可信 `Origin`。DELETE 是保留历史的归档。'
+  - name: sources
+    description: 'workspace 内数据来源管理端点。owner 可创建、修改、归档，member 只读；写操作必须携带可信 `Origin`。归档来源会在同一事务内撤销其有效凭证，历史全部保留。'
 
 paths:
   /api/v1/ingestion/events:
@@ -852,6 +856,340 @@ paths:
           $ref: '#/components/responses/AuthInternal'
         '503':
           $ref: '#/components/responses/AuthUnavailable'
+  /api/v1/workspaces/{workspaceID}/projects:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - projects
+      operationId: listProjects
+      summary: 列出 workspace 下的项目（含已归档）
+      description: |
+        读请求：要求有效浏览器会话，owner 与 member 均可读，非成员 `403`；**不要求 `Origin`**。成员角色数据库故障返回 `500 INTERNAL`，绝不当作非成员；会话存储故障返回 `503 UNAVAILABLE`。
+
+        按 `created_at, id` 升序返回，空列表为 `[]`，已归档项目也包含在内并带 `archived_at`。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '项目列表。'
+          headers:
+              Cache-Control:
+                $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectList'
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+    post:
+      tags:
+        - projects
+      operationId: createProject
+      summary: 创建项目
+      description: |
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+
+        请求体上限 16 KiB（超出 `413 BODY_TOO_LARGE`），`Content-Type` 必须为 `application/json`（否则 `415`）。严格解码：拒绝非 UTF-8、未知字段、重复键、尾随 JSON、`null` 字段与错误类型；文本字段为 1–128 UTF-8 字节、不含控制字符、不含首尾 Unicode 空白，且不做 trim 或大小写归一化。
+
+        请求 `{"project_key","name"}` 两者必填；workspace 只取路径并在创建后固定。创建**不是幂等操作**：重复提交同一 `project_key` 返回 `409 CONFLICT`，不会返回已有行。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreateRequest'
+      responses:
+        '201':
+          description: '项目已创建，返回完整对象。'
+          headers:
+              Cache-Control:
+                $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '409':
+          $ref: '#/components/responses/ManagementConflict'
+        '413':
+          $ref: '#/components/responses/ManagementBodyTooLarge'
+        '415':
+          $ref: '#/components/responses/ManagementUnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+  /api/v1/workspaces/{workspaceID}/projects/{projectID}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+      - $ref: '#/components/parameters/ProjectID'
+    patch:
+      tags:
+        - projects
+      operationId: updateProject
+      summary: 修改项目名称
+      description: |
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+
+        请求体上限 16 KiB（超出 `413 BODY_TOO_LARGE`），`Content-Type` 必须为 `application/json`（否则 `415`）。严格解码：拒绝非 UTF-8、未知字段、重复键、尾随 JSON、`null` 字段与错误类型；文本字段为 1–128 UTF-8 字节、不含控制字符、不含首尾 Unicode 空白，且不做 trim 或大小写归一化。
+
+        只允许 `{"name"}`；`project_key` 本期不可修改。重复提交相同值是幂等的，仍返回 `200` 和当前对象。项目属于另一空间时与不存在一样返回 `404 NOT_FOUND`。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectUpdateRequest'
+      responses:
+        '200':
+          description: '修改后的完整项目对象。'
+          headers:
+              Cache-Control:
+                $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '404':
+          $ref: '#/components/responses/ManagementNotFound'
+        '413':
+          $ref: '#/components/responses/ManagementBodyTooLarge'
+        '415':
+          $ref: '#/components/responses/ManagementUnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+    delete:
+      tags:
+        - projects
+      operationId: archiveProject
+      summary: 归档项目
+      description: |
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+
+        **DELETE 是归档，不是物理删除**：保留行、事件（`usage_events`）、分钟聚合（`usage_minute_stats`）与凭证记录，不重新归属；无恢复接口；归档行仍占用唯一键，因此删除后用相同键再次创建仍返回 `409 CONFLICT`。请求体必须为空，重复 DELETE 返回 `204` 且保留第一次 `archived_at`。
+
+        项目归档后采集接口仍按既有语义接收绑定该项目的事件。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      responses:
+        '204':
+          description: '已归档（或此前已归档），无响应体。'
+          headers:
+              Cache-Control:
+                $ref: '#/components/headers/NoStore'
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '404':
+          $ref: '#/components/responses/ManagementNotFound'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+  /api/v1/workspaces/{workspaceID}/sources:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - sources
+      operationId: listSources
+      summary: 列出 workspace 下的数据来源（含已归档）
+      description: |
+        读请求：要求有效浏览器会话，owner 与 member 均可读，非成员 `403`；**不要求 `Origin`**。成员角色数据库故障返回 `500 INTERNAL`，绝不当作非成员；会话存储故障返回 `503 UNAVAILABLE`。
+
+        按 `created_at, id` 升序返回，空列表为 `[]`，已归档来源也包含在内并带 `archived_at`。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '来源列表。'
+          headers:
+              Cache-Control:
+                $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceList'
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+    post:
+      tags:
+        - sources
+      operationId: createSource
+      summary: 创建数据来源
+      description: |
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+
+        请求体上限 16 KiB（超出 `413 BODY_TOO_LARGE`），`Content-Type` 必须为 `application/json`（否则 `415`）。严格解码：拒绝非 UTF-8、未知字段、重复键、尾随 JSON、`null` 字段与错误类型；文本字段为 1–128 UTF-8 字节、不含控制字符、不含首尾 Unicode 空白，且不做 trim 或大小写归一化。
+
+        请求 `{"platform","instance_key"}` 两者必填；不新增 DSH/PI 白名单。创建来源**不会**自动创建凭证，owner 随后调用凭证签发接口。创建不是幂等操作：重复的 `(platform, instance_key)` 返回 `409 CONFLICT`。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SourceCreateRequest'
+      responses:
+        '201':
+          description: '来源已创建，返回完整对象。'
+          headers:
+              Cache-Control:
+                $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Source'
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '409':
+          $ref: '#/components/responses/ManagementConflict'
+        '413':
+          $ref: '#/components/responses/ManagementBodyTooLarge'
+        '415':
+          $ref: '#/components/responses/ManagementUnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+  /api/v1/workspaces/{workspaceID}/sources/{sourceID}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+      - $ref: '#/components/parameters/SourceID'
+    patch:
+      tags:
+        - sources
+      operationId: updateSource
+      summary: 修改来源机器标识
+      description: |
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+
+        请求体上限 16 KiB（超出 `413 BODY_TOO_LARGE`），`Content-Type` 必须为 `application/json`（否则 `415`）。严格解码：拒绝非 UTF-8、未知字段、重复键、尾随 JSON、`null` 字段与错误类型；文本字段为 1–128 UTF-8 字节、不含控制字符、不含首尾 Unicode 空白，且不做 trim 或大小写归一化。
+
+        只允许 `platform` 与 `instance_key`，至少提供一个，未提供的保持不变；二者只是机器标识，`source_id`、workspace、事件归属、凭证绑定与令牌均不变（插件继续使用原令牌）。重复提交相同值是幂等的；与同空间其他来源冲突返回 `409 CONFLICT`。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SourceUpdateRequest'
+      responses:
+        '200':
+          description: '修改后的完整来源对象。'
+          headers:
+              Cache-Control:
+                $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Source'
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '404':
+          $ref: '#/components/responses/ManagementNotFound'
+        '409':
+          $ref: '#/components/responses/ManagementConflict'
+        '413':
+          $ref: '#/components/responses/ManagementBodyTooLarge'
+        '415':
+          $ref: '#/components/responses/ManagementUnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+    delete:
+      tags:
+        - sources
+      operationId: archiveSource
+      summary: 归档来源并撤销其有效凭证
+      description: |
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+
+        **DELETE 是归档，不是物理删除**：保留行、事件（`usage_events`）、分钟聚合（`usage_minute_stats`）与凭证记录，不重新归属；无恢复接口；归档行仍占用唯一键，因此删除后用相同键再次创建仍返回 `409 CONFLICT`。请求体必须为空，重复 DELETE 返回 `204` 且保留第一次 `archived_at`。
+
+        同一事务内先锁定来源行、写 `archived_at`，再把该来源下 `revoked_at IS NULL` 的凭证撤销（已撤销行不变，令牌摘要与 `source_id` 不变）；与凭证签发/轮换使用同一把来源行锁，因此归档提交之后不会再有有效凭证，已归档来源的签发/轮换返回 `409 CONFLICT`。
+
+        归档响应只保证**新的**采集认证失败（`401`）；归档前已完成认证的采集请求允许完成并写入历史，之后仍可能更新该来源的 `last_received_at`，但不会重新激活来源或凭证。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      responses:
+        '204':
+          description: '已归档（或此前已归档），无响应体。'
+          headers:
+              Cache-Control:
+                $ref: '#/components/headers/NoStore'
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '404':
+          $ref: '#/components/responses/ManagementNotFound'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
   /api/v1/workspaces/{workspaceID}/sources/{sourceID}/credentials:
     parameters:
       - $ref: '#/components/parameters/WorkspaceID'
@@ -1030,6 +1368,19 @@ paths:
                 error:
                   code: NOT_FOUND
                   message: credential resource not found
+        '409':
+          description: '`CONFLICT`：来源已归档（`source is archived`）。来源行锁与归档串行，归档提交后不会再产生有效凭证；列表与撤销在已归档来源上仍可用。不创建凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: CONFLICT
+                  message: source is archived
         '500':
           $ref: '#/components/responses/AuthInternal'
         '503':
@@ -1120,6 +1471,19 @@ paths:
                 error:
                   code: NOT_FOUND
                   message: credential resource not found
+        '409':
+          description: '`CONFLICT`：来源已归档（`source is archived`）。来源行锁与归档串行，归档提交后不会再产生有效凭证；列表与撤销在已归档来源上仍可用。不创建凭证。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialError'
+              example:
+                error:
+                  code: CONFLICT
+                  message: source is archived
         '500':
           $ref: '#/components/responses/AuthInternal'
         '503':
@@ -1260,6 +1624,14 @@ components:
       schema:
         type: string
         format: uuid
+    ProjectID:
+      name: projectID
+      in: path
+      required: true
+      description: '项目的 UUID。必须属于路径 `workspaceID`，否则返回 `404 NOT_FOUND`。'
+      schema:
+        type: string
+        format: uuid
     CredentialID:
       name: credentialID
       in: path
@@ -1371,6 +1743,123 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/CredentialError'
+          example:
+            error:
+              code: UNAVAILABLE
+              message: service is unavailable
+    ManagementInvalidArgument:
+      description: '`INVALID_ARGUMENT`：路径 UUID、JSON、字段或空请求体不符合要求（DELETE 带非空请求体也是此码）。消息固定，不回显请求值；不执行业务写入。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
+          example:
+            error:
+              code: INVALID_ARGUMENT
+              message: request is not acceptable
+    ManagementUnauthenticated:
+      description: '`UNAUTHENTICATED`：无 Cookie，或会话无效、过期、已撤销。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
+          example:
+            error:
+              code: UNAUTHENTICATED
+              message: authentication required
+    ManagementPermissionDenied:
+      description: '`PERMISSION_DENIED`：写请求 `Origin` 缺失、`null`、多值或不等于可信 origin；或会话用户不是该 workspace 成员（非成员），或 member 执行 owner 写操作。不区分未加入与角色不足。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
+          example:
+            error:
+              code: PERMISSION_DENIED
+              message: workspace owner required
+    ManagementNotFound:
+      description: '`NOT_FOUND`：项目或来源不存在，或属于另一空间。角色检查通过后才可能出现，不返回真实归属。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
+          example:
+            error:
+              code: NOT_FOUND
+              message: resource not found
+    ManagementConflict:
+      description: '`CONFLICT`：项目键或来源 `(platform, instance_key)` 与同空间已有行（含已归档行）冲突。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
+          example:
+            error:
+              code: CONFLICT
+              message: resource already exists
+    ManagementBodyTooLarge:
+      description: '`BODY_TOO_LARGE`：请求体超过 16 KiB。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
+          example:
+            error:
+              code: BODY_TOO_LARGE
+              message: request body is too large
+    ManagementUnsupportedMediaType:
+      description: '`UNSUPPORTED_MEDIA_TYPE`：`Content-Type` 不是 `application/json`。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
+          example:
+            error:
+              code: UNSUPPORTED_MEDIA_TYPE
+              message: content type must be application/json
+    ManagementInternal:
+      description: '`INTERNAL`：成员角色、项目、来源或凭证管理数据库故障。响应不含 SQL、约束细节或令牌；绝不降级为 `403`。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
+          example:
+            error:
+              code: INTERNAL
+              message: internal error
+    ManagementUnavailable:
+      description: '`UNAVAILABLE`：仅对应会话存储或续期依赖故障，请求在读取或写入资源之前停止；不得据此判定未认证或已写入，按原请求重试。数据库角色/资源故障是 `500`，不是本码。'
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ManagementError'
           example:
             error:
               code: UNAVAILABLE
@@ -2008,6 +2497,138 @@ components:
         | `INTERNAL` | 500 |
         | `UNAVAILABLE` | 503 |
 
+    ManagementError:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_ARGUMENT
+                - UNAUTHENTICATED
+                - PERMISSION_DENIED
+                - NOT_FOUND
+                - CONFLICT
+                - BODY_TOO_LARGE
+                - UNSUPPORTED_MEDIA_TYPE
+                - INTERNAL
+                - UNAVAILABLE
+              description: '程序分支依据。新增值属向后兼容变更，客户端必须忽略未知值。'
+            message:
+              type: string
+              description: 面向人的短说明，固定文案，不含 SQL、约束细节、令牌或请求值。
+      description: |
+        项目与来源管理端点的错误体：
+
+        | code | 状态码 |
+        |---|---|
+        | `INVALID_ARGUMENT` | 400 |
+        | `UNAUTHENTICATED` | 401 |
+        | `PERMISSION_DENIED` | 403 |
+        | `NOT_FOUND` | 404 |
+        | `CONFLICT` | 409 |
+        | `BODY_TOO_LARGE` | 413 |
+        | `UNSUPPORTED_MEDIA_TYPE` | 415 |
+        | `INTERNAL` | 500（成员角色或资源数据库故障） |
+        | `UNAVAILABLE` | 503（仅会话存储/续期故障） |
+
+        所有响应带 `Cache-Control: no-store`。
+
+    Project:
+      type: object
+      additionalProperties: false
+      required: [project_id, workspace_id, project_key, name, created_at, archived_at]
+      properties:
+        project_id: {type: string, format: uuid}
+        workspace_id: {type: string, format: uuid}
+        project_key: {type: string, minLength: 1, maxLength: 128, description: '机器标识，创建后不可修改；归档后仍占用唯一键。'}
+        name: {type: string, minLength: 1, maxLength: 128}
+        created_at: {type: string, format: date-time}
+        archived_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: '`null` 表示 active；否则为首次归档时间（RFC 3339），重复归档不改变它。'
+      description: 一个项目。
+
+    ProjectList:
+      type: array
+      items:
+        $ref: '#/components/schemas/Project'
+      description: 项目数组（顶层即数组），按 `created_at, id` 升序，含已归档项。
+
+    ProjectCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [project_key, name]
+      properties:
+        project_key: {type: string, minLength: 1, maxLength: 128}
+        name: {type: string, minLength: 1, maxLength: 128}
+
+    ProjectUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128}
+
+    Source:
+      type: object
+      additionalProperties: false
+      required: [source_id, workspace_id, platform, instance_key, created_at, last_received_at, archived_at]
+      properties:
+        source_id: {type: string, format: uuid}
+        workspace_id: {type: string, format: uuid}
+        platform: {type: string, minLength: 1, maxLength: 128}
+        instance_key: {type: string, minLength: 1, maxLength: 128}
+        created_at: {type: string, format: date-time}
+        last_received_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: '`null` 表示从未收到数据。归档前已认证的采集请求可能在归档后仍更新它。'
+        archived_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: '`null` 表示 active；否则为首次归档时间。重复归档不改变它。'
+      description: 一个数据来源。
+
+    SourceList:
+      type: array
+      items:
+        $ref: '#/components/schemas/Source'
+      description: 来源数组（顶层即数组），按 `created_at, id` 升序，含已归档项。
+
+    SourceCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [platform, instance_key]
+      properties:
+        platform: {type: string, minLength: 1, maxLength: 128}
+        instance_key: {type: string, minLength: 1, maxLength: 128}
+
+    SourceUpdateRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        platform: {type: string, minLength: 1, maxLength: 128}
+        instance_key: {type: string, minLength: 1, maxLength: 128}
+      description: 至少一个字段；只改机器标识，`source_id`、凭证绑定与令牌不变。
+
     CredentialList:
       type: object
       additionalProperties: false
@@ -2105,6 +2726,7 @@ components:
                 - UNAUTHENTICATED
                 - PERMISSION_DENIED
                 - NOT_FOUND
+                - CONFLICT
                 - INTERNAL
                 - UNAVAILABLE
               description: '程序分支依据。新增值属向后兼容变更，客户端必须忽略未知值而不是崩溃。'
@@ -2121,6 +2743,7 @@ components:
         | `UNAUTHENTICATED` | 401 | 无 Cookie，或会话不可用 |
         | `PERMISSION_DENIED` | 403 | 写操作 `Origin` 不合法，或会话用户不是该 workspace 的 owner |
         | `NOT_FOUND` | 404 | source/credential 不存在或不属于路径 workspace |
+        | `CONFLICT` | 409 | 签发/轮换时来源已归档（固定消息 `source is archived`） |
         | `INTERNAL` | 500 | 数据库等服务端故障；不假装成功 |
         | `UNAVAILABLE` | 503 | 会话存储等依赖不可用；请求在读取或创建凭证前停止 |
 

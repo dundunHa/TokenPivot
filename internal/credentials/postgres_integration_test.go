@@ -749,3 +749,74 @@ func TestRevokeKeepsSourceAndOtherRows(t *testing.T) {
 	}
 	t.Logf("revoke left source and the other credential intact")
 }
+
+func archiveSource(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sourceID ID) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, "UPDATE sources SET archived_at=now() WHERE id=$1", sourceID); err != nil {
+		t.Fatal(database.SafeError("archive source", err))
+	}
+}
+
+func countCredentials(t *testing.T, ctx context.Context, pool *pgxpool.Pool, workspaceID ID) int {
+	t.Helper()
+	var total int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ingest_credentials WHERE workspace_id=$1", workspaceID).Scan(&total); err != nil {
+		t.Fatal(database.SafeError("count credentials", err))
+	}
+	return total
+}
+
+func TestIssueAndRotateRequireActiveSourceAgainstPostgres(t *testing.T) {
+	_, appURL := integrationSchema(t)
+	pool := newPool(t, appURL)
+	service := New(NewPostgres(pool))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	workspaceID := insertWorkspace(t, ctx, pool, "synthetic-active")
+	otherWorkspace := insertWorkspace(t, ctx, pool, "synthetic-active-other")
+	sourceID := insertSource(t, ctx, pool, workspaceID)
+	foreignSource := insertSource(t, ctx, pool, otherWorkspace)
+
+	issued, err := service.Issue(ctx, workspaceID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := service.Rotate(ctx, workspaceID, issued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.SourceID != sourceID || rotated.WorkspaceID != workspaceID {
+		t.Fatal("rotate changed the fixed ownership")
+	}
+	if loadRow(t, ctx, pool, issued.ID).RevokedAt != nil {
+		t.Fatal("rotate changed the old credential")
+	}
+	if _, err := service.Issue(ctx, workspaceID, foreignSource); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign issue error=%v want ErrNotFound", err)
+	}
+	if _, err := service.Rotate(ctx, otherWorkspace, issued.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign rotate error=%v want ErrNotFound", err)
+	}
+	if _, err := service.Rotate(ctx, workspaceID, ID{Bytes: [16]byte{7}, Valid: true}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing rotate error=%v want ErrNotFound", err)
+	}
+	before := countCredentials(t, ctx, pool, workspaceID)
+
+	archiveSource(t, ctx, pool, sourceID)
+	if _, err := service.Issue(ctx, workspaceID, sourceID); !errors.Is(err, ErrSourceArchived) {
+		t.Fatalf("issue on archived error=%v want ErrSourceArchived", err)
+	}
+	if _, err := service.Rotate(ctx, workspaceID, issued.ID); !errors.Is(err, ErrSourceArchived) {
+		t.Fatalf("rotate on archived error=%v want ErrSourceArchived", err)
+	}
+	if after := countCredentials(t, ctx, pool, workspaceID); after != before {
+		t.Fatalf("archived source received rows: %d -> %d", before, after)
+	}
+	// Listing and revoking history stay possible on an archived source.
+	if list, err := service.List(ctx, workspaceID, sourceID); err != nil || len(list) != before {
+		t.Fatalf("list=%d err=%v", len(list), err)
+	}
+	if err := service.Revoke(ctx, workspaceID, issued.ID); err != nil {
+		t.Fatal(err)
+	}
+}
