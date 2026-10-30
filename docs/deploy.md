@@ -189,7 +189,9 @@ curl --fail --show-error --silent http://DESKTOP-C28DFS7:18080/healthz
 | healthz / readyz / Origin 403 / 版本核对结果 | 均通过；页面和静态资源 200，错误 Origin 403，生产用户保持 0 |
 | 停止/恢复 | 11:17:23 停止 app，11:17:25 启动原容器；readyz 恢复 200，DB、卷、容器 ID 不变 |
 | 旧资源对比结果 | 原容器名称/ID/状态/端口及 8080/8081 占用者不变；卷 143→144，仅新增 `tokenpivot-bf-pgdata-18` |
-| 未验证项 | 第二客户端可达性、防火墙/路由转发、实际暴露范围、远程 PG `verify-full`、备份恢复；Lord Howe 聚合与 Cookie 属性见后续补充记录 |
+| 未验证项 | 第二客户端可达性、防火墙/路由转发、实际暴露范围、远程 PG `verify-full`、备份恢复、DST 反向回拨边界 |
+
+补充验收使用同一最终镜像和既有专用测试 PG 的隔离 schema，未写入 BF 生产库。2026-10-04 Australia/Lord_Howe 前跳实测：小时聚合得到 `[14:30Z,15:30Z)` total 33、`[15:30Z,16:00Z)` total 77、`[16:00Z,17:00Z)` total 55；30 分钟桶对应本地 `+10:30→+11:00`。日桶为 23.5 小时，5 条请求、input 150、output 15、total 165，点位之和等于 totals。隔离实例成功 Cookie 为 host-only、`Path=/`、`HttpOnly`、`SameSite=Lax`；回环明文 HTTP 下无 `Secure`，符合预期。临时 schema、容器和脚本已清理，BF 生产用户和事件数仍为 0。反向回拨边界未测。
 
 ## 10. 已知未核实事项
 
