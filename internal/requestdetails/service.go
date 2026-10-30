@@ -60,7 +60,7 @@ type RateParams struct {
 	Filter      Filter
 }
 
-// Token is one token field of a stored event.
+// TokenRow is one token field of a stored event.
 type TokenRow struct {
 	Value   *int64
 	Quality string
@@ -198,9 +198,11 @@ func (s *Service) Events(ctx context.Context, workspaceID pgtype.UUID, values ur
 	}
 	now := s.sample()
 	limit := DefaultLimit
-	if raw, err := single(values, "limit"); err != nil {
+	raw, err := single(values, "limit")
+	if err != nil {
 		return nil, err
-	} else if _, present := values["limit"]; present {
+	}
+	if _, present := values["limit"]; present {
 		n, convErr := strconv.Atoi(raw)
 		if convErr != nil || n < 1 || n > MaxLimit || strconv.Itoa(n) != raw {
 			return nil, ErrInvalidArgument
@@ -345,23 +347,12 @@ func newEvent(row EventRow) Event {
 // belongs to the workspace before any event query runs.
 func (s *Service) parseFilter(ctx context.Context, workspaceID pgtype.UUID, values url.Values) (Filter, error) {
 	var filter Filter
-	for _, name := range []string{"provider", "model"} {
-		seen := map[string]bool{}
-		var list []string
-		for _, value := range values[name] {
-			if value == "" {
-				return Filter{}, ErrInvalidArgument
-			}
-			if !seen[value] {
-				seen[value] = true
-				list = append(list, value)
-			}
-		}
-		if name == "provider" {
-			filter.Providers = list
-		} else {
-			filter.Models = list
-		}
+	var err error
+	if filter.Providers, err = distinctNonEmpty(values["provider"]); err != nil {
+		return Filter{}, err
+	}
+	if filter.Models, err = distinctNonEmpty(values["model"]); err != nil {
+		return Filter{}, err
 	}
 	seen := map[pgtype.UUID]bool{}
 	for _, value := range values["project"] {
@@ -388,6 +379,22 @@ func (s *Service) parseFilter(ctx context.Context, workspaceID pgtype.UUID, valu
 		}
 	}
 	return filter, nil
+}
+
+// distinctNonEmpty drops repeated values in order and rejects an empty one.
+func distinctNonEmpty(values []string) ([]string, error) {
+	seen := map[string]bool{}
+	var list []string
+	for _, value := range values {
+		if value == "" {
+			return nil, ErrInvalidArgument
+		}
+		if !seen[value] {
+			seen[value] = true
+			list = append(list, value)
+		}
+	}
+	return list, nil
 }
 
 func validateValues(values url.Values, allowed map[string]bool) error {

@@ -47,8 +47,7 @@ function PanelBody({
 }) {
   const client = useQueryClient();
   const [cursors, setCursors] = useState<string[]>([]);
-  const cursor =
-    cursors.length > 0 ? (cursors[cursors.length - 1] ?? null) : null;
+  const cursor = cursors.at(-1) ?? null;
   const events = useRequestEvents(scope, filters, cursor);
   const rate = useRate(scope, filters);
   const tz = filters.timezone;
