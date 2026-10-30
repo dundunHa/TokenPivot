@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { describeError } from "@/features/overview/overviewApi";
 import {
   filterIdentity,
@@ -9,12 +10,13 @@ import {
 } from "@/features/overview/overviewFilters";
 import type { QueryScope } from "@/features/overview/overviewQueries";
 import { formatInstant } from "@/features/overview/overviewView";
-import type { RateData, RequestRow } from "./api";
+import type { RateData, RequestRange, RequestRow } from "./api";
 import {
   describeRate,
   formatDuration,
   formatStatus,
   formatTokenField,
+  parseRequestRange,
 } from "./model";
 import { eventsQuery, useRate, useRequestEvents } from "./useRequestLogs";
 
@@ -47,22 +49,83 @@ function PanelBody({
 }) {
   const client = useQueryClient();
   const [cursors, setCursors] = useState<string[]>([]);
+  const [range, setRange] = useState<RequestRange | null>(null);
+  const [draftStart, setDraftStart] = useState("");
+  const [draftEnd, setDraftEnd] = useState("");
+  const [rangeError, setRangeError] = useState<string | null>(null);
   const cursor = cursors.at(-1) ?? null;
-  const events = useRequestEvents(scope, filters, cursor);
+  const events = useRequestEvents(scope, filters, cursor, range);
   const rate = useRate(scope, filters);
   const tz = filters.timezone;
 
   const goLatest = () => {
     client.removeQueries({
-      queryKey: eventsQuery(scope, filters, null).queryKey,
+      queryKey: eventsQuery(scope, filters, null, range).queryKey,
       exact: true,
     });
     setCursors([]);
   };
 
+  // 范围变化必须同时丢弃旧游标，游标只对产生它的范围有效。
+  const applyRange = () => {
+    const parsed = parseRequestRange(draftStart, draftEnd);
+    if ("error" in parsed) {
+      setRangeError(parsed.error);
+      return;
+    }
+    setRangeError(null);
+    setCursors([]);
+    setRange(parsed.range);
+  };
+  const resetRange = () => {
+    setRangeError(null);
+    setCursors([]);
+    setRange(null);
+  };
+
   return (
     <div className="flex flex-col gap-4">
       <RateBlock rate={rate} timezone={tz} />
+      <div
+        className="flex flex-col gap-2"
+        aria-label="明细时间范围"
+        role="group"
+      >
+        <div className="flex flex-wrap items-end gap-2">
+          <label className="flex flex-col gap-1 text-xs">
+            明细起点
+            <Input
+              value={draftStart}
+              placeholder="2026-10-28T09:00:00+08:00"
+              onChange={(e) => setDraftStart(e.target.value)}
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs">
+            明细终点
+            <Input
+              value={draftEnd}
+              placeholder="2026-10-28T18:00:00+08:00"
+              onChange={(e) => setDraftEnd(e.target.value)}
+            />
+          </label>
+          <Button variant="outline" onClick={applyRange}>
+            查询范围
+          </Button>
+          {range ? (
+            <Button variant="outline" onClick={resetRange}>
+              最近 1 小时
+            </Button>
+          ) : null}
+        </div>
+        <p className="text-subtle text-xs">
+          {range ? "固定范围（历史补报可在此查询）" : "默认最近 1 小时"}
+        </p>
+        {rangeError ? (
+          <p role="alert" className="text-destructive text-xs">
+            {rangeError}
+          </p>
+        ) : null}
+      </div>
       <div aria-label="明细列表" role="region" className="flex flex-col gap-2">
         {events.isPending ? (
           <div

@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/dundunHa/TokenPivot/internal/requestdetails"
 	"github.com/dundunHa/TokenPivot/internal/workspaces"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -17,6 +19,7 @@ type detailsFakeStore struct {
 	calls     int
 	projects  int
 	workspace string
+	err       error
 }
 
 func (f *detailsFakeStore) CountProjects(_ context.Context, _ workspaces.ID, ids []pgtype.UUID) (int, error) {
@@ -27,13 +30,13 @@ func (f *detailsFakeStore) CountProjects(_ context.Context, _ workspaces.ID, ids
 func (f *detailsFakeStore) Events(_ context.Context, p requestdetails.EventsParams) ([]requestdetails.EventRow, error) {
 	f.calls++
 	f.workspace = p.WorkspaceID.String()
-	return nil, nil
+	return nil, f.err
 }
 
 func (f *detailsFakeStore) Rate(_ context.Context, p requestdetails.RateParams) (requestdetails.RateRow, error) {
 	f.calls++
 	f.workspace = p.WorkspaceID.String()
-	return requestdetails.RateRow{AsOf: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)}, nil
+	return requestdetails.RateRow{AsOf: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)}, f.err
 }
 
 func newDetailsFixture(t *testing.T) (*usageFixture, *detailsFakeStore) {
@@ -138,4 +141,42 @@ func TestRequestDetailsMalformedWorkspaceAndRateBody(t *testing.T) {
 
 func detailsPath(f *usageFixture, kind, query string) string {
 	return "/api/v1/workspaces/" + f.workspaceID.String() + "/usage-" + kind + "?" + query
+}
+
+// TestRequestDetailsDatabaseFailures: an unavailable database is 503 on both the
+// membership lookup and the query; cancellation and other faults stay 500, and
+// no body repeats a driver message.
+func TestRequestDetailsDatabaseFailures(t *testing.T) {
+	unavailable := database.SafeStoreError("stage", context.DeadlineExceeded)
+	cancelled := database.SafeStoreError("stage", context.Canceled)
+	other := database.SafeStoreError("stage", errors.New("secret driver text"))
+	cases := []struct {
+		name   string
+		member error
+		query  error
+		status int
+		code   string
+	}{
+		{"query unavailable", nil, unavailable, http.StatusServiceUnavailable, "UNAVAILABLE"},
+		{"query cancelled", nil, cancelled, http.StatusInternalServerError, "INTERNAL"},
+		{"query other", nil, other, http.StatusInternalServerError, "INTERNAL"},
+		{"member unavailable", unavailable, nil, http.StatusServiceUnavailable, "UNAVAILABLE"},
+		{"member cancelled", cancelled, nil, http.StatusInternalServerError, "INTERNAL"},
+		{"member other", other, nil, http.StatusInternalServerError, "INTERNAL"},
+	}
+	for _, kind := range []string{"events", "rate"} {
+		for _, c := range cases {
+			t.Run(kind+"/"+c.name, func(t *testing.T) {
+				f, store := newDetailsFixture(t)
+				f.roles.setRole(f.ownerID, f.workspaceID, workspaces.RoleMember)
+				f.roles.err, store.err = c.member, c.query
+				w := f.get(t, detailsPath(f, kind, ""), true)
+				got, _ := errorCode(t, w)
+				if w.Code != c.status || got != c.code || strings.Contains(w.Body.String(), "secret") {
+					t.Fatalf("status %d code %s body %s", w.Code, got, w.Body.String())
+				}
+				assertNoStore(t, w)
+			})
+		}
+	}
 }

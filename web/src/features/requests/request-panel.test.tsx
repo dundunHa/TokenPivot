@@ -409,4 +409,213 @@ describe("request log panel", () => {
       ).toHaveLength(0),
     );
   });
+
+  it("queries a chosen historical range, keeps it on every page and resets the cursor when it changes", async () => {
+    const seen = useBackend({
+      events: (url) =>
+        HttpResponse.json(
+          url.searchParams.get("cursor")
+            ? page([item("e2")])
+            : page([item("e1")], "c1"),
+        ),
+    });
+    const user = userEvent.setup();
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    expect(seen.events[0]?.searchParams.has("start")).toBe(false);
+
+    await user.type(screen.getByLabelText("明细起点"), "2026-09-01T00:00:00Z");
+    await user.type(screen.getByLabelText("明细终点"), "2026-09-02T00:00:00Z");
+    await user.click(screen.getByRole("button", { name: "查询范围" }));
+    await waitFor(() =>
+      expect(seen.events.at(-1)?.searchParams.get("start")).toBe(
+        "2026-09-01T00:00:00Z",
+      ),
+    );
+    expect(seen.events.at(-1)?.searchParams.get("end")).toBe(
+      "2026-09-02T00:00:00Z",
+    );
+    expect(seen.events.at(-1)?.searchParams.has("cursor")).toBe(false);
+    // 速率不受明细范围影响。
+    expect(seen.rates.at(-1)?.searchParams.has("start")).toBe(false);
+
+    await user.click(await screen.findByRole("button", { name: "下一页" }));
+    await waitFor(() =>
+      expect(seen.events.at(-1)?.searchParams.get("cursor")).toBe("c1"),
+    );
+    expect(seen.events.at(-1)?.searchParams.get("start")).toBe(
+      "2026-09-01T00:00:00Z",
+    );
+    expect(seen.events.at(-1)?.searchParams.get("end")).toBe(
+      "2026-09-02T00:00:00Z",
+    );
+
+    await user.clear(screen.getByLabelText("明细终点"));
+    await user.type(screen.getByLabelText("明细终点"), "2026-09-03T00:00:00Z");
+    await user.click(screen.getByRole("button", { name: "查询范围" }));
+    await waitFor(() =>
+      expect(seen.events.at(-1)?.searchParams.get("end")).toBe(
+        "2026-09-03T00:00:00Z",
+      ),
+    );
+    expect(seen.events.at(-1)?.searchParams.has("cursor")).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "最近 1 小时" }));
+    // 默认范围的缓存仍新鲜时不必再发请求，以界面状态为准。
+    await screen.findByText("默认最近 1 小时");
+    expect(screen.queryByRole("button", { name: "最近 1 小时" })).toBeNull();
+  });
+
+  it("rejects an invalid detail range without sending a request", async () => {
+    const seen = useBackend();
+    const user = userEvent.setup();
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    const n = seen.events.length;
+    await user.type(screen.getByLabelText("明细起点"), "2026-09-02T00:00:00Z");
+    await user.type(screen.getByLabelText("明细终点"), "2026-09-01T00:00:00Z");
+    await user.click(screen.getByRole("button", { name: "查询范围" }));
+    await screen.findByText("起点必须早于终点");
+    expect(seen.events.length).toBe(n);
+  });
+
+  it("keeps a fixed range stable across polling and keeps polling it on the first page", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const seen = useBackend();
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    const start = screen.getByLabelText("明细起点") as HTMLInputElement;
+    const end = screen.getByLabelText("明细终点") as HTMLInputElement;
+    const setValue = (el: HTMLInputElement, v: string) => {
+      const set = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      set?.call(el, v);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    await act(async () => {
+      setValue(start, "2026-09-01T00:00:00Z");
+      setValue(end, "2026-09-02T00:00:00Z");
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "查询范围" }).click();
+    });
+    await tick(0);
+    await tick(15_000);
+    const fixed = seen.events.filter(
+      (u) => u.searchParams.get("start") === "2026-09-01T00:00:00Z",
+    );
+    expect(fixed.length).toBeGreaterThan(1);
+    for (const u of fixed) {
+      expect(u.searchParams.get("end")).toBe("2026-09-02T00:00:00Z");
+    }
+  });
+
+  it("resumes polling the latest page when the page becomes visible again", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const seen = useBackend();
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    act(() => setVisibility("hidden"));
+    const before = seen.events.length;
+    await tick(10_000);
+    expect(seen.events.length).toBe(before);
+    act(() => setVisibility("visible"));
+    await tick(5_000);
+    expect(seen.events.length).toBeGreaterThan(before);
+    expect(seen.rates.length).toBeGreaterThan(1);
+  });
+
+  it("does not auto-refresh an older page after hide/show, and resumes on the latest page", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const seen = useBackend({
+      events: (url) =>
+        HttpResponse.json(
+          url.searchParams.get("cursor")
+            ? page([item("e2")])
+            : page([item("e1")], "c1"),
+        ),
+    });
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    await act(async () => {
+      screen.getByRole("button", { name: "下一页" }).click();
+    });
+    await screen.findByText(/更早页/);
+    act(() => setVisibility("hidden"));
+    act(() => setVisibility("visible"));
+    const e = seen.events.length;
+    await tick(15_000);
+    expect(seen.events.length).toBe(e);
+    await act(async () => {
+      screen.getByRole("button", { name: "返回最新页" }).click();
+    });
+    await tick(0);
+    const afterLatest = seen.events.length;
+    await tick(5_000);
+    expect(seen.events.length).toBeGreaterThan(afterLatest);
+    expect(seen.events.at(-1)?.searchParams.has("cursor")).toBe(false);
+  });
+
+  it("keeps showing rows on reconnect failure and recovers on the next poll", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let offline = false;
+    const seen = useBackend({
+      events: () =>
+        offline ? HttpResponse.error() : HttpResponse.json(page([item("e1")])),
+    });
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    offline = true;
+    await tick(5_000);
+    await screen.findByText(/^更新失败，展示截至/);
+    expect(screen.getByTestId("request-row")).toBeTruthy();
+    offline = false;
+    const n = seen.events.length;
+    await tick(5_000);
+    expect(seen.events.length).toBeGreaterThan(n);
+    await waitFor(() => expect(screen.queryByText(/^更新失败/)).toBeNull());
+  });
+
+  it("does not restore rows from a late response after sign-out", async () => {
+    const slow = deferred<void>();
+    let calls = 0;
+    const seen = useBackend({
+      events: async () => {
+        calls += 1;
+        if (calls > 1) {
+          await slow.promise;
+          return HttpResponse.json(page([item("late")]));
+        }
+        return HttpResponse.json(page([item("e1")], "c1"));
+      },
+    });
+    server.use(
+      http.post(
+        "/api/v1/auth/logout",
+        () => new HttpResponse(null, { status: 204 }),
+      ),
+    );
+    const user = userEvent.setup();
+    const client = renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+    await waitFor(() => expect(seen.events.length).toBe(2));
+    await user.click(screen.getByRole("button", { name: "登出" }));
+    await waitFor(() =>
+      expect(
+        client.getQueryCache().findAll({ queryKey: ["requests"] }),
+      ).toHaveLength(0),
+    );
+    await act(async () => {
+      slow.resolve();
+      await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    });
+    expect(
+      client.getQueryCache().findAll({ queryKey: ["requests"] }),
+    ).toHaveLength(0);
+    expect(screen.queryByText("late")).toBeNull();
+    expect(screen.queryByTestId("request-row")).toBeNull();
+  });
 });

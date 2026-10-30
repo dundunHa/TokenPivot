@@ -65,7 +65,7 @@ func (s *Postgres) Events(ctx context.Context, params EventsParams) ([]EventRow,
 	args = append(args, params.HasCursor, cursorTime, cursorID, params.Limit+1)
 	rows, err := s.pool.Query(ctx, eventsQuery, args...)
 	if err != nil {
-		return nil, database.SafeError("request events", err)
+		return nil, database.SafeStoreError("request events", err)
 	}
 	defer rows.Close()
 	var out []EventRow
@@ -75,12 +75,12 @@ func (s *Postgres) Events(ctx context.Context, params EventsParams) ([]EventRow,
 			&r.ProjectID, &r.ProjectKey, &r.ProjectName, &r.Platform, &r.InstanceKey,
 			&r.Input.Value, &r.Input.Quality, &r.Output.Value, &r.Output.Quality,
 			&r.Total.Value, &r.Total.Quality, &r.Status, &r.DurationMS); err != nil {
-			return nil, database.SafeError("scan request event", err)
+			return nil, database.SafeStoreError("scan request event", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, database.SafeError("request events", err)
+		return nil, database.SafeStoreError("request events", err)
 	}
 	return out, nil
 }
@@ -113,7 +113,7 @@ func (s *Postgres) Rate(ctx context.Context, params RateParams) (RateRow, error)
 	args := append([]any{params.WorkspaceID, asOf}, filterArgs(params.Filter)...)
 	var r RateRow
 	if err := s.pool.QueryRow(ctx, rateQuery, args...).Scan(&r.AsOf, &r.Sum, &r.Events, &r.Known, &r.Estimated, &r.Missing, &r.LastReceived); err != nil {
-		return RateRow{}, database.SafeError("request rate", err)
+		return RateRow{}, database.SafeStoreError("request rate", err)
 	}
 	return r, nil
 }
@@ -122,7 +122,7 @@ func (s *Postgres) Rate(ctx context.Context, params RateParams) (RateRow, error)
 func (s *Postgres) CountProjects(ctx context.Context, workspaceID pgtype.UUID, ids []pgtype.UUID) (int, error) {
 	var n int
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM projects WHERE workspace_id = $1 AND id = ANY($2::uuid[])`, workspaceID, ids).Scan(&n); err != nil {
-		return 0, database.SafeError("count projects", err)
+		return 0, database.SafeStoreError("count projects", err)
 	}
 	return n, nil
 }

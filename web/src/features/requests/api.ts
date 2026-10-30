@@ -169,13 +169,27 @@ export function filterParams(filters: OverviewFilters): URLSearchParams {
   return params;
 }
 
-/** 首页不带 cursor 与时间范围（服务端取最近 1 小时）；翻页只带 cursor（范围在 cursor 内）。 */
+/** 面板独立的明细时间范围；null 表示服务端默认的最近 1 小时（随轮询滚动）。 */
+export interface RequestRange {
+  start: string;
+  end: string;
+}
+
+/**
+ * 默认范围的首页不带 start/end（服务端取最近 1 小时），其翻页只带 cursor（范围在
+ * cursor 内）；显式范围的每一页都带同一组 start/end，翻页不漂移。
+ */
 export function eventsQueryString(
   filters: OverviewFilters,
   cursor: string | null,
+  range: RequestRange | null,
 ): string {
   const params = filterParams(filters);
   params.set("limit", String(PAGE_SIZE));
+  if (range) {
+    params.set("start", range.start);
+    params.set("end", range.end);
+  }
   if (cursor) params.set("cursor", cursor);
   return params.toString();
 }

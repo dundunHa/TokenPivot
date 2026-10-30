@@ -1,5 +1,6 @@
+import { parseInstant } from "@/features/overview/overviewFilters";
 import { formatExact } from "@/features/overview/overviewView";
-import type { RateData, TokenField } from "./api";
+import type { RateData, RequestRange, TokenField } from "./api";
 
 /** 纯展示与轮询决策；不重新计算后端口径。 */
 
@@ -48,4 +49,27 @@ export function describeRate(rate: RateData): RateView {
     notes.push(`部分覆盖：缺失 ${rate.missingCount} 条`);
   }
   return { headline, notes };
+}
+
+const FRACTION = /\.(\d+)(?=Z|[+-]\d{2}:\d{2}$)/;
+
+function tooPrecise(text: string): boolean {
+  return (FRACTION.exec(text)?.[1]?.length ?? 0) > 6;
+}
+
+/** 明细范围校验：带偏移的 RFC 3339、最多 6 位小数秒、起点早于终点；不要求分钟对齐。 */
+export function parseRequestRange(
+  start: string,
+  end: string,
+): { range: RequestRange } | { error: string } {
+  const a = parseInstant(start.trim());
+  const b = parseInstant(end.trim());
+  if (!a || !b || tooPrecise(start) || tooPrecise(end)) {
+    return {
+      error:
+        "时间格式无效，需要带偏移、最多 6 位小数秒的 RFC 3339，如 2026-10-28T09:00:00+08:00",
+    };
+  }
+  if (a.ms >= b.ms) return { error: "起点必须早于终点" };
+  return { range: { start: start.trim(), end: end.trim() } };
 }

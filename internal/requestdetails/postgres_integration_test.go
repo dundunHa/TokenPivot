@@ -500,3 +500,65 @@ VALUES ($1,$2,$3,'p','m',statement_timestamp(),statement_timestamp(),'v1','\x00'
 		}
 	}
 }
+
+// TestEventsPagingNewAndBackfilledEvents: after page one, a new event with the
+// same occurred_at (larger id) and a backfill at an already passed position are
+// not shown by later pages and nothing repeats; a backfill at a later position
+// (older time, or same time with a smaller id) is. Restarting from the latest
+// page then shows the earlier-hidden ones.
+func TestEventsPagingNewAndBackfilledEvents(t *testing.T) {
+	f := newFixture(t)
+	same := asOf.Add(-10 * time.Second)
+	var ids []string
+	for i := 0; i < 3; i++ {
+		ids = append(ids, f.add(t, ev{at: same, total: n(1)}).String())
+	}
+	old := f.add(t, ev{at: same.Add(-5 * time.Second), total: n(1)}).String()
+	q := withRange(url.Values{"limit": {"2"}})
+	first, err := f.svc.Events(f.ctx, ws, q)
+	if err != nil || !first.HasMore || len(first.Items) != 2 {
+		t.Fatalf("first = %+v err %v", first, err)
+	}
+	// ids[2], ids[1] are page one; the cursor is (same, ids[1]).
+	newSame := f.add(t, ev{at: same, total: n(1)}).String()                                                    // larger id: before the cursor
+	passed := f.add(t, ev{at: same.Add(time.Second), total: n(1)}).String()                                    // newer time: before the cursor
+	lowID := f.add(t, ev{at: same, total: n(1), id: pgtype.UUID{Bytes: [16]byte{0x01}, Valid: true}}).String() // smaller id: after the cursor
+	between := f.add(t, ev{at: same.Add(-time.Second), total: n(1)}).String()                                  // older time: after the cursor
+	q.Set("cursor", *first.NextCursor)
+	var later []string
+	for {
+		r, err := f.svc.Events(f.ctx, ws, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range r.Items {
+			later = append(later, item.ID)
+		}
+		if !r.HasMore {
+			break
+		}
+		q.Set("cursor", *r.NextCursor)
+	}
+	want := []string{ids[0], lowID, between, old} // same time by id DESC, then older times
+	if fmt.Sprint(later) != fmt.Sprint(want) {
+		t.Fatalf("later = %v want %v", later, want)
+	}
+	for _, hidden := range []string{newSame, passed} {
+		for _, id := range later {
+			if id == hidden {
+				t.Fatalf("passed position %s shown on later page", hidden)
+			}
+		}
+	}
+	latest, err := f.svc.Events(f.ctx, ws, withRange(url.Values{"limit": {"100"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shown := map[string]bool{}
+	for _, item := range latest.Items {
+		shown[item.ID] = true
+	}
+	if !shown[newSame] || !shown[passed] || len(latest.Items) != 8 {
+		t.Fatalf("restart shows %d items, newSame=%v passed=%v", len(latest.Items), shown[newSame], shown[passed])
+	}
+}

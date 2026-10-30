@@ -53,7 +53,7 @@ func (p *Postgres) MembershipRole(ctx context.Context, userID, workspaceID ID) (
 		return "", false, nil
 	}
 	if err != nil {
-		return "", false, database.SafeError("workspaces membership role", err)
+		return "", false, database.SafeStoreError("workspaces membership role", err)
 	}
 	return Role(role), true, nil
 }

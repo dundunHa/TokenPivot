@@ -8,6 +8,7 @@ import {
   formatDuration,
   formatStatus,
   formatTokenField,
+  parseRequestRange,
   POLL_MS,
 } from "./model";
 
@@ -75,6 +76,7 @@ describe("request model", () => {
           projects: ["unassigned", "0198f2b0-0000-7000-8000-0000000000bb"],
         },
         null,
+        null,
       ),
     );
     expect(q.getAll("project")).toEqual([
@@ -85,9 +87,39 @@ describe("request model", () => {
     expect(q.has("start")).toBe(false);
     expect(q.has("cursor")).toBe(false);
     const paged = new URLSearchParams(
-      eventsQueryString({ ...DEFAULT_OVERVIEW_FILTERS, timezone: "UTC" }, "c1"),
+      eventsQueryString(
+        { ...DEFAULT_OVERVIEW_FILTERS, timezone: "UTC" },
+        "c1",
+        null,
+      ),
     );
     expect(paged.get("cursor")).toBe("c1");
     expect(paged.has("start")).toBe(false);
+  });
+
+  it("sends the same fixed range on every page", () => {
+    const range = {
+      start: "2026-10-01T00:00:00Z",
+      end: "2026-10-02T00:00:00Z",
+    };
+    const f = { ...DEFAULT_OVERVIEW_FILTERS, timezone: "UTC" };
+    for (const cursor of [null, "c1"]) {
+      const q = new URLSearchParams(eventsQueryString(f, cursor, range));
+      expect(q.get("start")).toBe(range.start);
+      expect(q.get("end")).toBe(range.end);
+    }
+  });
+
+  it("validates the detail range like the server", () => {
+    expect(
+      parseRequestRange("2026-10-01T00:00:00.123456Z", "2026-10-02T00:00:00Z"),
+    ).toHaveProperty("range");
+    for (const [a, b] of [
+      ["2026-10-01T00:00:00.1234567Z", "2026-10-02T00:00:00Z"],
+      ["2026-10-01T00:00:00", "2026-10-02T00:00:00Z"],
+      ["2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z"],
+    ] as const) {
+      expect(parseRequestRange(a, b)).toHaveProperty("error");
+    }
   });
 });

@@ -3,6 +3,7 @@ import type { OverviewFilters } from "@/features/overview/overviewFilters";
 import type { QueryScope } from "@/features/overview/overviewQueries";
 import {
   eventsQueryString,
+  type RequestRange,
   fetchRate,
   fetchRequests,
   filterParams,
@@ -14,8 +15,9 @@ export function eventsQuery(
   scope: QueryScope,
   filters: OverviewFilters,
   cursor: string | null,
+  range: RequestRange | null,
 ) {
-  const query = eventsQueryString(filters, cursor);
+  const query = eventsQueryString(filters, cursor, range);
   return queryOptions({
     queryKey: [
       "requests",
@@ -48,9 +50,10 @@ export function useRequestEvents(
   scope: QueryScope,
   filters: OverviewFilters,
   cursor: string | null,
+  range: RequestRange | null,
 ) {
   return useQuery({
-    ...eventsQuery(scope, filters, cursor),
+    ...eventsQuery(scope, filters, cursor, range),
     ...eventsPollOptions(cursor === null),
   });
 }
