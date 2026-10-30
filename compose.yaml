@@ -1,0 +1,69 @@
+# bf 专用 Compose：项目 tokenpivot-bf，服务 db / migrate / app。
+# 不含任何秘密：数据库 URL 与源码提交只引用进程环境变量，PG 超级用户密码只引用宿主机文件。
+# 必需环境变量：TOKENPIVOT_SOURCE_COMMIT、TOKENPIVOT_DATABASE_URL、TOKENPIVOT_MIGRATION_DATABASE_URL、
+#   TOKENPIVOT_PG_PASSWORD_FILE（宿主机受限密码文件路径）。
+# 迁移不随 up 执行：migrate 在 migration profile 内，须显式 run。不要运行打印插值结果的 `docker compose config`。
+name: tokenpivot-bf
+
+services:
+  db:
+    image: postgres:18.6-bookworm@sha256:41a369edc91d9bdd7a58be6bc71ea0f8f7a3f49e82818a9f0829021ea7840b7c
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: tokenpivot
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    secrets:
+      - pg_password
+    volumes:
+      - pgdata:/var/lib/postgresql
+    networks:
+      - backend
+
+  migrate:
+    image: tokenpivot:${TOKENPIVOT_SOURCE_COMMIT:?set TOKENPIVOT_SOURCE_COMMIT}
+    platform: linux/amd64
+    profiles: ["migration"]
+    entrypoint: ["/tokenpivot-migrate"]
+    command: ["up"]
+    environment:
+      TOKENPIVOT_MIGRATION_DATABASE_URL: ${TOKENPIVOT_MIGRATION_DATABASE_URL:?set TOKENPIVOT_MIGRATION_DATABASE_URL}
+    depends_on:
+      db:
+        condition: service_started
+    networks:
+      - backend
+
+  app:
+    image: tokenpivot:${TOKENPIVOT_SOURCE_COMMIT:?set TOKENPIVOT_SOURCE_COMMIT}
+    platform: linux/amd64
+    environment:
+      TOKENPIVOT_HTTP_ADDR: ":18080"
+      TOKENPIVOT_WEB_ORIGIN: http://DESKTOP-C28DFS7:18080
+      TOKENPIVOT_ALLOW_INSECURE_HTTP: "true"
+      TOKENPIVOT_REGISTRATION_OPEN: "false"
+      TOKENPIVOT_DATABASE_URL: ${TOKENPIVOT_DATABASE_URL:?set TOKENPIVOT_DATABASE_URL}
+    ports:
+      - "0.0.0.0:18080:18080"
+    depends_on:
+      db:
+        condition: service_started
+    networks:
+      - backend
+
+secrets:
+  pg_password:
+    file: ${TOKENPIVOT_PG_PASSWORD_FILE:?set TOKENPIVOT_PG_PASSWORD_FILE}
+
+networks:
+  backend:
+    name: tokenpivot-bf-backend
+    ipam:
+      config:
+        - subnet: 192.168.240.0/24
+          gateway: 192.168.240.1
+
+volumes:
+  pgdata:
+    name: tokenpivot-bf-pgdata-18
