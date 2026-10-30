@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/dundunHa/TokenPivot/internal/requestdetails"
 	"github.com/dundunHa/TokenPivot/internal/workspaces"
 )
@@ -39,7 +40,7 @@ func (d *RequestDetails) routes(mux *http.ServeMux, sessions *Auth) {
 }
 
 func (d *RequestDetails) handleEvents(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := requireMember(w, r, d.Workspaces)
+	workspaceID, ok := requireMemberAvailable(w, r, d.Workspaces)
 	if !ok {
 		return
 	}
@@ -56,7 +57,7 @@ func (d *RequestDetails) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *RequestDetails) handleRate(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := requireMember(w, r, d.Workspaces)
+	workspaceID, ok := requireMemberAvailable(w, r, d.Workspaces)
 	if !ok {
 		return
 	}
@@ -83,11 +84,15 @@ func requestDetailsQuery(w http.ResponseWriter, r *http.Request) (url.Values, bo
 }
 
 // writeRequestDetailsError maps an error to a fixed message: no request value,
-// SQL or database message is repeated. A cancelled or unavailable database is
-// 503.
+// SQL or database message is repeated. An unavailable database is 503; a client
+// cancellation and other failures stay 500.
 func writeRequestDetailsError(r *http.Request, w http.ResponseWriter, err error) {
 	if errors.Is(err, requestdetails.ErrInvalidArgument) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request is not acceptable")
+		return
+	}
+	if errors.Is(err, database.ErrUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "service is unavailable")
 		return
 	}
 	slog.ErrorContext(r.Context(), "request details failed", "stage", "requestdetails", "err", err)

@@ -2066,7 +2066,7 @@ paths:
                   code: PERMISSION_DENIED
                   message: workspace membership required
         '500':
-          description: '`INTERNAL`：成员角色或查询数据库故障；不含 SQL 细节。'
+          description: '`INTERNAL`：成员角色或查询的非数据库不可用故障（含客户端取消）；不含 SQL 细节。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -2079,7 +2079,7 @@ paths:
                   code: INTERNAL
                   message: internal error
         '503':
-          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，请求在查询前停止。'
+          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，或成员检查/查询时数据库不可用（连接失败、连接已关闭、超时），请求停止；不含驱动或 SQL 细节。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -2169,7 +2169,7 @@ paths:
                   code: PERMISSION_DENIED
                   message: workspace membership required
         '500':
-          description: '`INTERNAL`：成员角色或查询数据库故障；不含 SQL 细节。'
+          description: '`INTERNAL`：成员角色或查询的非数据库不可用故障（含客户端取消）；不含 SQL 细节。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -2182,7 +2182,7 @@ paths:
                   code: INTERNAL
                   message: internal error
         '503':
-          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，请求在查询前停止。'
+          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，或成员检查/查询时数据库不可用（连接失败、连接已关闭、超时），请求停止；不含驱动或 SQL 细节。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'

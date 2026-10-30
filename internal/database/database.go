@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -27,6 +28,35 @@ func SafeError(stage string, err error) error {
 		return errors.Join(errors.New(stage), context.DeadlineExceeded)
 	}
 	return errors.New(stage + ": database operation failed")
+}
+
+// ErrUnavailable marks a failure of the database dependency itself (connection
+// failure, closed connection, SQLSTATE class 08, deadline), not a statement fault.
+var ErrUnavailable = errors.New("database unavailable")
+
+// SafeStoreError is SafeError plus ErrUnavailable when the database could not be
+// used. A client disconnect (context.Canceled) is not a dependency failure.
+func SafeStoreError(stage string, err error) error {
+	safe := SafeError(stage, err)
+	if safe != nil && isUnavailable(err) {
+		return errors.Join(ErrUnavailable, safe)
+	}
+	return safe
+}
+
+func isUnavailable(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, pgconn.ErrConnClosed) {
+		return true
+	}
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "08")
 }
 
 // ValidateURL requires explicit PostgreSQL connection coordinates and TLS policy.
