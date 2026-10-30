@@ -1,7 +1,8 @@
 # bf 专用 Compose：项目 tokenpivot-bf，服务 db / migrate / app。
 # 不含任何秘密：数据库 URL 与源码提交只引用进程环境变量，PG 超级用户密码只引用宿主机文件。
-# 必需环境变量：TOKENPIVOT_SOURCE_COMMIT、TOKENPIVOT_DATABASE_URL、TOKENPIVOT_MIGRATION_DATABASE_URL、
-#   TOKENPIVOT_PG_PASSWORD_FILE（宿主机受限密码文件路径）。
+# Compose 必需：TOKENPIVOT_SOURCE_COMMIT（公开值）、TOKENPIVOT_PG_PASSWORD_FILE（宿主机受限密码文件路径）。
+# 两个数据库 URL 允许未设置，便于分阶段只启动 db；缺 URL 时 app / migrate 二进制启动即报错（internal/config/config.go），不会带空 URL 运行。
+# 阶段内只提供该阶段需要的 URL：app 只给 TOKENPIVOT_DATABASE_URL，migrate 只给 TOKENPIVOT_MIGRATION_DATABASE_URL。
 # 迁移不随 up 执行：migrate 在 migration profile 内，须显式 run。不要运行打印插值结果的 `docker compose config`。
 name: tokenpivot-bf
 
@@ -28,7 +29,7 @@ services:
     entrypoint: ["/tokenpivot-migrate"]
     command: ["up"]
     environment:
-      TOKENPIVOT_MIGRATION_DATABASE_URL: ${TOKENPIVOT_MIGRATION_DATABASE_URL:?set TOKENPIVOT_MIGRATION_DATABASE_URL}
+      TOKENPIVOT_MIGRATION_DATABASE_URL: ${TOKENPIVOT_MIGRATION_DATABASE_URL:-}
     depends_on:
       db:
         condition: service_started
@@ -43,7 +44,7 @@ services:
       TOKENPIVOT_WEB_ORIGIN: http://DESKTOP-C28DFS7:18080
       TOKENPIVOT_ALLOW_INSECURE_HTTP: "true"
       TOKENPIVOT_REGISTRATION_OPEN: "false"
-      TOKENPIVOT_DATABASE_URL: ${TOKENPIVOT_DATABASE_URL:?set TOKENPIVOT_DATABASE_URL}
+      TOKENPIVOT_DATABASE_URL: ${TOKENPIVOT_DATABASE_URL:-}
     ports:
       - "0.0.0.0:18080:18080"
     depends_on:

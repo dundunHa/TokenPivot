@@ -17,6 +17,10 @@ ENV GOTOOLCHAIN=local \
     GOARCH=amd64
 WORKDIR /src
 
+# 构建开始即校验提交必须是 40 位十六进制，避免用短哈希或分支名打标签。
+ARG SOURCE_COMMIT
+RUN printf '%s' "${SOURCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' || { echo 'SOURCE_COMMIT must be a 40-hex commit' >&2; exit 1; }
+
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 
