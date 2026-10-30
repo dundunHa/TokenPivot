@@ -58,6 +58,12 @@ func (p *Postgres) MembershipRole(ctx context.Context, userID, workspaceID ID) (
 	return Role(role), true, nil
 }
 
+// CurrentWorkspace returns the earliest workspace the user owns, using the same
+// query as personal workspace creation so both agree on which one is "current".
+func (p *Postgres) CurrentWorkspace(ctx context.Context, userID ID) (Workspace, bool, error) {
+	return queryPersonal(ctx, p.q, userID)
+}
+
 // Tx is the transaction-bound adapter. It can only be built from an open pgx.Tx,
 // which keeps CreatePersonal inside the caller's transaction and keeps the users
 // row lock held until that transaction ends. It never begins, commits or rolls
@@ -99,8 +105,13 @@ func (t *Tx) lockUser(ctx context.Context, userID ID) (bool, error) {
 // only answers "current workspace" while every workspace is personal; it must be
 // re-examined before multiple workspaces per user exist.
 func (t *Tx) personalWorkspace(ctx context.Context, userID ID) (Workspace, bool, error) {
+	return queryPersonal(ctx, t.q, userID)
+}
+
+// queryPersonal runs the shared earliest-owner-workspace lookup.
+func queryPersonal(ctx context.Context, q querier, userID ID) (Workspace, bool, error) {
 	var workspace Workspace
-	err := t.q.QueryRow(ctx, personalWorkspaceQuery, userID).Scan(&workspace.ID, &workspace.Name)
+	err := q.QueryRow(ctx, personalWorkspaceQuery, userID).Scan(&workspace.ID, &workspace.Name)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Workspace{}, false, nil
 	}

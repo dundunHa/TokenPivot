@@ -161,6 +161,7 @@ type RankingsRows struct {
 type Store interface {
 	Aggregate(ctx context.Context, params AggregateParams) (AggregateRows, error)
 	Rankings(ctx context.Context, params RankingsParams) (RankingsRows, error)
+	Options(ctx context.Context, params OptionsParams) (OptionsRows, error)
 }
 
 // MetricStats is one token metric. Value is nil when nothing known or estimated

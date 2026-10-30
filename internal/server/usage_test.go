@@ -19,6 +19,8 @@ import (
 // can be proven to have stopped before SQL.
 type usageFakeStore struct {
 	calls     int
+	options   usage.OptionsRows
+	optParams usage.OptionsParams
 	aggregate usage.AggregateRows
 	rankings  usage.RankingsRows
 	err       error
@@ -37,6 +39,13 @@ func (f *usageFakeStore) Rankings(ctx context.Context, p usage.RankingsParams) (
 	return f.rankings, f.err
 }
 
+func (f *usageFakeStore) Options(ctx context.Context, p usage.OptionsParams) (usage.OptionsRows, error) {
+	f.calls++
+	f.optParams = p
+	f.workspace = p.WorkspaceID.String()
+	return f.options, f.err
+}
+
 type usageFixture struct {
 	*credentialFixture
 	store *usageFakeStore
@@ -49,9 +58,10 @@ func newUsageFixture(t *testing.T) *usageFixture {
 	roles := newRoleFakeStore()
 	store := &usageFakeStore{}
 	handler := NewHandler(Options{
-		CheckReady: func(context.Context) error { return nil },
-		Auth:       adapter,
-		Usage:      NewUsage(usage.New(store), workspaces.New(roles)),
+		CheckReady:       func(context.Context) error { return nil },
+		Auth:             adapter,
+		Usage:            NewUsage(usage.New(store), workspaces.New(roles)),
+		CurrentWorkspace: NewCurrentWorkspace(workspaces.New(roles)),
 	})
 	login := httptest.NewRequest(http.MethodPost, loginPath, strings.NewReader(`{"email":"reader@example.com","password":"synthetic-password"}`))
 	login.Header.Set("Content-Type", "application/json")

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dundunHa/TokenPivot/internal/aggregation"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -44,6 +45,15 @@ type fakeStore struct {
 	aggregateRows  AggregateRows
 	rankingsRows   RankingsRows
 	err            error
+	optionsCalls   int
+	options        OptionsParams
+	optionsRows    OptionsRows
+}
+
+func (f *fakeStore) Options(ctx context.Context, p OptionsParams) (OptionsRows, error) {
+	f.optionsCalls++
+	f.options = p
+	return f.optionsRows, f.err
 }
 
 func (f *fakeStore) Aggregate(ctx context.Context, p AggregateParams) (AggregateRows, error) {
@@ -981,5 +991,47 @@ func TestDecodeCursorRejectsTrailingData(t *testing.T) {
 		if _, err := decodeCursor(text); !errors.Is(err, ErrInvalidArgument) {
 			t.Fatalf("%s: error = %v, want ErrInvalidArgument", name, err)
 		}
+	}
+}
+
+func TestOptionsSamplesClockOnceAndUsesRetentionWindow(t *testing.T) {
+	store := &fakeStore{}
+	s, calls, now := newTestService(store)
+	got, err := s.Options(context.Background(), testWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *calls != 1 {
+		t.Fatalf("clock sampled %d times", *calls)
+	}
+	asOf := now.Truncate(time.Microsecond)
+	if !store.options.End.Equal(asOf) || !store.options.Start.Equal(aggregation.RetentionCutoff(asOf)) || store.options.WorkspaceID != testWorkspace {
+		t.Fatalf("params %+v", store.options)
+	}
+	if got.Providers == nil || got.Models == nil || len(got.Providers) != 0 || len(got.Models) != 0 {
+		t.Fatalf("empty result must be non-nil empty slices: %+v", got)
+	}
+}
+
+func TestOptionsDeduplicatesAndSorts(t *testing.T) {
+	store := &fakeStore{optionsRows: OptionsRows{
+		Providers: []string{"openai", "anthropic", "openai"},
+		Models:    []string{"b", "B", "a", "b"},
+	}}
+	s, _, _ := newTestService(store)
+	got, err := s.Options(context.Background(), testWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got.Providers, ",") != "anthropic,openai" || strings.Join(got.Models, ",") != "B,a,b" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestOptionsStoreErrorPassesThrough(t *testing.T) {
+	boom := errors.New("boom")
+	s, _, _ := newTestService(&fakeStore{err: boom})
+	if _, err := s.Options(context.Background(), testWorkspace); !errors.Is(err, boom) {
+		t.Fatalf("err = %v", err)
 	}
 }

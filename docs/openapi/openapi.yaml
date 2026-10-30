@@ -8,7 +8,7 @@ info:
 
     本文冻结 TokenPivot 首版三组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）、**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）与 **owner 凭证管理**（列表、签发、轮换、撤销，以及会话、`Origin`、owner 准入与错误码）。
 
-    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
+    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`workspaces/current`、`usage/options`，T-057）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
@@ -858,6 +858,38 @@ paths:
           $ref: '#/components/responses/AuthInternal'
         '503':
           $ref: '#/components/responses/AuthUnavailable'
+  /api/v1/workspaces/current:
+    get:
+      tags:
+        - usage
+      operationId: getCurrentWorkspace
+      summary: 读取当前用户的个人空间
+      description: |
+        返回会话用户创建最早的 owner 空间（`joined_at, id` 升序第一个）的 `workspace_id` 与 `name`。身份只来自会话，不接受任何查询参数或 body 指定用户或空间。读请求，不要求 `Origin`。
+
+        **仅限当前阶段**：每个用户只有一个注册时创建的 Personal 空间。它不是空间列表，也不是切换接口；多空间上线时必须重新设计。
+        找不到空间属于数据完整性故障，返回 `500 INTERNAL`，**不创建空间、不返回占位值**。所有响应 `Cache-Control: no-store`。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '当前个人空间。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentWorkspace'
+              example:
+                workspace_id: 0199a0b0-0000-7000-8000-00000000000a
+                name: Personal
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
   /api/v1/workspaces/{workspaceID}/projects:
     parameters:
       - $ref: '#/components/parameters/WorkspaceID'
@@ -1842,6 +1874,100 @@ paths:
                   code: UNAVAILABLE
                   message: service is unavailable
 
+  /api/v1/workspaces/{workspaceID}/usage/options:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - usage
+      operationId: getUsageOptions
+      summary: 列出 Provider 与 Model 筛选选项
+      description: |
+        返回该 workspace 在保留期内分钟聚合里出现过的非空 `provider` 与 `model` 值，供总览筛选使用。**不接受任何查询参数**，出现查询串返回 `400 INVALID_ARGUMENT`。项目不在此端点，请用项目列表接口。
+
+        **范围**：每次请求只采样一次 `as_of`，扫描 `bucket_start >= retention_cutoff AND bucket_start < as_of`（`retention_cutoff` 算法见 `UsageRangeBase`），不依赖物理清理。两个维度独立去重（按原文逐字节相等，不做大小写或别名合并），按字节序升序排列，不截断；无数据时为 `[]`，不是错误。
+
+        **授权**：先会话，再 workspace 成员角色（owner 与 member 可读），然后才查询；跨空间返回 `403`，不泄露其数据。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '筛选选项。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageOptions'
+              example:
+                providers: [anthropic, example-provider]
+                models: [example-model]
+        '400':
+          description: '`INVALID_ARGUMENT`：路径 UUID 非法或带了查询参数。不执行 SQL。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INVALID_ARGUMENT
+                  message: request is not acceptable
+        '401':
+          description: '`UNAUTHENTICATED`：无有效浏览器会话。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：不是该 workspace 成员。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace membership required
+        '500':
+          description: '`INTERNAL`：成员角色或查询数据库故障；不含 SQL 细节。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INTERNAL
+                  message: internal error
+        '503':
+          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，请求在查询前停止。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAVAILABLE
+                  message: service is unavailable
 components:
   securitySchemes:
     bearerAuth:
@@ -2923,6 +3049,34 @@ components:
           format: date-time
           description: '`null` 表示 active；否则为首次归档时间（RFC 3339），重复归档不改变它。'
       description: 一个项目。
+
+    CurrentWorkspace:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, name]
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+      description: 当前用户的个人空间身份。
+
+    UsageOptions:
+      type: object
+      additionalProperties: false
+      required: [providers, models]
+      properties:
+        providers:
+          type: array
+          items:
+            type: string
+          description: 去重后按字节序升序的 provider 值；无数据为 `[]`。
+        models:
+          type: array
+          items:
+            type: string
+          description: 去重后按字节序升序的 model 值；无数据为 `[]`。独立于 providers，不表示组合关系。
 
     ProjectList:
       type: array
