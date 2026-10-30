@@ -684,7 +684,7 @@ paths:
           description: |
             两种原因共用此状态码，靠 `code` 区分，响应都不写入、都不下发 Cookie：
 
-            - `PERMISSION_DENIED`：（默认开关下）`Origin` 缺失、为 `null`、多值或与可信 origin 不相等。它先于 JSON 解析、限流和注册开关判断。
+            - `PERMISSION_DENIED`：默认严格模式下 `Origin` 缺失、为 `null`、多值或与可信 origin 不相等。它先于 JSON 解析、限流和注册开关判断。
             - `REGISTRATION_CLOSED`：注册开关关闭且数据库已有用户。它先于用户写入和邮箱唯一冲突，因此已占用与未占用的邮箱得到完全相同的响应。
           headers:
             Cache-Control:
@@ -1377,7 +1377,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：（默认开关下）`Origin` 缺失、为 `null`、多值或不等于可信 origin，或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          description: '`PERMISSION_DENIED`：默认严格模式下 `Origin` 缺失、为 `null`、多值或不等于可信 origin，或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1480,7 +1480,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：（默认开关下）`Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          description: '`PERMISSION_DENIED`：默认严格模式下 `Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1576,7 +1576,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：（默认开关下）`Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          description: '`PERMISSION_DENIED`：默认严格模式下 `Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -2224,12 +2224,14 @@ components:
     TrustedOrigin:
       name: Origin
       in: header
-      required: true
+      required: false
       description: |
-        默认部署下浏览器写请求必须带此头；`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true`（BF 例外）时服务端不校验它。浏览器写请求的可信来源。必须恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等（host 与 scheme 比较不区分大小写，协议默认端口省略）。缺失、空白、`null`、多值列表或任何不等都返回 `403 PERMISSION_DENIED`，且不执行会话校验或数据库写入。服务端不从请求 `Host`、`Forwarded` 或 `X-Forwarded-Host` 建立信任。
+        浏览器写请求的来源头，行为取决于部署开关 `TOKENPIVOT_DISABLE_ORIGIN_CHECK`。
+        - **默认（`false`，严格模式）**：必须恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等（host 与 scheme 比较不区分大小写，协议默认端口省略，形如 `https://host[:port]`）。缺失、空白、`null`、多值列表或任何不等都返回 `403 PERMISSION_DENIED`，且不执行会话校验或数据库写入。
+        - **`true`（BF 经用户明确批准的例外）**：服务端完全不校验该头，可缺省，内容任意，不会因它返回 `403`；请求继续进行会话校验和权限检查（可能 `401`、`403`（权限）、`503` 等）。
+        两种模式下服务端都不从请求 `Host`、`Forwarded` 或 `X-Forwarded-Host` 建立信任。
       schema:
         type: string
-        pattern: '^https?://[^/?#@]+$'
     WorkspaceID:
       name: workspaceID
       in: path
@@ -2435,7 +2437,7 @@ components:
               code: INVALID_ARGUMENT
               message: request is not acceptable
     AuthPermissionDenied:
-      description: '`PERMISSION_DENIED`：写请求的 （默认开关下）`Origin` 缺失、为 `null`、多值或与可信 origin 不相等。不产生任何写入。'
+      description: '`PERMISSION_DENIED`：写请求在默认严格模式下 `Origin` 缺失、为 `null`、多值或与可信 origin 不相等（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时不产生此原因）。不产生任何写入。'
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
@@ -2502,7 +2504,7 @@ components:
               code: INTERNAL
               message: internal error
     CredentialUnavailable:
-      description: '`UNAVAILABLE`：会话存储等依赖不可用，请求在读取或创建凭证之前就停止。不得据此判定请求未认证或凭证已撤销、已创建；按原请求重试。写操作的 `Origin` 先于会话校验，因此 `Origin` 不合法时仍得到 `403` 而不是本码。'
+      description: '`UNAVAILABLE`：会话存储等依赖不可用，请求在读取或创建凭证之前就停止。不得据此判定请求未认证或凭证已撤销、已创建；按原请求重试。默认严格模式下写操作的 `Origin` 先于会话校验，因此 `Origin` 不合法时仍得到 `403` 而不是本码；`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，继续会话检查，会话存储故障仍返回本码，无会话则为 `401`。'
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
@@ -2541,7 +2543,7 @@ components:
               code: UNAUTHENTICATED
               message: authentication required
     ManagementPermissionDenied:
-      description: '`PERMISSION_DENIED`：写请求 （默认开关下）`Origin` 缺失、`null`、多值或不等于可信 origin；或会话用户不是该 workspace 成员（非成员），或 member 执行 owner 写操作。不区分未加入与角色不足。'
+      description: '`PERMISSION_DENIED`：写请求在默认严格模式下 `Origin` 缺失、`null`、多值或不等于可信 origin（开关 true 时无此原因）；或会话用户不是该 workspace 成员（非成员），或 member 执行 owner 写操作。不区分未加入与角色不足。'
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
@@ -3613,7 +3615,7 @@ components:
         |---|---|---|
         | `INVALID_ARGUMENT` | 400 | 请求体非空，或路径参数不是合法 UUID |
         | `UNAUTHENTICATED` | 401 | 无 Cookie，或会话不可用 |
-        | `PERMISSION_DENIED` | 403 | 写操作 （默认开关下）`Origin` 不合法，或会话用户不是该 workspace 的 owner |
+        | `PERMISSION_DENIED` | 403 | 写操作在默认严格模式下 `Origin` 不合法（开关 true 时无此原因），或会话用户不是该 workspace 的 owner |
         | `NOT_FOUND` | 404 | source/credential 不存在或不属于路径 workspace |
         | `CONFLICT` | 409 | 签发/轮换时来源已归档（固定消息 `source is archived`） |
         | `INTERNAL` | 500 | 数据库等服务端故障；不假装成功 |
