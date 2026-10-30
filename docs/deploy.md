@@ -44,7 +44,7 @@ HTTP 的已知风险：唯一 Origin 是明文 HTTP，凭证、会话 Cookie 和
 | `TOKENPIVOT_SOURCE_COMMIT` | Compose 选择镜像 `tokenpivot:<提交>` | 公开值 |
 | `TOKENPIVOT_DATABASE_URL` | app 进程连接，服务角色 `tokenpivot_app` | 完整 URL，密码由本地凭证工具注入；含 `host=db`、`search_path=tokenpivot`、`sslmode=disable` |
 | `TOKENPIVOT_MIGRATION_DATABASE_URL` | 迁移进程连接，角色 `tokenpivot_owner` | 只注入迁移进程；不进入 app 容器，不回退到服务 URL |
-| `TOKENPIVOT_PG_PASSWORD_FILE` | PostgreSQL 超级用户初始密码文件 | 宿主机受限文件路径；只引用路径，不读取或输出内容。**路径 TODO(待确认)** |
+| `TOKENPIVOT_PG_PASSWORD_FILE` | PostgreSQL 超级用户初始密码文件 | 固定为 `/root/.tokenpivot-bf/secrets/postgres-password`，权限 600；只引用路径，不读取或输出内容。 |
 
 非敏感 URL 模板（`<密码安全注入>` 由凭证工具替换，勿手写真实值）：
 
@@ -53,7 +53,7 @@ postgres://tokenpivot_owner@db:5432/tokenpivot?sslmode=disable&search_path=token
 postgres://tokenpivot_app@db:5432/tokenpivot?sslmode=disable&search_path=tokenpivot
 ```
 
-密码文件与备份目录在使用前创建，权限仅限部署账号；密码文件内容不打印。**备份目录路径 TODO(待确认)**。
+密码文件与备份目录在使用前创建，权限仅限部署账号；密码文件内容不打印。备份目录固定为 `/root/.tokenpivot-bf/backups/`，目录权限 700。
 
 ## 3. 构建镜像并记录版本
 
@@ -117,7 +117,7 @@ docker compose --profile migration run \
 
 - 保留该一次性容器供审计，**不使用 `--rm`**；记录执行 ID、开始/结束时间、退出码和日志中的版本行（`applied` 或 `no change`）。
 - 成功后才允许创建/启动 app。重复 `up` 成功并记录 `no change`。
-- 失败时 app 保持未启动。先核对原执行：`docker inspect tokenpivot-bf-migrate-<执行ID>` 看状态与退出码，再在 owner 连接下核对迁移历史与对象（`status` 可能创建历史表，README 已说明；结果未明前不得再次 `up`）。不自动 `down-one`、reset、force、删库或删卷。
+- 失败时 app 保持未启动。先核对原执行：`docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' tokenpivot-bf-migrate-<执行ID>` 只看状态与退出码，禁止不带 `--format` 输出完整环境；再在 owner 连接下核对迁移历史与对象（`status` 可能创建历史表，README 已说明；结果未明前不得再次 `up`）。不自动 `down-one`、reset、force、删库或删卷。
 - 生产优先前向修复；迁移失败或提交结果未知时，先查原执行，不重复触发。
 
 迁移后核对：实际迁移版本与固定源码一致；app 容器没有 `TOKENPIVOT_MIGRATION_DATABASE_URL`；数据库 host 连接规则为 SCRAM（compose 已设 `POSTGRES_HOST_AUTH_METHOD=scram-sha-256`），不使用 `trust`。
@@ -190,7 +190,7 @@ curl --fail --show-error --silent http://DESKTOP-C28DFS7:18080/healthz
 
 ## 10. 已知未核实事项
 
-- 最终完整提交与镜像 ID、密码文件路径、备份目录路径：TODO(待确认)。
+- 最终完整提交与镜像 ID：TODO(待确认)，发布执行时记录。
 - 镜像摘要可拉取性、固定摘要构建、scratch 中两个二进制与 Compose profile 行为，须由实际构建和分阶段启动验收证明；未验证前不得声称已通过。
 - Windows/Hyper-V 防火墙与路由器 18080 转发未纳入本方案；不新增来源限制，也不保证任何来源的可达或不可达。
 - 内部 `sslmode=disable` 的批准范围仅限本套单机专用网络；不适用于其他远程连接。
