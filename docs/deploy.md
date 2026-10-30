@@ -77,7 +77,7 @@ Dockerfile 内部会执行现有 `make build`，并检查两个二进制、时�
 ## 4. 创建新实例与初始化数据库
 
 1. 变更前记录旧资源基线（只记非敏感元数据）：`docker ps --format '{{.Names}}\t{{.ID}}\t{{.Status}}'`、`docker volume ls -q`。发现本项目所需的名称、端口、挂载冲突时停止，不处置旧资源。
-2. 创建受限密码文件（路径见 TODO），并确认其只对部署账号可读。
+2. 按第 2 节固定路径创建受限密码文件，并确认其只对部署账号可读。
 3. 分阶段注入变量：启动数据库只需 `TOKENPIVOT_SOURCE_COMMIT` 与 `TOKENPIVOT_PG_PASSWORD_FILE`，两个数据库 URL 此时可以不设置（compose 允许缺省，缺 URL 的 app / migrate 二进制启动即失败，不会带空 URL 运行）；迁移阶段再注入迁移 URL，应用阶段再注入服务 URL，彼此不混入。只启动数据库（不要运行不带服务名的 `docker compose up`，不要运行会打印插值后密钥的 `docker compose config`）：
 
 ```sh
