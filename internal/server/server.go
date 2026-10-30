@@ -41,6 +41,9 @@ type Options struct {
 	// Usage enables the read-only aggregate query routes for workspace members; nil
 	// leaves them absent. They also need Options.Auth for the session gate.
 	Usage *Usage
+	// RequestDetails enables the read-only request detail and 60 second rate
+	// routes; nil leaves them absent. They also need Options.Auth.
+	RequestDetails *RequestDetails
 	// CurrentWorkspace enables GET /api/v1/workspaces/current; nil leaves it
 	// absent. It also needs Options.Auth for the session gate.
 	CurrentWorkspace *CurrentWorkspace
@@ -93,6 +96,7 @@ func NewHandler(options Options) http.Handler {
 	options.Auth.routes(mux)
 	options.Credentials.routes(mux, options.Auth)
 	options.Usage.routes(mux, options.Auth)
+	options.RequestDetails.routes(mux, options.Auth)
 	options.CurrentWorkspace.routes(mux, options.Auth)
 	options.Projects.routes(mux, options.Auth)
 	options.Sources.routes(mux, options.Auth)
