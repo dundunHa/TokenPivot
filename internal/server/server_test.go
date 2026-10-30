@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -131,18 +132,21 @@ func await[T any](t *testing.T, ch <-chan T) T {
 	}
 }
 
-// assertNotListening requires that addr stops accepting connections. Close
-// returns before the kernel stops completing handshakes on the just-closed
-// socket (observed on WSL2: about 30% of immediate dials still succeed, none
-// after a few milliseconds), so the check polls until a dial is refused. A
-// listener that is really still open keeps accepting and fails at the deadline.
+// assertNotListening requires that addr refuses connections. In this
+// environment a dial made right after Close can still succeed, so the check
+// retries until the dial is refused. Only ECONNREFUSED counts as closed; a
+// timeout or any other error (for example a listener that stays open but never
+// accepts) fails, and so does a dial that still connects at the deadline.
 func assertNotListening(t *testing.T, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		conn, err := net.DialTimeout("tcp", addr, time.Second)
 		if err != nil {
-			return
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				return
+			}
+			t.Fatalf("dial %s: want connection refused, got %v", addr, err)
 		}
 		if closeErr := conn.Close(); closeErr != nil {
 			t.Error(closeErr)
