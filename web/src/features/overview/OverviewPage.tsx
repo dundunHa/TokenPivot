@@ -265,7 +265,7 @@ function OverviewContent({
         ) : null}
       </Section>
       <OverviewRanking
-        key={identity}
+        identity={identity}
         scope={scope}
         filters={filters}
         range={range}

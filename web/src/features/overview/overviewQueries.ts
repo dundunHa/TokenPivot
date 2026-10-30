@@ -82,7 +82,8 @@ export function useAggregate(
   return useQuery({
     ...aggregateQuery(scope, filters, range),
     refetchInterval: REFRESH_MS,
-    refetchOnWindowFocus: true,
+    // 共享 staleTime 为 Infinity；"always" 使固定范围从隐藏恢复可见时也立即刷新。
+    refetchOnWindowFocus: "always",
   });
 }
 
@@ -98,7 +99,7 @@ export function useRankings(
   return useQuery({
     ...rankingsQuery(scope, filters, range, groupBy, cursor),
     refetchInterval: tail ? false : REFRESH_MS,
-    refetchOnWindowFocus: !tail,
+    refetchOnWindowFocus: tail ? false : "always",
   });
 }
 

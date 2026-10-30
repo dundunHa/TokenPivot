@@ -212,3 +212,83 @@ describe("metrics and trend", () => {
     expect(t.points[0]?.unavailable).toBe(true);
   });
 });
+
+describe("DST edge cases", () => {
+  const base = {
+    providers: [],
+    models: [],
+    projects: [],
+    granularity: "hour" as const,
+    start: null,
+    end: null,
+  };
+
+  it("picks the earliest repeated midnight (Havana fall-back on 2020-11-01)", () => {
+    const now = Date.parse("2020-11-01T15:00:00Z");
+    const r = resolveRange(
+      { ...base, range: "today", timezone: "America/Havana" },
+      now,
+    );
+    expect(new Date(r.startMs).toISOString()).toBe("2020-11-01T04:00:00.000Z");
+    const y = resolveRange(
+      { ...base, range: "yesterday", timezone: "America/Havana" },
+      Date.parse("2020-11-02T15:00:00Z"),
+    );
+    expect(new Date(y.startMs).toISOString()).toBe("2020-11-01T04:00:00.000Z");
+    expect(new Date(y.endMs ?? 0).toISOString()).toBe(
+      "2020-11-02T05:00:00.000Z",
+    );
+  });
+
+  it("uses the transition instant when midnight does not exist (São Paulo 2018-11-04)", () => {
+    const now = Date.parse("2018-11-04T15:00:00Z");
+    const r = resolveRange(
+      { ...base, range: "today", timezone: "America/Sao_Paulo" },
+      now,
+    );
+    expect(new Date(r.startMs).toISOString()).toBe("2018-11-04T03:00:00.000Z");
+  });
+
+  it("keeps ordinary days unchanged", () => {
+    const r = resolveRange(
+      { ...base, range: "today", timezone: "Asia/Shanghai" },
+      Date.parse("2026-10-28T20:30:00Z"),
+    );
+    expect(new Date(r.startMs).toISOString()).toBe("2026-10-28T16:00:00.000Z");
+  });
+
+  it("disambiguates repeated local hour labels with the UTC offset", () => {
+    const t = buildTrend({
+      ...agg([
+        point(
+          "2026-11-01T05:00:00Z",
+          "2026-11-01T06:00:00Z",
+          stats("1", "1", "2"),
+        ),
+        point(
+          "2026-11-01T06:00:00Z",
+          "2026-11-01T07:00:00Z",
+          stats("1", "1", "2"),
+        ),
+        point(
+          "2026-11-01T07:00:00Z",
+          "2026-11-01T08:00:00Z",
+          stats("1", "1", "2"),
+        ),
+      ]),
+      range: {
+        start: "",
+        end: "",
+        asOf: "",
+        retentionCutoff: "",
+        timezone: "America/New_York",
+        granularity: "hour",
+      },
+    });
+    const labels = t.points.map((p) => p.label);
+    expect(new Set(labels).size).toBe(3);
+    expect(labels[0]).toContain("-04:00");
+    expect(labels[1]).toContain("-05:00");
+    expect(labels[2]).not.toMatch(/[+-]\d\d:\d\d$/);
+  });
+});

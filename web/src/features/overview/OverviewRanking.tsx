@@ -111,16 +111,24 @@ function Tail({ cursor, ...c }: Common & { cursor: string }) {
 }
 
 export function OverviewRanking({
+  identity,
   scope,
   filters,
   range,
   projectNames,
   onToggle,
 }: Omit<Common, "dimension" | "onToggle"> & {
+  /** 筛选标识；变化时收起旧长尾，但保留当前排名维度。 */
+  identity: string;
   onToggle: (dimension: RankingDimension, value: string) => void;
 }) {
   const [dimension, setDimension] = useState<RankingDimension>("project");
   const [expanded, setExpanded] = useState(false);
+  const [seenIdentity, setSeenIdentity] = useState(identity);
+  if (seenIdentity !== identity) {
+    setSeenIdentity(identity);
+    setExpanded(false);
+  }
   const query = useRankings(scope, filters, range, dimension, null);
   const data = query.data;
   const toggle = (value: string) => onToggle(dimension, value);
