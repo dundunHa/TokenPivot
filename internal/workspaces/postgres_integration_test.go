@@ -757,3 +757,29 @@ func TestCurrentWorkspaceAgainstPostgres(t *testing.T) {
 		t.Fatalf("read created rows: workspaces=%d memberships=%d", rows, memberships)
 	}
 }
+
+// TestMembershipRoleOnTerminatedConnectionIsUnavailable: a backend the server
+// closed makes the membership lookup an unavailable-database error, never a
+// "not a member" result.
+func TestMembershipRoleOnTerminatedConnectionIsUnavailable(t *testing.T) {
+	svc, pool, appURL := newWorkspaces(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(database.SafeError("acquire", err))
+	}
+	var pid int32
+	if err := c.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(database.SafeError("pid", err))
+	}
+	c.Release()
+	killer := openAppConn(t, ctx, appURL)
+	if _, err := killer.Exec(ctx, `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		t.Fatal(database.SafeError("terminate", err))
+	}
+	_, found, err := svc.MembershipRole(ctx, ID{Bytes: [16]byte{1}, Valid: true}, ID{Bytes: [16]byte{2}, Valid: true})
+	if found || !errors.Is(err, database.ErrUnavailable) {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+}

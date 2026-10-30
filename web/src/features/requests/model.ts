@@ -57,6 +57,12 @@ function tooPrecise(text: string): boolean {
   return (FRACTION.exec(text)?.[1]?.length ?? 0) > 6;
 }
 
+/** 微秒精度的时刻：parseInstant 的 ms 忽略小数秒，这里补回（已确认至多 6 位）。 */
+function micros(text: string, ms: number): bigint {
+  const frac = FRACTION.exec(text)?.[1] ?? "";
+  return BigInt(ms) * 1000n + BigInt(frac.padEnd(6, "0") || "0");
+}
+
 /** 明细范围校验：带偏移的 RFC 3339、最多 6 位小数秒、起点早于终点；不要求分钟对齐。 */
 export function parseRequestRange(
   start: string,
@@ -70,6 +76,7 @@ export function parseRequestRange(
         "时间格式无效，需要带偏移、最多 6 位小数秒的 RFC 3339，如 2026-10-28T09:00:00+08:00",
     };
   }
-  if (a.ms >= b.ms) return { error: "起点必须早于终点" };
+  if (micros(start.trim(), a.ms) >= micros(end.trim(), b.ms))
+    return { error: "起点必须早于终点" };
   return { range: { start: start.trim(), end: end.trim() } };
 }

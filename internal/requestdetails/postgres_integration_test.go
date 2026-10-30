@@ -165,6 +165,7 @@ type fixture struct {
 	svc   *Service
 	pool  *pgxpool.Pool
 	ctx   context.Context
+	url   string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -178,7 +179,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	t.Cleanup(pool.Close)
 	store := NewPostgres(pool)
-	f := &fixture{store: store, svc: New(store), pool: pool, ctx: ctx}
+	f := &fixture{store: store, svc: New(store), pool: pool, ctx: ctx, url: appURL}
 	for _, w := range []pgtype.UUID{ws, otherWS} {
 		f.exec(t, `INSERT INTO sources (id,workspace_id,platform,instance_key) VALUES ($1,$2,'p','i')`, srcFor(w), w)
 	}
@@ -560,5 +561,52 @@ func TestEventsPagingNewAndBackfilledEvents(t *testing.T) {
 	}
 	if !shown[newSame] || !shown[passed] || len(latest.Items) != 8 {
 		t.Fatalf("restart shows %d items, newSame=%v passed=%v", len(latest.Items), shown[newSame], shown[passed])
+	}
+}
+
+// killPoolConn terminates the pool's only idle backend from a second connection,
+// so the next query runs on a connection the server already closed.
+func (f *fixture) killPoolConn(t *testing.T) {
+	t.Helper()
+	c, err := f.pool.Acquire(f.ctx)
+	if err != nil {
+		t.Fatal(database.SafeError("acquire", err))
+	}
+	var pid int32
+	if err := c.QueryRow(f.ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(database.SafeError("pid", err))
+	}
+	c.Release()
+	killer, err := pgx.Connect(f.ctx, f.url)
+	if err != nil {
+		t.Fatal(database.SafeError("connect", err))
+	}
+	defer killer.Close(context.Background())
+	if _, err := killer.Exec(f.ctx, `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		t.Fatal(database.SafeError("terminate", err))
+	}
+}
+
+// TestQueriesOnTerminatedConnectionAreUnavailable: a connection closed by the
+// server mid-life (admin shutdown, EOF) is a dependency failure for events and
+// rate; a cancelled context and an ordinary statement error are not.
+func TestQueriesOnTerminatedConnectionAreUnavailable(t *testing.T) {
+	f := newFixture(t)
+	f.killPoolConn(t)
+	_, err := f.svc.Events(f.ctx, ws, withRange(nil))
+	if !errors.Is(err, database.ErrUnavailable) {
+		t.Fatalf("events err = %v", err)
+	}
+	f.killPoolConn(t)
+	if _, err := f.svc.Rate(f.ctx, ws, nil); !errors.Is(err, database.ErrUnavailable) {
+		t.Fatalf("rate err = %v", err)
+	}
+	cancelled, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if _, err := f.svc.Events(cancelled, ws, withRange(nil)); err == nil || errors.Is(err, database.ErrUnavailable) {
+		t.Fatalf("cancelled err = %v", err)
+	}
+	if _, err := f.pool.Exec(f.ctx, `SELECT * FROM no_such_table`); err == nil || errors.Is(database.SafeStoreError("x", err), database.ErrUnavailable) {
+		t.Fatalf("statement err = %v", err)
 	}
 }

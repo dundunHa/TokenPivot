@@ -110,6 +110,33 @@ describe("request model", () => {
     }
   });
 
+  it("compares the range at microsecond precision across offsets", () => {
+    const ok = (a: string, b: string) => "range" in parseRequestRange(a, b);
+    expect(
+      ok("2026-10-01T00:00:00.000001Z", "2026-10-01T00:00:00.000002Z"),
+    ).toBe(true);
+    expect(
+      ok("2026-10-01T00:00:00.000002Z", "2026-10-01T00:00:00.000001Z"),
+    ).toBe(false);
+    expect(
+      ok("2026-10-01T00:00:00.000001Z", "2026-10-01T00:00:00.000001Z"),
+    ).toBe(false);
+    expect(ok("2026-10-01T00:00:00.5Z", "2026-10-01T00:00:00.500001Z")).toBe(
+      true,
+    );
+    // 同一时刻的不同偏移写法相等；偏移之后的微秒先后仍成立。
+    expect(ok("2026-10-01T08:00:00+08:00", "2026-10-01T00:00:00Z")).toBe(false);
+    expect(
+      ok("2026-10-01T08:00:00.000001+08:00", "2026-10-01T00:00:00.000002Z"),
+    ).toBe(true);
+    expect(
+      ok("2026-10-01T08:00:00.000002+08:00", "2026-10-01T00:00:00.000001Z"),
+    ).toBe(false);
+    expect(ok("2026-09-30T23:59:59.999999-05:00", "2026-10-01T05:00:00Z")).toBe(
+      true,
+    );
+  });
+
   it("validates the detail range like the server", () => {
     expect(
       parseRequestRange("2026-10-01T00:00:00.123456Z", "2026-10-02T00:00:00Z"),

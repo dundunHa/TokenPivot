@@ -4,8 +4,11 @@ package database
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -44,11 +47,21 @@ func SafeStoreError(stage string, err error) error {
 	return safe
 }
 
+// isUnavailable recognizes dependency failures, not statement faults: failed
+// connection attempts, a connection the driver or peer already closed (EOF,
+// reset, broken pipe, network errors), SQLSTATE class 08 and the
+// server shutdown states 57P01/57P02/57P03. A client disconnect stays false.
 func isUnavailable(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, pgconn.ErrConnClosed) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, pgconn.ErrConnClosed) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
 		return true
 	}
 	var connectErr *pgconn.ConnectError
@@ -56,7 +69,14 @@ func isUnavailable(err error) bool {
 		return true
 	}
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "08")
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "57P01", "57P02", "57P03":
+		return true
+	}
+	return strings.HasPrefix(pgErr.Code, "08")
 }
 
 // ValidateURL requires explicit PostgreSQL connection coordinates and TLS policy.
