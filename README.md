@@ -64,6 +64,7 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 | `TOKENPIVOT_DATABASE_URL` | 服务必填，PostgreSQL URL，明确 host、database、user、sslmode |
 | `TOKENPIVOT_MIGRATION_DATABASE_URL` | 独立迁移账号，必填；不会回退到服务 URL |
 | `TOKENPIVOT_WEB_ORIGIN` | 服务必填，唯一可信浏览器 origin，如 `http://127.0.0.1:5173`；一个 http(s) origin，不含用户信息、路径、查询、片段或尾斜杠，scheme/host 规范化为小写并省略默认端口。`https` 用于生产；`http` 默认只允许 `localhost`、`127.0.0.1`、`::1` 回环地址，非回环 http 在启动时直接失败，除非设置 `TOKENPIVOT_ALLOW_INSECURE_HTTP=true`；`0.0.0.0` 是监听地址，不能作 Origin |
+| `TOKENPIVOT_DISABLE_ORIGIN_CHECK` | 关闭写请求 Origin 校验的开关，默认 `false`（未设置等同关闭开关，保持精确匹配）；只接受精确的 `true`/`false`，其他写法使启动失败，错误只指出变量名。启动时读取一次。设为 `true` 时缺失、IP、主机名或任何 Origin 都不会因此 403；会话认证与权限、注册开关不变，Cookie 的 Secure 仍由 `TOKENPIVOT_WEB_ORIGIN` 的 scheme 决定。这是 BF 部署经用户明确批准的例外，其他环境保持 `false`；失去 Origin 校验后 CSRF 仅靠 SameSite=Lax 缓解 |
 | `TOKENPIVOT_ALLOW_INSECURE_HTTP` | 允许非回环 http Origin 的显式开关，默认 `false`（未设置等同关闭）；只接受精确的 `true`/`false`，其他写法使启动失败，错误只指出变量名和允许值、不回显输入。启动时读取一次，不热加载。只放开“非回环 http”限制，Origin 其余校验与写请求精确匹配不变；不改变监听范围，也不开放注册。http 下凭证、会话和页面内容在链路上可被窃听或篡改，不能视作等同 https |
 | `TOKENPIVOT_REGISTRATION_OPEN` | 注册开关，默认 `false`（未设置等同关闭）；只接受精确的 `true`/`false`，空值、`TRUE`、` yes `、`1` 等其他写法使启动失败，错误只指出变量名和允许值、不回显输入。启动时读取一次，不热加载。关闭时只有**空库的首个用户**可以注册，此后所有注册返回 `403 REGISTRATION_CLOSED`；开放时不受此限制 |
 
@@ -175,7 +176,7 @@ stderr 输出 slog JSON；数据库错误只包含安全阶段/类别，不输�
 - 密码直接注册，不需要邮箱验证；密码以 Argon2id 编码存储（m=19456 KiB、t=2、p=1，16 字节 salt、32 字节 key），会话令牌为 `tps_` + `crypto/rand.Text()`，数据库只存 SHA-256 原始 32 字节摘要。
 - 会话 30 天精确滑动，每次有效认证用一条 `UPDATE ... RETURNING` 续期并返回到期时间；没有刷新阈值，也没有绝对截止时间。
 - Cookie 名 `tokenpivot_session`，`Path=/`、无 `Domain`、`HttpOnly`、`SameSite=Lax`；可信 origin 为 `https` 时 `Secure=true`，`http`（回环开发，或显式 `TOKENPIVOT_ALLOW_INSECURE_HTTP=true` 的非回环部署）时为 `false`；Cookie 无 `Domain`，按主机而非端口区分，同主机其他端口也可能收到。
-- 注册、登录、登出等写请求要求恰好一个 `Origin` 且与 `TOKENPIVOT_WEB_ORIGIN` 完全相等，否则 403 且不写库；`GET /api/v1/auth/session` 不要求 Origin。
+- 注册、登录、登出等写请求要求恰好一个 `Origin` 且与 `TOKENPIVOT_WEB_ORIGIN` 完全相等，否则 403 且不写库（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 的 BF 例外下不做此校验）；`GET /api/v1/auth/session` 不要求 Origin。
 - 四个端点的所有响应都带 `Cache-Control: no-store`。限流是单进程内存固定窗口：每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次；IP 只取 `RemoteAddr`，不信任任何转发头，多实例不共享计数。
 - 采集端点尚未实现（属后续任务），其接口规则已冻结为只认 `Authorization: Bearer`：即使同时携带有效 Cookie 也不回退浏览器身份。
 - 注册开关 `TOKENPIVOT_REGISTRATION_OPEN` 默认关闭。关闭时只有**空库的首个用户**可以注册，该用户同时获得展示名固定为 `Personal` 的个人空间和 `owner` 成员关系；此后所有注册一律 `403 REGISTRATION_CLOSED`（已占用和未占用的邮箱响应完全相同，不下发 Cookie，不写库），直到部署方显式改为 `true`。开放时重复邮箱仍是 `409 EMAIL_UNAVAILABLE`。空库判定与首个用户写入在同一 `READ COMMITTED` 事务内、在事务级排他 advisory lock 之后进行，所以空库上的并发首注册只会成功一个；开放模式跳过锁与空库查询。

@@ -44,6 +44,8 @@ services:
       TOKENPIVOT_WEB_ORIGIN: http://DESKTOP-C28DFS7:18080
       TOKENPIVOT_ALLOW_INSECURE_HTTP: "true"
       TOKENPIVOT_REGISTRATION_OPEN: "false"
+      # 用户明确批准的 BF 例外：不校验写请求 Origin，IP/主机名均可访问；仍需会话。
+      TOKENPIVOT_DISABLE_ORIGIN_CHECK: "true"
       TOKENPIVOT_DATABASE_URL: ${TOKENPIVOT_DATABASE_URL:-}
     ports:
       - "0.0.0.0:18080:18080"

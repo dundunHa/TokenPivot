@@ -284,6 +284,7 @@ func (f *roleFakeStore) MembershipRole(ctx context.Context, userID, workspaceID 
 // credentialFixture is one wired handler plus the fakes behind it.
 type credentialFixture struct {
 	handler http.Handler
+	adapter *Auth
 	store   *credentialFakeStore
 	roles   *roleFakeStore
 	service *credentials.Service
@@ -328,6 +329,7 @@ func newCredentialFixture(t *testing.T) *credentialFixture {
 
 	fixture := &credentialFixture{
 		handler:     handler,
+		adapter:     adapter,
 		store:       store,
 		roles:       roles,
 		service:     service,
@@ -1213,5 +1215,56 @@ func TestCredentialNoStoreOnSuccess(t *testing.T) {
 		if got := response.Header().Get("Cache-Control"); got != noStoreValue {
 			t.Fatalf("%s Cache-Control = %q", name, got)
 		}
+	}
+}
+
+// TestDisableOriginCheckOnCredentialRoutes drives the real credential write
+// routes with the switch on: any Origin shape without a session is 401 and never
+// reaches storage, a member session keeps its owner-only 403, and the owner
+// session works without a trusted Origin.
+func TestDisableOriginCheckOnCredentialRoutes(t *testing.T) {
+	fixture := newCredentialFixture(t)
+	fixture.adapter.DisableOriginCheck = true
+	seeded := fixture.store.seedCredential(fixture.workspaceID, fixture.sourceID, nil)
+	paths := map[string]string{
+		"issue":  fixture.collectionPath(),
+		"rotate": fixture.rotatePath(seeded.ID.String()),
+		"revoke": fixture.revokePath(seeded.ID.String()),
+	}
+	for name, path := range paths {
+		for originName, origins := range map[string][]string{"missing": nil, "foreign": {"https://evil.example.com"}, "multiple": {testOrigin, "http://192.0.2.10:18080"}} {
+			t.Run(name+"/"+originName+"/no session", func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodPost, path, nil)
+				for _, o := range origins {
+					req.Header.Add("Origin", o)
+				}
+				w := fixture.doRequest(t, req)
+				if w.Code != http.StatusUnauthorized {
+					t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+				}
+			})
+		}
+	}
+	if fixture.store.callCount("Insert") != 0 || fixture.store.callCount("Revoke") != 0 {
+		t.Fatal("unauthenticated requests reached storage")
+	}
+
+	// A member keeps the owner-only rule even though Origin is not checked.
+	fixture.roles.setRole(fixture.ownerID, fixture.workspaceID, workspaces.RoleMember)
+	req := fixture.newRequest(http.MethodPost, paths["issue"], "")
+	req.Header.Set("Origin", "http://192.0.2.10:18080")
+	if w := fixture.doRequest(t, req); w.Code != http.StatusForbidden {
+		t.Fatalf("member status = %d: %s", w.Code, w.Body.String())
+	}
+	if fixture.store.callCount("Insert") != 0 {
+		t.Fatal("member request reached storage")
+	}
+
+	// The owner with an arbitrary Origin is accepted.
+	fixture.roles.setRole(fixture.ownerID, fixture.workspaceID, workspaces.RoleOwner)
+	req = fixture.newRequest(http.MethodPost, paths["issue"], "")
+	req.Header.Set("Origin", "http://192.0.2.10:18080")
+	if w := fixture.doRequest(t, req); w.Code != http.StatusCreated {
+		t.Fatalf("owner status = %d: %s", w.Code, w.Body.String())
 	}
 }

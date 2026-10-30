@@ -17,6 +17,9 @@ import (
 type Auth struct {
 	Service *auth.Service
 	Origin  config.Origin
+	// DisableOriginCheck makes RequireOrigin pass every request through. It is set
+	// only from TOKENPIVOT_DISABLE_ORIGIN_CHECK; session checks still apply.
+	DisableOriginCheck bool
 	// now reads the current time for the cookie Max-Age; nil means time.Now. It
 	// is unexported and set only by tests, which pin the gap between the database
 	// expiry and the response without sleeping.
@@ -83,10 +86,11 @@ func (a *Auth) noStore(next http.Handler) http.Handler {
 // RequireOrigin rejects a browser write request unless it carries exactly one
 // Origin value equal to the configured trusted origin. It never trusts the Host
 // header, Forwarded or X-Forwarded-Host. It applies to browser write routes
-// only; plugin Bearer endpoints keep their existing authentication.
+// only; plugin Bearer endpoints keep their existing authentication. When
+// DisableOriginCheck is set the check is skipped completely.
 func (a *Auth) RequireOrigin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !config.OriginHeaderMatches(a.Origin, r.Header.Values("Origin")) {
+		if !a.DisableOriginCheck && !config.OriginHeaderMatches(a.Origin, r.Header.Values("Origin")) {
 			writeError(w, http.StatusForbidden, "PERMISSION_DENIED", "request origin is not allowed")
 			return
 		}

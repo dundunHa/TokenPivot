@@ -12,7 +12,7 @@ info:
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
-    - 三组接口的认证互不替代：采集只认 `Authorization: Bearer` 且**不回退 Cookie**；浏览器认证与凭证管理只认会话 Cookie，凭证管理的写操作还要求 `Origin`，插件令牌 `tpk_` 不能用于凭证管理。同一请求同时携带多种凭据时，各自按所属端点规则判定。
+    - 三组接口的认证互不替代：采集只认 `Authorization: Bearer` 且**不回退 Cookie**；浏览器认证与凭证管理只认会话 Cookie，凭证管理的写操作还要求 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行），插件令牌 `tpk_` 不能用于凭证管理。同一请求同时携带多种凭据时，各自按所属端点规则判定。
 
     # 2. 外部格式版本与规范化版本
 
@@ -50,7 +50,7 @@ info:
 
     - 只认 `cookieAuth`（`tokenpivot_session`）。明文为 `tps_` + `crypto/rand.Text()`，数据库只存完整令牌的 SHA-256 原始 32 字节摘要；`tpk_` 插件令牌在这里不被接受，Bearer 头也不建立浏览器身份。
     - 会话 30 天精确滑动：每次有效认证都用一条 `UPDATE ... FROM ... RETURNING` 续期并返回到期时间，无刷新阈值、无绝对截止；数据库返回 0 行即 `401 UNAUTHENTICATED`。四个端点的所有响应都带 `Cache-Control: no-store`。
-    - 写请求（注册、登录、登出）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。`GET /api/v1/auth/session` 是读请求，不要求 `Origin`。
+    - 写请求（注册、登录、登出）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。`GET /api/v1/auth/session` 是读请求，不要求 `Origin`。例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true`（BF 经用户明确批准）时完全不做 Origin 校验，缺失或不等不再 403，会话认证与权限不变。
     - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。owner 与工作空间成员判断属 T-019，本文不定义；注册时会为每个新用户创建展示名固定为 `Personal` 的个人空间并写入其 `owner` 成员关系，但响应不返回工作空间字段，也没有工作空间 HTTP 接口。
     - 注册与登录限流为单进程内存固定窗口（每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次），所有合法尝试都占额度、成功不返还；达到上限的请求不执行密码哈希或写库。
     - 注册开关由部署环境变量 `TOKENPIVOT_REGISTRATION_OPEN` 决定，启动时读取一次，未设置等同 `false`，只接受精确的 `true`/`false`。关闭时仅空库的首个用户可注册，其余一律 `403 REGISTRATION_CLOSED`；空库判定与首个用户写入在同一 `READ COMMITTED` 事务内，并在事务级排他 advisory lock 之后进行。没有查询注册状态的端点。
@@ -454,15 +454,15 @@ tags:
   - name: ingestion
     description: '插件凭证认证的同步批量采集端点。只接受 `Authorization: Bearer`，不回退 Cookie。'
   - name: browser-auth
-    description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出这些写操作必须携带与可信 Web origin 完全一致的 `Origin`。'
+    description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出这些写操作必须携带与可信 Web origin 完全一致的 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。'
   - name: credentials
-    description: 'owner 管理接入凭证的端点。只认浏览器会话 Cookie 且要求 workspace owner；列表是读请求、不要求 `Origin`，签发、轮换、撤销三个写操作必须携带可信 `Origin`。插件令牌 `tpk_` 不能用于这些路径。'
+    description: 'owner 管理接入凭证的端点。只认浏览器会话 Cookie 且要求 workspace owner；列表是读请求、不要求 `Origin`，签发、轮换、撤销三个写操作必须携带可信 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。插件令牌 `tpk_` 不能用于这些路径。'
   - name: usage
     description: '工作空间内的只读聚合查询（总量+趋势、分组排名）。只认浏览器会话 Cookie，workspace 的 owner 与 member 可读；都是 GET，不要求 `Origin`；所有响应（含认证失败）带 `Cache-Control: no-store`。'
   - name: projects
-    description: 'workspace 内项目管理端点。owner 可创建、修改、归档，member 只读；写操作必须携带可信 `Origin`。DELETE 是保留历史的归档。'
+    description: 'workspace 内项目管理端点。owner 可创建、修改、归档，member 只读；写操作必须携带可信 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。DELETE 是保留历史的归档。'
   - name: sources
-    description: 'workspace 内数据来源管理端点。owner 可创建、修改、归档，member 只读；写操作必须携带可信 `Origin`。归档来源会在同一事务内撤销其有效凭证，历史全部保留。'
+    description: 'workspace 内数据来源管理端点。owner 可创建、修改、归档，member 只读；写操作必须携带可信 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。归档来源会在同一事务内撤销其有效凭证，历史全部保留。'
 
 paths:
   /api/v1/ingestion/events:
@@ -646,7 +646,7 @@ paths:
       description: |
         用邮箱和密码直接创建账号，不需要邮箱验证。注册成功在**同一事务**内写入四部分数据：`users` 行、该用户展示名固定为 `Personal` 的个人空间、这条空间的 `owner` 成员关系，以及首个 `sessions` 行；然后返回 `201`、`{user, expires_at}` 和新的会话 Cookie，因此刚注册的用户无需再次输入密码。任一步失败整体回滚，不会出现只有用户没有个人空间或没有会话的半套数据。
 
-        **写请求必须携带 `Origin`**：恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等。缺失、空白、`null`、多值或不等一律 `403 PERMISSION_DENIED`，且不产生任何数据库写入。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。
+        **写请求默认必须携带 `Origin`**（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 的 BF 例外下不校验）：恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等。缺失、空白、`null`、多值或不等一律 `403 PERMISSION_DENIED`，且不产生任何数据库写入。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。
 
         **注册开关**：部署环境变量 `TOKENPIVOT_REGISTRATION_OPEN` 在启动时读取一次，不在运行中热加载；未设置等同 `false`，只接受精确的 `true`/`false`，其他值使服务启动失败。开关关闭时只有**空库的首个用户**可以注册，此后所有注册一律 `403 REGISTRATION_CLOSED`；开关开放时注册不受此限制。不提供查询注册是否开放的任何端点。
 
@@ -684,7 +684,7 @@ paths:
           description: |
             两种原因共用此状态码，靠 `code` 区分，响应都不写入、都不下发 Cookie：
 
-            - `PERMISSION_DENIED`：`Origin` 缺失、为 `null`、多值或与可信 origin 不相等。它先于 JSON 解析、限流和注册开关判断。
+            - `PERMISSION_DENIED`：默认严格模式下 `Origin` 缺失、为 `null`、多值或与可信 origin 不相等。它先于 JSON 解析、限流和注册开关判断。
             - `REGISTRATION_CLOSED`：注册开关关闭且数据库已有用户。它先于用户写入和邮箱唯一冲突，因此已占用与未占用的邮箱得到完全相同的响应。
           headers:
             Cache-Control:
@@ -930,7 +930,7 @@ paths:
       operationId: createProject
       summary: 创建项目
       description: |
-        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，无会话则返回 `401`，其余顺序与权限不变）；仅 owner 可写，member 与非成员一律 `403`。
 
         请求体上限 16 KiB（超出 `413 BODY_TOO_LARGE`），`Content-Type` 必须为 `application/json`（否则 `415`）。严格解码：拒绝非 UTF-8、未知字段、重复键、尾随 JSON、`null` 字段与错误类型；文本字段为 1–128 UTF-8 字节、不含控制字符、不含首尾 Unicode 空白，且不做 trim 或大小写归一化。
 
@@ -981,7 +981,7 @@ paths:
       operationId: updateProject
       summary: 修改项目名称
       description: |
-        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，无会话则返回 `401`，其余顺序与权限不变）；仅 owner 可写，member 与非成员一律 `403`。
 
         请求体上限 16 KiB（超出 `413 BODY_TOO_LARGE`），`Content-Type` 必须为 `application/json`（否则 `415`）。严格解码：拒绝非 UTF-8、未知字段、重复键、尾随 JSON、`null` 字段与错误类型；文本字段为 1–128 UTF-8 字节、不含控制字符、不含首尾 Unicode 空白，且不做 trim 或大小写归一化。
 
@@ -1028,7 +1028,7 @@ paths:
       operationId: archiveProject
       summary: 归档项目
       description: |
-        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，无会话则返回 `401`，其余顺序与权限不变）；仅 owner 可写，member 与非成员一律 `403`。
 
         **DELETE 是归档，不是物理删除**：保留行、事件（`usage_events`）、分钟聚合（`usage_minute_stats`）与凭证记录，不重新归属；无恢复接口；归档行仍占用唯一键，因此删除后用相同键再次创建仍返回 `409 CONFLICT`。请求体必须为空，重复 DELETE 返回 `204` 且保留第一次 `archived_at`。
 
@@ -1095,7 +1095,7 @@ paths:
       operationId: createSource
       summary: 创建数据来源
       description: |
-        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，无会话则返回 `401`，其余顺序与权限不变）；仅 owner 可写，member 与非成员一律 `403`。
 
         请求体上限 16 KiB（超出 `413 BODY_TOO_LARGE`），`Content-Type` 必须为 `application/json`（否则 `415`）。严格解码：拒绝非 UTF-8、未知字段、重复键、尾随 JSON、`null` 字段与错误类型；文本字段为 1–128 UTF-8 字节、不含控制字符、不含首尾 Unicode 空白，且不做 trim 或大小写归一化。
 
@@ -1146,7 +1146,7 @@ paths:
       operationId: updateSource
       summary: 修改来源机器标识
       description: |
-        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，无会话则返回 `401`，其余顺序与权限不变）；仅 owner 可写，member 与非成员一律 `403`。
 
         请求体上限 16 KiB（超出 `413 BODY_TOO_LARGE`），`Content-Type` 必须为 `application/json`（否则 `415`）。严格解码：拒绝非 UTF-8、未知字段、重复键、尾随 JSON、`null` 字段与错误类型；文本字段为 1–128 UTF-8 字节、不含控制字符、不含首尾 Unicode 空白，且不做 trim 或大小写归一化。
 
@@ -1195,7 +1195,7 @@ paths:
       operationId: archiveSource
       summary: 归档来源并撤销其有效凭证
       description: |
-        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`；仅 owner 可写，member 与非成员一律 `403`。
+        准入顺序固定为 **`Origin` → 会话 → 空间角色（先解析 `workspaceID`）→ 资源 ID → 请求体 → 数据库**：`Origin` 缺失、`null`、多值或不等时在会话检查之前返回 `403`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，无会话则返回 `401`，其余顺序与权限不变）；仅 owner 可写，member 与非成员一律 `403`。
 
         **DELETE 是归档，不是物理删除**：保留行、事件（`usage_events`）、分钟聚合（`usage_minute_stats`）与凭证记录，不重新归属；无恢复接口；归档行仍占用唯一键，因此删除后用相同键再次创建仍返回 `409 CONFLICT`。请求体必须为空，重复 DELETE 返回 `204` 且保留第一次 `archived_at`。
 
@@ -1323,7 +1323,7 @@ paths:
 
         请求体必须为空：`workspace_id`、`source_id`、`role`、凭证 TTL 等字段都不被接受，出现任何内容即 `400 INVALID_ARGUMENT` 且不创建凭证。归属只取自路径与数据库行，客户端不能指定。
 
-        写操作必须携带与可信 Web origin 完全一致的 `Origin`。准入顺序固定为 **`Origin` → 会话 → owner（含 `workspaceID` 解析）→ 请求体为空 → `sourceID` 解析 → 数据库**：`Origin` 缺失或不等时在会话检查之前就返回 `403`，因此同时缺 Cookie 又缺 `Origin` 的请求得到 `403` 而非 `401`；归属校验全部通过后才创建凭证，任一失败都不创建。签发**不是幂等操作**：响应丢失后重试可能留下多个有效凭证，此时用列表取得多余凭证的 ID 再撤销。
+        写操作默认必须携带与可信 Web origin 完全一致的 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。准入顺序固定为 **`Origin` → 会话 → owner（含 `workspaceID` 解析）→ 请求体为空 → `sourceID` 解析 → 数据库**：`Origin` 缺失或不等时在会话检查之前就返回 `403`，因此同时缺 Cookie 又缺 `Origin` 的请求默认得到 `403` 而非 `401`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，此类请求得到 `401`）；归属校验全部通过后才创建凭证，任一失败都不创建。签发**不是幂等操作**：响应丢失后重试可能留下多个有效凭证，此时用列表取得多余凭证的 ID 再撤销。
       security:
         - cookieAuth: []
       parameters:
@@ -1377,7 +1377,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：`Origin` 缺失、为 `null`、多值或不等于可信 origin，或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          description: '`PERMISSION_DENIED`：默认严格模式下 `Origin` 缺失、为 `null`、多值或不等于可信 origin，或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1433,7 +1433,7 @@ paths:
 
         旧凭证**保持原有撤销状态**：轮换不撤销、不复活旧凭证，因此轮换后旧令牌仍可用，直到 owner 显式调用撤销。已撤销的旧凭证也能作为轮换来源。
 
-        请求体必须为空。写操作必须携带可信 `Origin`，准入顺序与签发相同（`Origin` → 会话 → owner → 请求体 → `credentialID` 解析 → 数据库），任一失败都不创建凭证。与签发一样，轮换不是幂等操作，并发轮换会各自创建独立有效凭证，这是明确行为，不做隐形去重。
+        请求体必须为空。写操作默认必须携带可信 `Origin`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过，其余不变），准入顺序与签发相同（`Origin` → 会话 → owner → 请求体 → `credentialID` 解析 → 数据库），任一失败都不创建凭证。与签发一样，轮换不是幂等操作，并发轮换会各自创建独立有效凭证，这是明确行为，不做隐形去重。
       security:
         - cookieAuth: []
       parameters:
@@ -1480,7 +1480,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：`Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          description: '`PERMISSION_DENIED`：默认严格模式下 `Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -1538,7 +1538,7 @@ paths:
 
         生效边界：撤销提交后**开始**的认证都会失败，但提交前已通过认证的在途请求允许完成，本端点不提供全局即时停用。
 
-        请求体必须为空。写操作必须携带可信 `Origin`，准入顺序与签发相同（`Origin` → 会话 → owner → 请求体 → `credentialID` 解析 → 数据库）。凭证不属于路径 workspace 时返回 `404 NOT_FOUND`，且不泄露其存在性。
+        请求体必须为空。写操作默认必须携带可信 `Origin`（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过，其余不变），准入顺序与签发相同（`Origin` → 会话 → owner → 请求体 → `credentialID` 解析 → 数据库）。凭证不属于路径 workspace 时返回 `404 NOT_FOUND`，且不泄露其存在性。
       security:
         - cookieAuth: []
       parameters:
@@ -1576,7 +1576,7 @@ paths:
                   code: UNAUTHENTICATED
                   message: authentication required
         '403':
-          description: '`PERMISSION_DENIED`：`Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
+          description: '`PERMISSION_DENIED`：默认严格模式下 `Origin` 不合法或会话用户不是该 workspace 的 owner。不创建也不修改凭证。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -2224,12 +2224,14 @@ components:
     TrustedOrigin:
       name: Origin
       in: header
-      required: true
+      required: false
       description: |
-        浏览器写请求的可信来源。必须恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等（host 与 scheme 比较不区分大小写，协议默认端口省略）。缺失、空白、`null`、多值列表或任何不等都返回 `403 PERMISSION_DENIED`，且不执行会话校验或数据库写入。服务端不从请求 `Host`、`Forwarded` 或 `X-Forwarded-Host` 建立信任。
+        浏览器写请求的来源头，行为取决于部署开关 `TOKENPIVOT_DISABLE_ORIGIN_CHECK`。
+        - **默认（`false`，严格模式）**：必须恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等（host 与 scheme 比较不区分大小写，协议默认端口省略，形如 `https://host[:port]`）。缺失、空白、`null`、多值列表或任何不等都返回 `403 PERMISSION_DENIED`，且不执行会话校验或数据库写入。
+        - **`true`（BF 经用户明确批准的例外）**：服务端完全不校验该头，可缺省，内容任意，不会因它返回 `403`；请求继续进行会话校验和权限检查（可能 `401`、`403`（权限）、`503` 等）。
+        两种模式下服务端都不从请求 `Host`、`Forwarded` 或 `X-Forwarded-Host` 建立信任。
       schema:
         type: string
-        pattern: '^https?://[^/?#@]+$'
     WorkspaceID:
       name: workspaceID
       in: path
@@ -2435,7 +2437,7 @@ components:
               code: INVALID_ARGUMENT
               message: request is not acceptable
     AuthPermissionDenied:
-      description: '`PERMISSION_DENIED`：写请求的 `Origin` 缺失、为 `null`、多值或与可信 origin 不相等。不产生任何写入。'
+      description: '`PERMISSION_DENIED`：写请求在默认严格模式下 `Origin` 缺失、为 `null`、多值或与可信 origin 不相等（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时不产生此原因）。不产生任何写入。'
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
@@ -2502,7 +2504,7 @@ components:
               code: INTERNAL
               message: internal error
     CredentialUnavailable:
-      description: '`UNAVAILABLE`：会话存储等依赖不可用，请求在读取或创建凭证之前就停止。不得据此判定请求未认证或凭证已撤销、已创建；按原请求重试。写操作的 `Origin` 先于会话校验，因此 `Origin` 不合法时仍得到 `403` 而不是本码。'
+      description: '`UNAVAILABLE`：会话存储等依赖不可用，请求在读取或创建凭证之前就停止。不得据此判定请求未认证或凭证已撤销、已创建；按原请求重试。默认严格模式下写操作的 `Origin` 先于会话校验，因此 `Origin` 不合法时仍得到 `403` 而不是本码；`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时跳过 Origin，继续会话检查，会话存储故障仍返回本码，无会话则为 `401`。'
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
@@ -2541,7 +2543,7 @@ components:
               code: UNAUTHENTICATED
               message: authentication required
     ManagementPermissionDenied:
-      description: '`PERMISSION_DENIED`：写请求 `Origin` 缺失、`null`、多值或不等于可信 origin；或会话用户不是该 workspace 成员（非成员），或 member 执行 owner 写操作。不区分未加入与角色不足。'
+      description: '`PERMISSION_DENIED`：写请求在默认严格模式下 `Origin` 缺失、`null`、多值或不等于可信 origin（开关 true 时无此原因）；或会话用户不是该 workspace 成员（非成员），或 member 执行 owner 写操作。不区分未加入与角色不足。'
       headers:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
@@ -3613,7 +3615,7 @@ components:
         |---|---|---|
         | `INVALID_ARGUMENT` | 400 | 请求体非空，或路径参数不是合法 UUID |
         | `UNAUTHENTICATED` | 401 | 无 Cookie，或会话不可用 |
-        | `PERMISSION_DENIED` | 403 | 写操作 `Origin` 不合法，或会话用户不是该 workspace 的 owner |
+        | `PERMISSION_DENIED` | 403 | 写操作在默认严格模式下 `Origin` 不合法（开关 true 时无此原因），或会话用户不是该 workspace 的 owner |
         | `NOT_FOUND` | 404 | source/credential 不存在或不属于路径 workspace |
         | `CONFLICT` | 409 | 签发/轮换时来源已归档（固定消息 `source is archived`） |
         | `INTERNAL` | 500 | 数据库等服务端故障；不假装成功 |
