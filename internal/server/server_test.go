@@ -131,14 +131,26 @@ func await[T any](t *testing.T, ch <-chan T) T {
 	}
 }
 
+// assertNotListening requires that addr stops accepting connections. Close
+// returns before the kernel stops completing handshakes on the just-closed
+// socket (observed on WSL2: about 30% of immediate dials still succeed, none
+// after a few milliseconds), so the check polls until a dial is refused. A
+// listener that is really still open keeps accepting and fails at the deadline.
 func assertNotListening(t *testing.T, addr string) {
 	t.Helper()
-	conn, err := net.DialTimeout("tcp", addr, time.Second)
-	if err == nil {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			return
+		}
 		if closeErr := conn.Close(); closeErr != nil {
 			t.Error(closeErr)
 		}
-		t.Fatal("listener remains open")
+		if time.Now().After(deadline) {
+			t.Fatal("listener remains open")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
