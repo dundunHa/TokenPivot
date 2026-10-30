@@ -344,6 +344,8 @@ describe("logout", () => {
         HttpResponse.json(sessionBody("a@example.com", FUTURE)),
       ),
       http.post(LOGOUT, () => errorResponse(500, "INTERNAL")),
+      // 总览的空间请求保持挂起，本用例只关注退出失败提示。
+      http.get("/api/v1/workspaces/current", () => new Promise(() => {})),
     );
     const user = userEvent.setup();
     renderApp("/");
