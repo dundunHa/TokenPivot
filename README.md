@@ -63,7 +63,8 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 | `TOKENPIVOT_HTTP_ADDR` | 默认 `127.0.0.1:8080`，显式空值非法；host:port，端口数字 1–65535 |
 | `TOKENPIVOT_DATABASE_URL` | 服务必填，PostgreSQL URL，明确 host、database、user、sslmode |
 | `TOKENPIVOT_MIGRATION_DATABASE_URL` | 独立迁移账号，必填；不会回退到服务 URL |
-| `TOKENPIVOT_WEB_ORIGIN` | 服务必填，唯一可信浏览器 origin，如 `http://127.0.0.1:5173`；一个 http(s) origin，不含用户信息、路径、查询、片段或尾斜杠，scheme/host 规范化为小写并省略默认端口。`https` 用于生产；`http` 只允许 `localhost`、`127.0.0.1`、`::1` 回环地址，非回环 http 在启动时直接失败 |
+| `TOKENPIVOT_WEB_ORIGIN` | 服务必填，唯一可信浏览器 origin，如 `http://127.0.0.1:5173`；一个 http(s) origin，不含用户信息、路径、查询、片段或尾斜杠，scheme/host 规范化为小写并省略默认端口。`https` 用于生产；`http` 默认只允许 `localhost`、`127.0.0.1`、`::1` 回环地址，非回环 http 在启动时直接失败，除非设置 `TOKENPIVOT_ALLOW_INSECURE_HTTP=true`；`0.0.0.0` 是监听地址，不能作 Origin |
+| `TOKENPIVOT_ALLOW_INSECURE_HTTP` | 允许非回环 http Origin 的显式开关，默认 `false`（未设置等同关闭）；只接受精确的 `true`/`false`，其他写法使启动失败，错误只指出变量名和允许值、不回显输入。启动时读取一次，不热加载。只放开“非回环 http”限制，Origin 其余校验与写请求精确匹配不变；不改变监听范围，也不开放注册。http 下凭证、会话和页面内容在链路上可被窃听或篡改，不能视作等同 https |
 | `TOKENPIVOT_REGISTRATION_OPEN` | 注册开关，默认 `false`（未设置等同关闭）；只接受精确的 `true`/`false`，空值、`TRUE`、` yes `、`1` 等其他写法使启动失败，错误只指出变量名和允许值、不回显输入。启动时读取一次，不热加载。关闭时只有**空库的首个用户**可以注册，此后所有注册返回 `403 REGISTRATION_CLOSED`；开放时不受此限制 |
 
 哪个进程需要哪些变量（各变量之间没有回退关系）：
@@ -84,7 +85,7 @@ postgres://tokenpivot_app@127.0.0.1:5432/tokenpivot_local?sslmode=disable&search
 postgres://tokenpivot_owner@127.0.0.1:5432/tokenpivot_local?sslmode=disable&search_path=tokenpivot
 ```
 
-`sslmode=disable` 仅用于明确的回环本地实例；远程须用 `verify-full` 和可信 CA，不静默降级 TLS。pgx 仍支持 PG 环境变量、pgpass/service 等默认机制；应用不读取或打印其内容。操作前隔离这些默认值，使用完整 URL 和明确 `search_path`，避免误连默认库；不要依赖 shell 中遗留的 PG 配置。
+`sslmode=disable` 仅用于明确的回环本地实例，以及经批准的单机专用 Compose 内部网络（数据库不发布宿主端口、其他项目不加入该网络、凭证不跨主机传输）；其他远程须用 `verify-full` 和可信 CA，不静默降级 TLS。pgx 仍支持 PG 环境变量、pgpass/service 等默认机制；应用不读取或打印其内容。操作前隔离这些默认值，使用完整 URL 和明确 `search_path`，避免误连默认库；不要依赖 shell 中遗留的 PG 配置。
 
 配置只加载一次，不读取 `.env`/YAML，不支持热加载。支持 IPv4、主机名、方括号 IPv6、空 host；`:8080` 表示明确监听所有接口，默认回环监听不是生产安全方案。地址占用失败，不自动换端口或重试。
 
@@ -173,7 +174,7 @@ stderr 输出 slog JSON；数据库错误只包含安全阶段/类别，不输�
 
 - 密码直接注册，不需要邮箱验证；密码以 Argon2id 编码存储（m=19456 KiB、t=2、p=1，16 字节 salt、32 字节 key），会话令牌为 `tps_` + `crypto/rand.Text()`，数据库只存 SHA-256 原始 32 字节摘要。
 - 会话 30 天精确滑动，每次有效认证用一条 `UPDATE ... RETURNING` 续期并返回到期时间；没有刷新阈值，也没有绝对截止时间。
-- Cookie 名 `tokenpivot_session`，`Path=/`、无 `Domain`、`HttpOnly`、`SameSite=Lax`；可信 origin 为 `https` 时 `Secure=true`，回环开发 `http` 时为 `false`。
+- Cookie 名 `tokenpivot_session`，`Path=/`、无 `Domain`、`HttpOnly`、`SameSite=Lax`；可信 origin 为 `https` 时 `Secure=true`，`http`（回环开发，或显式 `TOKENPIVOT_ALLOW_INSECURE_HTTP=true` 的非回环部署）时为 `false`；Cookie 无 `Domain`，按主机而非端口区分，同主机其他端口也可能收到。
 - 注册、登录、登出等写请求要求恰好一个 `Origin` 且与 `TOKENPIVOT_WEB_ORIGIN` 完全相等，否则 403 且不写库；`GET /api/v1/auth/session` 不要求 Origin。
 - 四个端点的所有响应都带 `Cache-Control: no-store`。限流是单进程内存固定窗口：每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次；IP 只取 `RemoteAddr`，不信任任何转发头，多实例不共享计数。
 - 采集端点尚未实现（属后续任务），其接口规则已冻结为只认 `Authorization: Bearer`：即使同时携带有效 Cookie 也不回退浏览器身份。

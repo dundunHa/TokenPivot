@@ -1,11 +1,13 @@
 package server
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 
 	"github.com/dundunHa/TokenPivot/internal/auth"
+	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/dundunHa/TokenPivot/internal/workspaces"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -26,20 +28,27 @@ func (a *Auth) readRoute(handler http.Handler) http.Handler {
 // requireMember proves the session user belongs to the path workspace in any
 // role. It is the shared gate of every browser read of workspace resources.
 func requireMember(w http.ResponseWriter, r *http.Request, memberships *workspaces.Service) (workspaces.ID, bool) {
-	return requireRole(w, r, memberships, false)
+	return requireRole(w, r, memberships, false, false)
+}
+
+// requireMemberAvailable is requireMember that maps an unavailable database to
+// 503 UNAVAILABLE; other lookup failures stay 500. Only the request detail
+// endpoints use it, so the other endpoints keep their documented 500.
+func requireMemberAvailable(w http.ResponseWriter, r *http.Request, memberships *workspaces.Service) (workspaces.ID, bool) {
+	return requireRole(w, r, memberships, false, true)
 }
 
 // requireOwner proves the session user is the owner of the path workspace. It is
 // the shared gate of every browser write of workspace resources.
 func requireOwner(w http.ResponseWriter, r *http.Request, memberships *workspaces.Service) (workspaces.ID, bool) {
-	return requireRole(w, r, memberships, true)
+	return requireRole(w, r, memberships, true, false)
 }
 
 // requireRole resolves the path workspace and the session user's role through
 // the one membership lookup, MembershipRole. Every rejection happens before any
 // resource read or write. A lookup failure is a real error (500), never a
 // permission decision; a non-member and an insufficient role are both 403.
-func requireRole(w http.ResponseWriter, r *http.Request, memberships *workspaces.Service, ownerOnly bool) (workspaces.ID, bool) {
+func requireRole(w http.ResponseWriter, r *http.Request, memberships *workspaces.Service, ownerOnly, mapUnavailable bool) (workspaces.ID, bool) {
 	user, ok := UserFromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "authentication required")
@@ -51,6 +60,10 @@ func requireRole(w http.ResponseWriter, r *http.Request, memberships *workspaces
 	}
 	role, found, err := memberships.MembershipRole(r.Context(), membershipUserID(user), workspaceID)
 	if err != nil {
+		if mapUnavailable && errors.Is(err, database.ErrUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "service is unavailable")
+			return workspaces.ID{}, false
+		}
 		slog.ErrorContext(r.Context(), "workspace access failed", "stage", "workspace role", "err", err)
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
 		return workspaces.ID{}, false

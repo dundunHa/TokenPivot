@@ -241,7 +241,7 @@ func TestWebOriginRejected(t *testing.T) {
 }
 
 func TestOriginHeaderMatches(t *testing.T) {
-	origin, err := ParseOrigin("https://app.example.com")
+	origin, err := ParseOrigin("https://app.example.com", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestOriginHeaderMatches(t *testing.T) {
 // compares scheme, host and port exactly too, and that the explicit port is part
 // of the comparison.
 func TestOriginHeaderMatchesLoopbackDevelopmentOrigins(t *testing.T) {
-	origin, err := ParseOrigin("http://127.0.0.1:5173")
+	origin, err := ParseOrigin("http://127.0.0.1:5173", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,4 +359,63 @@ func TestPlainHTTPOriginLimitedToNamedLoopbackHosts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAllowInsecureHTTPSetting pins the explicit non-loopback http switch: it is
+// off by default, accepts only exact true/false and never echoes a bad value.
+func TestAllowInsecureHTTPSetting(t *testing.T) {
+	const origin = "http://DESKTOP-C28DFS7:18080"
+	t.Run("default rejects non-loopback http", func(t *testing.T) {
+		setLoadableEnv(t)
+		t.Setenv("TOKENPIVOT_WEB_ORIGIN", origin)
+		if _, err := Load(); err == nil {
+			t.Fatal("non-loopback http accepted without the switch")
+		}
+	})
+	t.Run("false rejects non-loopback http", func(t *testing.T) {
+		setLoadableEnv(t)
+		t.Setenv("TOKENPIVOT_WEB_ORIGIN", origin)
+		t.Setenv("TOKENPIVOT_ALLOW_INSECURE_HTTP", "false")
+		if _, err := Load(); err == nil {
+			t.Fatal("non-loopback http accepted with false")
+		}
+	})
+	t.Run("true allows it with a non-Secure cookie", func(t *testing.T) {
+		setLoadableEnv(t)
+		t.Setenv("TOKENPIVOT_WEB_ORIGIN", origin)
+		t.Setenv("TOKENPIVOT_ALLOW_INSECURE_HTTP", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.WebOrigin.String() != "http://desktop-c28dfs7:18080" || cfg.WebOrigin.Secure() {
+			t.Fatalf("origin = %q secure = %t", cfg.WebOrigin.String(), cfg.WebOrigin.Secure())
+		}
+		if cfg.RegistrationOpen {
+			t.Fatal("the switch opened registration")
+		}
+	})
+	t.Run("true keeps the other origin rules", func(t *testing.T) {
+		for _, value := range []string{"http://host:18080/", "http://host:18080/path", "http://user@host:18080", "http://host:0", "ftp://host", "http://host:18080?q=1", " http://host:18080"} {
+			setLoadableEnv(t)
+			t.Setenv("TOKENPIVOT_ALLOW_INSECURE_HTTP", "true")
+			t.Setenv("TOKENPIVOT_WEB_ORIGIN", value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("invalid origin %q accepted", value)
+			}
+		}
+	})
+	t.Run("invalid values fail without echo", func(t *testing.T) {
+		for _, value := range []string{"", "TRUE", " true", "true ", "1", "yes"} {
+			setLoadableEnv(t)
+			t.Setenv("TOKENPIVOT_ALLOW_INSECURE_HTTP", value)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("value %q accepted", value)
+			}
+			if !strings.Contains(err.Error(), "TOKENPIVOT_ALLOW_INSECURE_HTTP") || (value != "" && strings.Contains(err.Error(), value)) {
+				t.Fatalf("unsafe error: %v", err)
+			}
+		}
+	})
 }

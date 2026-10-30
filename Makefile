@@ -88,4 +88,4 @@ test-integration:
 
 # DSH 用量插件（plugins/dsh）：纯 Node 测试，不需要 npm install、PostgreSQL 或 DSH。
 test-plugin-dsh:
-	cd plugins/dsh && node --test test/
+	cd plugins/dsh && node --test test/*.test.js

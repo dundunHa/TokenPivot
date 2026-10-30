@@ -8,7 +8,7 @@ info:
 
     本文冻结 TokenPivot 首版三组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）、**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）与 **owner 凭证管理**（列表、签发、轮换、撤销，以及会话、`Origin`、owner 准入与错误码）。
 
-    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`workspaces/current`、`usage/options`，T-057）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
+    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`workspaces/current`、`usage/options`，T-057）与请求明细/60 秒速率接口（`usage-events`、`usage-rate`，T-058）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
@@ -1968,6 +1968,232 @@ paths:
                 error:
                   code: UNAVAILABLE
                   message: service is unavailable
+  /api/v1/workspaces/{workspaceID}/usage-events:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - usage
+      operationId: getUsageEvents
+      summary: 分页查询请求明细（T-058）
+      description: |
+        从原始 `usage_events` 按 `occurred_at DESC, id DESC` 返回请求级明细，keyset 分页，不用 OFFSET，不返回总数。Provider/Model/Project 筛选规则与 `usage-rate` 完全相同，同维 OR、异维 AND。
+
+        **范围**：`[start,end)` 过滤 `occurred_at`，`start`/`end` 必须同时出现或同时省略，带偏移、最多 6 位小数秒的 RFC 3339，不要求分钟对齐，`start<end`。无 cursor 且省略时，服务端取 `end=as_of`、`start=end-1h`；有 cursor 且省略时沿用 cursor 内的首页范围，不重新计算；有 cursor 且显式提供时按时间点比较，不相等返回 `400`。响应总是返回实际 `start/end/as_of`。
+
+        **分页**：`limit` 默认 50、最大 100（接口安全上限，不是性能承诺）。`cursor` 是不透明 base64url 文本，不是授权凭据，每页仍重做会话、成员与筛选校验；改变筛选必须丢弃 cursor。**不是跨请求快照**：翻页期间首页之后到达且发生时间落在已翻过位置的补报，要从最新页重新查询才可见。
+
+        **字段质量**：`input_tokens`/`output_tokens`/`total_tokens` 各自 `{value,quality}`；`quality=missing` 时 `value=null`（不可用），known/estimated 的 `0` 是真实数值。`status`、`duration_ms` 为 `null` 表示来源未提供，不是 0。`project=null` 表示未归属。`retention_cutoff=as_of-180天`，仅提示按 `received_at` 的保留截点，空结果只表示保留明细中没有匹配事件。
+
+        **授权**：先会话，再 workspace 成员角色（owner 与 member 可读），再校验参数；Project UUID 不属于路径 workspace 一律 `400 INVALID_ARGUMENT`，不透露它属于哪个空间。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestStart'
+        - $ref: '#/components/parameters/RequestEnd'
+        - $ref: '#/components/parameters/RequestLimit'
+        - $ref: '#/components/parameters/RequestCursor'
+        - $ref: '#/components/parameters/RequestProvider'
+        - $ref: '#/components/parameters/RequestModel'
+        - $ref: '#/components/parameters/RequestProject'
+      responses:
+        '200':
+          description: '一页明细，最新在前。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequestDetailsResponse'
+              example:
+                items:
+                  - id: 0199a0b0-0000-7000-8000-000000000101
+                    occurred_at: '2026-10-28T11:59:58.123456Z'
+                    received_at: '2026-10-28T12:00:00.5Z'
+                    provider: example-provider
+                    model: example-model
+                    project: {id: 0199a0b0-0000-7000-8000-00000000000a, key: demo, name: Demo}
+                    source: {id: 0199a0b0-0000-7000-8000-000000000010, platform: example, instance_key: laptop}
+                    input_tokens: {value: 100, quality: known}
+                    output_tokens: {value: null, quality: missing}
+                    total_tokens: {value: 120, quality: estimated}
+                    status: null
+                    duration_ms: 0
+                next_cursor: null
+                has_more: false
+                start: '2026-10-28T11:00:00Z'
+                end: '2026-10-28T12:00:00Z'
+                as_of: '2026-10-28T12:00:00Z'
+                retention_cutoff: '2026-05-01T12:00:00Z'
+        '400':
+          description: '`INVALID_ARGUMENT`：路径 UUID、参数、范围、cursor 非法，或 Project UUID 不属于该 workspace。不执行明细 SQL。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INVALID_ARGUMENT
+                  message: request is not acceptable
+        '401':
+          description: '`UNAUTHENTICATED`：无有效浏览器会话。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：不是该 workspace 成员。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace membership required
+        '500':
+          description: '`INTERNAL`：成员角色或查询的非数据库不可用故障（含客户端取消）；不含 SQL 细节。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INTERNAL
+                  message: internal error
+        '503':
+          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，或成员检查/查询时数据库不可用（连接失败、连接已关闭、超时），请求停止；不含驱动或 SQL 细节。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAVAILABLE
+                  message: service is unavailable
+  /api/v1/workspaces/{workspaceID}/usage-rate:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - usage
+      operationId: getUsageRate
+      summary: 查询精确 60 秒总 Token 速率（T-058）
+      description: |
+        读取原始 `usage_events`，按 `occurred_at` 在精确滚动窗口 `[as_of-60s,as_of)` 内对 `total_tokens` 求和；窗口恰为 60 秒，所以该和就是 tokens/min，不外推、不按自然分钟拼接。`as_of` 是数据库单条语句的开始时间，客户端不能指定。只接受 `provider`/`model`/`project` 筛选，其他参数（含 `start`/`end`/`limit`）返回 `400`。
+
+        **口径**：`total_tokens.value` 是 known+estimated 的精确和（十进制字符串，可能超过 2^53-1）；`event_count=0` 与「有事件但全为 missing」都得 `value=null`，不是 0，调用方需分别展示。`estimated_count>0` 表示含估算，`missing_count>0` 表示部分覆盖。`window_last_received_at` 只取窗口内、符合筛选的事件的 `max(received_at)`，无事件为 `null`；它不表示数据源在线状态。早于窗口的历史补报即使刚到达也不计入。
+
+        **授权**与筛选规则同 `usage-events`。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestProvider'
+        - $ref: '#/components/parameters/RequestModel'
+        - $ref: '#/components/parameters/RequestProject'
+      responses:
+        '200':
+          description: '当前 60 秒窗口速率。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentUsageRateResponse'
+              example:
+                start: '2026-10-28T11:59:00Z'
+                end: '2026-10-28T12:00:00Z'
+                as_of: '2026-10-28T12:00:00Z'
+                window_seconds: 60
+                unit: tokens/min
+                total_tokens: {value: '12000', event_count: 5, known_count: 3, estimated_count: 1, missing_count: 1}
+                window_last_received_at: '2026-10-28T11:59:59.9Z'
+        '400':
+          description: '`INVALID_ARGUMENT`：路径 UUID、参数非法，或 Project UUID 不属于该 workspace。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INVALID_ARGUMENT
+                  message: request is not acceptable
+        '401':
+          description: '`UNAUTHENTICATED`：无有效浏览器会话。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：不是该 workspace 成员。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace membership required
+        '500':
+          description: '`INTERNAL`：成员角色或查询的非数据库不可用故障（含客户端取消）；不含 SQL 细节。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INTERNAL
+                  message: internal error
+        '503':
+          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，或成员检查/查询时数据库不可用（连接失败、连接已关闭、超时），请求停止；不含驱动或 SQL 细节。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAVAILABLE
+                  message: service is unavailable
 components:
   securitySchemes:
     bearerAuth:
@@ -1988,7 +2214,7 @@ components:
       description: |
         浏览器会话 Cookie。明文令牌为 `tps_` + `crypto/rand.Text()`（随机部分长度由 Go 标准库决定，本文不硬编码它）；数据库只保存完整令牌的 SHA-256 原始 32 字节摘要，不保存明文、十六进制文本或额外 pepper。插件令牌 `tpk_` 与本 Cookie 互不接受。
 
-        Cookie 属性固定为：名称 `tokenpivot_session`、`Path=/`、**不设置 `Domain`**（因此是主机范围）、`HttpOnly`、`SameSite=Lax`。可信 Web origin 为 `https` 时 `Secure=true`；只有明确配置的回环开发 origin（`localhost`、`127.0.0.1`、`::1`）允许使用 `http`，此时 `Secure=false`；生产非回环 http origin 在启动时就被拒绝，不存在第二套 Cookie 配置。
+        Cookie 属性固定为：名称 `tokenpivot_session`、`Path=/`、**不设置 `Domain`**（因此是主机范围）、`HttpOnly`、`SameSite=Lax`。可信 Web origin 为 `https` 时 `Secure=true`；`http` origin 时 `Secure=false`：默认只有明确配置的回环开发 origin（`localhost`、`127.0.0.1`、`::1`）允许使用 `http`，非回环 http origin 在启动时被拒绝，除非部署显式设置 `TOKENPIVOT_ALLOW_INSECURE_HTTP=true`；不存在第二套 Cookie 配置。Cookie 不区分端口，http 下凭证与会话可在链路上被窃听或篡改，HttpOnly 与 Origin 校验不能弥补。
 
         签发和实际续期时写 `Expires=<数据库返回的 expires_at>`，`Max-Age` 固定为 2592000 秒（30 天）——因为每个签发或续期后的 `expires_at` 都由数据库取 `now() + interval '30 days'`，两者表达同一期限。会话为 30 天精确滑动过期，无绝对上限；过期行暂不清理，但不会通过认证。
 
@@ -2104,6 +2330,58 @@ components:
         items:
           type: string
           pattern: '^(unassigned|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
+    RequestStart:
+      name: start
+      in: query
+      required: false
+      description: '明细范围起点（含），带偏移、最多 6 位小数秒的 RFC 3339；必须与 `end` 同时出现。'
+      schema: {type: string, format: date-time}
+    RequestEnd:
+      name: end
+      in: query
+      required: false
+      description: '明细范围终点（不含），规则同 `start`，且晚于 `start`。'
+      schema: {type: string, format: date-time}
+    RequestLimit:
+      name: limit
+      in: query
+      required: false
+      description: '每页行数，默认 50，最大 100；不接受前导零或重复。'
+      schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+    RequestCursor:
+      name: cursor
+      in: query
+      required: false
+      description: '上一页返回的不透明 `next_cursor`；不是授权凭据。'
+      schema: {type: string, minLength: 1}
+    RequestProvider:
+      name: provider
+      in: query
+      required: false
+      description: '精确、区分大小写的 provider；可重复，同维 OR，空值拒绝。'
+      style: form
+      explode: true
+      schema: {type: array, items: {type: string, minLength: 1}}
+    RequestModel:
+      name: model
+      in: query
+      required: false
+      description: '精确、区分大小写的 model；可重复，同维 OR，空值拒绝。'
+      style: form
+      explode: true
+      schema: {type: array, items: {type: string, minLength: 1}}
+    RequestProject:
+      name: project
+      in: query
+      required: false
+      description: '项目 UUID 或字面量 `unattributed`（`project_id IS NULL`）；可重复，同维 OR。注意不是 T-055 的 `unassigned`。UUID 不属于路径 workspace 返回 `400`。'
+      style: form
+      explode: true
+      schema:
+        type: array
+        items:
+          type: string
+          pattern: '^(unattributed|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
     UsageGroupBy:
       name: group_by
       in: query
@@ -3077,6 +3355,83 @@ components:
           items:
             type: string
           description: 去重后按字节序升序的 model 值；无数据为 `[]`。独立于 providers，不表示组合关系。
+
+    RequestToken:
+      type: object
+      additionalProperties: false
+      required: [value, quality]
+      properties:
+        value: {type: [integer, 'null'], minimum: 0, maximum: 9007199254740991, description: '`quality=missing` 时必为 null。'}
+        quality: {type: string, enum: [known, estimated, missing]}
+
+    RequestDetail:
+      type: object
+      additionalProperties: false
+      required: [id, occurred_at, received_at, provider, model, project, source, input_tokens, output_tokens, total_tokens, status, duration_ms]
+      properties:
+        id: {type: string, format: uuid}
+        occurred_at: {type: string, format: date-time}
+        received_at: {type: string, format: date-time}
+        provider: {type: string}
+        model: {type: string}
+        project:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [id, key, name]
+          properties:
+            id: {type: string, format: uuid}
+            key: {type: string}
+            name: {type: string}
+        source:
+          type: object
+          additionalProperties: false
+          required: [id, platform, instance_key]
+          properties:
+            id: {type: string, format: uuid}
+            platform: {type: string}
+            instance_key: {type: string}
+        input_tokens: {$ref: '#/components/schemas/RequestToken'}
+        output_tokens: {$ref: '#/components/schemas/RequestToken'}
+        total_tokens: {$ref: '#/components/schemas/RequestToken'}
+        status: {type: [string, 'null']}
+        duration_ms: {type: [integer, 'null'], minimum: 0}
+
+    RequestDetailsResponse:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more, start, end, as_of, retention_cutoff]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/RequestDetail'}
+        next_cursor: {type: [string, 'null']}
+        has_more: {type: boolean}
+        start: {type: string, format: date-time}
+        end: {type: string, format: date-time}
+        as_of: {type: string, format: date-time}
+        retention_cutoff: {type: string, format: date-time}
+
+    CurrentUsageRateResponse:
+      type: object
+      additionalProperties: false
+      required: [start, end, as_of, window_seconds, unit, total_tokens, window_last_received_at]
+      properties:
+        start: {type: string, format: date-time}
+        end: {type: string, format: date-time}
+        as_of: {type: string, format: date-time}
+        window_seconds: {type: integer, const: 60}
+        unit: {type: string, const: tokens/min}
+        total_tokens:
+          type: object
+          additionalProperties: false
+          required: [value, event_count, known_count, estimated_count, missing_count]
+          properties:
+            value: {type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$', description: 'known+estimated 精确和；无可用值为 null。'}
+            event_count: {type: integer, minimum: 0}
+            known_count: {type: integer, minimum: 0}
+            estimated_count: {type: integer, minimum: 0}
+            missing_count: {type: integer, minimum: 0}
+        window_last_received_at: {type: [string, 'null'], format: date-time}
 
     ProjectList:
       type: array

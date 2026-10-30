@@ -75,6 +75,35 @@ function useBackend(opts?: { aggregate?: () => Response | Promise<Response> }) {
         })
       );
     }),
+    // 请求明细面板的默认空响应；本文件不断言它们。
+    http.get(`${BASE}/usage-events`, () =>
+      HttpResponse.json({
+        items: [],
+        next_cursor: null,
+        has_more: false,
+        start: "2026-10-28T01:00:00Z",
+        end: "2026-10-28T02:00:00Z",
+        as_of: "2026-10-28T02:00:00Z",
+        retention_cutoff: "2026-04-01T00:00:00Z",
+      }),
+    ),
+    http.get(`${BASE}/usage-rate`, () =>
+      HttpResponse.json({
+        start: "2026-10-28T01:59:00Z",
+        end: "2026-10-28T02:00:00Z",
+        as_of: "2026-10-28T02:00:00Z",
+        window_seconds: 60,
+        unit: "tokens/min",
+        total_tokens: {
+          value: null,
+          event_count: 0,
+          known_count: 0,
+          estimated_count: 0,
+          missing_count: 0,
+        },
+        window_last_received_at: null,
+      }),
+    ),
     http.get(`${BASE}/usage/rankings`, ({ request }) => {
       const by = new URL(request.url).searchParams.get("group_by");
       return HttpResponse.json({

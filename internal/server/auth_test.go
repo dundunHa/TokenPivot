@@ -223,7 +223,7 @@ func newTestAuth(t *testing.T) (*Auth, *authFakeStore) {
 func newTestAuthWithRegistration(t *testing.T, registrationOpen bool) (*Auth, *authFakeStore) {
 	t.Helper()
 	store := newAuthFakeStore()
-	origin, err := config.ParseOrigin(testOrigin)
+	origin, err := config.ParseOrigin(testOrigin, false)
 	if err != nil {
 		t.Fatal(err)
 	}

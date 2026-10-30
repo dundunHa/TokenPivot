@@ -6,6 +6,7 @@ import {
   useCurrentWorkspace,
   useUsageOptions,
 } from "@/features/workspace/queries";
+import { RequestLogPanel } from "@/features/requests/RequestLogPanel";
 import { OverviewFilterBar } from "./OverviewFilterBar";
 import { OverviewMetrics } from "./OverviewMetrics";
 import { OverviewRanking } from "./OverviewRanking";
@@ -272,6 +273,7 @@ function OverviewContent({
         projectNames={projectNames}
         onToggle={onRankingToggle}
       />
+      <RequestLogPanel scope={scope} filters={filters} />
     </div>
   );
 }

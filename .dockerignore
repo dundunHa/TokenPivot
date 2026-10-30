@@ -1,0 +1,17 @@
+# 构建上下文排除：版本库元数据、真实环境文件、本机产物与依赖、备份、日志
+.git
+.agents
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+bin/
+web/node_modules/
+web/dist/
+backup/
+backups/
+*.log
+*.pem
+*.key
