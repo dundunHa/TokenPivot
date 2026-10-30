@@ -618,4 +618,39 @@ describe("request log panel", () => {
     expect(screen.queryByText("late")).toBeNull();
     expect(screen.queryByTestId("request-row")).toBeNull();
   });
+
+  it("on an older page a network drop and reconnect never refetch rows, while the rate recovers", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let offline = false;
+    const seen = useBackend({
+      events: (url) =>
+        HttpResponse.json(
+          url.searchParams.get("cursor")
+            ? page([item("e2")])
+            : page([item("e1")], "c1"),
+        ),
+      rate: () =>
+        offline ? HttpResponse.error() : HttpResponse.json(rateBody()),
+    });
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    await screen.findByTestId("rate-value");
+    await act(async () => {
+      screen.getByRole("button", { name: "下一页" }).click();
+    });
+    await screen.findByText(/更早页/);
+    const e = seen.events.length;
+    offline = true;
+    await tick(5_000);
+    await screen.findByText(/速率更新失败，展示截至/);
+    offline = false;
+    act(() => {
+      window.dispatchEvent(new Event("online"));
+    });
+    await tick(5_000);
+    await waitFor(() => expect(screen.queryByText(/速率更新失败/)).toBeNull());
+    expect(screen.getByTestId("rate-value").textContent).toBe("12,000");
+    expect(screen.getAllByTestId("request-row")).toHaveLength(1);
+    expect(seen.events.length).toBe(e);
+  });
 });

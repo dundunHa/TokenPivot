@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -428,7 +429,7 @@ func single(values url.Values, name string) (string, error) {
 
 // parseTime accepts RFC 3339 with an offset and at most six fractional digits.
 func parseTime(raw string) (time.Time, error) {
-	if tooManyFractionDigits(raw) {
+	if !timeShape.MatchString(raw) {
 		return time.Time{}, ErrInvalidArgument
 	}
 	t, err := time.Parse(time.RFC3339Nano, raw)
@@ -438,22 +439,10 @@ func parseTime(raw string) (time.Time, error) {
 	return t.UTC(), nil
 }
 
-// tooManyFractionDigits reports more than six digits after the seconds dot, so
-// ".1234560" is refused even though its value is microsecond-aligned.
-func tooManyFractionDigits(raw string) bool {
-	i := strings.IndexByte(raw, '.')
-	if i < 0 {
-		return false
-	}
-	n := 0
-	for _, c := range raw[i+1:] {
-		if c < '0' || c > '9' {
-			break
-		}
-		n++
-	}
-	return n > 6
-}
+// timeShape is the only accepted spelling: RFC 3339 with an offset, a '.'
+// fraction of 1-6 digits at most. It runs before time.Parse, which would also
+// take a comma fraction or an unaligned 7th digit.
+var timeShape = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,6})?([Zz]|[+-]\d{2}:\d{2})$`)
 
 func encodeCursor(payload cursorPayload) (string, error) {
 	raw, err := json.Marshal(payload)

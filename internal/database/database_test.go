@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func isolatePG(t *testing.T) {
@@ -60,5 +65,49 @@ func TestSafeError(t *testing.T) {
 	}
 	if SafeError("test", nil) != nil {
 		t.Fatal("nil error changed")
+	}
+}
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "synthetic-sensitive-marker timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+func TestSafeStoreErrorClassification(t *testing.T) {
+	wrap := func(e error) error { return fmt.Errorf("synthetic-sensitive-marker: %w", e) }
+	unavailable := map[string]error{
+		"deadline":   context.DeadlineExceeded,
+		"eof":        io.EOF,
+		"unexpected": io.ErrUnexpectedEOF,
+		"reset":      &net.OpError{Op: "read", Err: syscall.ECONNRESET},
+		"pipe":       &net.OpError{Op: "write", Err: syscall.EPIPE},
+		"net":        timeoutErr{},
+		"closed":     pgconn.ErrConnClosed,
+		"connect":    &pgconn.ConnectError{},
+		"08006":      &pgconn.PgError{Code: "08006"},
+		"57P01":      &pgconn.PgError{Code: "57P01"},
+		"57P03":      &pgconn.PgError{Code: "57P03"},
+	}
+	for name, cause := range unavailable {
+		err := SafeStoreError("stage", wrap(cause))
+		if !errors.Is(err, ErrUnavailable) || strings.Contains(err.Error(), "synthetic-sensitive-marker") {
+			t.Fatalf("%s: unavailable=%v err=%v", name, errors.Is(err, ErrUnavailable), err)
+		}
+	}
+	other := map[string]error{
+		"canceled":  context.Canceled,
+		"statement": &pgconn.PgError{Code: "42P01"},
+		"deadlock":  &pgconn.PgError{Code: "40P01"},
+		"plain":     errors.New("boom"),
+	}
+	for name, cause := range other {
+		err := SafeStoreError("stage", wrap(cause))
+		if errors.Is(err, ErrUnavailable) || strings.Contains(err.Error(), "synthetic-sensitive-marker") {
+			t.Fatalf("%s misclassified: %v", name, err)
+		}
+	}
+	if SafeStoreError("stage", nil) != nil {
+		t.Fatal("nil changed")
 	}
 }
