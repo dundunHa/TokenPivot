@@ -1,3 +1,4 @@
+import { formatExact } from "@/features/overview/overviewView";
 import type { RateData, TokenField } from "./api";
 
 /** 纯展示与轮询决策；不重新计算后端口径。 */
@@ -14,7 +15,7 @@ export function eventsPollOptions(onLatestPage: boolean) {
 
 export function formatTokenField(field: TokenField): string {
   if (field.quality === "missing" || field.value === null) return UNAVAILABLE;
-  const n = String(field.value).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const n = formatExact(String(field.value));
   return field.quality === "estimated" ? `${n}（估算）` : n;
 }
 
@@ -41,7 +42,7 @@ export function describeRate(rate: RateData): RateView {
     notes.push(`缺失 ${rate.missingCount} 条`);
     return { headline: "用量不可用", notes };
   }
-  const headline = rate.value.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const headline = formatExact(rate.value);
   if (rate.estimatedCount > 0) notes.push(`含估算 ${rate.estimatedCount} 条`);
   if (rate.missingCount > 0) {
     notes.push(`部分覆盖：缺失 ${rate.missingCount} 条`);

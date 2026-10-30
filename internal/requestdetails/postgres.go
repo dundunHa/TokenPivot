@@ -58,8 +58,7 @@ LIMIT $11`
 func (s *Postgres) Events(ctx context.Context, params EventsParams) ([]EventRow, error) {
 	args := []any{params.WorkspaceID, params.Start, params.End}
 	args = append(args, filterArgs(params.Filter)...)
-	var cursorTime any
-	var cursorID any
+	var cursorTime, cursorID any
 	if params.HasCursor {
 		cursorTime, cursorID = params.CursorTime, params.CursorID
 	}
