@@ -636,6 +636,25 @@ func TestIntegrationOptionsWindowTenancyDedupAndOrder(t *testing.T) {
 	}
 }
 
+func TestIntegrationOptionsExcludeEmptyStrings(t *testing.T) {
+	f := newFixture(t)
+	s, _, asOf := optionsService(f)
+	at := asOf.Add(-time.Hour)
+	f.insert(t,
+		optionRow(at, ws, "", "m"),
+		optionRow(at.Add(time.Minute), ws, "p", ""),
+		optionRow(at.Add(2*time.Minute), ws, "", ""),
+		optionRow(at.Add(3*time.Minute), ws, "q", "n"),
+	)
+	got, err := s.Options(f.ctx, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got.Providers, ",") != "p,q" || strings.Join(got.Models, ",") != "m,n" {
+		t.Fatalf("got %+v want providers p,q and models m,n", got)
+	}
+}
+
 func TestIntegrationOptionsEmptyIsNotAnError(t *testing.T) {
 	f := newFixture(t)
 	s, _, _ := optionsService(f)

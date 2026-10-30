@@ -30,6 +30,40 @@ describe("shared api", () => {
     expect((error as Error).name).toBe("AbortError");
   });
 
+  it("an abort while the body is being read rejects with the abort error, not undefined", async () => {
+    const encoder = new TextEncoder();
+    server.use(
+      http.get("/api/v1/stream", () => {
+        const stream = new ReadableStream({
+          async start(c) {
+            c.enqueue(encoder.encode('{"a":'));
+            await new Promise((r) => setTimeout(r, 300));
+            c.enqueue(encoder.encode("1}"));
+            c.close();
+          },
+        });
+        return new HttpResponse(stream, {
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    const controller = new AbortController();
+    const pending = getJson("/api/v1/stream", controller.signal).catch(
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    const error = await pending;
+    expect(error).not.toBeInstanceOf(ApiError);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).name).toBe("AbortError");
+  });
+
+  it("invalid json without an abort still yields undefined body", async () => {
+    server.use(http.get("/api/v1/junk", () => new HttpResponse("not json")));
+    expect(await getJson("/api/v1/junk")).toBeUndefined();
+  });
+
   it("parses code, details and Retry-After from an error body", async () => {
     server.use(
       http.get("/api/v1/bad", () =>

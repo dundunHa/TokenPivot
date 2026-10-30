@@ -31,10 +31,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function readJson(response: Response): Promise<unknown> {
+async function readJson(
+  response: Response,
+  signal: AbortSignal | null | undefined,
+): Promise<unknown> {
   try {
     return await response.json();
-  } catch {
+  } catch (cause) {
+    // 读取响应体期间被中止是取消，不是“非法 JSON”。
+    if (signal?.aborted) throw cause;
     return undefined;
   }
 }
@@ -66,7 +71,7 @@ export async function requestJson(
     if (init.signal?.aborted) throw cause;
     throw new ApiError(0, "NETWORK");
   }
-  const body = await readJson(response);
+  const body = await readJson(response, init.signal);
   if (!response.ok) throw failure(response, body);
   return { status: response.status, body };
 }

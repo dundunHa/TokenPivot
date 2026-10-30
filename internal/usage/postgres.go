@@ -148,12 +148,12 @@ ORDER BY kind, rn`, nil
 const optionsQuery = `SELECT kind, v FROM (
   SELECT 'provider'::text AS kind, v FROM (
     SELECT DISTINCT provider AS v FROM usage_minute_stats
-    WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3
+    WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3 AND provider <> ''
   ) p
   UNION ALL
   SELECT 'model'::text, v FROM (
     SELECT DISTINCT model AS v FROM usage_minute_stats
-    WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3
+    WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3 AND model <> ''
   ) m
 ) o
 ORDER BY kind, v COLLATE "C"`

@@ -5,6 +5,7 @@ import { ApiError } from "@/lib/api";
 import {
   createAppQueryClient,
   sessionKey,
+  useCredentialsMutation,
   useLogoutMutation,
 } from "@/features/auth/queries";
 import { login } from "@/features/auth/api";
@@ -154,6 +155,26 @@ describe("business cache cleanup", () => {
     expect(client.getQueryData(sessionKey)).toEqual(SESSION_A);
   });
 
+  it("403 on a background refetch hides the failing query's old data but keeps its error", async () => {
+    const client = await loaded();
+    const key = ["workspace", "usage-options", "user-a", WS];
+    expect(client.getQueryData(key)).toBeDefined();
+    server.use(
+      http.get(`/api/v1/workspaces/${WS}/usage/options`, () =>
+        errorResponse(403, "PERMISSION_DENIED"),
+      ),
+    );
+    await act(async () => {
+      await client.refetchQueries({ queryKey: key });
+    });
+    await waitFor(() => expect(client.getQueryData(key)).toBeUndefined());
+    const state = client.getQueryState(key);
+    expect(state?.status).toBe("error");
+    expect((state?.error as ApiError).status).toBe(403);
+    expect(client.getQueryData(sessionKey)).toEqual(SESSION_A);
+    expect(screen.getByTestId("out").textContent).not.toContain("p1");
+  });
+
   it("a late 401 from an old identity cannot sign out the new login", async () => {
     mockWorkspace();
     const gate = deferred();
@@ -190,6 +211,70 @@ describe("business cache cleanup", () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(client.getQueryData(sessionKey)).toEqual(SESSION_B);
   });
+
+  function LoginProbe() {
+    const login = useCredentialsMutation("login");
+    return (
+      <button
+        type="button"
+        onClick={() =>
+          login.mutate({
+            email: "b@example.com",
+            password: "synthetic-password",
+          })
+        }
+      >
+        in
+      </button>
+    );
+  }
+
+  it.each([401, 403])(
+    "a delayed old-identity %i that lands after the real login mutation cannot touch the new session",
+    async (status) => {
+      mockWorkspace();
+      const gate = deferred();
+      const client = createAppQueryClient();
+      seed(client, SESSION_A);
+      server.use(
+        http.get(`/api/v1/workspaces/${WS}/usage/options`, async () => {
+          await gate.promise;
+          return errorResponse(
+            status,
+            status === 401 ? "UNAUTHENTICATED" : "PERMISSION_DENIED",
+          );
+        }),
+        http.post("/api/v1/auth/login", () =>
+          HttpResponse.json({
+            user: SESSION_B.user,
+            expires_at: SESSION_B.expires_at,
+          }),
+        ),
+      );
+      mount(client, "user-a");
+      const key = ["workspace", "usage-options", "user-a", WS];
+      await waitFor(() =>
+        expect(client.getQueryState(key)?.fetchStatus).toBe("fetching"),
+      );
+      render(
+        <QueryClientProvider client={client}>
+          <LoginProbe />
+        </QueryClientProvider>,
+      );
+      await act(async () => {
+        screen.getByRole("button", { name: "in" }).click();
+      });
+      await waitFor(() =>
+        expect(client.getQueryData(sessionKey)).toEqual(SESSION_B),
+      );
+      // 登录 onSuccess 已取消并移除旧身份业务缓存；旧请求此时才返回。
+      expect(client.getQueryState(key)).toBeUndefined();
+      gate.resolve();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(client.getQueryData(sessionKey)).toEqual(SESSION_B);
+      expect(client.getQueryState(key)).toBeUndefined();
+    },
+  );
 
   it("session refetch resolving anonymous removes business cache", async () => {
     const client = await loaded();

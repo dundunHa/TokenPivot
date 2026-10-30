@@ -72,6 +72,8 @@ async function handleBusinessError(
     return;
   }
   await dropBusiness(client, query);
+  // 失败查询自身保留错误态供界面显示无权限，但旧 data 不得继续可见。
+  query.setState({ data: undefined, dataUpdatedAt: 0 });
 }
 
 export function createAppQueryClient(): QueryClient {
