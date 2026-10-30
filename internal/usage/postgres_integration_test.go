@@ -375,6 +375,12 @@ func TestIntegrationCountsBeyondInt64(t *testing.T) {
 		rows = append(rows, r)
 	}
 	f.insert(t, rows...)
+	// The shared helper leaves the cache and reasoning metrics' missing counts at
+	// r.missing; make them add up to request_count so the quality counts stay valid.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE usage_minute_stats SET cache_read_tokens_missing_count=event_count,
+cache_write_tokens_missing_count=event_count, reasoning_tokens_missing_count=event_count WHERE workspace_id=$1`, ws); err != nil {
+		t.Fatal(database.SafeError("fix missing counts", err))
+	}
 	check := func(name string, raw RawStats) {
 		t.Helper()
 		s, err := convertStats(raw)
@@ -385,6 +391,11 @@ func TestIntegrationCountsBeyondInt64(t *testing.T) {
 		m := s.TotalTokens
 		if s.RequestCount != "55340232221128654842" || m.KnownCount != twice || m.EstimatedCount != twice || m.MissingCount != twice {
 			t.Fatalf("%s: request=%s known=%s estimated=%s missing=%s", name, s.RequestCount, m.KnownCount, m.EstimatedCount, m.MissingCount)
+		}
+		for _, o := range []MetricStats{s.CacheReadTokens, s.CacheWriteTokens, s.ReasoningTokens} {
+			if o.KnownCount != "0" || o.EstimatedCount != "0" || o.MissingCount != s.RequestCount {
+				t.Fatalf("%s: other metric known=%s estimated=%s missing=%s", name, o.KnownCount, o.EstimatedCount, o.MissingCount)
+			}
 		}
 	}
 	agg, err := f.store.Aggregate(f.ctx, AggregateParams{WorkspaceID: ws, Start: base, End: base.Add(time.Hour), Buckets: buckets(base, base.Add(time.Hour))})
