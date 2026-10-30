@@ -9,7 +9,8 @@
 | 项 | 值 |
 |---|---|
 | 项目名 | `tokenpivot-bf`（独立网络 `tokenpivot-bf-backend`，独立卷 `tokenpivot-bf-pgdata-18`） |
-| 访问地址 | 唯一浏览器 Origin `http://DESKTOP-C28DFS7:18080`，端口绑定 `0.0.0.0:18080:18080` |
+| 访问地址 | `TOKENPIVOT_WEB_ORIGIN=http://DESKTOP-C28DFS7:18080`（仅决定 Cookie Secure 等既有配置），端口绑定 `0.0.0.0:18080:18080`；可用 IP 或主机名访问 |
+| Origin 校验 | 用户明确批准的 BF 例外：compose 设 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true`，写请求不再校验 Origin，不存在固定 Origin 限制；会话认证与权限不变 |
 | 来源范围 | 不限来源网段。只能声称“绑定所有主机接口”，不能声称仅局域网、已验证公网可达或已实现来源隔离 |
 | 数据库 | PostgreSQL 18.6，容器内主机名 `db`，数据库 `tokenpivot`，schema `tokenpivot`；不发布宿主机端口 |
 | 内部网络 | `192.168.240.0/24`，网关 `192.168.240.1`；与其他项目网络、卷、容器不复用 |
@@ -19,7 +20,7 @@
 
 已批准的窄例外：只有本套单机、专用 Compose 网络内部允许数据库连接使用 `sslmode=disable`，前提是数据库不发布宿主机端口、其他项目不加入该网络、凭证不跨主机传输。其他远程数据库连接仍要求 `sslmode=verify-full` 和可信 CA，不因“同机”说法降级。
 
-HTTP 的已知风险：唯一 Origin 是明文 HTTP，凭证、会话 Cookie 和页面内容可在链路上被窃听或篡改；`TOKENPIVOT_ALLOW_INSECURE_HTTP=true` 只放开“非回环 http Origin”这一条限制，不改变监听范围、不开放注册，也不是 HTTPS 的安全等价物。会话 Cookie 按主机而非端口区分，同主机其他端口也可能收到。
+HTTP 与无 Origin 校验的已知风险：站点是明文 HTTP，且已关闭 Origin 校验（CSRF 仅靠 SameSite=Lax 缓解），凭证、会话 Cookie 和页面内容可在链路上被窃听或篡改；`TOKENPIVOT_ALLOW_INSECURE_HTTP=true` 只放开“非回环 http Origin”这一条限制，不改变监听范围、不开放注册，也不是 HTTPS 的安全等价物。会话 Cookie 按主机而非端口区分，同主机其他端口也可能收到。
 
 不在本文范围：HTTPS/反向代理、CI/CD、镜像仓库、自动重启策略、定时备份、监控日志平台、PgBouncer、Redis；旧资源处置；数据库迁移回滚或删卷。
 
@@ -29,7 +30,7 @@ HTTP 的已知风险：唯一 Origin 是明文 HTTP，凭证、会话 Cookie 和
 
 - BF 本机：Docker 与 `docker compose`（v2）、`curl`、`psql` 可用；构建机另需 `git`。
 - 构建镜像所需的 Go 1.26.4 / Node 26 由 Dockerfile 固定镜像提供，不在宿主机安装 Node；宿主源码树只用于 `docker build`。
-- 端口 18080 空闲；`DESKTOP-C28DFS7` 解析到当前 BF；`192.168.240.0/24` 未被占用。任何一项不符即停止，不换端口、不换网段、不加第二个 Origin。
+- 端口 18080 空闲；`DESKTOP-C28DFS7` 解析到当前 BF；`192.168.240.0/24` 未被占用。任何一项不符即停止，不换端口、不换网段、不加第二个 Origin（Origin 校验已关闭，无需也不得再用它限制访问）。
 
 源码与镜像前提：
 
@@ -145,22 +146,22 @@ curl --fail --show-error --silent http://DESKTOP-C28DFS7:18080/healthz
 
    容器镜像 ID 与构建记录一致，标签 revision 等于完整提交。
 
-2. **健康与页面**：上面三个探针 200；HEAD 无正文、不支持的方法 405、`/healthz/` 与 `/readyz/` 404；页面与静态资源经唯一 Origin 可访问。
+2. **健康与页面**：上面三个探针 200；HEAD 无正文、不支持的方法 405、`/healthz/` 与 `/readyz/` 404；页面与静态资源经 `http://DESKTOP-C28DFS7:18080` 或本机 IP 均可访问。
 
-3. **错误 Origin 仍被拒绝**（不带真实凭证、不写库）：
+3. **错误 Origin 不再被拒绝**（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true`；不带真实凭证、不写库）：
 
    ```sh
    curl -i -X POST -H 'Origin: http://example.invalid' \
      --data '{}' http://127.0.0.1:18080/api/v1/auth/login
    ```
 
-   预期 403。成功 Cookie 的属性只在用户做首次真实注册时观察，不为测试制造首个生产用户。
+   预期不再因 Origin 返回 403，而是进入后续处理（空凭据按登录规则被拒，如 400/401）；会话认证不受影响。2026-10-29 首次部署记录里的“错误 Origin 403”是关闭校验前的旧结果，不再适用。成功 Cookie 的属性只在用户做首次真实注册时观察，不为测试制造首个生产用户。
 
 4. **端口与数据面**：`docker port "$(docker compose ps -q app)"` 显示 `0.0.0.0:18080`；`docker port "$(docker compose ps -q db)"` 为空；卷为 `tokenpivot-bf-pgdata-18` 且挂载到 `/var/lib/postgresql`，旧卷未被挂载。不要把“绑定所有接口”描述成私网绑定或来源隔离。
 
 5. **旧资源未变**：与第 4 节基线比较容器名称/ID/状态和卷列表，8080/8081 原占用者保持原状；基线若有漂移，先记录并确认无本项目冲突。
 
-6. **其他来源**：如另有客户端可用，从该客户端复核同一 Origin；不可用时明确记为未验证，不据此推断公网或局域网可达性。
+6. **其他来源**：如另有客户端可用，从该客户端按 IP 或主机名访问复核；不可用时明确记为未验证，不据此推断公网或局域网可达性。
 
 ## 7. 恢复与回滚限制
 
@@ -186,7 +187,7 @@ curl --fail --show-error --silent http://DESKTOP-C28DFS7:18080/healthz
 | DB 创建时间 / 容器 ID | 11:14:38 / `307950e2d690aafdf3909ff2fbd613da80ad45c0210e612e5aa7163d2d8828c5`；实际 PG 18.6，无宿主端口 |
 | 迁移执行 ID / 时间 / 退出码 / 版本 | `20261030T1116Z` / 11:15:22–11:15:23 / 0 / 1–7 全部 applied |
 | app 启动时间 / 容器 ID | 11:15:46 / `f32722940ecfdafd75afcb0c61a88a79fa4277f449f6ff2bb48274581a9f1785`；运行镜像与固定镜像一致，UID 65532 |
-| healthz / readyz / Origin 403 / 版本核对结果 | 均通过；页面和静态资源 200，错误 Origin 403，生产用户保持 0 |
+| healthz / readyz / Origin 403 / 版本核对结果 | 均通过；页面和静态资源 200，错误 Origin 403（旧结果，开关上线前；现已按用户批准关闭 Origin 校验），生产用户保持 0 |
 | 停止/恢复 | 11:17:23 停止 app，11:17:25 启动原容器；readyz 恢复 200，DB、卷、容器 ID 不变 |
 | 旧资源对比结果 | 原容器名称/ID/状态/端口及 8080/8081 占用者不变；卷 143→144，仅新增 `tokenpivot-bf-pgdata-18` |
 | 未验证项 | 第二客户端可达性、防火墙/路由转发、实际暴露范围、远程 PG `verify-full`、备份恢复、DST 反向回拨边界 |

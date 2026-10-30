@@ -50,7 +50,7 @@ info:
 
     - 只认 `cookieAuth`（`tokenpivot_session`）。明文为 `tps_` + `crypto/rand.Text()`，数据库只存完整令牌的 SHA-256 原始 32 字节摘要；`tpk_` 插件令牌在这里不被接受，Bearer 头也不建立浏览器身份。
     - 会话 30 天精确滑动：每次有效认证都用一条 `UPDATE ... FROM ... RETURNING` 续期并返回到期时间，无刷新阈值、无绝对截止；数据库返回 0 行即 `401 UNAUTHENTICATED`。四个端点的所有响应都带 `Cache-Control: no-store`。
-    - 写请求（注册、登录、登出）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。`GET /api/v1/auth/session` 是读请求，不要求 `Origin`。
+    - 写请求（注册、登录、登出）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。`GET /api/v1/auth/session` 是读请求，不要求 `Origin`。例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true`（BF 经用户明确批准）时完全不做 Origin 校验，缺失或不等不再 403，会话认证与权限不变。
     - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。owner 与工作空间成员判断属 T-019，本文不定义；注册时会为每个新用户创建展示名固定为 `Personal` 的个人空间并写入其 `owner` 成员关系，但响应不返回工作空间字段，也没有工作空间 HTTP 接口。
     - 注册与登录限流为单进程内存固定窗口（每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次），所有合法尝试都占额度、成功不返还；达到上限的请求不执行密码哈希或写库。
     - 注册开关由部署环境变量 `TOKENPIVOT_REGISTRATION_OPEN` 决定，启动时读取一次，未设置等同 `false`，只接受精确的 `true`/`false`。关闭时仅空库的首个用户可注册，其余一律 `403 REGISTRATION_CLOSED`；空库判定与首个用户写入在同一 `READ COMMITTED` 事务内，并在事务级排他 advisory lock 之后进行。没有查询注册状态的端点。

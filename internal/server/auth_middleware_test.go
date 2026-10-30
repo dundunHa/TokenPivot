@@ -77,6 +77,47 @@ func TestRequireOriginAppliesToEveryWriteRoute(t *testing.T) {
 	}
 }
 
+// TestDisableOriginCheckSkipsOnlyOrigin proves the BF exception: with the switch
+// on, missing, IP, host-name and foreign Origins reach the handler, while a
+// protected route still demands a session and the default stays strict.
+func TestDisableOriginCheckSkipsOnlyOrigin(t *testing.T) {
+	adapter, _, h := authHandler(t)
+	adapter.DisableOriginCheck = true
+	for name, origin := range map[string]string{
+		"missing":    "",
+		"ip":         "http://192.0.2.10:18080",
+		"host name":  "http://synthetic-host:18080",
+		"foreign":    "https://evil.example.com",
+		"null value": "null",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, registerPath, strings.NewReader(`{"email":"`+strings.ReplaceAll(name, " ", "")+`@example.com","password":"synthetic-password"}`))
+			req.Header.Set("Content-Type", "application/json")
+			if origin != "" {
+				req.Header.Set("Origin", origin)
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+
+	reached := false
+	protected := adapter.RequireOrigin(adapter.RequireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusNoContent)
+	})))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/protected", nil)
+	req.Header.Set("Origin", "http://192.0.2.10:18080")
+	w := httptest.NewRecorder()
+	protected.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized || reached {
+		t.Fatalf("protected route without session: status %d reached %t", w.Code, reached)
+	}
+}
+
 // TestRequireSessionAttachesUser proves a protected route can read the identity
 // from the request context and cannot invent one from the request body.
 func TestRequireSessionAttachesUser(t *testing.T) {

@@ -21,6 +21,10 @@ type Config struct {
 	// one. It is read once at startup and never reloaded; the service keeps it as
 	// an immutable startup setting.
 	RegistrationOpen bool
+	// DisableOriginCheck turns off the write-request Origin check entirely. It is
+	// an explicitly approved exception for the BF deployment, read once at startup;
+	// session authentication and the Secure cookie attribute are unaffected.
+	DisableOriginCheck bool
 }
 
 // Load reads the service's environment once and validates it. Invalid values are
@@ -57,7 +61,11 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{HTTPAddr: addr, DatabaseURL: databaseURL, WebOrigin: origin, RegistrationOpen: registrationOpen}, nil
+	disableOriginCheck, err := strictBoolSetting("TOKENPIVOT_DISABLE_ORIGIN_CHECK")
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{HTTPAddr: addr, DatabaseURL: databaseURL, WebOrigin: origin, RegistrationOpen: registrationOpen, DisableOriginCheck: disableOriginCheck}, nil
 }
 
 // strictBoolSetting reads a boolean environment variable once. Unset means

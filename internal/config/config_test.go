@@ -419,3 +419,29 @@ func TestAllowInsecureHTTPSetting(t *testing.T) {
 		}
 	})
 }
+
+func TestDisableOriginCheckSetting(t *testing.T) {
+	load := func() (Config, error) {
+		t.Setenv("TOKENPIVOT_DATABASE_URL", "postgres://synthetic")
+		t.Setenv("TOKENPIVOT_WEB_ORIGIN", "http://127.0.0.1:5173")
+		return Load()
+	}
+	cfg, err := load()
+	if err != nil || cfg.DisableOriginCheck {
+		t.Fatalf("default: %+v %v", cfg, err)
+	}
+	for value, want := range map[string]bool{"true": true, "false": false} {
+		t.Setenv("TOKENPIVOT_DISABLE_ORIGIN_CHECK", value)
+		cfg, err := load()
+		if err != nil || cfg.DisableOriginCheck != want {
+			t.Fatalf("%q: %+v %v", value, cfg, err)
+		}
+	}
+	for _, value := range []string{"", "TRUE", "1", "yes", " true", "synthetic-sensitive-marker"} {
+		t.Setenv("TOKENPIVOT_DISABLE_ORIGIN_CHECK", value)
+		_, err := load()
+		if err == nil || !strings.Contains(err.Error(), "TOKENPIVOT_DISABLE_ORIGIN_CHECK") || strings.Contains(err.Error(), "synthetic-sensitive-marker") {
+			t.Fatalf("%q: err = %v", value, err)
+		}
+	}
+}

@@ -53,11 +53,13 @@ func run(logger *slog.Logger) error {
 	workspaceService := workspaces.New(workspaces.NewPostgres(pool))
 	usageService := usage.New(usage.NewPostgres(pool))
 	ingestionService := ingestion.New(ingestion.NewPostgres(pool), credentialService, logger)
+	webAuth := server.NewAuth(authService, cfg.WebOrigin)
+	webAuth.DisableOriginCheck = cfg.DisableOriginCheck
 	srv := &http.Server{
 		Handler: server.NewHandler(server.Options{
 			CheckReady:       pool.Ping,
 			Frontend:         frontend,
-			Auth:             server.NewAuth(authService, cfg.WebOrigin),
+			Auth:             webAuth,
 			Credentials:      server.NewCredentials(credentialService, workspaceService),
 			Usage:            server.NewUsage(usageService, workspaceService),
 			RequestDetails:   server.NewRequestDetails(requestdetails.New(requestdetails.NewPostgres(pool)), workspaceService),
