@@ -8,7 +8,7 @@ info:
 
     本文冻结 TokenPivot 首版三组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）、**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）与 **owner 凭证管理**（列表、签发、轮换、撤销，以及会话、`Origin`、owner 准入与错误码）。
 
-    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`workspaces/current`、`usage/options`，T-057）与请求明细/60 秒速率接口（`usage/events`、`usage/rate`，T-058）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
+    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`workspaces/current`、`usage/options`，T-057）与请求明细/60 秒速率接口（`usage-events`、`usage-rate`，T-058）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
@@ -1968,7 +1968,7 @@ paths:
                 error:
                   code: UNAVAILABLE
                   message: service is unavailable
-  /api/v1/workspaces/{workspaceID}/usage/events:
+  /api/v1/workspaces/{workspaceID}/usage-events:
     parameters:
       - $ref: '#/components/parameters/WorkspaceID'
     get:
@@ -1977,7 +1977,7 @@ paths:
       operationId: getUsageEvents
       summary: 分页查询请求明细（T-058）
       description: |
-        从原始 `usage_events` 按 `occurred_at DESC, id DESC` 返回请求级明细，keyset 分页，不用 OFFSET，不返回总数。Provider/Model/Project 筛选规则与 `usage/rate` 完全相同，同维 OR、异维 AND。
+        从原始 `usage_events` 按 `occurred_at DESC, id DESC` 返回请求级明细，keyset 分页，不用 OFFSET，不返回总数。Provider/Model/Project 筛选规则与 `usage-rate` 完全相同，同维 OR、异维 AND。
 
         **范围**：`[start,end)` 过滤 `occurred_at`，`start`/`end` 必须同时出现或同时省略，带偏移、最多 6 位小数秒的 RFC 3339，不要求分钟对齐，`start<end`。无 cursor 且省略时，服务端取 `end=as_of`、`start=end-1h`；有 cursor 且省略时沿用 cursor 内的首页范围，不重新计算；有 cursor 且显式提供时按时间点比较，不相等返回 `400`。响应总是返回实际 `start/end/as_of`。
 
@@ -2091,7 +2091,7 @@ paths:
                 error:
                   code: UNAVAILABLE
                   message: service is unavailable
-  /api/v1/workspaces/{workspaceID}/usage/rate:
+  /api/v1/workspaces/{workspaceID}/usage-rate:
     parameters:
       - $ref: '#/components/parameters/WorkspaceID'
     get:
@@ -2104,7 +2104,7 @@ paths:
 
         **口径**：`total_tokens.value` 是 known+estimated 的精确和（十进制字符串，可能超过 2^53-1）；`event_count=0` 与「有事件但全为 missing」都得 `value=null`，不是 0，调用方需分别展示。`estimated_count>0` 表示含估算，`missing_count>0` 表示部分覆盖。`window_last_received_at` 只取窗口内、符合筛选的事件的 `max(received_at)`，无事件为 `null`；它不表示数据源在线状态。早于窗口的历史补报即使刚到达也不计入。
 
-        **授权**与筛选规则同 `usage/events`。
+        **授权**与筛选规则同 `usage-events`。
       security:
         - cookieAuth: []
       parameters:

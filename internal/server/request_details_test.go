@@ -67,7 +67,7 @@ func TestRequestDetailsAccess(t *testing.T) {
 	for _, kind := range []string{"events", "rate"} {
 		t.Run(kind, func(t *testing.T) {
 			f, store := newDetailsFixture(t)
-			path := f.path(kind, "provider=p&project=unattributed")
+			path := detailsPath(f, kind, "provider=p&project=unattributed")
 			w := f.get(t, path, false)
 			if code, _ := errorCode(t, w); w.Code != http.StatusUnauthorized || code != "UNAUTHENTICATED" {
 				t.Fatalf("anon status %d code %s", w.Code, code)
@@ -101,7 +101,7 @@ func TestRequestDetailsInvalidArguments(t *testing.T) {
 	for kind, queries := range bad {
 		for _, q := range queries {
 			store.calls = 0
-			w := f.get(t, f.path(kind, q), true)
+			w := f.get(t, detailsPath(f, kind, q), true)
 			if code, _ := errorCode(t, w); w.Code != http.StatusBadRequest || code != "INVALID_ARGUMENT" || store.calls != 0 {
 				t.Fatalf("%s?%s: status %d code %s calls %d", kind, q, w.Code, code, store.calls)
 			}
@@ -110,7 +110,7 @@ func TestRequestDetailsInvalidArguments(t *testing.T) {
 	}
 	// A project outside the workspace is the same 400 after membership.
 	store.projects = 1
-	w := f.get(t, f.path("rate", "project=0199a0b0-0000-7000-8000-00000000000a"), true)
+	w := f.get(t, detailsPath(f, "rate", "project=0199a0b0-0000-7000-8000-00000000000a"), true)
 	if w.Code != http.StatusBadRequest || strings.Contains(w.Body.String(), "0199a0b0") {
 		t.Fatalf("foreign project status %d body %s", w.Code, w.Body.String())
 	}
@@ -119,19 +119,23 @@ func TestRequestDetailsInvalidArguments(t *testing.T) {
 func TestRequestDetailsMalformedWorkspaceAndRateBody(t *testing.T) {
 	f, _ := newDetailsFixture(t)
 	f.roles.setRole(f.ownerID, f.workspaceID, workspaces.RoleOwner)
-	w := f.get(t, "/api/v1/workspaces/nope/usage/rate", true)
+	w := f.get(t, "/api/v1/workspaces/nope/usage-rate", true)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status %d", w.Code)
 	}
-	w = f.get(t, f.path("rate", ""), true)
+	w = f.get(t, detailsPath(f, "rate", ""), true)
 	body := w.Body.String()
 	for _, want := range []string{`"window_seconds":60`, `"unit":"tokens/min"`, `"value":null`, `"window_last_received_at":null`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("missing %s in %s", want, body)
 		}
 	}
-	w = f.get(t, f.path("events", ""), true)
+	w = f.get(t, detailsPath(f, "events", ""), true)
 	if !strings.Contains(w.Body.String(), `"items":[]`) {
 		t.Fatalf("events body %s", w.Body.String())
 	}
+}
+
+func detailsPath(f *usageFixture, kind, query string) string {
+	return "/api/v1/workspaces/" + f.workspaceID.String() + "/usage-" + kind + "?" + query
 }

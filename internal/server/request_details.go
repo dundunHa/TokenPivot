@@ -19,8 +19,8 @@ type RequestDetails struct {
 
 // Request detail routes under /api/v1.
 const (
-	usageEventsPath = "/api/v1/workspaces/{workspaceID}/usage/events"
-	usageRatePath   = "/api/v1/workspaces/{workspaceID}/usage/rate"
+	usageEventsPath = "/api/v1/workspaces/{workspaceID}/usage-events"
+	usageRatePath   = "/api/v1/workspaces/{workspaceID}/usage-rate"
 )
 
 // NewRequestDetails returns the adapter; both dependencies are required.

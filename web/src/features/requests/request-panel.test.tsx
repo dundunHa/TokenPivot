@@ -123,12 +123,12 @@ function useBackend(opts?: {
         next_cursor: null,
       }),
     ),
-    http.get(`${BASE}/usage/events`, ({ request }) => {
+    http.get(`${BASE}/usage-events`, ({ request }) => {
       const url = new URL(request.url);
       seen.events.push(url);
       return opts?.events?.(url) ?? HttpResponse.json(page([item("e1")]));
     }),
-    http.get(`${BASE}/usage/rate`, ({ request }) => {
+    http.get(`${BASE}/usage-rate`, ({ request }) => {
       const url = new URL(request.url);
       seen.rates.push(url);
       return opts?.rate?.(url) ?? HttpResponse.json(rateBody());

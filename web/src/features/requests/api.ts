@@ -1,7 +1,7 @@
 import { ApiError, getJson } from "@/lib/api";
 import type { OverviewFilters } from "@/features/overview/overviewFilters";
 
-/** 请求明细与 60 秒速率：唯一读取 usage/events、usage/rate 响应结构的位置。 */
+/** 请求明细与 60 秒速率：唯一读取 usage-events、usage-rate 响应结构的位置。 */
 
 export type Quality = "known" | "estimated" | "missing";
 
@@ -190,7 +190,7 @@ export async function fetchRequests(
   signal: AbortSignal,
 ): Promise<RequestPage> {
   return parsePage(
-    await getJson(`${base(workspaceId)}/events?${query}`, signal),
+    await getJson(`${base(workspaceId)}-events?${query}`, signal),
   );
 }
 
@@ -199,5 +199,5 @@ export async function fetchRate(
   query: string,
   signal: AbortSignal,
 ): Promise<RateData> {
-  return parseRate(await getJson(`${base(workspaceId)}/rate?${query}`, signal));
+  return parseRate(await getJson(`${base(workspaceId)}-rate?${query}`, signal));
 }
