@@ -2,17 +2,17 @@
 
 > TODO ID：T-059
 > 规划日期：2026-10-29；外部资料抓取日期：2026-10-28。
-> 状态：**已批准实施与 BF 部署（2026-10-30），访问范围待澄清**。用户选择完成整个里程碑二后部署，授权严格限于 `tokenpivot-bf` 新资源的网络/卷/数据库创建、迁移、防火墙变更和应用启动；全部旧资源保持不动。用户已确认保留全部旧 PostgreSQL 资源，并批准仅本项目单机专用 Docker 网络内 `sslmode=disable`。用户对访问参数的回复为“这个不用限制”，唯一浏览器 Origin、实际绑定地址和来源范围仍须确认，不得据此默认开放公网。
+> 状态：**已批准实施与 BF 部署（2026-10-30），访问参数已确认**。用户选择完成整个里程碑二后部署，授权严格限于 `tokenpivot-bf` 新资源的网络/卷/数据库创建、迁移、防火墙变更和应用启动；全部旧资源保持不动。用户已确认保留全部旧 PostgreSQL 资源，并批准仅本项目单机专用 Docker 网络内 `sslmode=disable`。最新决定为监听 `0.0.0.0:18080`、不限制来源网段，唯一浏览器 Origin 为 `http://DESKTOP-C28DFS7:18080`；不得再声称“仅局域网可访问”。
 > 本轮只写本计划，不写 Dockerfile、Compose、应用代码、部署文档或 TODO，不连接 bf，不改变 git 状态。主代理审阅后只提交本计划；实施须另行授权。
 
 ## 1. 已定决策与目标
 
 ### 已定
 
-1. 将 TokenPivot 的 Go 单体和内嵌 React 页面部署到 bf 的 Docker；页面与 API 同源，应用使用 **HTTP 18080**，只在批准的局域网范围提供访问。
+1. 将 TokenPivot 的 Go 单体和内嵌 React 页面部署到 bf 的 Docker；页面与 API 同源，应用使用 **HTTP 18080**，监听 `0.0.0.0` 且不限制来源网段。Windows/Hyper-V 防火墙当前均关闭，部署不能宣称仅局域网或已具备来源隔离。
 2. 不再比较 HTTPS、隧道或 nginx 转发方案；bf 上现有 nginx 不作为依赖。
-3. 最新决定取代“先清理停止实例”：**全部旧容器、卷及其数据保留原状，不启动、不备份或处置其他项目资源**；为 TokenPivot 规划隔离的新 PostgreSQL 实例。新库实际创建仍需单独批准，旧资源清理不再是其前置条件。
-4. 访问地址选用 bf 或其私网 IP，不引入专用主机名；用户已知悉并接受同一主机不同端口可能收到会话 Cookie 的风险。最终只能配置一个精确 Origin，具体地址与允许网段为 TODO(待确认)。
+3. 最新决定取代“先清理停止实例”：**全部旧容器、卷及其数据保留原状，不启动、不备份或处置其他项目资源**；为 TokenPivot 创建隔离的新 PostgreSQL 实例属于本次已批准范围，旧资源清理不是其前置条件。
+4. 唯一访问地址已确认为 `http://DESKTOP-C28DFS7:18080`，内网 DNS 已验证可解析；`bf` 不是可解析主机名，不能用作 Origin。用户已知悉并接受同一主机不同端口可能收到会话 Cookie 的风险，并选择不限制来源网段。
 5. 仅本项目单机专用 Docker 网络内允许数据库 `sslmode=disable`，数据库不发布宿主端口，其他项目不加入此网络；其他远程数据库继续要求 `verify-full`。
 6. 新实例使用独立持久卷，数据库角色分为 `tokenpivot_owner` 与 `tokenpivot_app`；数据库不发布到局域网。
 7. 所有旧 PostgreSQL 容器及其卷、网络、镜像均不停止、不重建、不修改；8080/8081 的现有占用者也不动。
@@ -45,37 +45,27 @@
 - 当前根目录无 Dockerfile、Compose、`.dockerignore`，`docs/deploy.md` 不存在。本轮未创建它们。
 - 主代理报告 main `4c1d602947e4c1d8f59d2b52833f4edeb6515652` 的 `make check` 九阶段已通过；本子代理只解析了该提交号，未重跑检查。该记录不包含数据库集成，也不覆盖本计划将新增的代码，**不能作为最终发布检查**。
 
-### bf（来自另一 deploy 子代理本轮只读调查，本子代理未重复连接）
+### bf（2026-10-30 deploy 子代理只读预检）
 
-- hostname `DESKTOP-C28DFS7`；WSL2，Linux `6.18.33.2-microsoft-standard-WSL2`，x86_64，mirrored 网络。
-- Docker 服务端 `29.1.3`；Compose `2.40.3+ds1-0ubuntu1~24.04.1`。
-- 已有多套运行中的 postgres 17.9、16-alpine、18 镜像容器；这些是镜像/标签信息，不是其 `server_version` 证明。全部保持不动。
-- 8080/8081 已占用；18080 必须在实际创建前重新核查，占用时停止部署，不自动换端口。
-- Windows/Hyper-V 防火墙、局域网客户端可达性、路由器端口转发均未核实；nginx active 但无 80/443 监听，本方案不使用它。
+- 当前会话就在目标 BF：hostname `DESKTOP-C28DFS7`；WSL2 mirrored 网络，x86_64。原 `ssh bf` 别名失效，部署使用本机入口。
+- Docker 服务端 `29.1.3`；Compose `2.40.3`。18080 当前空闲；8080 的 nginx 与 `127.0.0.1:8081` 的现有 GUI 保持不动。实际创建前必须重新核查端口。
+- 当前运行容器保护基线为 `postgres-local`、`geo-eyes-t018-regression-pg-cc95`、`tokenpivot-test-pg18` 三项，现有 139 个卷全部不动；旧计划中的 27 个 PostgreSQL 容器清单已过时，不再作为验收口径。
+- `tokenpivot-bf` 项目名、`tokenpivot-bf-backend` 网络、`tokenpivot-bf-pgdata-18` 卷均无冲突。专用测试容器 `tokenpivot-test-pg18` 的实际 `server_version` 仍须在集成验收时核实。
+- Windows/Hyper-V 防火墙均关闭；路由器 18080 转发、另一客户端和不同来源可达性未核实，不能据此作公网或局域网保证。
 
 ## 3. 已确认的安全边界与部署前待确认参数
 
 ### Q1：全部旧 PostgreSQL 资源保留（已确认）
 
-用户已选择保留全部旧容器和卷，继续规划新库。旧资源处置不进入本次执行范围，不构成新库的前置步骤；没有任何删除例外或其他项目备份授权。以下仅保留已有调查记录，不能作为后续操作名单。
+用户已选择保留全部旧容器和卷，继续规划新库。旧资源处置不进入本次执行范围，不构成新库的前置步骤；没有任何删除例外或其他项目备份授权。
 
-现有清单为 27 个 PostgreSQL 镜像容器：13 running、11 exited、3 created；只有后 14 个进入候选清单，当前无需也不能停止它们：
+2026-10-30 当前保护基线为 3 个运行容器：`postgres-local`、`geo-eyes-t018-regression-pg-cc95`、`tokenpivot-test-pg18`，以及全部现有卷。只核对避免冲突所需的非敏感元数据，不读取其他项目数据，不启动、停止、重建或修改旧资源。执行前重新核对实际状态；如有漂移，以当时实际资源为保护对象并记录，不沿用旧清单推断。
 
-| 状态 | 候选对象（仅清单，未批准处置） |
-|---|---|
-| exited | `artmind-t016-budget-pg-20261029`、`geo-eyes-t020-final-pg-20261028`、`t008-v2-test-pg-20261028`、`artmind-t008-postgres-20261027`、`t017-eval-daily-pg-dev-d050`、`t007-job1185-pg-20261026`、`t011-job-scope-check-20261025`、`geo-t007-test-pg`、`howtosay-t025-pg`、`geo-agent-autobind-itest2`、`t002-brand-pg` |
-| created | `t003-pg`、`server-postgres-1`、`geo-agent-autobind-itest` |
+### Q2：唯一浏览器地址与来源范围（已确认）
 
-- 另有 12 个卷与运行中容器已挂卷无交集，但这**不能证明数据无用**；本次不需要其他项目的处置矩阵，也不读取卷内数据。
-- `artmind-t008-postgres-20261027` 与 `t011-job-scope-check-20261025` 无挂载，可写层是否含数据未核实；保留整个容器，不为本次部署导出或检查其数据。
-- `server-postgres-1` 使用命名卷 `server_pgdata`，且绑定到已不存在的其他项目 worktree 脚本路径，不能启动；不得为“试试看”启动它。
-- 状态及挂载关系仅作为保护基线；旧清单不授权停止任何容器。
+**唯一 Origin 为 `http://DESKTOP-C28DFS7:18080`；Docker 端口绑定为 `0.0.0.0:18080:18080`，不限制来源网段。** 预检确认内网 DNS 可把 `DESKTOP-C28DFS7` 解析到当前主机；执行前仍须复核解析与端口。当前会话就在 BF 本机，后续使用本机入口，不依赖已失效的 `ssh bf` 别名。
 
-### Q2：唯一浏览器地址与局域网范围
-
-**用户选择仍使用 bf 或私网 IP，接受同主机 Cookie 的跨端口风险，不配置专用主机名。** 部署前仍须核实并确认：唯一访问地址（`http://bf:18080` 或一个确定的私网 IP 地址，二者只能选一）、Docker 私网绑定 IP、允许访问的局域网 CIDR（网段）及对应的 `TOKENPIVOT_WEB_ORIGIN`。以上实际值均为 TODO(待确认)，不得猜测，也不得同时接受两个 Origin。
-
-不推荐直接使用与其他服务共用的 IP/主机名。Cookie 不区分端口：`tokenpivot_session` 的 `Path=/` 且无 Domain，会在浏览器访问同一主机名的其他端口时发送，bf 的 8080/8081 服务因此可能收到会话 Cookie。专用主机名是当前 HTTP 约束下避免跨端口暴露的最简单办法；若用户选择共用 IP/主机名，必须显式接受该风险，本计划不声称 Cookie 能按端口隔离。
+Windows 三档防火墙和 Hyper-V 防火墙在预检时均关闭，路由器转发与其他客户端可达性尚未核实。因此本方案只能声称绑定所有主机接口，不能声称仅局域网、已验证公网可达或已验证来源隔离。用户接受 HTTP 和共用主机名的风险；`tokenpivot_session` 不区分端口，可能在访问同主机其他端口时发送，不能把它描述成按端口隔离。
 
 ### Q3：单机 Compose 内部连接是否允许 `sslmode=disable`
 
@@ -91,7 +81,7 @@
 |---|---|
 | `Dockerfile`（新增） | 固定 Go/Node 构建镜像摘要；复用 `make build`；产出静态 linux/amd64 服务和迁移二进制；最终使用无 shell 的 `scratch`、数值非 root 用户和源码提交标签 |
 | `.dockerignore`（新增） | 排除 `.git`、所有真实 `.env*`、`bin/`、`web/node_modules/`、`web/dist/`、备份和日志，避免密钥、旧产物及本机依赖进入构建上下文 |
-| `compose.yaml`（新增） | 唯一项目 `tokenpivot-bf`；定义 `db`、显式调用的 `migrate`、`app`；固定镜像、独立网络/卷、唯一局域网端口绑定，不发布 PostgreSQL |
+| `compose.yaml`（新增） | 唯一项目 `tokenpivot-bf`；定义 `db`、显式调用的 `migrate`、`app`；固定镜像、独立网络/卷、应用绑定 `0.0.0.0:18080`，不发布 PostgreSQL |
 | [internal/config/config.go](../../internal/config/config.go) | 新增严格布尔配置 `TOKENPIVOT_ALLOW_INSECURE_HTTP`，默认 `false`；仅在该值为精确 `true` 时允许非回环 HTTP Origin |
 | [internal/config/config_test.go](../../internal/config/config_test.go) | 覆盖默认拒绝、显式开关、非法值脱敏、其余 Origin 规则不变及 HTTP 的 `Secure=false` |
 | [internal/server/auth_middleware_test.go](../../internal/server/auth_middleware_test.go) | 调整 Origin 解析调用；增加非回环 HTTP 下 Cookie 仍 `HttpOnly`、`SameSite=Lax`、`Secure=false` 的回归 |
@@ -112,15 +102,15 @@
 3. 不给 `Config` 增加运行期无用字段，不新增第二套 Cookie 配置、环境探测、CORS 或 Host/Forwarded 信任。[Origin.Secure](../../internal/config/config.go#L93-L96) 继续只由 scheme 决定：HTTPS 为 `true`，获批准的 HTTP 为 `false`。
 4. bf 的 Compose 显式写 `TOKENPIVOT_ALLOW_INSECURE_HTTP: "true"`；其他环境不写即关闭。不能用启动命令跳过 `config.Load`，也不能通过监听 `:18080` 隐式获得 HTTP 例外。
 
-这个开关解决的是当前明确的局域网 HTTP 需求，而不是通用“关闭安全”选项。它不证明一个 Origin 位于局域网；实际范围由固定私网绑定、Windows/Hyper-V 防火墙和无路由器转发共同保证。
+这个开关解决的是当前明确的 HTTP 部署需求，而不是通用“关闭安全”选项。唯一 Origin 仍受严格校验；实际暴露范围由 `0.0.0.0` 绑定和主机/上游网络共同决定，本计划不作局域网或公网可达保证。
 
 ### Cookie、Origin 与跨站请求伪造（CSRF）边界
 
 - 保留写请求恰好一个 Origin、与配置的 scheme/host/port 精确相等；错误、`null`、多值、缺失仍 403，不读取 `Host`、`Forwarded` 或 `X-Forwarded-Host` 建立信任。
 - `SameSite=Lax` 不是完整 CSRF 防线，所有现有及后续浏览器写路由仍必须复用 Origin 中间件。采集 Bearer 接口不因 Cookie 或该开关改变认证。
 - HTTP 下凭证、会话 Cookie 和页面内容在链路上可被窃听或篡改；Origin 校验、`HttpOnly` 和 Argon2id 都不能弥补这一点。获得会话者可持续滑动续期，网络攻击者还可修改 JavaScript 后冒充同源操作。
-- `Secure=false` 是浏览器通过 HTTP 返回会话 Cookie 的必要结果，不把它描述成安全等价于 HTTPS。只在用户批准的局域网使用，不开放到公网。
-- `TOKENPIVOT_REGISTRATION_OPEN` 保持显式 `false`：空库首个用户之后关闭注册，不因局域网部署开放注册。
+- `Secure=false` 是浏览器通过 HTTP 返回会话 Cookie 的必要结果，不把它描述成安全等价于 HTTPS。用户已选择不限来源网段；这不等于已验证公网可达，也不免除记录实际暴露面的义务。
+- `TOKENPIVOT_REGISTRATION_OPEN` 保持显式 `false`：空库首个用户之后关闭注册，不因 HTTP 部署开放注册。
 
 ## 6. 镜像与 Compose 设计
 
@@ -141,28 +131,28 @@ Dockerfile 使用两个官方构建镜像的 **linux/amd64 镜像清单摘要**�
 3. 复制其余受 `.dockerignore` 过滤的源码，记录实际 `node`、`npm`、Go 版本。
 4. 以 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64` 执行现有 `make build`，不复制其 recipe，不在 Dockerfile 另写一套前端/Go 构建顺序。
 
-最终 `FROM scratch`，复制两个静态二进制，并从固定摘要的构建阶段复制 `/usr/share/zoneinfo` 与 `/etc/ssl/certs/ca-certificates.crt`，保留标准路径。构建时检查这些文件实际存在；缺失即停止，不以 UTC 或跳过证书验证兜底。需要私有 CA 时仅按批准路径只读挂载并配置可信证书，不将私钥或数据库凭证写入镜像。使用 `USER 65532:65532`，入口为 `/tokenpivot`；同一镜像通过覆盖入口执行 `/tokenpivot-migrate`。不为容器健康检查额外加入 shell、curl 或新的应用子命令，健康验收从宿主机和局域网客户端执行。
+最终 `FROM scratch`，复制两个静态二进制，并从固定摘要的构建阶段复制 `/usr/share/zoneinfo` 与 `/etc/ssl/certs/ca-certificates.crt`，保留标准路径。构建时检查这些文件实际存在；缺失即停止，不以 UTC 或跳过证书验证兜底。需要私有 CA 时仅按批准路径只读挂载并配置可信证书，不将私钥或数据库凭证写入镜像。使用 `USER 65532:65532`，入口为 `/tokenpivot`；同一镜像通过覆盖入口执行 `/tokenpivot-migrate`。不为容器健康检查额外加入 shell、curl 或新的应用子命令，健康验收从宿主机和可用的另一客户端执行。
 
 构建参数 `SOURCE_COMMIT` 必须是实施合入后的完整 40 位提交，写入开放容器倡议（OCI）的 `org.opencontainers.image.revision` 标签；本地镜像名为 `tokenpivot:<完整提交>`。构建前要求工作树干净、HEAD 与该值一致；构建后记录镜像 ID。不能拿上述基线提交冒充含本计划改动的最终提交。
 
 ### 6.2 Compose 资源与数据流
 
-- 顶层项目名 `tokenpivot-bf`，独立网络 `tokenpivot-bf-backend`，独立命名卷 `tokenpivot-bf-pgdata-18`。不得复用旧项目网络或卷。
+- 顶层项目名 `tokenpivot-bf`，独立网络 `tokenpivot-bf-backend`，独立命名卷 `tokenpivot-bf-pgdata-18`。不得复用旧项目网络或卷。网络显式使用 `192.168.240.0/24`、网关 `192.168.240.1`，避免 Docker 默认 `172.17.0.0/16`–`172.31.0.0/16` 地址池及当前 LAN/Tailscale 路由；创建时仍须复核，发现重叠立即停止，不自行换段。
 - `db`：固定 PostgreSQL 引用和 `platform: linux/amd64`；卷挂载到 **PG 18 官方要求的 `/var/lib/postgresql`**，不覆盖其默认 `PGDATA=/var/lib/postgresql/18/docker`；没有 `ports`。
 - `db` 使用 `POSTGRES_DB=tokenpivot`、`POSTGRES_HOST_AUTH_METHOD=scram-sha-256`、`POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256`，不设置任何 `trust`。超级用户密码只经官方 `POSTGRES_PASSWORD_FILE` 从宿主机受限文件挂载；Compose 的本地 secret 是文件挂载，不宣称它是加密密钥管理服务。
 - `migrate`：使用同一应用镜像，只接收 `TOKENPIVOT_MIGRATION_DATABASE_URL`，入口 `/tokenpivot-migrate`、命令 `up`；置于显式 migration profile，普通 `up` 不得连带执行迁移。保留一次性容器供审计，禁止使用 `--rm`。
 - `app`：只接收 `TOKENPIVOT_DATABASE_URL`、可信 Origin、`TOKENPIVOT_ALLOW_INSECURE_HTTP=true`、`TOKENPIVOT_REGISTRATION_OPEN=false` 与 `TOKENPIVOT_HTTP_ADDR=:18080`；不接收迁移账号。
 - 两条数据库 URL 均明确 `host=db`、数据库 `tokenpivot`、`search_path=tokenpivot` 和经 Q3 批准的 sslmode；真实密码由本地凭证工具注入进程环境，不写仓库、命令参数、shell 历史或日志。不要运行会打印插值后密钥的 `docker compose config`，也不要输出完整容器环境。
-- 应用唯一端口映射为 `<批准的bf私网IP>:18080:18080`，不使用 `0.0.0.0` 兜底；如果 mirrored WSL 下该绑定不能工作，停止并重新审查，不自动改绑全部接口。
+- 应用唯一端口映射为用户确认的 `0.0.0.0:18080:18080`；不限制来源网段。若 mirrored WSL 下该绑定或选定 Origin 不能工作，停止并报告，不自动换端口或增加第二个 Origin。
 - 不设置自动 restart，不运行不带服务名的 `docker compose up`，避免意外执行 migration profile 或重建资源。初始创建/启动分开执行；未来更新/重建不在本次授权内。
 
-数据流：凭证工具 → Compose 进程环境/密码文件 → 独立迁移（仅 owner）→ PostgreSQL；浏览器 → 批准的私网 IP:18080 → 内嵌 Go 页面/API → app 角色 → PostgreSQL。迁移凭证不会进入 app 容器，数据库流量不跨主机。
+数据流：凭证工具 → Compose 进程环境/密码文件 → 独立迁移（仅 owner）→ PostgreSQL；浏览器 → `http://DESKTOP-C28DFS7:18080` → 内嵌 Go 页面/API → app 角色 → PostgreSQL。迁移凭证不会进入 app 容器，数据库流量不跨主机。
 
 ## 7. 新 PostgreSQL 初始化、迁移与备份
 
 ### 7.1 显式创建后的角色准备
 
-新容器健康只说明 PostgreSQL 可接受连接，不代表 TokenPivot 角色或迁移完成。经单独数据库初始化审批后，管理员在该实例内交互执行，不在命令参数或日志中写密码：
+新容器健康只说明 PostgreSQL 可接受连接，不代表 TokenPivot 角色或迁移完成。在已批准的新实例范围内，由管理员交互执行以下初始化，不在命令参数或日志中写密码：
 
 ```sql
 CREATE ROLE tokenpivot_owner LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
@@ -179,7 +169,7 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 
 不预授未来表权限；现有迁移逐表向固定角色 `tokenpivot_app` 授予 `SELECT/INSERT/UPDATE`。迁移账号不是超级用户，服务账号不是 schema/表 owner，不授予 DELETE、TRUNCATE 或迁移历史写权限。
 
-### 7.2 单独迁移审批与执行记录
+### 7.2 迁移执行记录
 
 1. 确认生产库不是 `_test` 库，确认实际 `SELECT version()` 为 18.6、`tokenpivot_app` 存在、目标 schema 正确；不得用镜像标签代替这些检查。
 2. 先执行普通发布检查和**独立专用测试库**上的 `make test-integration`，后者目标服务端也应为 18.6。生产库绝不承担集成测试；测试环境未准备好则发布停止。
@@ -195,13 +185,13 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 
 ## 8. 旧资源保护边界
 
-用户已经确认全部保留：14 个停止/未启动容器、12 个候选卷及 `server_pgdata` 均保持原状，13 个原运行容器也不停止、不修改。新项目不复用它们的卷、网络或容器。
+用户已经确认全部保留。以执行时实际清单为准，当前 3 个运行容器及全部现有卷、网络、容器均保持原状；新项目不复用它们的卷、网络或容器。
 
 仅为避免名称、挂载、端口冲突和确认未影响原服务检查必要的非敏感元数据，不读取、导出或备份其他项目数据，不启动旧实例。不得直接 `mv` Docker 的 containers/volumes 目录，不得用 Docker 删除命令或全局 prune 绕过 A2。未来若要清理，必须另行明确范围、保护和恢复方案与授权，不属于本计划。
 
 ## 9. 有序实施与停止条件
 
-### A. 代码与镜像准备（仍需实施授权）
+### A. 代码与镜像准备（已批准实施）
 
 1. 主代理先协调 T-055 和共享文件，再在最新 HEAD 实施第 4 节；若 OpenAPI/README 正被其他任务修改，串行等待而不是覆盖。
 2. 完成 HTTP 配置与测试、Dockerfile/Compose/部署文档；主代理只读 review。
@@ -211,24 +201,24 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 ### B. bf 预检（只读，部署前重新执行）
 
 1. 核对 Docker/Compose、项目名/网络/卷无冲突、18080 在 WSL 与 Windows 均未占用，8080/8081 原占用者保持。
-2. 重新核对旧 PostgreSQL 的运行状态与挂载关系，仅记录必要非敏感元数据；发现与本项目冲突或原服务状态异常时停止协调，不处置旧资源。Q1、Q3 已确认，Q2 的实际地址/网段未确认时不进入变更步骤。
-3. 核实选定的 bf 解析或私网 IP、允许 CIDR、Windows 与 Hyper-V 实际过滤层、路由器无 18080 转发。只检查拟用密码文件及备份目录的路径、权限与可用容量，不创建或修改任何文件、不读取/输出秘密内容。
+2. 重新核对旧 PostgreSQL 的运行状态与挂载关系，仅记录必要非敏感元数据；发现与本项目冲突或原服务状态异常时停止协调，不处置旧资源。确认 `DESKTOP-C28DFS7` 仍解析到当前 BF、18080 可用，且 `192.168.240.0/24` 未被本机或 Docker 路由占用。
+3. 复核 Windows 与 Hyper-V 防火墙状态；本方案不新增来源限制，也不要求核实路由器转发或非批准来源失败。只检查拟用密码文件及备份目录的路径、权限与可用容量，不创建或修改任何文件、不读取/输出秘密内容。
 4. 从最终 Compose 做不泄露秘密的静态审查，确认只有 app 有端口、db 无端口、 migrate 不在默认启动路径、所有摘要和源码提交固定。
 
-### C. 变更步骤（每一步单独显式批准）
+### C. 变更步骤（限于已批准的 tokenpivot-bf 新资源）
 
-1. **变更准备**：在获明确批准后创建本项目受限密码文件和仓库外备份目录，凭证由工具安全注入；不输出内容。旧资源一律保留，不执行清理。
-2. **创建新实例**：获单独批准后只创建本项目的网络、卷和 db 容器，再启动 db 并等待健康；不附带 app 或 migrate。
+1. **变更准备**：创建本项目受限密码文件和仓库外备份目录，凭证由工具安全注入；不输出内容。旧资源一律保留，不执行清理。
+2. **创建新实例**：只创建本项目的网络、卷和 db 容器，再启动 db 并等待健康；不附带 app 或 migrate。
 3. **初始化**：创建数据库角色、权限和 schema；验证 SCRAM 与实际角色权限。
-4. **防火墙**：备份现有规则后，只新增/修改允许批准 CIDR 到指定私网 IP 的 TCP 18080 规则；不得禁用 Windows/Hyper-V 防火墙或开放任意来源。
+4. **网络复核**：确认应用按用户决定绑定 `0.0.0.0:18080`，不新增来源限制；不修改现有防火墙状态，若实际过滤导致选定 Origin 不可用则停止报告。
 5. **迁移**：按第 7.2 节执行；结果未知先查，不重触发。
 6. **部署**：创建并启动 app；不自动重启、重建、回滚或清理旧资源。
-7. **验收**：保存不含秘密的命令退出码、版本、镜像 ID、端口和客户端结果。任何一步失败都停在当前阶段。
+7. **验收**：保存不含秘密的命令退出码、版本、镜像 ID、端口和客户端结果。任何一步失败都停在当前阶段；超出本项目新资源的动作仍需另行授权。
 
 ### 失败与回滚
 
 - 构建失败：不接触 bf 数据库或防火墙。
-- 端口占用、地址绑定失败、主机名解析不符：不启动 app，不换端口、不改绑全部接口。
+- 端口占用、`0.0.0.0` 绑定失败、主机名解析不符：不启动 app，不换端口、不改绑私网地址或增加第二个 Origin。
 - 迁移失败：不启动 app；按实际历史处理，不自动 Down。
 - app 启动或 readyz 失败：只检查本项目容器、配置和网络；不重建数据库。healthz 成功而 readyz 失败仍算未就绪。
 - 需要撤回时，经批准只停止本项目 app，保留应用容器、数据库容器、卷、日志和备份。数据库已迁移时不承诺旧应用兼容，不自动回滚或删除数据。
@@ -250,12 +240,12 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 3. 迁移在 app 启动前成功，实际版本与最终源码迁移一致；app 容器没有 owner URL。不得为验收重复触发结果未知的迁移。
 4. `docker inspect` 的选定非敏感字段和 `docker port` 证明 db 没有任何宿主机端口发布，卷为本项目新卷且挂载 `/var/lib/postgresql`；旧卷未被挂载。
 
-### 10.3 HTTP、健康与只局域网
+### 10.3 HTTP、健康与访问边界
 
-1. 从批准的局域网客户端访问唯一 Origin：页面及静态资源成功，`GET /healthz`、`GET /readyz` 均 200，HEAD/405/404 行为符合 [README.md:136-155](../../README.md#L136-L155)；页面不依赖运行时 Node。
+1. 在 BF 通过唯一 Origin 访问页面及静态资源，`GET /healthz`、`GET /readyz` 均 200，HEAD/405/404 行为符合 [README.md:136-155](../../README.md#L136-L155)；页面不依赖运行时 Node。若另一客户端可用，再从该客户端复核；不可用时明确记为未验证。
 2. 用无真实凭证的请求验证错误 Origin 仍为 403 且无业务写入。成功 Cookie 的部署观察只在用户进行首个真实注册时记录属性，不记录令牌；不为了测试擅造首个生产用户。
-3. 端口/防火墙证据共同证明：Docker 仅绑定批准私网 IP:18080，Windows/Hyper-V 仅允许批准 CIDR，其他来源连接失败，路由器无 18080 转发。缺少非批准来源或路由器证据时，不得宣称“只局域网”验收完成。
-4. 批准网段内另一台设备可访问；bf 上 8080/8081 与全部 13 个原 running PostgreSQL 容器保持运行，挂载/卷无变化。数据库无新 LAN 监听，不能用“本机 5432 总体不可达”掩盖其他既有服务状态。
+3. Docker 与非敏感端口检查证明应用绑定 `0.0.0.0:18080`，db 没有宿主机端口；不得把该结果描述成私网绑定或来源隔离，也不以其他来源连接失败作为验收条件。
+4. BF 上 8080/8081 与执行前记录的 3 个原 running 容器保持原状态，挂载/卷无变化；若执行前基线变化，先记录并确认无本项目冲突。不能用“本机 5432 总体不可达”掩盖其他既有服务状态。
 5. 记录停止/失败恢复结果：停止本项目 app 后页面不可达而数据库和卷仍保留；恢复启动须经批准，不删除或重建任何资源。
 
 ## 11. 执行切分与共享文件责任
@@ -279,7 +269,7 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 
 ### 块 C：bf 执行
 
-- 文件范围：无仓库文件；主代理在全部开放问题解决、A/B 合入、发布检查通过后，按第 9 节逐步取得执行批准，再派 deploy 以“部署执行”模式执行，不由文档任务自动切换。
+- 文件范围：无仓库文件；主代理在 A/B 合入、发布检查通过后，按第 9 节已批准边界派 deploy 以“部署执行”模式执行，不由文档任务自动切换；越出边界仍须停止并取得授权。
 - 主代理向 deploy 明确提供 bf、固定完整源码提交/镜像 ID、环境、目标、允许动作和批准边界、现有入口及版本/健康验收要求；源码上传只用干净固定版本，不从文档工作区上传。deploy 回报精确执行 ID、实际运行版本和健康证据，未知结果先查原执行。脚本缺陷交回 dev，迁移、回滚和资源变更不得越权。
 - 主代理核对 Compose 实际动作、执行 ID 和验收记录。任何共享文件冲突由主代理串行处理，不在合并后重新生成锁文件。
 
@@ -298,11 +288,11 @@ GRANT USAGE ON SCHEMA tokenpivot TO tokenpivot_app;
 
 ## 13. 主要风险与未核实事项
 
-- **当前不能实施**：Q1 保留旧资源、Q3 专用网络内部明文已确认；Q2 已选 bf/私网 IP，但唯一实际 Origin、绑定 IP 和允许网段仍为 TODO(待确认)。代码/镜像实现、新实例创建、初始化、迁移、防火墙和部署尚未获执行批准；旧资源处置已排除。
-- bf 的只读事实来自交接报告，未由本子代理复核；执行前必须重新核对易变状态，但不因此重复做无目的调查。
-- Windows/Hyper-V 防火墙、 mirrored 网络下指定私网 IP 的 Docker 端口绑定、局域网客户端、非批准来源隔离及路由器配置均未验证。
+- **实施与 BF 新资源变更已获批准**：保留旧资源、专用网络内部明文、监听 `0.0.0.0`、不限来源网段和唯一 Origin 均已确认；任何旧资源处置、回滚或越出 tokenpivot-bf 新资源的动作未获批准。
+- BF 的只读事实来自 deploy 子代理预检报告；执行前必须重新核对易变状态，但不因此重复做无目的调查。
+- Windows/Hyper-V 防火墙已观测为关闭；另一客户端、路由器转发及公网/局域网实际可达范围未验证，不作保证。
 - 固定摘要的可拉取性、Node 与 Go 工具合并构建、scratch 中两个静态二进制、Compose migration profile 行为均未在本轮执行；必须通过实际构建和分阶段启动验收，失败不得换成 latest。
-- 局域网 HTTP 会暴露明文凭据/会话及被篡改页面；共用主机名还存在 Cookie 跨端口发送风险。专用主机名不能解决链路明文，只解决 Cookie 主机隔离。
+- 所有可路由来源上的 HTTP 都可能暴露明文凭据/会话及被篡改页面；共用主机名还存在 Cookie 跨端口发送风险。专用主机名不能解决链路明文，只解决 Cookie 主机隔离。
 - 内部 PostgreSQL `sslmode=disable` 仅在用户已批准的本项目单机专用网络适用；其他远程连接不得因“同机”说法或部署便利而降级。
 - 旧卷与运行卷无交集不代表数据无用；备份也不授予删除权。直接移动 Docker 管理目录可能损坏全部项目，明确禁止。
 - 初次部署没有可直接恢复的旧 TokenPivot 应用/数据库状态；撤回只保证停止本项目 app 并保留数据，不承诺自动回到某个业务版本或自动清理新资源。

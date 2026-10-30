@@ -1,6 +1,6 @@
+import { ApiError, postResult, requestJson } from "@/lib/api";
 import {
   AuthApiError,
-  parseAuthErrorCode,
   parseAuthSession,
   type AuthCredentials,
   type AuthSession,
@@ -8,86 +8,70 @@ import {
 
 const BASE = "/api/v1/auth";
 
-async function send(path: string, init: RequestInit): Promise<Response> {
+/** 共享请求层的错误转成认证错误，保持既有 AuthApiError 形状。 */
+async function guarded<T>(run: () => Promise<T>): Promise<T> {
   try {
-    return await fetch(path, { ...init, credentials: "same-origin" });
+    return await run();
   } catch (cause) {
-    if (init.signal?.aborted) throw cause;
-    throw new AuthApiError(0, "NETWORK");
+    if (cause instanceof ApiError) {
+      throw new AuthApiError(cause.status, cause.code, cause.retryAfter);
+    }
+    throw cause;
   }
 }
 
-async function readJson(response: Response): Promise<unknown> {
-  try {
-    return await response.json();
-  } catch {
-    return undefined;
-  }
-}
-
-async function failure(response: Response): Promise<AuthApiError> {
-  const code = parseAuthErrorCode(await readJson(response));
-  return new AuthApiError(
-    response.status,
-    code ?? "UNKNOWN",
-    response.headers.get("Retry-After") ?? undefined,
-  );
-}
-
-async function readSession(response: Response): Promise<AuthSession> {
-  if (!response.ok) throw await failure(response);
-  const session = parseAuthSession(await readJson(response));
-  if (session === undefined)
-    throw new AuthApiError(response.status, "BAD_RESPONSE");
+function toSession(status: number, body: unknown): AuthSession {
+  const session = parseAuthSession(body);
+  if (session === undefined) throw new AuthApiError(status, "BAD_RESPONSE");
   return session;
 }
 
-function postCredentials(
+async function postCredentials(
   path: string,
   credentials: AuthCredentials,
-): Promise<Response> {
-  return send(`${BASE}/${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({
+): Promise<AuthSession> {
+  return guarded(async () => {
+    const { status, body } = await postResult(`${BASE}/${path}`, {
       email: credentials.email,
       password: credentials.password,
-    }),
+    });
+    return toSession(status, body);
   });
 }
 
-export async function register(
-  credentials: AuthCredentials,
-): Promise<AuthSession> {
-  return readSession(await postCredentials("register", credentials));
+export function register(credentials: AuthCredentials): Promise<AuthSession> {
+  return postCredentials("register", credentials);
 }
 
-export async function login(
-  credentials: AuthCredentials,
-): Promise<AuthSession> {
-  return readSession(await postCredentials("login", credentials));
+export function login(credentials: AuthCredentials): Promise<AuthSession> {
+  return postCredentials("login", credentials);
 }
 
 /** 仅 401 UNAUTHENTICATED 视为匿名（null）；其他失败一律抛出。 */
 export async function fetchSession(
   signal: AbortSignal,
 ): Promise<AuthSession | null> {
-  const response = await send(`${BASE}/session`, {
-    method: "GET",
-    headers: { Accept: "application/json" },
-    signal,
-  });
-  if (response.status === 401) {
-    const error = await failure(response);
-    if (error.code === "UNAUTHENTICATED") return null;
+  try {
+    return await guarded(async () => {
+      const { status, body } = await requestJson(`${BASE}/session`, {
+        method: "GET",
+        signal,
+      });
+      return toSession(status, body);
+    });
+  } catch (error) {
+    if (
+      error instanceof AuthApiError &&
+      error.status === 401 &&
+      error.code === "UNAUTHENTICATED"
+    ) {
+      return null;
+    }
     throw error;
   }
-  return readSession(response);
 }
 
 export async function logout(): Promise<void> {
-  const response = await send(`${BASE}/logout`, { method: "POST" });
-  if (response.status === 204) return;
-  if (!response.ok) throw await failure(response);
-  throw new AuthApiError(response.status, "BAD_RESPONSE");
+  const { status } = await guarded(() => postResult(`${BASE}/logout`));
+  if (status !== 204) throw new AuthApiError(status, "BAD_RESPONSE");
 }

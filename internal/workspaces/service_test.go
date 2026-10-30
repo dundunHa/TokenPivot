@@ -83,6 +83,9 @@ type fakeRoleStore struct {
 	rows   map[[16]byte]map[[16]byte]Role
 	err    error
 	answer *Role
+
+	current      Workspace
+	currentFound bool
 }
 
 func (f *fakeRoleStore) MembershipRole(ctx context.Context, userID, workspaceID ID) (Role, bool, error) {
@@ -98,6 +101,10 @@ func (f *fakeRoleStore) MembershipRole(ctx context.Context, userID, workspaceID 
 	}
 	role, ok := byWorkspace[workspaceID.Bytes]
 	return role, ok, nil
+}
+
+func (f *fakeRoleStore) CurrentWorkspace(ctx context.Context, userID ID) (Workspace, bool, error) {
+	return f.current, f.currentFound, f.err
 }
 
 func id(tag byte) ID {
@@ -277,5 +284,24 @@ func TestMembershipRoleDatabaseFailureIsNotAMiss(t *testing.T) {
 func TestRolesAreTheDocumentedVocabulary(t *testing.T) {
 	if RoleOwner != "owner" || RoleMember != "member" {
 		t.Fatalf("roles=%q,%q want owner,member", RoleOwner, RoleMember)
+	}
+}
+
+func TestCurrentWorkspaceReturnsStoreAnswer(t *testing.T) {
+	store := &fakeRoleStore{current: Workspace{ID: id(0x09), Name: "Personal"}, currentFound: true}
+	got, found, err := New(store).CurrentWorkspace(context.Background(), id(0x01))
+	if err != nil || !found || got.ID != id(0x09) || got.Name != "Personal" {
+		t.Fatalf("got %+v found=%v err=%v", got, found, err)
+	}
+}
+
+func TestCurrentWorkspaceMissingAndError(t *testing.T) {
+	_, found, err := New(&fakeRoleStore{}).CurrentWorkspace(context.Background(), id(0x01))
+	if err != nil || found {
+		t.Fatalf("missing: found=%v err=%v", found, err)
+	}
+	boom := errors.New("boom")
+	if _, found, err := New(&fakeRoleStore{err: boom}).CurrentWorkspace(context.Background(), id(0x01)); !errors.Is(err, boom) || found {
+		t.Fatalf("error: found=%v err=%v", found, err)
 	}
 }

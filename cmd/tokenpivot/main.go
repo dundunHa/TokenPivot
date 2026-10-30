@@ -54,14 +54,15 @@ func run(logger *slog.Logger) error {
 	ingestionService := ingestion.New(ingestion.NewPostgres(pool), credentialService, logger)
 	srv := &http.Server{
 		Handler: server.NewHandler(server.Options{
-			CheckReady:  pool.Ping,
-			Frontend:    frontend,
-			Auth:        server.NewAuth(authService, cfg.WebOrigin),
-			Credentials: server.NewCredentials(credentialService, workspaceService),
-			Usage:       server.NewUsage(usageService, workspaceService),
-			Projects:    server.NewProjects(projects.New(projects.NewPostgres(pool)), workspaceService),
-			Sources:     server.NewSources(sources.New(sources.NewPostgres(pool)), workspaceService),
-			Ingestion:   ingestion.NewHandler(ingestionService),
+			CheckReady:       pool.Ping,
+			Frontend:         frontend,
+			Auth:             server.NewAuth(authService, cfg.WebOrigin),
+			Credentials:      server.NewCredentials(credentialService, workspaceService),
+			Usage:            server.NewUsage(usageService, workspaceService),
+			CurrentWorkspace: server.NewCurrentWorkspace(workspaceService),
+			Projects:         server.NewProjects(projects.New(projects.NewPostgres(pool)), workspaceService),
+			Sources:          server.NewSources(sources.New(sources.NewPostgres(pool)), workspaceService),
+			Ingestion:        ingestion.NewHandler(ingestionService),
 		}),
 		ReadHeaderTimeout: server.ReadHeaderTimeout,
 		ReadTimeout:       server.ReadTimeout,

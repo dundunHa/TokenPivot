@@ -705,3 +705,55 @@ VALUES ($1,$2,$3,$4,'synthetic-provider','synthetic-model',now(),now(),'v1','\x0
 		t.Fatal("another user reused an existing personal workspace")
 	}
 }
+
+// seedMembershipAt inserts a membership with an explicit joined_at so the
+// "earliest owner workspace" order is deterministic.
+func seedMembershipAt(t *testing.T, ctx context.Context, pool *pgxpool.Pool, workspaceID, userID ID, role string, joined time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, "INSERT INTO workspace_memberships (workspace_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)", workspaceID, userID, role, joined); err != nil {
+		t.Fatal(database.SafeError("seed membership", err))
+	}
+}
+
+// TestCurrentWorkspaceAgainstPostgres runs the real SQL: the earliest owner
+// workspace wins, a member-only workspace and another user's workspace are never
+// returned, and a user without an owner workspace is found=false.
+func TestCurrentWorkspaceAgainstPostgres(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	user := seedUser(t, ctx, pool, "current@example.com")
+	other := seedUser(t, ctx, pool, "other-current@example.com")
+	loner := seedUser(t, ctx, pool, "loner@example.com")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	late := seedWorkspace(t, ctx, pool, "Late")
+	early := seedWorkspace(t, ctx, pool, "Early")
+	memberOnly := seedWorkspace(t, ctx, pool, "MemberOnly")
+	foreign := seedWorkspace(t, ctx, pool, "Foreign")
+	seedMembershipAt(t, ctx, pool, late, user, "owner", now.Add(-time.Hour))
+	seedMembershipAt(t, ctx, pool, early, user, "owner", now.Add(-2*time.Hour))
+	// A member role, even the earliest, is not an owned workspace.
+	seedMembershipAt(t, ctx, pool, memberOnly, user, "member", now.Add(-3*time.Hour))
+	seedMembershipAt(t, ctx, pool, foreign, other, "owner", now.Add(-4*time.Hour))
+	seedMembershipAt(t, ctx, pool, memberOnly, loner, "member", now.Add(-time.Hour))
+
+	got, found, err := service.CurrentWorkspace(ctx, user)
+	if err != nil || !found || got.ID != early || got.Name != "Early" {
+		t.Fatalf("got %+v found=%t err=%v want earliest owner workspace %v", got, found, err, early)
+	}
+	got, found, err = service.CurrentWorkspace(ctx, other)
+	if err != nil || !found || got.ID != foreign {
+		t.Fatalf("other got %+v found=%t err=%v", got, found, err)
+	}
+	if _, found, err = service.CurrentWorkspace(ctx, loner); err != nil || found {
+		t.Fatalf("member-only user found=%t err=%v want not found", found, err)
+	}
+	if _, found, err = service.CurrentWorkspace(ctx, ID{Bytes: [16]byte{9}, Valid: true}); err != nil || found {
+		t.Fatalf("unknown user found=%t err=%v want not found", found, err)
+	}
+	rows, memberships := rowCounts(t, ctx, pool)
+	if rows != 4 || memberships != 5 {
+		t.Fatalf("read created rows: workspaces=%d memberships=%d", rows, memberships)
+	}
+}

@@ -1,6 +1,7 @@
 import { Navigate } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { OverviewPage } from "@/features/overview/OverviewPage";
 import { authErrorMessage } from "../model";
 import { useAuthSession, useLogoutMutation } from "../queries";
 
@@ -11,7 +12,7 @@ export function HomePage() {
   if (auth.status === "anonymous") return <Navigate to="/login" replace />;
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-md flex-col justify-center gap-6 px-6 py-10">
+    <main className="mx-auto flex min-h-screen w-full max-w-6xl flex-col gap-6 px-6 py-10">
       <header className="flex flex-col gap-2">
         <p className="text-primary text-sm">TokenPivot</p>
         <h1 className="text-xl font-semibold">当前会话</h1>
@@ -58,6 +59,8 @@ export function HomePage() {
           >
             {logout.isPending ? "正在退出…" : "登出"}
           </Button>
+          <div className="border-divider border-t" />
+          <OverviewPage userId={auth.session.user.id} />
         </div>
       ) : null}
     </main>

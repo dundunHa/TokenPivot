@@ -143,6 +143,21 @@ FROM ranked
 ORDER BY kind, rn`, nil
 }
 
+// optionsQuery lists the distinct provider and model values of the workspace in
+// [$2,$3). The kind column keeps the two independent dimensions in one statement.
+const optionsQuery = `SELECT kind, v FROM (
+  SELECT 'provider'::text AS kind, v FROM (
+    SELECT DISTINCT provider AS v FROM usage_minute_stats
+    WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3 AND provider <> ''
+  ) p
+  UNION ALL
+  SELECT 'model'::text, v FROM (
+    SELECT DISTINCT model AS v FROM usage_minute_stats
+    WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3 AND model <> ''
+  ) m
+) o
+ORDER BY kind, v COLLATE "C"`
+
 // querier is the read subset of a pool.
 type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -257,6 +272,32 @@ func (p *Postgres) Rankings(ctx context.Context, params RankingsParams) (Ranking
 	}
 	if !sawOverall {
 		return RankingsRows{}, errors.New("usage rankings: overall row missing")
+	}
+	return result, nil
+}
+
+// Options returns the distinct provider and model values in the window.
+func (p *Postgres) Options(ctx context.Context, params OptionsParams) (OptionsRows, error) {
+	rows, err := p.q.Query(ctx, optionsQuery, params.WorkspaceID, params.Start, params.End)
+	if err != nil {
+		return OptionsRows{}, database.SafeError("usage options", err)
+	}
+	defer rows.Close()
+	var result OptionsRows
+	for rows.Next() {
+		var kind, value string
+		if err := rows.Scan(&kind, &value); err != nil {
+			return OptionsRows{}, database.SafeError("usage options scan", err)
+		}
+		switch kind {
+		case "provider":
+			result.Providers = append(result.Providers, value)
+		case "model":
+			result.Models = append(result.Models, value)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return OptionsRows{}, database.SafeError("usage options rows", err)
 	}
 	return result, nil
 }
