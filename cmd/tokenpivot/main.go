@@ -16,6 +16,7 @@ import (
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/dundunHa/TokenPivot/internal/ingestion"
 	"github.com/dundunHa/TokenPivot/internal/projects"
+	"github.com/dundunHa/TokenPivot/internal/requestdetails"
 	"github.com/dundunHa/TokenPivot/internal/server"
 	"github.com/dundunHa/TokenPivot/internal/sources"
 	"github.com/dundunHa/TokenPivot/internal/usage"
@@ -59,6 +60,7 @@ func run(logger *slog.Logger) error {
 			Auth:             server.NewAuth(authService, cfg.WebOrigin),
 			Credentials:      server.NewCredentials(credentialService, workspaceService),
 			Usage:            server.NewUsage(usageService, workspaceService),
+			RequestDetails:   server.NewRequestDetails(requestdetails.New(requestdetails.NewPostgres(pool)), workspaceService),
 			CurrentWorkspace: server.NewCurrentWorkspace(workspaceService),
 			Projects:         server.NewProjects(projects.New(projects.NewPostgres(pool)), workspaceService),
 			Sources:          server.NewSources(sources.New(sources.NewPostgres(pool)), workspaceService),
