@@ -70,7 +70,7 @@ docker image inspect tokenpivot:<完整40位提交> \
 
 Dockerfile 内部会执行现有 `make build`，并检查两个二进制、时区数据与 CA 证书存在；缺一项即构建失败，不得换成 `latest` 兜底。
 
-记录：完整提交、镜像 ID、构建退出码与时间。**最终提交与镜像 ID TODO(待确认)**（实施合入后填写）。
+记录：完整提交、镜像 ID、构建退出码与时间。本次实际固定提交为 `72f8482bbf98295b5b694cea17d78b2a075543ee`，镜像 ID 为 `sha256:309bd4d05db47dadbaba2d66151053f3abf84b00741208581c2eb91a2c8dd7d3`，镜像内 revision 与提交一致。
 
 构建需要访问镜像仓库与依赖源；若构建机通过出网代理访问，这属于构建环境条件，由该环境提供，不写进 Dockerfile、镜像或本仓库，也不作为本项目的默认要求。
 
@@ -120,7 +120,7 @@ docker compose --profile migration run \
 - 失败时 app 保持未启动。先核对原执行：`docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' tokenpivot-bf-migrate-<执行ID>` 只看状态与退出码，禁止不带 `--format` 输出完整环境；再在 owner 连接下核对迁移历史与对象（`status` 可能创建历史表，README 已说明；结果未明前不得再次 `up`）。不自动 `down-one`、reset、force、删库或删卷。
 - 生产优先前向修复；迁移失败或提交结果未知时，先查原执行，不重复触发。
 
-迁移后核对：实际迁移版本与固定源码一致；app 容器没有 `TOKENPIVOT_MIGRATION_DATABASE_URL`；数据库 host 连接规则为 SCRAM（compose 已设 `POSTGRES_HOST_AUTH_METHOD=scram-sha-256`），不使用 `trust`。
+迁移后核对：实际迁移版本与固定源码一致；app 容器没有 `TOKENPIVOT_MIGRATION_DATABASE_URL`；数据库 host 连接规则为 SCRAM（compose 已设 `POSTGRES_HOST_AUTH_METHOD=scram-sha-256`）。PostgreSQL 镜像的容器内 local socket 仍可使用其默认 `trust`，app 必须走 `host=db` 的 TCP/SCRAM，不得把 local socket 规则误当成业务连接方式。
 
 ## 6. 启动应用与验收
 
@@ -169,28 +169,31 @@ curl --fail --show-error --silent http://DESKTOP-C28DFS7:18080/healthz
 - 数据库已迁移时，不承诺旧应用兼容；优先前向修复，不自动 down、不删库、不删卷。
 - 禁止用 `docker compose down`、`docker compose rm`、`docker rm`、`docker prune`、`--rm` 绕过保留要求。
 
-## 8. 初次验收后备份（路径待定）
+## 8. 初次验收后备份
 
-用 owner 凭证执行自定义格式 `pg_dump`，输出到批准的仓库外受限目录（**路径 TODO(待确认)**）；业务备份含密码哈希与会话摘要，按敏感数据处理，不打印内容。记录 PG 版本、源码提交、迁移版本、时间和 SHA-256，并用 `pg_restore --list` 检查可读性。`pg_restore --list` 只证明归档可读，不替代恢复验证；恢复验证需另行批准的隔离空实例，不对现有对象使用覆盖或清理选项。后续每次迁移前另行备份与审批，本文不设定时任务。
+用 owner 凭证执行自定义格式 `pg_dump`，输出到 `/root/.tokenpivot-bf/backups/`；业务备份含密码哈希与会话摘要，按敏感数据处理，不打印内容。记录 PG 版本、源码提交、迁移版本、时间和 SHA-256，并用 `pg_restore --list` 检查可读性。`pg_restore --list` 只证明归档可读，不替代恢复验证；恢复验证需另行批准的隔离空实例，不对现有对象使用覆盖或清理选项。后续每次迁移前另行备份与审批，本文不设定时任务。
 
-## 9. 执行记录表（每次发布填写）
+本次备份为 `/root/.tokenpivot-bf/backups/tokenpivot-bf-72f8482-20261030T111714Z.dump`，权限 600，SHA-256 为 `59b0f16868cf167578149f78a6d7753b15c6d400e26c1471331e65b0b2b8afdc`；`pg_restore --list` 可读，95 个 TOC 项，未做恢复验证。
+
+## 9. 本次执行记录（2026-10-30，UTC）
 
 | 项 | 值 |
 |---|---|
-| 固定源码提交 | TODO(待确认) |
-| 镜像 ID / revision 标签 | TODO(待确认) |
-| 构建时间与退出码 | |
-| 旧资源基线记录时间 | |
-| DB 创建执行 ID / 时间 | |
-| 迁移执行 ID / 时间 / 退出码 / 版本 | |
-| app 启动时间 / 容器 ID | |
-| healthz / readyz / Origin 403 / 版本核对结果 | |
-| 旧资源对比结果 | |
-| 未验证项 | 其他客户端可达性、防火墙/路由转发、实际暴露范围；按当时实际记录 |
+| 固定源码提交 | `72f8482bbf98295b5b694cea17d78b2a075543ee` |
+| 镜像 ID / revision 标签 | `sha256:309bd4d05db47dadbaba2d66151053f3abf84b00741208581c2eb91a2c8dd7d3` / 同固定提交 |
+| 构建结果 | 第一次直连 `proxy.golang.org` 超时，退出 1；第二次使用宿主代理和 `--network host` 成功，退出 0，结束于 11:14 前；代理未持久化到镜像或仓库 |
+| 旧资源基线记录时间 | 11:12:26；3 个 running 旧容器、143 个卷、8080/8081 原占用者、18080 空闲 |
+| DB 创建时间 / 容器 ID | 11:14:38 / `307950e2d690aafdf3909ff2fbd613da80ad45c0210e612e5aa7163d2d8828c5`；实际 PG 18.6，无宿主端口 |
+| 迁移执行 ID / 时间 / 退出码 / 版本 | `20261030T1116Z` / 11:15:22–11:15:23 / 0 / 1–7 全部 applied |
+| app 启动时间 / 容器 ID | 11:15:46 / `f32722940ecfdafd75afcb0c61a88a79fa4277f449f6ff2bb48274581a9f1785`；运行镜像与固定镜像一致，UID 65532 |
+| healthz / readyz / Origin 403 / 版本核对结果 | 均通过；页面和静态资源 200，错误 Origin 403，生产用户保持 0 |
+| 停止/恢复 | 11:17:23 停止 app，11:17:25 启动原容器；readyz 恢复 200，DB、卷、容器 ID 不变 |
+| 旧资源对比结果 | 原容器名称/ID/状态/端口及 8080/8081 占用者不变；卷 143→144，仅新增 `tokenpivot-bf-pgdata-18` |
+| 未验证项 | 第二客户端可达性、防火墙/路由转发、实际暴露范围、远程 PG `verify-full`、备份恢复；Lord Howe 聚合与 Cookie 属性见后续补充记录 |
 
 ## 10. 已知未核实事项
 
-- 最终完整提交与镜像 ID：TODO(待确认)，发布执行时记录。
-- 镜像摘要可拉取性、固定摘要构建、scratch 中两个二进制与 Compose profile 行为，须由实际构建和分阶段启动验收证明；未验证前不得声称已通过。
+- 镜像运行时文件系统、Compose profile、分阶段启动和实际迁移已由本次执行验证；镜像摘要的外部可拉取性未验证（未 push，也没有镜像仓库）。
 - Windows/Hyper-V 防火墙与路由器 18080 转发未纳入本方案；不新增来源限制，也不保证任何来源的可达或不可达。
-- 内部 `sslmode=disable` 的批准范围仅限本套单机专用网络；不适用于其他远程连接。
+- 内部 `sslmode=disable` 的批准范围仅限本套单机专用网络；不适用于其他远程连接。远程 PostgreSQL `verify-full` 与失败时回退保护未在隔离 TLS 实例验证，不声称已通过。
+- 生产真实用户注册后的 Cookie 观察仍需首次注册；不得以隔离测试结果代替生产用户操作记录。
