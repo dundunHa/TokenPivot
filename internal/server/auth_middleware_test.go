@@ -118,15 +118,17 @@ func TestUserFromContextWithoutSession(t *testing.T) {
 // configured origin: https requires it, loopback http does not.
 func TestCookieSecureFollowsOrigin(t *testing.T) {
 	for _, tt := range []struct {
-		origin string
-		secure bool
+		origin   string
+		insecure bool
+		secure   bool
 	}{
-		{"http://127.0.0.1:5173", false},
-		{"http://localhost:5173", false},
-		{"https://app.example.com", true},
+		{"http://127.0.0.1:5173", false, false},
+		{"http://localhost:5173", false, false},
+		{"http://DESKTOP-C28DFS7:18080", true, false},
+		{"https://app.example.com", false, true},
 	} {
 		t.Run(tt.origin, func(t *testing.T) {
-			origin, err := config.ParseOrigin(tt.origin)
+			origin, err := config.ParseOrigin(tt.origin, tt.insecure)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -147,6 +149,18 @@ func TestCookieSecureFollowsOrigin(t *testing.T) {
 			}
 			if cookie.Domain != "" {
 				t.Fatalf("cookie has a Domain attribute: %q", cookie.Domain)
+			}
+			if cookie.Path != "/" || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode {
+				t.Fatalf("cookie attributes = path %q httpOnly %t sameSite %v", cookie.Path, cookie.HttpOnly, cookie.SameSite)
+			}
+			// A write request must still match the configured origin exactly.
+			bad := httptest.NewRequest(http.MethodPost, registerPath, strings.NewReader(`{"email":"other@example.com","password":"synthetic-password"}`))
+			bad.Header.Set("Content-Type", "application/json")
+			bad.Header.Set("Origin", "http://0.0.0.0:18080")
+			bw := httptest.NewRecorder()
+			h.ServeHTTP(bw, bad)
+			if bw.Code != http.StatusForbidden {
+				t.Fatalf("mismatched origin status = %d", bw.Code)
 			}
 		})
 	}
@@ -188,7 +202,7 @@ func TestSessionCookieMaxAgeUsesDatabaseExpiryThroughHTTP(t *testing.T) {
 	responseTime := databaseTime
 	store := newAuthFakeStore()
 	store.now = func() time.Time { return databaseTime }
-	origin, err := config.ParseOrigin(testOrigin)
+	origin, err := config.ParseOrigin(testOrigin, false)
 	if err != nil {
 		t.Fatal(err)
 	}
