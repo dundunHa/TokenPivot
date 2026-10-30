@@ -1,12 +1,16 @@
 import { useEffect, useReducer, useRef } from "react";
 import {
+  CancelledError,
+  QueryCache,
   QueryClient,
   queryOptions,
+  type Query,
   useIsMutating,
   useMutation,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
+import { ApiError } from "@/lib/api";
 import { fetchSession, login, logout, register } from "./api";
 import { expiresAtMs, type AuthCredentials, type AuthSession } from "./model";
 
@@ -18,8 +22,74 @@ const MAX_TIMEOUT_MS = 2_147_483_647;
 
 const now = () => Date.now();
 
+/** 业务查询 = 键不属于 "auth" 命名空间的查询；会话查询自成一类。 */
+const isBusiness = (query: { queryKey: readonly unknown[] }): boolean =>
+  query.queryKey[0] !== "auth";
+
+function sessionUserId(client: QueryClient): string | undefined {
+  return client.getQueryData<AuthSession | null>(sessionKey)?.user.id;
+}
+
+/** 取消并移除业务缓存（可排除一个查询，如刚失败、需保留错误态的那个）。 */
+async function dropBusiness(
+  client: QueryClient,
+  except?: object,
+): Promise<void> {
+  const filters = {
+    predicate: (query: { queryKey: readonly unknown[] }) =>
+      isBusiness(query) && query !== except,
+  };
+  await client.cancelQueries(filters);
+  client.removeQueries(filters);
+}
+
+/** 统一的匿名清理：取消会话与业务请求、移除业务缓存，再写入匿名状态。 */
+async function clearToAnonymous(client: QueryClient): Promise<void> {
+  await Promise.all([
+    cancelSession(client),
+    client.cancelQueries({ predicate: isBusiness }),
+  ]);
+  client.removeQueries({ predicate: isBusiness });
+  client.setQueryData<AuthSession | null>(sessionKey, null);
+}
+
+/**
+ * 业务请求的 401/403。只有发起请求时的身份（meta.userId）仍是当前会话身份才处理；
+ * 已取消、旧身份或已匿名的迟到失败不产生任何清理副作用。
+ */
+async function handleBusinessError(
+  client: QueryClient,
+  error: unknown,
+  query: Query<unknown, unknown, unknown>,
+): Promise<void> {
+  if (!isBusiness(query) || error instanceof CancelledError) return;
+  if (!(error instanceof ApiError)) return;
+  if (error.status !== 401 && error.status !== 403) return;
+  const issuer = query.meta?.userId;
+  if (typeof issuer !== "string" || sessionUserId(client) !== issuer) return;
+  if (error.status === 401) {
+    await clearToAnonymous(client);
+    return;
+  }
+  await dropBusiness(client, query);
+  // 失败查询自身保留错误态供界面显示无权限，但旧 data 不得继续可见。
+  query.setState({ data: undefined, dataUpdatedAt: 0 });
+}
+
 export function createAppQueryClient(): QueryClient {
-  return new QueryClient({
+  const cache = new QueryCache({
+    onError: (error, query) => {
+      void handleBusinessError(client, error, query);
+    },
+    onSuccess: (data, query) => {
+      // 会话重查确定匿名：同样移除业务缓存，避免旧空间数据残留。
+      if (query.queryKey[0] === "auth" && data === null) {
+        void dropBusiness(client);
+      }
+    },
+  });
+  const client = new QueryClient({
+    queryCache: cache,
     defaultOptions: {
       queries: {
         retry: false,
@@ -30,6 +100,7 @@ export function createAppQueryClient(): QueryClient {
       mutations: { retry: false },
     },
   });
+  return client;
 }
 
 const sessionQuery = queryOptions({
@@ -55,7 +126,8 @@ export function useCredentialsMutation(kind: "login" | "register") {
       kind === "login" ? login(credentials) : register(credentials),
     onMutate: () => cancelSession(client),
     onSuccess: async (session) => {
-      await cancelSession(client);
+      // 先清旧身份的业务缓存，再写入新会话，防止跨账号残留。
+      await Promise.all([cancelSession(client), dropBusiness(client)]);
       client.setQueryData<AuthSession | null>(sessionKey, session);
     },
   });
@@ -66,11 +138,13 @@ export function useLogoutMutation() {
   return useMutation({
     mutationKey: writeKey,
     mutationFn: logout,
-    onMutate: () => cancelSession(client),
-    onSuccess: async () => {
-      await cancelSession(client);
-      client.setQueryData<AuthSession | null>(sessionKey, null);
+    onMutate: async () => {
+      await Promise.all([
+        cancelSession(client),
+        client.cancelQueries({ predicate: isBusiness }),
+      ]);
     },
+    onSuccess: () => clearToAnonymous(client),
   });
 }
 

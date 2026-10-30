@@ -52,6 +52,9 @@ async function until(check: () => unknown) {
       return;
     } catch {
       await act(async () => {
+        // MSW 的响应交付依赖被替换的 setTimeout：假时钟下只等真实时间不会放行，
+        // 须每轮推进 1ms 让其定时器执行；1ms 远小于各用例的时间断言粒度。
+        if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(1);
         await new Promise((r) => realSetTimeout(r, 5));
       });
     }

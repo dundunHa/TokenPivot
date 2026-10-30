@@ -215,10 +215,25 @@ type roleFakeStore struct {
 	roles map[[16]byte]map[[16]byte]workspaces.Role
 	err   error
 	calls int
+	// current holds each user's earliest owned workspace for CurrentWorkspace.
+	current map[[16]byte]workspaces.Workspace
 }
 
 func newRoleFakeStore() *roleFakeStore {
-	return &roleFakeStore{roles: make(map[[16]byte]map[[16]byte]workspaces.Role)}
+	return &roleFakeStore{
+		roles:   make(map[[16]byte]map[[16]byte]workspaces.Role),
+		current: make(map[[16]byte]workspaces.Workspace),
+	}
+}
+
+func (f *roleFakeStore) CurrentWorkspace(ctx context.Context, userID workspaces.ID) (workspaces.Workspace, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return workspaces.Workspace{}, false, f.err
+	}
+	w, ok := f.current[userID.Bytes]
+	return w, ok, nil
 }
 
 func (f *roleFakeStore) setRole(userID, workspaceID workspaces.ID, role workspaces.Role) {

@@ -51,6 +51,9 @@ type RoleStore interface {
 	// MembershipRole returns the stored role for the pair. found=false means the
 	// user is not a member; a database failure is a real error, never a miss.
 	MembershipRole(ctx context.Context, userID, workspaceID ID) (Role, bool, error)
+	// CurrentWorkspace returns the earliest workspace the user owns. found=false
+	// means the user owns none; a database failure is a real error.
+	CurrentWorkspace(ctx context.Context, userID ID) (Workspace, bool, error)
 }
 
 // createStore is the transaction-bound persistence surface of personal workspace
@@ -101,6 +104,15 @@ func (s *Service) MembershipRole(ctx context.Context, userID, workspaceID ID) (R
 	default:
 		return "", false, ErrUnknownRole
 	}
+}
+
+// CurrentWorkspace returns the personal workspace of the user: the earliest
+// workspace the user owns. found=false means none exists, which is a data
+// integrity fault for a registered user and must never be answered with a
+// created or invented workspace. It only holds while every user has a single
+// personal workspace and must be redesigned before multiple workspaces exist.
+func (s *Service) CurrentWorkspace(ctx context.Context, userID ID) (Workspace, bool, error) {
+	return s.roles.CurrentWorkspace(ctx, userID)
 }
 
 // createPersonal runs the documented creation sequence on a transaction-bound

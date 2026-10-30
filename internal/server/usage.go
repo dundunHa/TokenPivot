@@ -23,6 +23,7 @@ type Usage struct {
 const (
 	usageAggregatePath = "/api/v1/workspaces/{workspaceID}/usage/aggregate"
 	usageRankingsPath  = "/api/v1/workspaces/{workspaceID}/usage/rankings"
+	usageOptionsPath   = "/api/v1/workspaces/{workspaceID}/usage/options"
 )
 
 // usageErrorEnvelope is the error body of the query endpoints: the shared code and
@@ -62,6 +63,7 @@ func (u *Usage) routes(mux *http.ServeMux, sessions *Auth) {
 	}
 	mux.Handle("GET "+usageAggregatePath, sessions.readRoute(http.HandlerFunc(u.handleAggregate)))
 	mux.Handle("GET "+usageRankingsPath, sessions.readRoute(http.HandlerFunc(u.handleRankings)))
+	mux.Handle("GET "+usageOptionsPath, sessions.readRoute(http.HandlerFunc(u.handleOptions)))
 }
 
 func (u *Usage) handleAggregate(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +93,25 @@ func (u *Usage) handleRankings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response, err := u.Service.Rankings(r.Context(), workspaceID, values)
+	if err != nil {
+		writeUsageError(r, w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// handleOptions lists the provider and model filter options. It takes no query
+// parameters: any query string is refused so a typo cannot look like a filter.
+func (u *Usage) handleOptions(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := requireMember(w, r, u.Workspaces)
+	if !ok {
+		return
+	}
+	if r.URL.RawQuery != "" {
+		writeUsageError(r, w, usage.ErrInvalidArgument)
+		return
+	}
+	response, err := u.Service.Options(r.Context(), workspaceID)
 	if err != nil {
 		writeUsageError(r, w, err)
 		return
