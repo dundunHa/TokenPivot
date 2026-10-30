@@ -2214,7 +2214,7 @@ components:
       description: |
         浏览器会话 Cookie。明文令牌为 `tps_` + `crypto/rand.Text()`（随机部分长度由 Go 标准库决定，本文不硬编码它）；数据库只保存完整令牌的 SHA-256 原始 32 字节摘要，不保存明文、十六进制文本或额外 pepper。插件令牌 `tpk_` 与本 Cookie 互不接受。
 
-        Cookie 属性固定为：名称 `tokenpivot_session`、`Path=/`、**不设置 `Domain`**（因此是主机范围）、`HttpOnly`、`SameSite=Lax`。可信 Web origin 为 `https` 时 `Secure=true`；只有明确配置的回环开发 origin（`localhost`、`127.0.0.1`、`::1`）允许使用 `http`，此时 `Secure=false`；生产非回环 http origin 在启动时就被拒绝，不存在第二套 Cookie 配置。
+        Cookie 属性固定为：名称 `tokenpivot_session`、`Path=/`、**不设置 `Domain`**（因此是主机范围）、`HttpOnly`、`SameSite=Lax`。可信 Web origin 为 `https` 时 `Secure=true`；`http` origin 时 `Secure=false`：默认只有明确配置的回环开发 origin（`localhost`、`127.0.0.1`、`::1`）允许使用 `http`，非回环 http origin 在启动时被拒绝，除非部署显式设置 `TOKENPIVOT_ALLOW_INSECURE_HTTP=true`；不存在第二套 Cookie 配置。Cookie 不区分端口，http 下凭证与会话可在链路上被窃听或篡改，HttpOnly 与 Origin 校验不能弥补。
 
         签发和实际续期时写 `Expires=<数据库返回的 expires_at>`，`Max-Age` 固定为 2592000 秒（30 天）——因为每个签发或续期后的 `expires_at` 都由数据库取 `now() + interval '30 days'`，两者表达同一期限。会话为 30 天精确滑动过期，无绝对上限；过期行暂不清理，但不会通过认证。
 

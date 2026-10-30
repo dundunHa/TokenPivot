@@ -45,24 +45,28 @@ func Load() (Config, error) {
 	if strings.TrimSpace(databaseURL) == "" {
 		return Config{}, errors.New("TOKENPIVOT_DATABASE_URL is required")
 	}
-	origin, err := ParseOrigin(os.Getenv("TOKENPIVOT_WEB_ORIGIN"))
+	allowInsecureHTTP, err := strictBoolSetting("TOKENPIVOT_ALLOW_INSECURE_HTTP")
 	if err != nil {
 		return Config{}, err
 	}
-	registrationOpen, err := registrationOpenSetting()
+	origin, err := ParseOrigin(os.Getenv("TOKENPIVOT_WEB_ORIGIN"), allowInsecureHTTP)
+	if err != nil {
+		return Config{}, err
+	}
+	registrationOpen, err := strictBoolSetting("TOKENPIVOT_REGISTRATION_OPEN")
 	if err != nil {
 		return Config{}, err
 	}
 	return Config{HTTPAddr: addr, DatabaseURL: databaseURL, WebOrigin: origin, RegistrationOpen: registrationOpen}, nil
 }
 
-// registrationOpenSetting reads TOKENPIVOT_REGISTRATION_OPEN once. Unset means
-// closed; only the exact spellings "true" and "false" are accepted, so an empty
+// strictBoolSetting reads a boolean environment variable once. Unset means
+// false; only the exact spellings "true" and "false" are accepted, so an empty
 // value, another case, surrounding whitespace, "1" or "yes" all fail at startup
 // instead of being interpreted differently by two deployments. The returned error
 // names the variable and its allowed values and never repeats the rejected value.
-func registrationOpenSetting() (bool, error) {
-	value, ok := os.LookupEnv("TOKENPIVOT_REGISTRATION_OPEN")
+func strictBoolSetting(name string) (bool, error) {
+	value, ok := os.LookupEnv(name)
 	if !ok {
 		return false, nil
 	}
@@ -72,7 +76,7 @@ func registrationOpenSetting() (bool, error) {
 	case "false":
 		return false, nil
 	default:
-		return false, errors.New(`TOKENPIVOT_REGISTRATION_OPEN must be exactly "true" or "false"`)
+		return false, errors.New(name + ` must be exactly "true" or "false"`)
 	}
 }
 
@@ -91,14 +95,14 @@ func (o Origin) String() string { return o.scheme + "://" + o.host }
 func (o Origin) Scheme() string { return o.scheme }
 
 // Secure reports whether cookies for this origin must set the Secure attribute:
-// every https origin requires it, and loopback development http origins are the
-// only accepted exception.
+// every https origin requires it, while plain http origins (loopback development
+// or explicitly allowed by TOKENPIVOT_ALLOW_INSECURE_HTTP) cannot.
 func (o Origin) Secure() bool { return o.scheme == "https" }
 
 // ParseOrigin validates and normalizes TOKENPIVOT_WEB_ORIGIN. Only one http(s)
-// origin is accepted; plain http is limited to loopback development hosts.
-// Returned errors name the variable but never echo its value.
-func ParseOrigin(value string) (Origin, error) {
+// origin is accepted; plain http is limited to loopback development hosts unless
+// allowInsecureHTTP is true, which only lifts that restriction. Returned errors name the variable but never echo its value.
+func ParseOrigin(value string, allowInsecureHTTP bool) (Origin, error) {
 	if value == "" || strings.TrimSpace(value) != value {
 		return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN is required and must not have surrounding whitespace")
 	}
@@ -124,8 +128,8 @@ func ParseOrigin(value string) (Origin, error) {
 			port = ""
 		}
 	}
-	if scheme == "http" && !isLoopbackHost(hostname) {
-		return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN may use plain http only for localhost, 127.0.0.1 or ::1")
+	if scheme == "http" && !allowInsecureHTTP && !isLoopbackHost(hostname) {
+		return Origin{}, errors.New("TOKENPIVOT_WEB_ORIGIN may use plain http only for localhost, 127.0.0.1 or ::1 unless TOKENPIVOT_ALLOW_INSECURE_HTTP is set to true")
 	}
 	host := hostname
 	if port != "" {
