@@ -142,7 +142,7 @@ export function formatInstant(
   return `${local} ${offsetLabel(timezone, ms)}`;
 }
 
-function offsetLabel(timezone: string, ms: number): string {
+export function offsetLabel(timezone: string, ms: number): string {
   const w = formatter(timezone, "w", {
     year: "numeric",
     month: "numeric",
@@ -196,6 +196,8 @@ export interface TrendPoint {
   /** 桶的唯一标识（UTC 起点）；缺口项为其前一桶终点。 */
   key: string;
   label: string;
+  /** 该点对应的 UTC 时刻（缺口项为前一桶终点）。 */
+  at: string;
   title: string;
   input: number | null;
   output: number | null;
@@ -257,6 +259,7 @@ export function buildTrend(data: AggregateData): TrendModel {
       points.push({
         key: `gap:${previous.bucketEnd}`,
         label: bucketLabel(previous.bucketEnd, timezone, granularity),
+        at: previous.bucketEnd,
         title: "该区间服务端未返回数据",
         input: null,
         output: null,
@@ -288,6 +291,7 @@ export function buildTrend(data: AggregateData): TrendModel {
     points.push({
       key: p.bucketStart,
       label: bucketLabel(p.bucketStart, timezone, granularity),
+      at: p.bucketStart,
       title: `${formatInstant(p.bucketStart, timezone)} → ${formatInstant(p.bucketEnd, timezone)}`,
       input: num(p.stats.input),
       output: num(p.stats.output),
@@ -298,6 +302,16 @@ export function buildTrend(data: AggregateData): TrendModel {
       quality: pointQuality(p),
     });
     previous = p;
+  }
+  if (granularity !== "day") {
+    // DST 回拨使本地时间重复：重名标签附 UTC 偏移区分，桶与 UTC 口径不变。
+    const counts = new Map<string, number>();
+    for (const p of points) counts.set(p.label, (counts.get(p.label) ?? 0) + 1);
+    for (const p of points) {
+      if ((counts.get(p.label) ?? 0) > 1) {
+        p.label = `${p.label} ${offsetLabel(timezone, Date.parse(p.at))}`;
+      }
+    }
   }
   return { points, stackable, stackNote };
 }

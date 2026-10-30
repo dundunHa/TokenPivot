@@ -145,6 +145,74 @@ describe("overview page", () => {
     expect(screen.getByRole("button", { name: "移除 模型 m1" })).toBeTruthy();
   });
 
+  it("keeps the model tab after a model click and collapses the long tail", async () => {
+    useBackend();
+    server.use(
+      http.get(`${BASE}/usage/rankings`, ({ request }) => {
+        const u = new URL(request.url).searchParams;
+        const by = u.get("group_by");
+        const tail = u.get("cursor") !== null;
+        return HttpResponse.json({
+          group_by: by,
+          overall: stats("100", "20", "120", "7"),
+          groups: [
+            {
+              key: tail
+                ? { provider: "p", model: "tail-model" }
+                : { provider: "anthropic", model: "m1" },
+              share: 0.5,
+              stats: stats("100", "20", "120", "7"),
+            },
+          ],
+          other: tail ? null : { share: 0.5, stats: stats("1", "1", "2", "1") },
+          next_cursor: tail ? null : "c1",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("metric-total");
+    await user.click(screen.getByRole("tab", { name: "模型" }));
+    await user.click(await screen.findByRole("button", { name: /其他/ }));
+    await screen.findByRole("button", { name: /tail-model/ });
+    await user.click(screen.getByRole("button", { name: /^m1/ }));
+    await screen.findByRole("button", { name: "移除 模型 m1" });
+    expect(
+      screen.getByRole("tab", { name: "模型", selected: true }),
+    ).toBeTruthy();
+    // 等新筛选的排名加载完成（m1 行变为已筛选），再确认长尾已收起。
+    await screen.findByRole("button", { name: /^m1/, pressed: true });
+    expect(screen.queryByRole("button", { name: /tail-model/ })).toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: /其他/ })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
+  });
+
+  it("refetches immediately when the page becomes visible again (fixed range, infinite staleTime)", async () => {
+    const calls = useBackend();
+    renderApp(
+      "/?tz=UTC&range=custom&start=2026-10-28T00:00:00Z&end=2026-10-28T02:00:00Z",
+    );
+    await screen.findByTestId("metric-total");
+    const before = calls.length;
+    const set = (state: string) => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => state,
+      });
+      window.dispatchEvent(new Event("visibilitychange"));
+    };
+    try {
+      set("hidden");
+      set("visible");
+      await waitFor(() => expect(calls.length).toBeGreaterThan(before));
+    } finally {
+      Reflect.deleteProperty(document, "visibilityState");
+    }
+  });
+
   it("a failing region does not wipe the others", async () => {
     useBackend();
     server.use(

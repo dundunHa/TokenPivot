@@ -112,12 +112,27 @@ export function isValidTimezone(timezone: string): boolean {
   }
 }
 
-/** timezone 当前自然日 00:00 的 UTC 毫秒。 */
+/**
+ * timezone 当前自然日最早存在的时刻（UTC 毫秒）。
+ * 午夜重复（如 Havana 秋季回拨）取较早一次；午夜不存在（如圣保罗春季前拨）取跳变瞬间。
+ * 不用单一 offset 推算：候选 offset 取前后 36 小时内各时点的实际值，逐个验证。
+ */
 export function startOfLocalDay(timezone: string, ms: number): number {
   const w = wallParts(timezone, ms);
   const wall = Date.UTC(w.year, w.month - 1, w.day);
-  const guess = wall - tzOffsetMs(timezone, ms);
-  return wall - tzOffsetMs(timezone, guess);
+  const offsets = new Set(
+    [-36, 0, 36].map((h) => tzOffsetMs(timezone, ms + h * 3_600_000)),
+  );
+  const exact: number[] = [];
+  const shifted: number[] = [];
+  for (const off of offsets) {
+    const t = wall - off;
+    const local = t + tzOffsetMs(timezone, t);
+    if (local === wall) exact.push(t);
+    else if (local > wall && local < wall + 86_400_000) shifted.push(t);
+  }
+  const pool = exact.length > 0 ? exact : shifted;
+  return pool.length > 0 ? Math.min(...pool) : wall - tzOffsetMs(timezone, ms);
 }
 
 const RFC3339 =
