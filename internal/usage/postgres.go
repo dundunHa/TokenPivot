@@ -145,16 +145,18 @@ ORDER BY kind, rn`, nil
 
 // optionsQuery lists the distinct provider and model values of the workspace in
 // [$2,$3). The kind column keeps the two independent dimensions in one statement.
-const optionsQuery = `SELECT 'provider'::text AS kind, v FROM (
-  SELECT DISTINCT provider AS v FROM usage_minute_stats
-  WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3
-) p
-UNION ALL
-SELECT 'model'::text, v FROM (
-  SELECT DISTINCT model AS v FROM usage_minute_stats
-  WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3
-) m
-ORDER BY 1, 2 COLLATE "C"`
+const optionsQuery = `SELECT kind, v FROM (
+  SELECT 'provider'::text AS kind, v FROM (
+    SELECT DISTINCT provider AS v FROM usage_minute_stats
+    WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3
+  ) p
+  UNION ALL
+  SELECT 'model'::text, v FROM (
+    SELECT DISTINCT model AS v FROM usage_minute_stats
+    WHERE workspace_id = $1 AND bucket_start >= $2 AND bucket_start < $3
+  ) m
+) o
+ORDER BY kind, v COLLATE "C"`
 
 // querier is the read subset of a pool.
 type querier interface {

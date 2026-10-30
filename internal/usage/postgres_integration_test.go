@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/dundunHa/TokenPivot/db/migrations"
+	"github.com/dundunHa/TokenPivot/internal/aggregation"
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -584,5 +585,72 @@ func TestIntegrationServiceEndToEndWithLordHoweBoundaries(t *testing.T) {
 	counts := []string{response.Points[0].Stats.RequestCount, response.Points[1].Stats.RequestCount, response.Points[2].Stats.RequestCount}
 	if strings.Join(counts, ",") != "2,2,1" || response.Points[1].BucketEnd != "2026-10-03T16:00:00Z" {
 		t.Fatalf("counts=%v points=%+v: rows must follow the Go boundaries", counts, response.Points)
+	}
+}
+
+// optionsClock fixes the service clock on a minute boundary so the window edges
+// land exactly on stored bucket_start values.
+func optionsService(f *fixture) (*Service, time.Time, time.Time) {
+	asOf := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	s := New(f.store)
+	s.now = func() time.Time { return asOf }
+	return s, aggregation.RetentionCutoff(asOf), asOf
+}
+
+func optionRow(minute time.Time, workspace pgtype.UUID, provider, model string) row {
+	r := rowAt(0, provider, model, projA, 1, 1, 2)
+	r.workspace, r.minute = workspace, minute
+	return r
+}
+
+func TestIntegrationOptionsWindowTenancyDedupAndOrder(t *testing.T) {
+	f := newFixture(t)
+	s, cutoff, asOf := optionsService(f)
+	f.insert(t,
+		optionRow(cutoff.Add(-time.Minute), ws, "before-p", "before-m"), // before cutoff: excluded
+		optionRow(cutoff, ws, "b", "m2"),                                // equal to cutoff: included
+		optionRow(asOf.Add(-time.Minute), ws, "a", "M1"),                // last minute before as_of: included
+		optionRow(asOf, ws, "at-p", "at-m"),                             // == as_of: excluded
+		optionRow(asOf.Add(time.Minute), ws, "after-p", "after-m"),      // after as_of: excluded
+		optionRow(asOf.Add(-time.Hour), otherWS, "foreign-p", "foreign-m"),
+		optionRow(asOf.Add(-time.Hour), ws, "B", "m2"), // case differs: a separate value, byte order puts it first
+	)
+	// Same provider/model under a second project and source: still one value.
+	dup := optionRow(asOf.Add(-2*time.Hour), ws, "a", "M1")
+	dup.project, dup.source = projB, uid(11)
+	f.insert(t, dup)
+
+	got, err := s.Options(f.ctx, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "B,a,b"; strings.Join(got.Providers, ",") != want {
+		t.Fatalf("providers = %v want %s", got.Providers, want)
+	}
+	if want := "M1,m2"; strings.Join(got.Models, ",") != want {
+		t.Fatalf("models = %v want %s", got.Models, want)
+	}
+	foreign, err := s.Options(f.ctx, otherWS)
+	if err != nil || strings.Join(foreign.Providers, ",") != "foreign-p" || strings.Join(foreign.Models, ",") != "foreign-m" {
+		t.Fatalf("other workspace = %+v err=%v", foreign, err)
+	}
+}
+
+func TestIntegrationOptionsEmptyIsNotAnError(t *testing.T) {
+	f := newFixture(t)
+	s, _, _ := optionsService(f)
+	got, err := s.Options(f.ctx, ws)
+	if err != nil || got.Providers == nil || got.Models == nil || len(got.Providers) != 0 || len(got.Models) != 0 {
+		t.Fatalf("empty = %+v err=%v", got, err)
+	}
+}
+
+func TestIntegrationOptionsCanceledContextIsNotEmptyResult(t *testing.T) {
+	f := newFixture(t)
+	s, _, _ := optionsService(f)
+	ctx, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if _, err := s.Options(ctx, ws); err == nil {
+		t.Fatal("canceled context returned no error")
 	}
 }
