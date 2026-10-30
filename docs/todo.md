@@ -1,28 +1,13 @@
 # TODO
 
-<!-- todo-meta: next-id=60 -->
+<!-- todo-meta: next-id=61 -->
 
 ## 里程碑一：采集打通
 
 
 ## 里程碑二：能看数据
 
-- [ ] T-055 {running} {P1} **聚合查询接口：格式定稿 + 趋势 + 汇总 + 排名** 已合入 main；完整 make check、integration 标签 vet 与衔接静态审查通过。按用户决定暂缓真实 PostgreSQL 集成与 EXPLAIN，验收未完成。
-  - 架构: docs/architecture.md
-  - prd: docs/prd.md
-  - 决策: docs/decisions/0003-minute-aggregation-and-retention.md
-  - plan: docs/plans/2026-10-29-aggregate-query-api.md
-  - 提交: b37a05d
-- [ ] T-057 {paused} {P1} **总览页：筛选栏 + 指标区 + 趋势图 + 排名** 用户要求停工，子代理已停止。共享基础改动未提交，保留于 milestone2-supervised-delivery-dev-e0a0 工作区；总览页面未开工，待新规划。
-  - 视觉基准: docs/prototypes/dashboard-f.html
-  - prd: docs/prd.md
-  - plan: docs/plans/2026-10-29-overview-dashboard.md
-- [ ] T-058 {paused} {P2} **请求明细：60 秒速率 + 明细查询 + 明细面板** 用户要求停工并准备调整规划；本任务尚未开工，无实现改动。恢复前等待用户确认新范围。
-  - prd: docs/prd.md
-  - plan: docs/plans/2026-10-29-request-details-and-rate.md
-- [ ] T-059 {paused} {P1} **BF 部署：采集服务与仪表盘** 用户要求停工。容器三文件已提交子分支 30be360，未合入、镜像未构建成功；HTTP 配置和部署文档尚未开工，构建方案未改，bf 未变更。
-  - plan: docs/plans/2026-10-29-bf-docker-deployment.md
-  - 提交: 725061f
+
 
 ## 里程碑三：多人与运维
 
