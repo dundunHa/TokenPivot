@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest";
 import { parseCommand, filtersToCommand } from "./geek-command";
 import { DEFAULT_OVERVIEW_FILTERS } from "../overviewFilters";
 
+const TZ = "Asia/Shanghai";
+const defaults = { ...DEFAULT_OVERVIEW_FILTERS, timezone: TZ };
+
 describe("parseCommand", () => {
   it("parses single provider filter", () => {
     const result = parseCommand("provider=openai");
@@ -67,12 +70,12 @@ describe("parseCommand", () => {
 
 describe("filtersToCommand", () => {
   it("serializes empty filters", () => {
-    expect(filtersToCommand(DEFAULT_OVERVIEW_FILTERS)).toBe("");
+    expect(filtersToCommand(defaults)).toBe("");
   });
 
   it("serializes all filters", () => {
     const cmd = filtersToCommand({
-      ...DEFAULT_OVERVIEW_FILTERS,
+      ...defaults,
       providers: ["openai"],
       models: ["gpt-5.2"],
       projects: ["tokenpivot"],
@@ -82,7 +85,7 @@ describe("filtersToCommand", () => {
 
   it("roundtrip: parse(filtersToCommand(f)) preserves filters", () => {
     const original = {
-      ...DEFAULT_OVERVIEW_FILTERS,
+      ...defaults,
       providers: ["openai", "anthropic"],
       models: ["gpt-5.2"],
       projects: [],

@@ -1,4 +1,6 @@
 @import "tailwindcss";
+@import "./features/overview/geek/geek-tokens.css";
+@import "./features/overview/geek/geek-layout.css";
 
 /* F 极客终端原型（docs/prototypes/dashboard-f.html）的单一深色主题。 */
 :root {

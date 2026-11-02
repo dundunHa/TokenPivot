@@ -81,16 +81,16 @@ export function brailleRender(
 
   // 绘制每条序列
   for (let si = 0; si < series.length; si++) {
-    const s = series[si];
+    const s = series[si]!;
     const n = s.values.length;
     if (n < 2) continue;
 
     for (let i = 0; i < n - 1; i++) {
       const x0 = Math.round((i / (n - 1)) * (pixelW - 1));
       const x1 = Math.round(((i + 1) / (n - 1)) * (pixelW - 1));
-      const y0 = Math.round((1 - (s.values[i] - minY) / ySpan) * (pixelH - 1));
+      const y0 = Math.round((1 - (s.values[i]! - minY) / ySpan) * (pixelH - 1));
       const y1 = Math.round(
-        (1 - (s.values[i + 1] - minY) / ySpan) * (pixelH - 1),
+        (1 - (s.values[i + 1]! - minY) / ySpan) * (pixelH - 1),
       );
 
       // Bresenham 画线
@@ -144,9 +144,9 @@ export function brailleRender(
         for (let dc = 0; dc < 2; dc++) {
           const px = col * 2 + dc;
           const py = row * 4 + dr;
-          const si = buf[py * pixelW + px];
+          const si = buf[py * pixelW + px]!;
           if (si >= 0) {
-            bits |= BRAILLE_BITS[dr][dc];
+            bits |= BRAILLE_BITS[dr]![dc]!;
           }
         }
       }
@@ -160,9 +160,9 @@ export function brailleRender(
   const axisLabels = ["0", "¼", "½", "¾", "1"];
   for (let i = 0; i < axisLabels.length; i++) {
     const pos = Math.round((i / (axisLabels.length - 1)) * (cols - 1));
-    const label = axisLabels[i];
+    const label = axisLabels[i]!;
     for (let j = 0; j < label.length && pos + j < cols; j++) {
-      axisChars[pos + j] = label[j];
+      axisChars[pos + j] = label[j]!;
     }
   }
   const axisLine = axisChars.join("");
