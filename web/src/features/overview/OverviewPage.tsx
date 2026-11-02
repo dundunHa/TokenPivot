@@ -8,11 +8,17 @@ import {
 } from "@/features/workspace/queries";
 import { RequestLogPanel } from "@/features/requests/RequestLogPanel";
 import { OverviewFilterBar } from "./OverviewFilterBar";
-import { OverviewMetrics } from "./OverviewMetrics";
 import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
-import { OverviewTrendChart } from "./OverviewTrendChart";
-import { describeError, type RankingDimension } from "./overviewApi";
+import { describeError } from "./overviewApi";
+import { GeekShell } from "./geek/GeekShell";
+import { GeekCommandBar } from "./geek/GeekCommandBar";
+import { GeekHeroMetrics } from "./geek/GeekHeroMetrics";
+import { GeekTrendChart } from "./geek/GeekTrendChart";
+import { GeekBrailleChart } from "./geek/GeekBrailleChart";
+
+import { GeekDataStatus } from "./geek/GeekDataStatus";
+import { GeekRequestLog } from "./geek/GeekRequestLog";
 import {
   browserTimezone,
   DEFAULT_OVERVIEW_FILTERS,
@@ -24,7 +30,7 @@ import {
   type OverviewFilters,
 } from "./overviewFilters";
 import { useAggregate, useProjects, type QueryScope } from "./overviewQueries";
-import { buildTrend, formatInstant } from "./overviewView";
+import { buildTrend } from "./overviewView";
 
 const TICK_MS = 10_000;
 
@@ -206,74 +212,125 @@ function OverviewContent({
   const tz = filters.timezone;
   const identity = filterIdentity(filters);
 
-  const onRankingToggle = (dimension: RankingDimension, value: string) => {
-    if (dimension === "project") {
-      update({ ...filters, projects: toggle(filters.projects, value) });
-    } else if (dimension === "provider") {
-      update({ ...filters, providers: toggle(filters.providers, value) });
-    } else {
-      update({ ...filters, models: toggle(filters.models, value) });
-    }
-  };
-
   const data = aggregate.data;
+  const [showBraille, setShowBraille] = useState(false);
+
   return (
-    <div className="flex flex-col gap-6">
-      <OverviewFilterBar
+    <GeekShell workspaceName={workspaceName} filterSummary={identity}>
+      {/* 命令输入条 */}
+      <GeekCommandBar
         filters={filters}
-        providerOptions={(options.data?.providers ?? []).map(asOption)}
-        modelOptions={(options.data?.models ?? []).map(asOption)}
-        projectOptions={projectOptions}
-        optionsError={
-          options.isError ? "筛选选项加载失败，暂时无法编辑供应商/模型。" : null
-        }
-        projectsError={
-          projects.isError ? "项目列表加载失败，暂时无法编辑项目。" : null
-        }
-        onChange={update}
+        onApply={(updates) => update({ ...filters, ...updates })}
       />
-      <p className="text-subtle text-xs">
-        空间 {workspaceName} · 时区 {tz}
-        {data ? (
-          <>
-            {" "}
-            · 统计范围 {formatInstant(data.range.start, tz)} →{" "}
-            {formatInstant(data.range.end, tz)} · 统计截点{" "}
-            {formatInstant(data.range.asOf, tz, true)} · 保留截点{" "}
-            {formatInstant(data.range.retentionCutoff, tz)} · 页面更新{" "}
-            {formatInstant(
-              new Date(aggregate.dataUpdatedAt).toISOString(),
-              tz,
-              true,
-            )}
-          </>
-        ) : null}
-      </p>
-      <Section title="指标" query={aggregate} timezone={tz}>
-        {data ? <OverviewMetrics totals={data.totals} /> : null}
-      </Section>
-      <Section title="趋势" query={aggregate} timezone={tz}>
-        {data && trend ? (
-          trend.points.length === 0 ? (
-            <p className="text-muted-foreground text-sm">
-              {data.totals.requestCount === "0"
-                ? "所选范围与筛选下没有用量。"
-                : "没有可展示的趋势点。"}
-            </p>
-          ) : (
-            <OverviewTrendChart trend={trend} />
-          )
-        ) : null}
-      </Section>
-      <OverviewRanking
-        identity={identity}
-        scope={scope}
-        filters={filters}
-        range={range}
-        projectNames={projectNames}
-        onToggle={onRankingToggle}
-      />
-      <RequestLogPanel scope={scope} filters={filters} />
-    </div>
+
+      {/* 可视化筛选栏（保留为可折叠入口） */}
+      <details className="geek-filter-details">
+        <summary className="geek-dim" style={{ cursor: "pointer", fontSize: 12 }}>
+          ▾ 可视化筛选
+        </summary>
+        <OverviewFilterBar
+          filters={filters}
+          providerOptions={(options.data?.providers ?? []).map(asOption)}
+          modelOptions={(options.data?.models ?? []).map(asOption)}
+          projectOptions={projectOptions}
+          optionsError={
+            options.isError ? "筛选选项加载失败，暂时无法编辑供应商/模型。" : null
+          }
+          projectsError={
+            projects.isError ? "项目列表加载失败，暂时无法编辑项目。" : null
+          }
+          onChange={update}
+        />
+      </details>
+
+      {/* 60/40 双栏 */}
+      <div className="geek-workbench">
+        {/* 左栏 */}
+        <div className="flex flex-col gap-4">
+          {/* Hero 指标 */}
+          {data ? (
+            <GeekHeroMetrics
+              totals={data.totals}
+              rate60={null}
+              timezone={tz}
+            />
+          ) : null}
+
+          {/* 趋势图 */}
+          <Section title="趋势" query={aggregate} timezone={tz}>
+            <div className="geek-trend-toggle">
+              <button
+                className={`geek-ranking-tab ${!showBraille ? "geek-tab-active" : ""}`}
+                onClick={() => setShowBraille(false)}
+              >
+                面积图
+              </button>
+              <button
+                className={`geek-ranking-tab ${showBraille ? "geek-tab-active" : ""}`}
+                onClick={() => setShowBraille(true)}
+              >
+                braille
+              </button>
+            </div>
+            {data && trend ? (
+              trend.points.length === 0 ? (
+                <p className="geek-empty geek-dim">
+                  {data.totals.requestCount === "0"
+                    ? "所选范围与筛选下没有用量。"
+                    : "没有可展示的趋势点。"}
+                </p>
+              ) : showBraille ? (
+                <GeekBrailleChart trend={trend} />
+              ) : (
+                <GeekTrendChart trend={trend} timezone={tz} />
+              )
+            ) : null}
+          </Section>
+
+          {/* 排名 — 复用现有 OverviewRanking 保持查询/交互逻辑 */}
+          <div className="geek-ranking-wrapper">
+            <OverviewRanking
+              identity={identity}
+              scope={scope}
+              filters={filters}
+              range={range}
+              projectNames={projectNames}
+              onToggle={(dim, val) => {
+                if (dim === "provider") {
+                  update({ ...filters, providers: toggle(filters.providers, val) });
+                } else if (dim === "model") {
+                  update({ ...filters, models: toggle(filters.models, val) });
+                } else if (dim === "project") {
+                  update({ ...filters, projects: toggle(filters.projects, val) });
+                }
+              }}
+            />
+          </div>
+        </div>
+
+        {/* 右栏 */}
+        <div className="flex flex-col gap-4">
+          {/* 数据状态 */}
+          {data ? (
+            <GeekDataStatus
+              workspaceName={workspaceName}
+              timezone={tz}
+              lastReceivedAt={null}
+              sourceCount={0}
+              rangeStart={data.range.start}
+              rangeEnd={data.range.end}
+              asOf={data.range.asOf}
+              retentionCutoff={data.range.retentionCutoff}
+              pageUpdatedAt={new Date(aggregate.dataUpdatedAt).toISOString()}
+            />
+          ) : null}
+
+          {/* 请求日志 */}
+          <GeekRequestLog>
+            <RequestLogPanel scope={scope} filters={filters} />
+          </GeekRequestLog>
+        </div>
+      </div>
+    </GeekShell>
   );
 }

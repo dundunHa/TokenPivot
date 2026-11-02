@@ -1,0 +1,333 @@
+/* J 极客重奏 F++ — 布局样式 */
+
+/* ===== 壳 ===== */
+.geek-topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--geek-border);
+}
+.geek-topbar-prompt { color: var(--geek-text); }
+.geek-topbar-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--geek-amber);
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.geek-topbar-right {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.geek-main {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ===== 60/40 双栏 ===== */
+.geek-workbench {
+  display: grid;
+  grid-template-columns: 3fr 2fr;
+  gap: var(--geek-gap);
+}
+@media (max-width: 1279px) {
+  .geek-workbench { grid-template-columns: 1fr; }
+}
+@media (max-width: 767px) {
+  .geek-workbench { grid-template-columns: 1fr; }
+  .geek-main { padding: 12px; }
+}
+
+/* ===== 命令条 ===== */
+.geek-cmdbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--geek-bg-panel);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+}
+.geek-cmdbar-prompt { font-size: 14px; }
+.geek-cmdbar-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--geek-text);
+  font-family: var(--geek-mono);
+  font-size: 13px;
+}
+.geek-cmdbar-input:focus-visible {
+  outline: 1px solid var(--geek-amber);
+  outline-offset: 2px;
+}
+.geek-cmdbar-input::placeholder { color: var(--geek-text-faint); }
+.geek-cmdbar-error { font-size: 11px; margin-left: 8px; }
+
+/* ===== Hero ===== */
+.geek-hero {
+  padding: 20px;
+  background: var(--geek-bg-panel);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+}
+.geek-hero-number {
+  font-size: 72px;
+  font-weight: 300;
+  line-height: 1.1;
+  letter-spacing: -2px;
+  color: var(--geek-amber);
+}
+.geek-hero-unit {
+  font-size: 16px;
+  color: var(--geek-text-dim);
+  margin-left: 8px;
+  letter-spacing: 0;
+}
+.geek-hero-axiom {
+  font-size: 11px;
+  margin-top: 8px;
+}
+
+.geek-hero-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  margin-top: 16px;
+  background: var(--geek-border);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+  overflow: hidden;
+}
+.geek-hm-cell {
+  background: var(--geek-bg-panel);
+  padding: 12px 16px;
+}
+.geek-hm-accent .geek-hm-value { color: var(--geek-amber); }
+.geek-hm-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--geek-text-muted); }
+.geek-hm-value { font-size: 24px; font-weight: 500; margin-top: 4px; }
+.geek-hm-sub { font-size: 10px; margin-top: 2px; }
+
+/* breakdown */
+.geek-hero-breakdown {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+.geek-bd-row {
+  display: grid;
+  grid-template-columns: 90px 1fr auto auto;
+  gap: 12px;
+  align-items: center;
+}
+.geek-bd-label { text-align: right; }
+.geek-bd-bar {
+  font-size: 10px;
+  line-height: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.geek-bd-value { min-width: 60px; text-align: right; }
+.geek-bd-pct { min-width: 50px; text-align: right; font-size: 11px; }
+
+/* 数据状态 */
+.geek-data-status {
+  display: flex;
+  gap: 24px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--geek-border);
+}
+.geek-ds-cell { font-size: 12px; }
+.geek-ds-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+.geek-ds-value { margin-top: 2px; }
+
+/* ===== 趋势图 ===== */
+.geek-trend {
+  background: var(--geek-bg-panel);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+  padding: 16px;
+}
+.geek-trend-footer {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-top: 8px;
+}
+
+/* ===== Braille ===== */
+.geek-braille {
+  background: var(--geek-bg-panel);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+  padding: 16px;
+  font-size: 15px;
+  line-height: 1.3;
+  overflow-x: auto;
+}
+.geek-braille-line {
+  white-space: pre;
+  color: var(--geek-amber);
+}
+.geek-braille-axis { font-size: 11px; margin-top: 4px; white-space: pre; }
+.geek-braille-legend { font-size: 11px; margin-top: 4px; }
+.geek-braille-note { font-size: 10px; margin-top: 6px; }
+
+/* ===== 排名 ===== */
+.geek-ranking {
+  background: var(--geek-bg-panel);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+  padding: 16px;
+}
+.geek-ranking-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 12px;
+}
+.geek-ranking-tab {
+  background: transparent;
+  border: 1px solid var(--geek-border);
+  color: var(--geek-text-dim);
+  padding: 4px 12px;
+  font-family: var(--geek-mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+.geek-ranking-tab:first-child { border-radius: 4px 0 0 4px; }
+.geek-ranking-tab:last-child { border-radius: 0 4px 4px 0; }
+.geek-tab-active {
+  background: var(--geek-amber);
+  color: var(--geek-bg);
+  border-color: var(--geek-amber);
+}
+.geek-rank-item {
+  display: grid;
+  grid-template-columns: 120px 1fr 70px;
+  gap: 12px;
+  align-items: center;
+  padding: 4px 4px;
+  font-size: 12px;
+  border-radius: 2px;
+}
+.geek-rank-clickable { cursor: pointer; transition: background 0.1s; }
+.geek-rank-clickable:hover { background: var(--geek-bg-hover); }
+.geek-rank-active { background: var(--geek-bg-active); }
+.geek-rank-dim { opacity: 0.55; cursor: default; }
+.geek-rank-name { text-align: right; color: var(--geek-text-dim); }
+.geek-rank-item:first-child .geek-rank-name { color: var(--geek-amber); }
+.geek-rank-item:first-child .geek-rank-value { color: var(--geek-amber); }
+.geek-rank-bar { font-size: 10px; white-space: nowrap; }
+.geek-rank-value { text-align: left; min-width: 70px; }
+
+/* ===== 请求日志 ===== */
+.geek-request-log {
+  background: var(--geek-bg-panel);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+  padding: 16px;
+}
+.geek-request-log-header {
+  font-size: 12px;
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+}
+.geek-feed-legend {
+  display: flex;
+  gap: 14px;
+  font-size: 10px;
+  color: var(--geek-text-muted);
+  margin-bottom: 8px;
+}
+.geek-feed-legend i { font-style: normal; margin-right: 4px; }
+.geek-q-known { color: var(--geek-amber); }
+.geek-q-est { color: var(--geek-text-dim); }
+.geek-q-miss { color: var(--geek-error); }
+.geek-q-cell { font-weight: 600; min-width: 14px; text-align: center; }
+.geek-request-log-body {
+  max-height: 480px;
+  overflow-y: auto;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* ===== 状态行 ===== */
+.geek-statusbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 20px;
+  background: var(--geek-amber);
+  color: var(--geek-bg);
+  font-size: 12px;
+  font-weight: 500;
+}
+.geek-statusbar-left { display: flex; gap: 12px; align-items: center; }
+.geek-statusbar-right { display: flex; gap: 8px; align-items: center; font-size: 11px; }
+.geek-statusbar-sep { opacity: 0.4; }
+.geek-statusbar-ws { font-weight: 600; }
+.geek-statusbar-filter { font-size: 11px; }
+.geek-statusbar kbd {
+  display: inline-block;
+  padding: 1px 4px;
+  border: 1px solid rgba(0,0,0,0.3);
+  border-radius: 2px;
+  font-size: 10px;
+  font-family: var(--geek-mono);
+}
+
+/* ===== 数据状态面板 ===== */
+.geek-data-status-panel {
+  background: var(--geek-bg-panel);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+.geek-ds-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.geek-ds-key { font-size: 11px; }
+.geek-ds-val { text-align: right; }
+.geek-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 6px;
+  background: var(--geek-success);
+}
+
+/* ===== 空态 ===== */
+.geek-empty {
+  padding: 32px;
+  text-align: center;
+  font-size: 13px;
+}
+
+/* ===== 响应式 ===== */
+@media (max-width: 767px) {
+  .geek-hero-number { font-size: 48px; }
+  .geek-hero-metrics { grid-template-columns: repeat(2, 1fr); }
+  .geek-statusbar { flex-direction: column; gap: 4px; padding: 8px 12px; }
+  .geek-braille { font-size: 11px; }
+}
