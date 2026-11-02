@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useId } from "react";
 import { parseCommand, filtersToCommand } from "./geek-command";
 import type { OverviewFilters } from "../overviewFilters";
 
@@ -16,10 +16,14 @@ export function GeekCommandBar({ filters, onApply }: GeekCommandBarProps) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const inputId = useId();
+  const errorId = useId();
 
-  // 外部筛选变化时回填
+  // 外部筛选变化时回填（仅在非聚焦时，避免打断用户输入）
   useEffect(() => {
-    setInput(filtersToCommand(filters));
+    if (document.activeElement !== inputRef.current) {
+      setInput(filtersToCommand(filters));
+    }
   }, [filters]);
 
   // 键盘快捷键
@@ -49,14 +53,22 @@ export function GeekCommandBar({ filters, onApply }: GeekCommandBarProps) {
       return;
     }
     setError(null);
-    onApply(result.updates);
+    // 完整替换三个筛选字段：未出现的字段清空
+    onApply({
+      providers: result.updates.providers ?? [],
+      models: result.updates.models ?? [],
+      projects: result.updates.projects ?? [],
+    });
   };
 
   return (
     <div className="geek-cmdbar">
-      <span className="geek-cmdbar-prompt geek-amber">❯</span>
+      <label htmlFor={inputId} className="geek-cmdbar-prompt geek-amber">
+        ❯
+      </label>
       <input
         ref={inputRef}
+        id={inputId}
         className="geek-cmdbar-input"
         value={input}
         onChange={(e) => {
@@ -66,11 +78,17 @@ export function GeekCommandBar({ filters, onApply }: GeekCommandBarProps) {
         onKeyDown={(e) => {
           if (e.key === "Enter") handleSubmit();
         }}
-        placeholder="provider=openai · model=gpt · project=tokenpivot · 回车应用 / Esc 清空"
+        placeholder="provider=openai · model=gpt · project=UUID · 回车应用 / Esc 清空"
         spellCheck={false}
         autoComplete="off"
+        aria-describedby={error ? errorId : undefined}
+        aria-invalid={error ? true : undefined}
       />
-      {error && <span className="geek-cmdbar-error geek-err">{error}</span>}
+      {error && (
+        <span id={errorId} className="geek-cmdbar-error geek-err" role="alert">
+          {error}
+        </span>
+      )}
     </div>
   );
 }

@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { fmt } from "./geek-utils";
 
 export interface RankingItem {
@@ -57,7 +56,6 @@ export function GeekRanking({
             activeFilter &&
             activeFilter.key === item.filterKey &&
             activeFilter.val === item.filterVal?.toLowerCase();
-          const isDim = !item.clickable;
 
           return (
             <div

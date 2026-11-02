@@ -22,7 +22,7 @@ export function GeekShell({ children, workspaceName, filterSummary }: GeekShellP
         <span className="geek-topbar-badge geek-amber">J</span>
         <span className="geek-cursor" />
         <span className="geek-topbar-right geek-dim">
-          ws:{workspaceName} · 示例数据 · 原型
+          ws:{workspaceName}
         </span>
       </div>
       <hr className="geek-divider" />

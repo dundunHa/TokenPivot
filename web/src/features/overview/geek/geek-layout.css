@@ -67,6 +67,10 @@
   font-family: var(--geek-mono);
   font-size: 13px;
 }
+.geek-cmdbar-input:focus-visible {
+  outline: 1px solid var(--geek-amber);
+  outline-offset: 2px;
+}
 .geek-cmdbar-input::placeholder { color: var(--geek-text-faint); }
 .geek-cmdbar-error { font-size: 11px; margin-left: 8px; }
 

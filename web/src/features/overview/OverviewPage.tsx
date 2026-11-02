@@ -10,7 +10,7 @@ import { RequestLogPanel } from "@/features/requests/RequestLogPanel";
 import { OverviewFilterBar } from "./OverviewFilterBar";
 import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
-import { describeError, type RankingDimension } from "./overviewApi";
+import { describeError } from "./overviewApi";
 import { GeekShell } from "./geek/GeekShell";
 import { GeekCommandBar } from "./geek/GeekCommandBar";
 import { GeekHeroMetrics } from "./geek/GeekHeroMetrics";
@@ -30,7 +30,7 @@ import {
   type OverviewFilters,
 } from "./overviewFilters";
 import { useAggregate, useProjects, type QueryScope } from "./overviewQueries";
-import { buildTrend, formatInstant } from "./overviewView";
+import { buildTrend } from "./overviewView";
 
 const TICK_MS = 10_000;
 
@@ -212,24 +212,8 @@ function OverviewContent({
   const tz = filters.timezone;
   const identity = filterIdentity(filters);
 
-  const onRankingToggle = (dimension: RankingDimension, value: string) => {
-    if (dimension === "project") {
-      update({ ...filters, projects: toggle(filters.projects, value) });
-    } else if (dimension === "provider") {
-      update({ ...filters, providers: toggle(filters.providers, value) });
-    } else {
-      update({ ...filters, models: toggle(filters.models, value) });
-    }
-  };
-
   const data = aggregate.data;
   const [showBraille, setShowBraille] = useState(false);
-
-  // 排名数据由 OverviewRanking 内部 query 提供
-  const rankingItems = useMemo(() => {
-    if (!data) return [];
-    return [];
-  }, [data]);
 
   return (
     <GeekShell workspaceName={workspaceName} filterSummary={identity}>

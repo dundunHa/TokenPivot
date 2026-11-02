@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { fmt } from "./geek-utils";
-import type { UsageStats } from "../overviewApi";
+import { metricQuality, qualityNote, formatCount } from "../overviewView";
+import type { UsageStats, MetricStat } from "../overviewApi";
 
 interface GeekHeroMetricsProps {
   totals: UsageStats;
@@ -13,32 +14,48 @@ interface GeekHeroMetricsProps {
 /**
  * J 风格大数 hero + 4 格指标 rail。
  * PRD §5.2：输入 Token / 输出 Token / 请求数 / 最近 60 秒速率。
- * PRD §7：total = input + output，cache 不额外加到 total。
+ * PRD §7：total 取自服务端，cache 不额外加到 total。
  */
 export function GeekHeroMetrics({ totals, rate60, timezone }: GeekHeroMetricsProps) {
   const reduced = usePrefersReducedMotion();
-  const inputVal = Number(totals.input.value ?? "0");
-  const outputVal = Number(totals.output.value ?? "0");
-  const totalTokens = inputVal + outputVal;
-  // cache 不在 UsageStats 里，由父组件传入
-  const cacheRead = 0;
+  const totalStat = totals.total;
+  const totalVal = totalStat.value !== null ? Number(totalStat.value) : null;
 
   return (
     <div className="geek-hero">
-      {/* 大数 hero */}
+      {/* 大数 hero — 总量取自服务端 */}
       <div className="geek-hero-number" data-testid="metric-total">
-        <CountUpNumber target={totalTokens} reduced={reduced} />
+        {totalVal !== null ? (
+          <CountUpNumber target={totalVal} reduced={reduced} />
+        ) : (
+          <span className="geek-num">—</span>
+        )}
         <span className="geek-hero-unit">tokens</span>
       </div>
       <div className="geek-hero-axiom geek-dim">
-        口径：total = input + output · cache 为 input 子集，不加到 total · 完成时刻计数
+        {qualityNote(totalStat) ?? "口径：total = input + output · cache 为 input 子集，不加到 total · 完成时刻计数"}
       </div>
 
       {/* 4 格指标 rail */}
       <div className="geek-hero-metrics">
-        <MetricCell label="INPUT" value={fmt(inputVal)} sub={qualityLabel(totals.input)} />
-        <MetricCell label="OUTPUT" value={fmt(outputVal)} sub={qualityLabel(totals.output)} />
-        <MetricCell label="REQUESTS" value={fmt(Number(totals.requestCount))} sub="所选时段完成" testId="metric-requests" />
+        <MetricCell
+          label="INPUT"
+          value={formatCount(totals.input.value)}
+          sub={qualityLabel(totals.input)}
+          testId="metric-input"
+        />
+        <MetricCell
+          label="OUTPUT"
+          value={formatCount(totals.output.value)}
+          sub={qualityLabel(totals.output)}
+          testId="metric-output"
+        />
+        <MetricCell
+          label="REQUESTS"
+          value={formatCount(totals.requestCount)}
+          sub="所选时段完成"
+          testId="metric-requests"
+        />
         <MetricCell
           label="RATE 60S"
           value={rate60 !== null ? fmt(rate60) : "—"}
@@ -49,9 +66,8 @@ export function GeekHeroMetrics({ totals, rate60, timezone }: GeekHeroMetricsPro
 
       {/* breakdown 字符条 */}
       <div className="geek-hero-breakdown">
-        <BreakdownRow label="input" value={inputVal} total={totalTokens} />
-        <BreakdownRow label="output" value={outputVal} total={totalTokens} />
-        <BreakdownRow label="cache.read" value={cacheRead} total={totalTokens} note="⊂ input" />
+        <BreakdownRow label="input" stat={totals.input} total={totalVal} />
+        <BreakdownRow label="output" stat={totals.output} total={totalVal} />
       </div>
 
       {/* 数据状态 */}
@@ -82,23 +98,26 @@ function MetricCell({ label, value, sub, accent, testId }: {
   );
 }
 
-function BreakdownRow({ label, value, total, note }: {
+function BreakdownRow({ label, stat, total }: {
   label: string;
-  value: number;
-  total: number;
-  note?: string;
+  stat: MetricStat;
+  total: number | null;
 }) {
   const BAR_W = 32;
-  const pct = total > 0 ? value / total : 0;
+  const val = stat.value !== null ? Number(stat.value) : null;
+  const pct = total !== null && total > 0 && val !== null ? val / total : 0;
   const filled = Math.round(pct * BAR_W);
   const bar = "█".repeat(filled) + "░".repeat(BAR_W - filled);
+  const q = metricQuality(stat);
 
   return (
     <div className="geek-bd-row">
       <span className="geek-bd-label geek-dim">{label}</span>
       <span className="geek-bd-bar geek-amber">{bar}</span>
-      <span className="geek-bd-value geek-num">{fmt(value)}</span>
-      <span className="geek-bd-pct geek-dim">{note ?? fmtPct(pct)}</span>
+      <span className="geek-bd-value geek-num">{formatCount(stat.value)}</span>
+      <span className="geek-bd-pct geek-dim">
+        {q !== "known" ? qualityNote(stat) : total !== null && total > 0 ? `${(pct * 100).toFixed(1)}%` : "—"}
+      </span>
     </div>
   );
 }
@@ -114,42 +133,35 @@ function StatusCell({ label, value }: { label: string; value: string }) {
 
 /* ---------- 工具 ---------- */
 
-function fmtPct(ratio: number): string {
-  return (ratio * 100).toFixed(1) + "%";
-}
-
-function qualityLabel(stat: { known: string; estimated: string; missing: string }): string {
-  const k = Number(stat.known), e = Number(stat.estimated), m = Number(stat.missing);
-  if (m > 0 && k === 0 && e === 0) return "缺失 · missing";
-  if (e > 0 && m > 0) return "部分覆盖";
-  if (e > 0) return "含估算";
-  if (m > 0) return "部分缺失";
-  return "已知 · known";
+function qualityLabel(stat: MetricStat): string {
+  return qualityNote(stat) ?? "已知 · known";
 }
 
 function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(false);
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-    setReduced(mq.matches);
-    const handler = (e: MediaQueryListEvent) => setReduced(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
-  return reduced;
+  return useSyncExternalStore(
+    (callback) => {
+      if (typeof window === "undefined" || !window.matchMedia) return () => {};
+      const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+      mq.addEventListener("change", callback);
+      return () => mq.removeEventListener("change", callback);
+    },
+    () => {
+      if (typeof window === "undefined" || !window.matchMedia) return false;
+      return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    },
+    () => false,
+  );
 }
 
 function CountUpNumber({ target, reduced }: { target: number; reduced: boolean }) {
   // 测试环境直接显示目标值，避免异步动画导致断言不稳定
   const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
-  const [current, setCurrent] = useState(reduced || isTest ? target : 0);
+  const skipAnimation = reduced || isTest;
+  const [current, setCurrent] = useState(skipAnimation ? target : 0);
   const rafRef = useRef<number>(0);
 
   useEffect(() => {
-    if (reduced || isTest) {
-      setCurrent(target);
-      return;
-    }
+    if (skipAnimation) return;
     const start = performance.now();
     const duration = 1200;
     const from = 0;
@@ -164,7 +176,9 @@ function CountUpNumber({ target, reduced }: { target: number; reduced: boolean }
     };
     rafRef.current = requestAnimationFrame(animate);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [target, reduced, isTest]);
+  }, [target, skipAnimation]);
 
-  return <span className="geek-num">{fmt(current)}</span>;
+  // skipAnimation 时直接显示目标值
+  const display = skipAnimation ? target : current;
+  return <span className="geek-num">{fmt(display)}</span>;
 }
