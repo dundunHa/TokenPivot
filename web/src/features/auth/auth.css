@@ -96,7 +96,7 @@
   letter-spacing: 0.12em;
 }
 
-/* ── 主舞台：居中聚光登录卡 + 底部轻量遥测坞 ────────────────── */
+/* ── 主舞台：左侧登录 + 右侧轻量遥测 ────────────────────────── */
 
 .main-stage {
   display: flex;
@@ -109,17 +109,17 @@
 }
 
 .split-workbench {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
   align-items: center;
   justify-content: center;
-  gap: 24px;
+  gap: 32px;
   width: 100%;
-  max-width: 1040px;
+  max-width: 1360px;
   margin: 0 auto;
 }
 
-/* ── 底部轻量化确定性遥测快照 ───────────────────────────────── */
+/* ── 轻量化确定性遥测快照 ───────────────────────────────────── */
 
 .dash-snapshot {
   width: 100%;
@@ -999,8 +999,26 @@
 
 /* ── 响应式 ─────────────────────────────────────────────────── */
 
+@media (min-width: 1101px) {
+  .ds-sections-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ds-section:nth-child(2) {
+    padding-right: 0;
+    border-right: 0;
+  }
+
+  .ds-section:last-child {
+    grid-column: 1 / -1;
+    padding-top: 16px;
+    border-top: 1px dashed var(--panel-edge-faint);
+  }
+}
+
 @media (max-width: 1100px) {
   .split-workbench {
+    grid-template-columns: minmax(0, 1fr);
     gap: 34px;
   }
 
