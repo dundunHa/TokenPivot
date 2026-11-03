@@ -34,14 +34,12 @@ function createErrorMessage(error: unknown): string | null {
   }
 }
 
-/** 提交瞬间的选择与位置；父容器据此判断创建返回后是否仍可导航。 */
+/** 提交瞬间的归属；父容器据此判断创建返回后是否仍可导航。 */
 export interface CreateSubmitScope {
   /** 提交瞬间的容器身份。 */
   userId: string;
-  /** 提交瞬间的选择序号；之后任何更新选择都会让它失效。 */
+  /** 提交瞬间的选择序号；之后任何更新选择或外部路由选择都会让它失效。 */
   ticket: number;
-  /** 提交瞬间 URL 上的工作区选择；用于识别提交之后的外部导航。 */
-  urlWorkspaceId: string | null;
 }
 
 export function WorkspaceCreateDialog({

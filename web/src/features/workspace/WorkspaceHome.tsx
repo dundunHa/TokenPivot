@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router";
+import { useLocation, useSearchParams } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { OverviewPage } from "@/features/overview/OverviewPage";
@@ -25,6 +25,13 @@ function listErrorMessage(error: unknown): string {
   return "工作区列表加载失败，请稍后重试。";
 }
 
+/** 读取本容器写 URL 时带出的事件标记；其他来源的路由状态一律返回 null。 */
+function readWriteToken(state: unknown): number | null {
+  if (typeof state !== "object" || state === null) return null;
+  const token: unknown = Reflect.get(state, "workspaceWrite");
+  return typeof token === "number" ? token : null;
+}
+
 /**
  * 工作区容器：列表就绪前或为空时不挂载任何业务页面。
  * 当前空间只来自 URL 的 `workspace` 参数；参数缺失或不属于当前用户时回落到服务端首项。
@@ -33,13 +40,12 @@ export function WorkspaceHome({ userId }: { userId: string }) {
   const client = useQueryClient();
   const list = useWorkspaceList(userId);
   const [params, setParams] = useSearchParams();
+  const routeState = useLocation().state;
   const [createOpen, setCreateOpen] = useState(false);
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [switchError, setSwitchError] = useState<string | null>(null);
   /** 选择序号：每次最新选择自增，旧回调据此失效。 */
   const switchSeq = useRef(0);
-  /** 进行中切换的目标空间；URL 被外部改到别的空间时据此作废旧选择。 */
-  const switchTarget = useRef<string | null>(null);
   /** 本容器实例当前的身份；身份变化后旧选择不得再导航。 */
   const identity = useRef(userId);
   /** 挂载状态：卸载后的迟到回调只返回，不再设置状态或 URL。 */
@@ -48,15 +54,38 @@ export function WorkspaceHome({ userId }: { userId: string }) {
   const activeDetail = useRef<{ userId: string; workspaceId: string } | null>(
     null,
   );
-  /** 最新 URL 选择，供创建完成后判断期间是否发生过外部导航。 */
-  const urlSelection = useRef<string | null>(null);
+  /** 系统自己写 URL 时分配的事件标记；只有携带同一标记的路由事件才算系统写入。 */
+  const writeSeq = useRef(0);
+  const pendingWrite = useRef<number | null>(null);
+  /** 上一次观察到的 URL 工作区选择；据此识别选择被外部改掉。 */
+  const observedSelection = useRef<string | null | undefined>(undefined);
 
   /** 作废进行中的选择：递增序号、清掉 pending，旧回调此后一律提前返回。 */
   const resetSelection = useCallback(() => {
     switchSeq.current += 1;
-    switchTarget.current = null;
     setPendingId(null);
   }, []);
+
+  /**
+   * 系统写 URL：给这次导航带一个一次性事件标记，观察者据此只认领自己写的那一次。
+   * 不按目标值判断，所以外部把 URL 改到同一个值、或历史返回到旧位置都不会被误认。
+   */
+  const writeWorkspaceParam = useCallback(
+    (workspaceId: string) => {
+      const token = writeSeq.current + 1;
+      writeSeq.current = token;
+      pendingWrite.current = token;
+      setParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.set("workspace", workspaceId);
+          return next;
+        },
+        { replace: true, state: { workspaceWrite: token } },
+      );
+    },
+    [setParams],
+  );
 
   const workspaces = useMemo(() => list.data ?? [], [list.data]);
   const urlWorkspaceId = params.get("workspace");
@@ -70,21 +99,35 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     );
   }, [list.isSuccess, workspaces, urlWorkspaceId]);
 
+  // 路由事件先结算，规范化再基于最新事件决定写什么：
+  // 带本容器标记的那次写入算系统事件；其余 workspace 选择变化都算外部事件，作废旧选择。
+  useEffect(() => {
+    const selected = urlWorkspaceId;
+    const written = readWriteToken(routeState);
+    if (written !== null && written === pendingWrite.current) {
+      // 认领后立刻清掉标记：同一位置再次出现（例如历史返回）不再算系统写入。
+      pendingWrite.current = null;
+      observedSelection.current = selected;
+      return;
+    }
+    // 没有可认领的标记：旧标记随这次外部事件作废，避免晚到的事件冒领。
+    pendingWrite.current = null;
+    const previous = observedSelection.current;
+    observedSelection.current = selected;
+    if (previous === undefined || previous === selected) return;
+    resetSelection();
+    void client.cancelQueries({ queryKey: ["workspace", "detail", userId] });
+  }, [client, resetSelection, routeState, urlWorkspaceId, userId]);
+
   // URL 无有效成员工作区时规范化到当前选择，其他查询参数原样保留。
+  // 系统自己的规范化不算用户选择，所以不递增选择序号。
   useEffect(() => {
     if (!current) return;
     if (workspaceParamCount === 1 && urlWorkspaceId === current.workspaceId) {
       return;
     }
-    setParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.set("workspace", current.workspaceId);
-        return next;
-      },
-      { replace: true },
-    );
-  }, [current, setParams, urlWorkspaceId, workspaceParamCount]);
+    writeWorkspaceParam(current.workspaceId);
+  }, [current, writeWorkspaceParam, urlWorkspaceId, workspaceParamCount]);
 
   // 身份变化：旧身份进行中的选择作废，取消其详情验证，迟到的成功不得再改 URL。
   useEffect(() => {
@@ -96,11 +139,6 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     void client.cancelQueries({ queryKey: ["workspace", "detail", previous] });
   }, [client, resetSelection, userId]);
 
-  // URL 选择的最新值；创建完成时据此识别期间发生的外部导航。
-  useEffect(() => {
-    urlSelection.current = urlWorkspaceId;
-  }, [urlWorkspaceId]);
-
   // 卸载后旧回调同样作废：离开的容器不得再设置 URL 或状态。
   // 只取消本容器发起的那条详情验证，不动其他容器或新身份的任务。
   useEffect(() => {
@@ -108,7 +146,6 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     return () => {
       mounted.current = false;
       switchSeq.current += 1;
-      switchTarget.current = null;
       const detail = activeDetail.current;
       activeDetail.current = null;
       if (detail === null) return;
@@ -117,14 +154,6 @@ export function WorkspaceHome({ userId }: { userId: string }) {
       });
     };
   }, [client]);
-
-  // URL 被浏览器前进/后退或其他入口改到别的空间：先到的新位置优先，进行中的切换作废。
-  useEffect(() => {
-    const target = switchTarget.current;
-    if (target === null || urlWorkspaceId === target) return;
-    resetSelection();
-    void client.cancelQueries({ queryKey: ["workspace", "detail", userId] });
-  }, [client, resetSelection, urlWorkspaceId, userId]);
 
   function cancelWorkspaceBusiness(workspaceId: string): Promise<void> {
     return client.cancelQueries({
@@ -143,27 +172,20 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     return false;
   }
 
-  /** 创建提交瞬间的选择与位置；返回后凭它判断是否还能导航。 */
+  /** 创建提交瞬间的归属；返回后凭它判断是否还能导航。 */
   const captureCreateScope = useCallback(
-    (): CreateSubmitScope => ({
-      userId,
-      ticket: switchSeq.current,
-      urlWorkspaceId: urlSelection.current,
-    }),
+    (): CreateSubmitScope => ({ userId, ticket: switchSeq.current }),
     [userId],
   );
 
-  /** 创建完成时仍可导航：容器挂载、提交身份未变、选择未被接管、URL 未被外部改动。 */
-  function canNavigateAfterCreate(
-    scope: CreateSubmitScope,
-    created: Workspace,
-  ): boolean {
+  /**
+   * 创建完成时仍可导航：容器挂载、提交身份未变、选择序号未被接管。
+   * 外部路由选择同样递增序号，所以这里只认事件历史，不用 URL 是否相等替代。
+   */
+  function canNavigateAfterCreate(scope: CreateSubmitScope): boolean {
     if (!mounted.current) return false;
     if (scope.userId !== userId) return false;
-    if (!canContinue(scope.ticket)) return false;
-    const urlNow = urlSelection.current;
-    // 提交时的位置未变，或已经落在新建空间上（零空间规范化），才不算外部导航。
-    return urlNow === scope.urlWorkspaceId || urlNow === created.workspaceId;
+    return canContinue(scope.ticket);
   }
 
   async function selectWorkspace(target: Workspace) {
@@ -178,7 +200,6 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     switchSeq.current = ticket;
     setSwitchError(null);
     setPendingId(selectingCurrent ? null : target.workspaceId);
-    switchTarget.current = selectingCurrent ? null : target.workspaceId;
     // 取消上一个详情验证；新选择到来时旧请求不会再发或再写 URL。
     await client.cancelQueries({
       queryKey: ["workspace", "detail", userId],
@@ -192,19 +213,10 @@ export function WorkspaceHome({ userId }: { userId: string }) {
       if (!canContinue(ticket)) return;
       await cancelWorkspaceBusiness(current.workspaceId);
       if (!canContinue(ticket)) return;
-      switchTarget.current = null;
-      setParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          next.set("workspace", target.workspaceId);
-          return next;
-        },
-        { replace: true },
-      );
+      writeWorkspaceParam(target.workspaceId);
       setPendingId(null);
     } catch (error) {
       if (!canContinue(ticket)) return;
-      switchTarget.current = null;
       setPendingId(null);
       setSwitchError(
         error instanceof ApiError && error.status === 403
@@ -218,23 +230,16 @@ export function WorkspaceHome({ userId }: { userId: string }) {
   }
 
   async function handleCreated(created: Workspace, scope: CreateSubmitScope) {
-    // 创建已成功、列表已重查；此后只在提交时的容器、身份、选择与位置都仍有效时导航。
-    if (!canNavigateAfterCreate(scope, created)) return;
+    // 创建已成功、列表已重查；此后只在容器、身份和选择序号都仍有效时导航。
+    if (!canNavigateAfterCreate(scope)) return;
     await client.cancelQueries({ queryKey: ["workspace", "detail", userId] });
-    if (!canNavigateAfterCreate(scope, created)) return;
+    if (!canNavigateAfterCreate(scope)) return;
     if (current) await cancelWorkspaceBusiness(current.workspaceId);
-    if (!canNavigateAfterCreate(scope, created)) return;
+    if (!canNavigateAfterCreate(scope)) return;
     setPendingId(null);
     setSwitchError(null);
     setCreateOpen(false);
-    setParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.set("workspace", created.workspaceId);
-        return next;
-      },
-      { replace: true },
-    );
+    writeWorkspaceParam(created.workspaceId);
   }
 
   if (list.isPending) {
