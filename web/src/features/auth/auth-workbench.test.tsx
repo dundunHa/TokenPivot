@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { sessionKey } from "./queries";
 import { renderApp } from "@/test/render";
 import {
+  deferred,
   errorResponse,
   http,
   HttpResponse,
@@ -43,6 +44,17 @@ async function fill(
 }
 
 const location = () => screen.getByTestId("location").textContent;
+
+/** 按 F：返回 false 说明快捷键处理因不可唤起而没有拦截，也就不会跳转。 */
+function pressLaunchKey(): boolean {
+  const event = new KeyboardEvent("keydown", {
+    key: "f",
+    bubbles: true,
+    cancelable: true,
+  });
+  document.dispatchEvent(event);
+  return event.defaultPrevented;
+}
 
 describe("dashboard snapshot", () => {
   it("renders the hard-coded telemetry without creating a session query", async () => {
@@ -169,6 +181,42 @@ describe("feishu cabin", () => {
     await waitFor(() => expect(screen.queryByText("二维码已过期")).toBeNull());
     await waitFor(() => expect(calls).toBe(2));
     await waitFor(() => expect(launch.hasAttribute("disabled")).toBe(false));
+  });
+
+  it("keeps the launch entry disabled while a refresh is in flight", async () => {
+    const pending = deferred();
+    let calls = 0;
+    server.use(
+      http.get(AUTHORIZE, async () => {
+        calls += 1;
+        if (calls > 1) await pending.promise;
+        return HttpResponse.json({
+          enabled: true,
+          authorize_url: `https://open.feishu.cn/open-apis/authen/v1/authorize?app_id=cli_x&state=s${calls}`,
+          expires_in_seconds: calls === 1 ? 0 : 180,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/login");
+
+    await screen.findByText("二维码已过期");
+    const launch = screen.getByRole("button", {
+      name: "一键唤起飞书授权 [F]",
+    });
+    expect(launch.hasAttribute("disabled")).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "点击刷新 [R]" }));
+    await waitFor(() => expect(calls).toBe(2));
+
+    // 新授权响应还没回来：旧地址已清空，按钮与 F 都不得再跳转。
+    expect(launch.hasAttribute("disabled")).toBe(true);
+    expect(pressLaunchKey()).toBe(false);
+    expect(location()).toBe("/login|POP");
+
+    pending.resolve();
+    await waitFor(() => expect(launch.hasAttribute("disabled")).toBe(false));
+    expect(screen.queryByText("二维码已过期")).toBeNull();
   });
 
   it("shows the expired mask and keeps the entry disabled when the endpoint fails", async () => {
