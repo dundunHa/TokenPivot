@@ -14,7 +14,11 @@ interface GeekBrailleChartProps {
  * J 风格 braille 4×2 点阵真曲线图。
  * 缺口（gap）映射为 0 值断段；null 映射为 0 保持连续但不虚报。
  */
-export function GeekBrailleChart({ trend, cols = 88, rows = 10 }: GeekBrailleChartProps) {
+export function GeekBrailleChart({
+  trend,
+  cols = 88,
+  rows = 10,
+}: GeekBrailleChartProps) {
   const result = useMemo(() => {
     if (trend.points.length === 0) return null;
 

@@ -41,9 +41,7 @@ export function GeekTrendChart({ trend, timezone }: GeekTrendChartProps) {
 
   if (data.length === 0) {
     return (
-      <div className="geek-empty geek-dim">
-        所选范围与筛选下没有用量。
-      </div>
+      <div className="geek-empty geek-dim">所选范围与筛选下没有用量。</div>
     );
   }
 
@@ -52,7 +50,10 @@ export function GeekTrendChart({ trend, timezone }: GeekTrendChartProps) {
   return (
     <div className="geek-trend">
       <ResponsiveContainer width="100%" height={280}>
-        <ComposedChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <ComposedChart
+          data={data}
+          margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+        >
           <defs>
             <linearGradient id="geek-input-grad" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#e0a64b" stopOpacity={0.3} />
@@ -66,7 +67,11 @@ export function GeekTrendChart({ trend, timezone }: GeekTrendChartProps) {
           <CartesianGrid stroke="#1e1c18" strokeDasharray="3 3" />
           <XAxis
             dataKey="time"
-            tick={{ fill: "#5c574a", fontSize: 11, fontFamily: "var(--geek-mono)" }}
+            tick={{
+              fill: "#5c574a",
+              fontSize: 11,
+              fontFamily: "var(--geek-mono)",
+            }}
             tickFormatter={(v: string) => {
               const point = data.find((d) => d.time === v);
               return point?.label ?? v;
@@ -75,7 +80,11 @@ export function GeekTrendChart({ trend, timezone }: GeekTrendChartProps) {
             tickLine={false}
           />
           <YAxis
-            tick={{ fill: "#5c574a", fontSize: 11, fontFamily: "var(--geek-mono)" }}
+            tick={{
+              fill: "#5c574a",
+              fontSize: 11,
+              fontFamily: "var(--geek-mono)",
+            }}
             tickFormatter={(v: number) => fmt(v)}
             axisLine={false}
             tickLine={false}
@@ -138,9 +147,7 @@ export function GeekTrendChart({ trend, timezone }: GeekTrendChartProps) {
       </ResponsiveContainer>
       <div className="geek-trend-footer geek-dim">
         <span>▪ input ▫ output ─ total</span>
-        <span>
-          {trend.stackNote ?? "完成时刻计数 · 补报回填发生时段"}
-        </span>
+        <span>{trend.stackNote ?? "完成时刻计数 · 补报回填发生时段"}</span>
       </div>
     </div>
   );

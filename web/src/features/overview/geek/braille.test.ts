@@ -3,28 +3,28 @@ import { brailleRender, fmtCompact } from "./braille";
 
 describe("brailleRender", () => {
   it("returns correct number of lines", () => {
-    const result = brailleRender(
-      [{ values: [1, 2, 3, 4, 5], label: "test" }],
-      { cols: 20, rows: 4 },
-    );
+    const result = brailleRender([{ values: [1, 2, 3, 4, 5], label: "test" }], {
+      cols: 20,
+      rows: 4,
+    });
     expect(result.lines).toHaveLength(4);
   });
 
   it("each line has correct character count", () => {
-    const result = brailleRender(
-      [{ values: [1, 2, 3], label: "test" }],
-      { cols: 10, rows: 2 },
-    );
+    const result = brailleRender([{ values: [1, 2, 3], label: "test" }], {
+      cols: 10,
+      rows: 2,
+    });
     for (const line of result.lines) {
       expect([...line].length).toBe(10);
     }
   });
 
   it("returns axis and legend lines", () => {
-    const result = brailleRender(
-      [{ values: [1, 2, 3], label: "input" }],
-      { cols: 20, rows: 4 },
-    );
+    const result = brailleRender([{ values: [1, 2, 3], label: "input" }], {
+      cols: 20,
+      rows: 4,
+    });
     expect(result.axisLine).toBeTruthy();
     expect(result.legendLine).toContain("input");
   });
@@ -42,18 +42,18 @@ describe("brailleRender", () => {
   });
 
   it("handles empty values gracefully", () => {
-    const result = brailleRender(
-      [{ values: [], label: "empty" }],
-      { cols: 10, rows: 2 },
-    );
+    const result = brailleRender([{ values: [], label: "empty" }], {
+      cols: 10,
+      rows: 2,
+    });
     expect(result.lines).toHaveLength(2);
   });
 
   it("handles constant values (min === max)", () => {
-    const result = brailleRender(
-      [{ values: [5, 5, 5, 5], label: "flat" }],
-      { cols: 10, rows: 2 },
-    );
+    const result = brailleRender([{ values: [5, 5, 5, 5], label: "flat" }], {
+      cols: 10,
+      rows: 2,
+    });
     expect(result.lines).toHaveLength(2);
     expect(result.yRange.max).toBeGreaterThan(result.yRange.min);
   });
