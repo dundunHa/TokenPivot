@@ -26,8 +26,11 @@ func TestSourceArchivalMigration(t *testing.T) {
 	if _, err := p.UpTo(ctx, beforeArchival); err != nil {
 		t.Fatal(database.SafeError("up to 6", err))
 	}
-	var workspaceID, sourceID string
-	if err := db.QueryRowContext(ctx, "INSERT INTO workspaces (name) VALUES ('synthetic') RETURNING id::text").Scan(&workspaceID); err != nil {
+	var userID, workspaceID, sourceID string
+	if err := db.QueryRowContext(ctx, "INSERT INTO users (email, password_hash) VALUES ('archival@example.com','synthetic-encoding') RETURNING id::text").Scan(&userID); err != nil {
+		t.Fatal(database.SafeError("seed creator", err))
+	}
+	if err := db.QueryRowContext(ctx, "INSERT INTO workspaces (created_by_user_id, name) VALUES ($1,'synthetic') RETURNING id::text", userID).Scan(&workspaceID); err != nil {
 		t.Fatal(database.SafeError("seed workspace", err))
 	}
 	if err := db.QueryRowContext(ctx, "INSERT INTO sources (workspace_id, platform, instance_key) VALUES ($1,'dsh','old') RETURNING id::text", workspaceID).Scan(&sourceID); err != nil {
