@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -332,6 +333,91 @@ func TestFeishuBindTokenExpires(t *testing.T) {
 	}
 }
 
+// TestFeishuBindConcurrentSingleUse proves the pending token is spent once: ten
+// requests carrying the same token and the correct password must produce exactly
+// one session, and every other request fails as unauthenticated.
+func TestFeishuBindConcurrentSingleUse(t *testing.T) {
+	stub := newFeishuStub(t)
+	service, store, _, _ := newFeishuService(t, stub, true, true)
+	store.seedUser("synthetic@example.com", "synthetic-password")
+	result, err := service.FeishuLogin(context.Background(), "synthetic-code", "127.0.0.1")
+	if err != nil || result.BindToken == "" {
+		t.Fatalf("login result = %+v err = %v, want a pending bind token", result, err)
+	}
+
+	const attempts = 10
+	start := make(chan struct{})
+	sessions := make([]Session, attempts)
+	errs := make([]error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			sessions[index], errs[index] = service.FeishuBind(context.Background(), result.BindToken, "synthetic-password", "127.0.0.1")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var succeeded int
+	for index, err := range errs {
+		if err == nil {
+			succeeded++
+			if sessions[index].Token == "" {
+				t.Fatalf("attempt %d succeeded without a session token", index)
+			}
+			continue
+		}
+		if !errors.Is(err, ErrUnauthenticated) {
+			t.Fatalf("attempt %d error = %v, want ErrUnauthenticated", index, err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("successful binds = %d, want exactly 1", succeeded)
+	}
+	if len(store.sessions) != 1 {
+		t.Fatalf("stored sessions = %d, want exactly 1", len(store.sessions))
+	}
+	if len(store.identities) != 1 {
+		t.Fatalf("stored identities = %d, want exactly 1", len(store.identities))
+	}
+	if _, ok := service.bindings.entries[feishuBindKey(result.BindToken)]; ok {
+		t.Fatal("a completed bind kept the pending token")
+	}
+}
+
+// TestFeishuBindRefusesSecondOpenIDForBoundAccount proves an account that already
+// holds a Feishu open_id cannot be rebound to a different one: the bind fails as
+// unauthenticated, keeps the original binding, spends the pending token and issues
+// no session.
+func TestFeishuBindRefusesSecondOpenIDForBoundAccount(t *testing.T) {
+	stub := newFeishuStub(t)
+	stub.openID = "ou_other"
+	service, store, _, _ := newFeishuService(t, stub, true, true)
+	local := store.seedUser("synthetic@example.com", "synthetic-password")
+	store.seedFeishuBinding("ou_existing", local)
+
+	result, err := service.FeishuLogin(context.Background(), "synthetic-code", "127.0.0.1")
+	if err != nil || result.BindToken == "" {
+		t.Fatalf("login result = %+v err = %v, want a pending bind token", result, err)
+	}
+	session, err := service.FeishuBind(context.Background(), result.BindToken, "synthetic-password", "127.0.0.1")
+	if !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("bind error = %v, want ErrUnauthenticated", err)
+	}
+	if session.Token != "" || len(store.sessions) != 0 {
+		t.Fatal("a conflicting rebind issued a session")
+	}
+	if identity := store.identities[local.ID]; identity.OpenID != "ou_existing" {
+		t.Fatalf("stored identity = %+v, want the original binding kept", identity)
+	}
+	if _, ok := service.bindings.entries[feishuBindKey(result.BindToken)]; ok {
+		t.Fatal("a conflicting rebind kept the pending token")
+	}
+}
+
 func TestFeishuLoginAutoProvisionsWhenRegistrationIsClosed(t *testing.T) {
 	stub := newFeishuStub(t)
 	service, store, runner, _ := newFeishuService(t, stub, false, true)
@@ -351,7 +437,10 @@ func TestFeishuLoginAutoProvisionsWhenRegistrationIsClosed(t *testing.T) {
 	if identity := store.identities[result.Session.User.ID]; identity.OpenID != stub.openID {
 		t.Fatalf("stored identity = %+v", identity)
 	}
-	want := []string{"feishu_user", "identity", "session"}
+	// The auto-provisioning path still takes the registration lock, so a
+	// concurrent ordinary registration cannot also pass the empty-database check,
+	// but it stores no empty-database query of its own.
+	want := []string{"lock", "feishu_user", "identity", "session"}
 	if len(store.registrations) != len(want) {
 		t.Fatalf("registration steps = %v, want %v", store.registrations, want)
 	}
@@ -363,8 +452,35 @@ func TestFeishuLoginAutoProvisionsWhenRegistrationIsClosed(t *testing.T) {
 	if runner.inTxCall != 1 {
 		t.Fatalf("transactions = %d, want 1", runner.inTxCall)
 	}
-	if store.lockCalls != 0 || store.hasUsersCalls != 0 {
-		t.Fatalf("auto-provisioning used the closed-registration path: lock=%d hasUsers=%d", store.lockCalls, store.hasUsersCalls)
+	if store.lockCalls != 1 || store.hasUsersCalls != 0 {
+		t.Fatalf("auto-provisioning skipped the lock: lock=%d hasUsers=%d", store.lockCalls, store.hasUsersCalls)
+	}
+}
+
+// TestFeishuLoginProvisioningHoldsTheRegistrationLock proves the auto-provisioning
+// path joins the same registration lock as ordinary registration: once it commits
+// the first account, an ordinary registration must see a non-empty database rather
+// than being accepted as a second first user.
+func TestFeishuLoginProvisioningHoldsTheRegistrationLock(t *testing.T) {
+	stub := newFeishuStub(t)
+	service, store, _, _ := newFeishuService(t, stub, false, true)
+
+	if _, err := service.FeishuLogin(context.Background(), "synthetic-code", "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if store.lockCalls != 1 || store.hasUsersCalls != 0 {
+		t.Fatalf("lock=%d hasUsers=%d, want the lock without the empty-database query", store.lockCalls, store.hasUsersCalls)
+	}
+
+	_, err := service.Register(context.Background(), "other@example.com", "synthetic-password", "127.0.0.2")
+	if !errors.Is(err, ErrRegistrationClosed) {
+		t.Fatalf("register error = %v, want ErrRegistrationClosed", err)
+	}
+	if _, ok := store.users["other@example.com"]; ok {
+		t.Fatal("a registration refused after provisioning created an account")
+	}
+	if len(store.sessions) != 1 {
+		t.Fatalf("sessions = %d, want only the Feishu session", len(store.sessions))
 	}
 }
 

@@ -27,12 +27,16 @@ const (
 FROM user_identities ui
 JOIN users u ON u.id = ui.user_id
 WHERE ui.provider = 'feishu' AND ui.provider_user_id = $1`
-	// upsertFeishuIdentityQuery writes the binding once per (user, provider). An
-	// existing row is kept, so repeating a bind is idempotent. Empty optional
-	// values are stored as NULL.
+	// upsertFeishuIdentityQuery writes the binding once per (user, provider). The
+	// update only fires when the stored provider_user_id is the same one, so
+	// repeating a bind is idempotent and a second open_id for the same account is
+	// reported as zero affected rows instead of being silently dropped. Empty
+	// optional values are stored as NULL.
 	upsertFeishuIdentityQuery = `INSERT INTO user_identities (user_id, provider, provider_user_id, union_id, tenant_key, email, display_name)
 VALUES ($1, 'feishu', $2, NULLIF($3, ''), NULLIF($4, ''), $5, NULLIF($6, ''))
-ON CONFLICT (user_id, provider) DO NOTHING`
+ON CONFLICT (user_id, provider) DO UPDATE
+SET provider_user_id = user_identities.provider_user_id
+WHERE user_identities.provider_user_id = EXCLUDED.provider_user_id`
 	createSessionQuery       = `INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '30 days') RETURNING expires_at`
 	authenticateSessionQuery = `UPDATE sessions
 SET expires_at = now() + interval '30 days'
@@ -141,11 +145,17 @@ func (s *registrationTxStore) CreateFeishuUser(ctx context.Context, email string
 }
 
 // UpsertFeishuIdentity writes the provider binding and keeps an existing row for
-// the same (user, provider) pair. A conflict on the open_id unique index means
-// the identity already belongs to another account, which is a refused write.
+// the same (user, provider) pair only when it holds the same open_id. A conflict
+// on the open_id unique index means the identity already belongs to another
+// account; zero affected rows means this account is already bound to a different
+// open_id. Both are refused writes.
 func (s *registrationTxStore) UpsertFeishuIdentity(ctx context.Context, userID ID, identity FeishuIdentity) error {
-	if _, err := s.q.Exec(ctx, upsertFeishuIdentityQuery, userID, identity.OpenID, identity.UnionID, identity.TenantKey, identity.Email, identity.DisplayName); err != nil {
+	tag, err := s.q.Exec(ctx, upsertFeishuIdentityQuery, userID, identity.OpenID, identity.UnionID, identity.TenantKey, identity.Email, identity.DisplayName)
+	if err != nil {
 		return mapFeishuIdentityConflict(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrFeishuIdentityConflict
 	}
 	return nil
 }

@@ -195,12 +195,16 @@ func (f *authFakeStore) CreateFeishuUser(ctx context.Context, email string) (aut
 }
 
 // UpsertFeishuIdentity writes the binding once per (user, provider) and reports
-// an open_id already owned by another account.
+// an open_id already owned by another account or a second open_id for an account
+// that is already bound.
 func (f *authFakeStore) UpsertFeishuIdentity(ctx context.Context, userID auth.ID, identity auth.FeishuIdentity) error {
 	f.record("UpsertFeishuIdentity")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if owner, exists := f.feishuIdentities[identity.OpenID]; exists && owner.ID != userID {
+		return auth.ErrFeishuIdentityConflict
+	}
+	if current, exists := f.identities[userID]; exists && current.OpenID != identity.OpenID {
 		return auth.ErrFeishuIdentityConflict
 	}
 	var user auth.User
