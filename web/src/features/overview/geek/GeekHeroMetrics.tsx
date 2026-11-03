@@ -16,7 +16,11 @@ interface GeekHeroMetricsProps {
  * PRD §5.2：输入 Token / 输出 Token / 请求数 / 最近 60 秒速率。
  * PRD §7：total 取自服务端，cache 不额外加到 total。
  */
-export function GeekHeroMetrics({ totals, rate60, timezone }: GeekHeroMetricsProps) {
+export function GeekHeroMetrics({
+  totals,
+  rate60,
+  timezone,
+}: GeekHeroMetricsProps) {
   const reduced = usePrefersReducedMotion();
   const totalStat = totals.total;
   const totalVal = totalStat.value !== null ? Number(totalStat.value) : null;
@@ -33,7 +37,8 @@ export function GeekHeroMetrics({ totals, rate60, timezone }: GeekHeroMetricsPro
         <span className="geek-hero-unit">tokens</span>
       </div>
       <div className="geek-hero-axiom geek-dim">
-        {qualityNote(totalStat) ?? "口径：total = input + output · cache 为 input 子集，不加到 total · 完成时刻计数"}
+        {qualityNote(totalStat) ??
+          "口径：total = input + output · cache 为 input 子集，不加到 total · 完成时刻计数"}
       </div>
 
       {/* 4 格指标 rail */}
@@ -82,7 +87,13 @@ export function GeekHeroMetrics({ totals, rate60, timezone }: GeekHeroMetricsPro
 
 /* ---------- 子组件 ---------- */
 
-function MetricCell({ label, value, sub, accent, testId }: {
+function MetricCell({
+  label,
+  value,
+  sub,
+  accent,
+  testId,
+}: {
   label: string;
   value: string;
   sub: string;
@@ -90,7 +101,10 @@ function MetricCell({ label, value, sub, accent, testId }: {
   testId?: string;
 }) {
   return (
-    <div className={`geek-hm-cell ${accent ? "geek-hm-accent" : ""}`} data-testid={testId}>
+    <div
+      className={`geek-hm-cell ${accent ? "geek-hm-accent" : ""}`}
+      data-testid={testId}
+    >
       <div className="geek-hm-label">{label}</div>
       <div className="geek-hm-value geek-num">{value}</div>
       <div className="geek-hm-sub geek-dim">{sub}</div>
@@ -98,7 +112,11 @@ function MetricCell({ label, value, sub, accent, testId }: {
   );
 }
 
-function BreakdownRow({ label, stat, total }: {
+function BreakdownRow({
+  label,
+  stat,
+  total,
+}: {
   label: string;
   stat: MetricStat;
   total: number | null;
@@ -116,7 +134,11 @@ function BreakdownRow({ label, stat, total }: {
       <span className="geek-bd-bar geek-amber">{bar}</span>
       <span className="geek-bd-value geek-num">{formatCount(stat.value)}</span>
       <span className="geek-bd-pct geek-dim">
-        {q !== "known" ? qualityNote(stat) : total !== null && total > 0 ? `${(pct * 100).toFixed(1)}%` : "—"}
+        {q !== "known"
+          ? qualityNote(stat)
+          : total !== null && total > 0
+            ? `${(pct * 100).toFixed(1)}%`
+            : "—"}
       </span>
     </div>
   );
@@ -153,9 +175,16 @@ function usePrefersReducedMotion(): boolean {
   );
 }
 
-function CountUpNumber({ target, reduced }: { target: number; reduced: boolean }) {
+function CountUpNumber({
+  target,
+  reduced,
+}: {
+  target: number;
+  reduced: boolean;
+}) {
   // 测试环境直接显示目标值，避免异步动画导致断言不稳定
-  const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
+  const isTest =
+    typeof process !== "undefined" && process.env.NODE_ENV === "test";
   const skipAnimation = reduced || isTest;
   const [current, setCurrent] = useState(skipAnimation ? target : 0);
   const rafRef = useRef<number>(0);

@@ -31,18 +31,24 @@ export function GeekDataStatus({
 }: GeekDataStatusProps) {
   // 通过 useSyncExternalStore 获取当前时间，避免 render 中调用 impure Date.now()
   const now = useSyncExternalStore(
-    (cb) => { const t = setInterval(cb, 5000); return () => clearInterval(t); },
+    (cb) => {
+      const t = setInterval(cb, 5000);
+      return () => clearInterval(t);
+    },
     () => Date.now(),
     () => 0,
   );
-  const agoText = lastReceivedAt && now > 0
-    ? fmtAgo(now - new Date(lastReceivedAt).getTime())
-    : null;
+  const agoText =
+    lastReceivedAt && now > 0
+      ? fmtAgo(now - new Date(lastReceivedAt).getTime())
+      : null;
   return (
     <div className="geek-data-status-panel">
       <div className="geek-ds-row">
         <span className="geek-ds-key geek-dim">workspace / tz</span>
-        <span className="geek-ds-val">{workspaceName} · {timezone}</span>
+        <span className="geek-ds-val">
+          {workspaceName} · {timezone}
+        </span>
       </div>
       <div className="geek-ds-row">
         <span className="geek-ds-key geek-dim">last received</span>
@@ -52,7 +58,9 @@ export function GeekDataStatus({
               <span className="geek-dot geek-ok" />
               {agoText}
             </>
-          ) : "—"}
+          ) : (
+            "—"
+          )}
         </span>
       </div>
       <div className="geek-ds-row">
@@ -61,19 +69,28 @@ export function GeekDataStatus({
       </div>
       <div className="geek-ds-row">
         <span className="geek-ds-key geek-dim">range</span>
-        <span className="geek-ds-val geek-num">{formatInstant(rangeStart, timezone)} → {formatInstant(rangeEnd, timezone)}</span>
+        <span className="geek-ds-val geek-num">
+          {formatInstant(rangeStart, timezone)} →{" "}
+          {formatInstant(rangeEnd, timezone)}
+        </span>
       </div>
       <div className="geek-ds-row">
         <span className="geek-ds-key geek-dim">as_of</span>
-        <span className="geek-ds-val geek-num">{formatInstant(asOf, timezone)}</span>
+        <span className="geek-ds-val geek-num">
+          {formatInstant(asOf, timezone)}
+        </span>
       </div>
       <div className="geek-ds-row">
         <span className="geek-ds-key geek-dim">retention</span>
-        <span className="geek-ds-val geek-num">{formatInstant(retentionCutoff, timezone)}</span>
+        <span className="geek-ds-val geek-num">
+          {formatInstant(retentionCutoff, timezone)}
+        </span>
       </div>
       <div className="geek-ds-row">
         <span className="geek-ds-key geek-dim">updated</span>
-        <span className="geek-ds-val geek-num">{formatInstant(pageUpdatedAt, timezone)}</span>
+        <span className="geek-ds-val geek-num">
+          {formatInstant(pageUpdatedAt, timezone)}
+        </span>
       </div>
     </div>
   );

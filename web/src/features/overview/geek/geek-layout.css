@@ -9,7 +9,9 @@
   font-size: 13px;
   border-bottom: 1px solid var(--geek-border);
 }
-.geek-topbar-prompt { color: var(--geek-text); }
+.geek-topbar-prompt {
+  color: var(--geek-text);
+}
 .geek-topbar-badge {
   display: inline-flex;
   align-items: center;
@@ -40,11 +42,17 @@
   gap: var(--geek-gap);
 }
 @media (max-width: 1279px) {
-  .geek-workbench { grid-template-columns: 1fr; }
+  .geek-workbench {
+    grid-template-columns: 1fr;
+  }
 }
 @media (max-width: 767px) {
-  .geek-workbench { grid-template-columns: 1fr; }
-  .geek-main { padding: 12px; }
+  .geek-workbench {
+    grid-template-columns: 1fr;
+  }
+  .geek-main {
+    padding: 12px;
+  }
 }
 
 /* ===== 命令条 ===== */
@@ -57,7 +65,9 @@
   border: 1px solid var(--geek-border);
   border-radius: var(--geek-radius);
 }
-.geek-cmdbar-prompt { font-size: 14px; }
+.geek-cmdbar-prompt {
+  font-size: 14px;
+}
 .geek-cmdbar-input {
   flex: 1;
   background: transparent;
@@ -71,8 +81,13 @@
   outline: 1px solid var(--geek-amber);
   outline-offset: 2px;
 }
-.geek-cmdbar-input::placeholder { color: var(--geek-text-faint); }
-.geek-cmdbar-error { font-size: 11px; margin-left: 8px; }
+.geek-cmdbar-input::placeholder {
+  color: var(--geek-text-faint);
+}
+.geek-cmdbar-error {
+  font-size: 11px;
+  margin-left: 8px;
+}
 
 /* ===== Hero ===== */
 .geek-hero {
@@ -113,10 +128,24 @@
   background: var(--geek-bg-panel);
   padding: 12px 16px;
 }
-.geek-hm-accent .geek-hm-value { color: var(--geek-amber); }
-.geek-hm-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--geek-text-muted); }
-.geek-hm-value { font-size: 24px; font-weight: 500; margin-top: 4px; }
-.geek-hm-sub { font-size: 10px; margin-top: 2px; }
+.geek-hm-accent .geek-hm-value {
+  color: var(--geek-amber);
+}
+.geek-hm-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--geek-text-muted);
+}
+.geek-hm-value {
+  font-size: 24px;
+  font-weight: 500;
+  margin-top: 4px;
+}
+.geek-hm-sub {
+  font-size: 10px;
+  margin-top: 2px;
+}
 
 /* breakdown */
 .geek-hero-breakdown {
@@ -132,15 +161,24 @@
   gap: 12px;
   align-items: center;
 }
-.geek-bd-label { text-align: right; }
+.geek-bd-label {
+  text-align: right;
+}
 .geek-bd-bar {
   font-size: 10px;
   line-height: 10px;
   white-space: nowrap;
   overflow: hidden;
 }
-.geek-bd-value { min-width: 60px; text-align: right; }
-.geek-bd-pct { min-width: 50px; text-align: right; font-size: 11px; }
+.geek-bd-value {
+  min-width: 60px;
+  text-align: right;
+}
+.geek-bd-pct {
+  min-width: 50px;
+  text-align: right;
+  font-size: 11px;
+}
 
 /* 数据状态 */
 .geek-data-status {
@@ -150,9 +188,17 @@
   padding-top: 12px;
   border-top: 1px solid var(--geek-border);
 }
-.geek-ds-cell { font-size: 12px; }
-.geek-ds-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
-.geek-ds-value { margin-top: 2px; }
+.geek-ds-cell {
+  font-size: 12px;
+}
+.geek-ds-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.geek-ds-value {
+  margin-top: 2px;
+}
 
 /* ===== 趋势图 ===== */
 .geek-trend {
@@ -182,9 +228,19 @@
   white-space: pre;
   color: var(--geek-amber);
 }
-.geek-braille-axis { font-size: 11px; margin-top: 4px; white-space: pre; }
-.geek-braille-legend { font-size: 11px; margin-top: 4px; }
-.geek-braille-note { font-size: 10px; margin-top: 6px; }
+.geek-braille-axis {
+  font-size: 11px;
+  margin-top: 4px;
+  white-space: pre;
+}
+.geek-braille-legend {
+  font-size: 11px;
+  margin-top: 4px;
+}
+.geek-braille-note {
+  font-size: 10px;
+  margin-top: 6px;
+}
 
 /* ===== 排名 ===== */
 .geek-ranking {
@@ -207,8 +263,12 @@
   font-size: 12px;
   cursor: pointer;
 }
-.geek-ranking-tab:first-child { border-radius: 4px 0 0 4px; }
-.geek-ranking-tab:last-child { border-radius: 0 4px 4px 0; }
+.geek-ranking-tab:first-child {
+  border-radius: 4px 0 0 4px;
+}
+.geek-ranking-tab:last-child {
+  border-radius: 0 4px 4px 0;
+}
 .geek-tab-active {
   background: var(--geek-amber);
   color: var(--geek-bg);
@@ -223,15 +283,38 @@
   font-size: 12px;
   border-radius: 2px;
 }
-.geek-rank-clickable { cursor: pointer; transition: background 0.1s; }
-.geek-rank-clickable:hover { background: var(--geek-bg-hover); }
-.geek-rank-active { background: var(--geek-bg-active); }
-.geek-rank-dim { opacity: 0.55; cursor: default; }
-.geek-rank-name { text-align: right; color: var(--geek-text-dim); }
-.geek-rank-item:first-child .geek-rank-name { color: var(--geek-amber); }
-.geek-rank-item:first-child .geek-rank-value { color: var(--geek-amber); }
-.geek-rank-bar { font-size: 10px; white-space: nowrap; }
-.geek-rank-value { text-align: left; min-width: 70px; }
+.geek-rank-clickable {
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.geek-rank-clickable:hover {
+  background: var(--geek-bg-hover);
+}
+.geek-rank-active {
+  background: var(--geek-bg-active);
+}
+.geek-rank-dim {
+  opacity: 0.55;
+  cursor: default;
+}
+.geek-rank-name {
+  text-align: right;
+  color: var(--geek-text-dim);
+}
+.geek-rank-item:first-child .geek-rank-name {
+  color: var(--geek-amber);
+}
+.geek-rank-item:first-child .geek-rank-value {
+  color: var(--geek-amber);
+}
+.geek-rank-bar {
+  font-size: 10px;
+  white-space: nowrap;
+}
+.geek-rank-value {
+  text-align: left;
+  min-width: 70px;
+}
 
 /* ===== 请求日志 ===== */
 .geek-request-log {
@@ -253,11 +336,24 @@
   color: var(--geek-text-muted);
   margin-bottom: 8px;
 }
-.geek-feed-legend i { font-style: normal; margin-right: 4px; }
-.geek-q-known { color: var(--geek-amber); }
-.geek-q-est { color: var(--geek-text-dim); }
-.geek-q-miss { color: var(--geek-error); }
-.geek-q-cell { font-weight: 600; min-width: 14px; text-align: center; }
+.geek-feed-legend i {
+  font-style: normal;
+  margin-right: 4px;
+}
+.geek-q-known {
+  color: var(--geek-amber);
+}
+.geek-q-est {
+  color: var(--geek-text-dim);
+}
+.geek-q-miss {
+  color: var(--geek-error);
+}
+.geek-q-cell {
+  font-weight: 600;
+  min-width: 14px;
+  text-align: center;
+}
 .geek-request-log-body {
   max-height: 480px;
   overflow-y: auto;
@@ -276,15 +372,30 @@
   font-size: 12px;
   font-weight: 500;
 }
-.geek-statusbar-left { display: flex; gap: 12px; align-items: center; }
-.geek-statusbar-right { display: flex; gap: 8px; align-items: center; font-size: 11px; }
-.geek-statusbar-sep { opacity: 0.4; }
-.geek-statusbar-ws { font-weight: 600; }
-.geek-statusbar-filter { font-size: 11px; }
+.geek-statusbar-left {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.geek-statusbar-right {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+}
+.geek-statusbar-sep {
+  opacity: 0.4;
+}
+.geek-statusbar-ws {
+  font-weight: 600;
+}
+.geek-statusbar-filter {
+  font-size: 11px;
+}
 .geek-statusbar kbd {
   display: inline-block;
   padding: 1px 4px;
-  border: 1px solid rgba(0,0,0,0.3);
+  border: 1px solid rgba(0, 0, 0, 0.3);
   border-radius: 2px;
   font-size: 10px;
   font-family: var(--geek-mono);
@@ -306,8 +417,12 @@
   justify-content: space-between;
   align-items: center;
 }
-.geek-ds-key { font-size: 11px; }
-.geek-ds-val { text-align: right; }
+.geek-ds-key {
+  font-size: 11px;
+}
+.geek-ds-val {
+  text-align: right;
+}
 .geek-dot {
   display: inline-block;
   width: 6px;
@@ -326,8 +441,18 @@
 
 /* ===== 响应式 ===== */
 @media (max-width: 767px) {
-  .geek-hero-number { font-size: 48px; }
-  .geek-hero-metrics { grid-template-columns: repeat(2, 1fr); }
-  .geek-statusbar { flex-direction: column; gap: 4px; padding: 8px 12px; }
-  .geek-braille { font-size: 11px; }
+  .geek-hero-number {
+    font-size: 48px;
+  }
+  .geek-hero-metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .geek-statusbar {
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 12px;
+  }
+  .geek-braille {
+    font-size: 11px;
+  }
 }
