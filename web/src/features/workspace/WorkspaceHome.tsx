@@ -6,7 +6,10 @@ import { Button } from "@/components/ui/button";
 import { OverviewPage } from "@/features/overview/OverviewPage";
 import { ApiError } from "@/lib/api";
 import type { Workspace } from "./api";
-import { WorkspaceCreateDialog } from "./WorkspaceCreateDialog";
+import {
+  WorkspaceCreateDialog,
+  type CreateSubmitScope,
+} from "./WorkspaceCreateDialog";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 import {
   isCurrentSessionUser,
@@ -39,6 +42,14 @@ export function WorkspaceHome({ userId }: { userId: string }) {
   const switchTarget = useRef<string | null>(null);
   /** 本容器实例当前的身份；身份变化后旧选择不得再导航。 */
   const identity = useRef(userId);
+  /** 挂载状态：卸载后的迟到回调只返回，不再设置状态或 URL。 */
+  const mounted = useRef(true);
+  /** 本容器发起、仍在等待的详情验证；卸载时只取消这一条。 */
+  const activeDetail = useRef<{ userId: string; workspaceId: string } | null>(
+    null,
+  );
+  /** 最新 URL 选择，供创建完成后判断期间是否发生过外部导航。 */
+  const urlSelection = useRef<string | null>(null);
 
   /** 作废进行中的选择：递增序号、清掉 pending，旧回调此后一律提前返回。 */
   const resetSelection = useCallback(() => {
@@ -85,14 +96,27 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     void client.cancelQueries({ queryKey: ["workspace", "detail", previous] });
   }, [client, resetSelection, userId]);
 
-  // 卸载后旧回调同样作废：离开的容器不得再设置 URL。
-  useEffect(
-    () => () => {
+  // URL 选择的最新值；创建完成时据此识别期间发生的外部导航。
+  useEffect(() => {
+    urlSelection.current = urlWorkspaceId;
+  }, [urlWorkspaceId]);
+
+  // 卸载后旧回调同样作废：离开的容器不得再设置 URL 或状态。
+  // 只取消本容器发起的那条详情验证，不动其他容器或新身份的任务。
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
       switchSeq.current += 1;
       switchTarget.current = null;
-    },
-    [],
-  );
+      const detail = activeDetail.current;
+      activeDetail.current = null;
+      if (detail === null) return;
+      void client.cancelQueries({
+        queryKey: ["workspace", "detail", detail.userId, detail.workspaceId],
+      });
+    };
+  }, [client]);
 
   // URL 被浏览器前进/后退或其他入口改到别的空间：先到的新位置优先，进行中的切换作废。
   useEffect(() => {
@@ -108,9 +132,38 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     });
   }
 
-  /** 这次选择是否仍有效：序号未被作废，且发起身份仍是当前会话。 */
-  function isStillSelected(ticket: number): boolean {
-    return switchSeq.current === ticket && isCurrentSessionUser(client, userId);
+  /**
+   * 每个 await 之后调用：仍持有当前 ticket 才能继续操作共享状态。
+   * 更新选择已接管时纯返回；仍持有 ticket 但身份失效时只清掉自己的 pending。
+   */
+  function canContinue(ticket: number): boolean {
+    if (switchSeq.current !== ticket) return false;
+    if (isCurrentSessionUser(client, userId)) return true;
+    resetSelection();
+    return false;
+  }
+
+  /** 创建提交瞬间的选择与位置；返回后凭它判断是否还能导航。 */
+  const captureCreateScope = useCallback(
+    (): CreateSubmitScope => ({
+      userId,
+      ticket: switchSeq.current,
+      urlWorkspaceId: urlSelection.current,
+    }),
+    [userId],
+  );
+
+  /** 创建完成时仍可导航：容器挂载、提交身份未变、选择未被接管、URL 未被外部改动。 */
+  function canNavigateAfterCreate(
+    scope: CreateSubmitScope,
+    created: Workspace,
+  ): boolean {
+    if (!mounted.current) return false;
+    if (scope.userId !== userId) return false;
+    if (!canContinue(scope.ticket)) return false;
+    const urlNow = urlSelection.current;
+    // 提交时的位置未变，或已经落在新建空间上（零空间规范化），才不算外部导航。
+    return urlNow === scope.urlWorkspaceId || urlNow === created.workspaceId;
   }
 
   async function selectWorkspace(target: Workspace) {
@@ -130,13 +183,15 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     await client.cancelQueries({
       queryKey: ["workspace", "detail", userId],
     });
-    if (switchSeq.current !== ticket) return;
+    if (!canContinue(ticket)) return;
     if (selectingCurrent) return;
+    const detail = { userId, workspaceId: target.workspaceId };
+    activeDetail.current = detail;
     try {
       await client.fetchQuery(workspaceDetailQuery(userId, target.workspaceId));
-      if (!isStillSelected(ticket)) return resetSelection();
+      if (!canContinue(ticket)) return;
       await cancelWorkspaceBusiness(current.workspaceId);
-      if (!isStillSelected(ticket)) return resetSelection();
+      if (!canContinue(ticket)) return;
       switchTarget.current = null;
       setParams(
         (prev) => {
@@ -148,7 +203,7 @@ export function WorkspaceHome({ userId }: { userId: string }) {
       );
       setPendingId(null);
     } catch (error) {
-      if (switchSeq.current !== ticket) return;
+      if (!canContinue(ticket)) return;
       switchTarget.current = null;
       setPendingId(null);
       setSwitchError(
@@ -156,16 +211,19 @@ export function WorkspaceHome({ userId }: { userId: string }) {
           ? `无法切换到「${target.name}」：没有访问权限。`
           : "切换失败，请重试。",
       );
+    } finally {
+      // 只清自己登记的那条，避免覆盖更新选择刚登记的详情验证。
+      if (activeDetail.current === detail) activeDetail.current = null;
     }
   }
 
-  async function handleCreated(created: Workspace) {
-    const ticket = switchSeq.current + 1;
-    switchSeq.current = ticket;
+  async function handleCreated(created: Workspace, scope: CreateSubmitScope) {
+    // 创建已成功、列表已重查；此后只在提交时的容器、身份、选择与位置都仍有效时导航。
+    if (!canNavigateAfterCreate(scope, created)) return;
     await client.cancelQueries({ queryKey: ["workspace", "detail", userId] });
+    if (!canNavigateAfterCreate(scope, created)) return;
     if (current) await cancelWorkspaceBusiness(current.workspaceId);
-    // 提交前确认仍是同一次有效选择，且容器身份未变。
-    if (!isStillSelected(ticket)) return resetSelection();
+    if (!canNavigateAfterCreate(scope, created)) return;
     setPendingId(null);
     setSwitchError(null);
     setCreateOpen(false);
@@ -211,6 +269,7 @@ export function WorkspaceHome({ userId }: { userId: string }) {
         userId={userId}
         required
         onClose={() => undefined}
+        captureScope={captureCreateScope}
         onCreated={handleCreated}
       />
     );
@@ -237,6 +296,7 @@ export function WorkspaceHome({ userId }: { userId: string }) {
           userId={userId}
           required={false}
           onClose={() => setCreateOpen(false)}
+          captureScope={captureCreateScope}
           onCreated={handleCreated}
         />
       ) : null}
