@@ -1014,6 +1014,83 @@ func TestProjectRules(t *testing.T) {
 	})
 }
 
+// prefetchRecordingStore hands out item transactions that announce the optional
+// project prefetch hint, so a test can prove when the hint is issued.
+type prefetchRecordingStore struct {
+	*fakeStore
+	prefetched []projectLookup
+}
+
+func (s *prefetchRecordingStore) BeginItem(ctx context.Context) (itemTx, error) {
+	tx, err := s.fakeStore.BeginItem(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &prefetchRecordingTx{itemTx: tx, store: s}, nil
+}
+
+// prefetchRecordingTx delegates every statement to the scripted transaction and
+// records the hint in the shared call sequence.
+type prefetchRecordingTx struct {
+	itemTx
+	store *prefetchRecordingStore
+}
+
+func (t *prefetchRecordingTx) PrefetchProject(workspaceID, projectID credentials.ID) {
+	t.store.record("prefetch")
+	t.store.mu.Lock()
+	defer t.store.mu.Unlock()
+	t.store.prefetched = append(t.store.prefetched, projectLookup{workspaceID: workspaceID, projectID: projectID})
+}
+
+// TestProjectPrefetchHint proves the hint is only issued for an attributed event
+// and always before the first clock sample, which is the only position where the
+// store can still merge the two statements into one round trip.
+func TestProjectPrefetchHint(t *testing.T) {
+	projectID := syntheticID(0x44)
+	projectJSON := `{"source_event_id":"req-prefetch","project_id":"44444444-4444-4444-4444-444444444445","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+
+	t.Run("attributed event prefetches before the first sample", func(t *testing.T) {
+		store := &prefetchRecordingStore{fakeStore: newFakeStore()}
+		store.projects[projectID.Bytes] = struct{}{}
+		results := New(store, &fakeAuthenticator{token: "tpk_synthetic"}, nil).process(context.Background(), credentials.Credential{
+			WorkspaceID: syntheticWorkspace,
+			SourceID:    syntheticSource,
+		}, []item{{event: mustDecodeEvent(t, projectJSON)}})
+		if len(results) != 1 || results[0].status != statusAccepted {
+			t.Fatalf("results=%+v want one accepted item", results)
+		}
+		if len(store.prefetched) != 1 {
+			t.Fatalf("prefetch calls=%d want=1", len(store.prefetched))
+		}
+		want := projectLookup{workspaceID: syntheticWorkspace, projectID: projectID}
+		if store.prefetched[0] != want {
+			t.Fatalf("prefetched=%+v want=%+v", store.prefetched[0], want)
+		}
+		sequence := store.sequence()
+		if !strings.HasPrefix(sequence, "begin,prefetch,now,") {
+			t.Fatalf("store calls=%q want prefetch between begin and the first sample", sequence)
+		}
+	})
+
+	t.Run("unattributed event never prefetches", func(t *testing.T) {
+		store := &prefetchRecordingStore{fakeStore: newFakeStore()}
+		results := New(store, &fakeAuthenticator{token: "tpk_synthetic"}, nil).process(context.Background(), credentials.Credential{
+			WorkspaceID: syntheticWorkspace,
+			SourceID:    syntheticSource,
+		}, []item{{event: mustDecodeEvent(t, validEventJSON("req-no-prefetch", fixedNow))}})
+		if len(results) != 1 || results[0].status != statusAccepted {
+			t.Fatalf("results=%+v want one accepted item", results)
+		}
+		if len(store.prefetched) != 0 {
+			t.Fatalf("prefetch calls=%d want=0 for an unattributed event", len(store.prefetched))
+		}
+		if sequence := store.sequence(); strings.Contains(sequence, "prefetch") {
+			t.Fatalf("store calls=%q want no prefetch", sequence)
+		}
+	})
+}
+
 func TestCancellationStopsRemainingItemsWithoutAccepted(t *testing.T) {
 	environment := newTestEnvironment(t)
 	ctx, cancel := context.WithCancel(context.Background())

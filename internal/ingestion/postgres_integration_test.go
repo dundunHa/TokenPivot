@@ -1257,6 +1257,160 @@ func TestLockWaitCrossesLowerBoundInsideMinute(t *testing.T) {
 	}
 }
 
+// TestBatchPipelineSamplesClockAfterLockWait drives the real pipelined statements
+// with no scripted clock: the second statement of each write must observe the
+// database server time after a lock wait released, and that value is cached for the
+// window re-check that follows. A sample taken while the write was still blocked is
+// therefore a lower bound the cached value may never undercut.
+func TestBatchPipelineSamplesClockAfterLockWait(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	store := NewPostgres(pool)
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	t.Run("pipelined statements keep their results", func(t *testing.T) {
+		service := e.service(t, pool, &syncBuffer{})
+		conflict := fmt.Sprintf(`{"source_event_id":"evt-batch-new","project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			uuidText(projectID), occurredAt.UTC().Format(microLayout))
+		results := runBatch(t, service, credential, encodedBatch(t,
+			acceptedEventJSON("evt-batch-new", occurredAt, projectID),
+			conflict,
+			acceptedEventJSON("evt-batch-new", occurredAt, projectID),
+		))
+		requireResultStatuses(t, results, statusAccepted, statusConflict, statusDuplicate)
+		if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-batch-new"); count != 1 {
+			t.Fatalf("rows=%d want=1", count)
+		}
+		bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		if bucket.eventCount != 1 || bucket.sum[0] != 100 {
+			t.Fatalf("bucket=%+v want one count of 100", bucket)
+		}
+	})
+
+	t.Run("insert samples the clock after the identity lock", func(t *testing.T) {
+		observer := e.probeConn(t)
+		item := beginItem(t, ctx, store)
+		defer rollbackItem(t, ctx, item)
+		postgresItem, ok := item.(*postgresTx)
+		if !ok {
+			t.Fatal("NewPostgres did not return its own item transaction")
+		}
+		event := mustDecodeEvent(t, acceptedEventJSON("evt-batch-insert", occurredAt, projectID))
+
+		// The prefetch hint merges the initial sample with the ownership query, so
+		// the buffered answer must be consumed without a second statement.
+		postgresItem.PrefetchProject(credential.WorkspaceID, event.ProjectID)
+		receivedAt, window, err := sampleWindow(ctx, item, event)
+		if err != nil || window != verdictValid {
+			t.Fatalf("initial window err=%v verdict=%v want valid", err, window)
+		}
+		exists, err := item.ProjectExists(ctx, credential.WorkspaceID, event.ProjectID)
+		if err != nil || !exists {
+			t.Fatalf("prefetched project exists=%v err=%v want true", exists, err)
+		}
+
+		release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
+			holdIdentityLock(t, ctx, tx, workspaceID, sourceID, "evt-batch-insert", receivedAt)
+		})
+		done := make(chan error, 1)
+		go func() {
+			_, insertErr := item.InsertEvent(ctx, storedEventFor(credential, event, receivedAt))
+			done <- insertErr
+		}()
+		waitForWaitingBackend(t, ctx, observer)
+		blocked := e.serverTime(t, ctx, observer)
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("blocked insert failed: %v", err)
+		}
+		sampled := postgresItem.sampledNow
+		if sampled == nil || sampled.err != nil {
+			t.Fatalf("insert cached sample=%+v want the pipelined server time", sampled)
+		}
+		if sampled.at.Before(blocked) {
+			t.Fatalf("sampled %s is earlier than the server time %s read while the insert was blocked", sampled.at, blocked)
+		}
+		now, err := item.Now(ctx)
+		if err != nil || !now.Equal(sampled.at) {
+			t.Fatalf("following sample now=%s err=%v want the cached %s", now, err, sampled.at)
+		}
+	})
+
+	t.Run("minute increment samples the clock after the bucket lock", func(t *testing.T) {
+		observer := e.probeConn(t)
+		seed := e.service(t, pool, &syncBuffer{})
+		requireResultStatuses(t, runBatch(t, seed, credential, encodedBatch(t,
+			acceptedEventJSON("evt-batch-minute-seed", occurredAt, projectID),
+		)), statusAccepted)
+
+		item := beginItem(t, ctx, store)
+		defer rollbackItem(t, ctx, item)
+		postgresItem, ok := item.(*postgresTx)
+		if !ok {
+			t.Fatal("NewPostgres did not return its own item transaction")
+		}
+		event := mustDecodeEvent(t, acceptedEventJSON("evt-batch-minute", occurredAt, projectID))
+
+		release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
+			holdMinuteLock(t, ctx, tx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		})
+		done := make(chan error, 1)
+		go func() {
+			done <- item.ApplyMinute(ctx, minuteInputFor(credential, event))
+		}()
+		waitForWaitingBackend(t, ctx, observer)
+		blocked := e.serverTime(t, ctx, observer)
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("blocked minute increment failed: %v", err)
+		}
+		sampled := postgresItem.sampledNow
+		if sampled == nil || sampled.err != nil {
+			t.Fatalf("minute increment cached sample=%+v want the pipelined server time", sampled)
+		}
+		if sampled.at.Before(blocked) {
+			t.Fatalf("sampled %s is earlier than the server time %s read while the increment was blocked", sampled.at, blocked)
+		}
+		now, err := item.Now(ctx)
+		if err != nil || !now.Equal(sampled.at) {
+			t.Fatalf("following sample now=%s err=%v want the cached %s", now, err, sampled.at)
+		}
+	})
+}
+
+// beginItem opens one real item transaction on the test goroutine.
+func beginItem(t *testing.T, ctx context.Context, store *Postgres) itemTx {
+	t.Helper()
+	item, err := store.BeginItem(ctx)
+	if err != nil {
+		t.Fatal(database.SafeError("begin item", err))
+	}
+	return item
+}
+
+// rollbackItem discards an item transaction that must never commit.
+func rollbackItem(t *testing.T, ctx context.Context, item itemTx) {
+	t.Helper()
+	if err := item.Rollback(ctx); err != nil {
+		t.Error(database.SafeError("rollback item", err))
+	}
+}
+
+// serverTime reads the server clock on the observation connection, so a test can
+// record a lower bound for a sample taken by another transaction.
+func (e *integrationEnv) serverTime(t *testing.T, ctx context.Context, observer *pgx.Conn) time.Time {
+	t.Helper()
+	var now time.Time
+	if err := observer.QueryRow(ctx, nowQuery).Scan(&now); err != nil {
+		t.Fatal(database.SafeError("sample server time", err))
+	}
+	return now
+}
+
 // hookStore wraps the real store and lets a test act at one exact point of the item
 // transaction, so a race is created by ordering and never by a sleep.
 type hookStore struct {
@@ -1296,6 +1450,18 @@ func (t *hookTx) Now(ctx context.Context) (time.Time, error) {
 
 func (t *hookTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
 	return t.inner.ProjectExists(ctx, workspaceID, projectID)
+}
+
+// PrefetchProject forwards the optional hint only while the server time is real. A
+// scripted clock answers Now on this wrapper, so the inner transaction must not
+// queue the ownership query behind a sample its owner never reads.
+func (t *hookTx) PrefetchProject(workspaceID, projectID credentials.ID) {
+	if t.hooks.now != nil {
+		return
+	}
+	if prefetcher, ok := t.inner.(projectPrefetcher); ok {
+		prefetcher.PrefetchProject(workspaceID, projectID)
+	}
 }
 
 func (t *hookTx) InsertEvent(ctx context.Context, event storedEvent) (bool, error) {
