@@ -2,6 +2,7 @@
 
 > 关联待办：`T-066`
 > 依据文档：[OpenAPI 接口文档](../openapi/openapi.yaml) §5.3 / §8、[ADR-0002](../decisions/0002-ingestion-idempotency-and-batch.md)、[ADR-0003](../decisions/0003-minute-aggregation-and-retention.md)、[数据模型](../data-model.md) §4–§5
+> 当前状态：**已交付并验证通过**（见文末 [§5 交付与验证记录](#5-交付与验证记录)）
 
 ---
 
@@ -76,3 +77,22 @@
    - `GOTOOLCHAIN=local go test -race -count=1 ./internal/ingestion/...` 通过；
    - `make check`（全部 9 个检查阶段）通过；
    - 在真实 PostgreSQL 18 实例上执行 `GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -race -count=1 -p 1 -v ./internal/ingestion` 全部通过。
+
+---
+
+## 5. 交付与验证记录
+
+- **交付日期**：2026-11-03
+- **实现与合入提交**：
+  - `baa0386`：初版 `pgx.Batch` 管道合并；
+  - `8ee7aa1`：经独立 `review`（`0de58ba4`）与 `oracle`（`ef9c1de3`）审查，改用 `pipelinedBatch`（`pgx.ExtendedQueryBuilder` + `pgconn.Batch.ExecParams` + `ExecBatch` 单次 `Sync`）并对单发查询启用 `pgx.QueryExecModeExec`；
+  - `a30032a`：经第二轮 `review`（`0c282d43`）、`oracle`（`e4a67544`）裁决与用户确认，拆开首次 `Now` 与 `ProjectExists` 以严格保障时间窗口判断先于项目查询，`service.go` 与 `handler_test.go` 恢复零改动，补齐 12 项冷/热连接 RTT 矩阵测试；
+  - `6fdee57`：`--no-ff` 合入 `main`。
+- **范围与方案调整记录**：
+  - 初版尝试将首次 `Now` 与 `ProjectExists` 同批发送以压至全 5 RTT，经 `review` 与 `oracle` 指出在 `projects` 表被 `ACCESS EXCLUSIVE` 排他锁阻塞时会延迟 `expired` / `FUTURE_EVENT` 返回，最终由用户确认为「严格保语义：无项目 5 RTT / 有项目 6 RTT」。
+- **验证证据**：
+  - `GOTOOLCHAIN=local go test -race -count=1 ./internal/ingestion/...`：通过；
+  - `make check`（9/9 阶段：格式检查、`go vet`、前端 `lint`、全包 Go `race` 测试、前端 229 项单测与代理测试、`build-go`、`build`、`uiembed` Go `race` 测试、`uiembed` `go vet`）：全部通过；
+  - 真实 PostgreSQL 18.6 集成测试（`GOTOOLCHAIN=local go test -mod=readonly -tags=uiembed,integration -race -count=1 -p 1 -v ./internal/ingestion`）：全量 39 个测试（含 `TestBatchPipelineSamplesClockAfterLockWait` 4 个子测试与 12 项冷/热连接 RTT 计数矩阵）全部 `PASS`；
+  - 独立只读终审 `review`（`211dbf46`）：`PASS`。
+- **未验证项**：无。
