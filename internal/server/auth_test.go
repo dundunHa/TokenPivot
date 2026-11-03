@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,6 +36,10 @@ type authFakeStore struct {
 	// from the HTTP clock to model a response that is written after the database
 	// already assigned the expiry.
 	now func() time.Time
+	// feishuIdentities maps a Feishu open_id to its bound account.
+	feishuIdentities map[string]auth.User
+	// identities records the binding written per account.
+	identities map[auth.ID]auth.FeishuIdentity
 }
 
 type fakeSession struct {
@@ -50,7 +57,13 @@ type authStoreFailures struct {
 }
 
 func newAuthFakeStore() *authFakeStore {
-	return &authFakeStore{users: make(map[string]auth.Credential), sessions: make(map[string]fakeSession), calls: make(map[string]int)}
+	return &authFakeStore{
+		users:            make(map[string]auth.Credential),
+		sessions:         make(map[string]fakeSession),
+		calls:            make(map[string]int),
+		feishuIdentities: make(map[string]auth.User),
+		identities:       make(map[auth.ID]auth.FeishuIdentity),
+	}
 }
 
 // clock reads the store clock, so a test can hold the database time still while
@@ -136,6 +149,72 @@ func (f *authFakeStore) CreateUser(ctx context.Context, email, passwordHash stri
 	user := auth.User{ID: f.identifier(), Email: email}
 	f.users[email] = auth.Credential{User: user, PasswordHash: passwordHash}
 	return user, nil
+}
+
+// seedFeishuUser inserts an account that has no local password, as the Feishu
+// callback creates it.
+func (f *authFakeStore) seedFeishuUser(email string) auth.User {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	user := auth.User{ID: f.identifier(), Email: email}
+	f.users[email] = auth.Credential{User: user}
+	return user
+}
+
+// seedFeishuBinding binds an open_id to an existing account.
+func (f *authFakeStore) seedFeishuBinding(openID string, user auth.User) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.feishuIdentities[openID] = user
+	f.identities[user.ID] = auth.FeishuIdentity{OpenID: openID, Email: user.Email}
+}
+
+// UserByFeishuOpenID reports the account bound to an open_id.
+func (f *authFakeStore) UserByFeishuOpenID(ctx context.Context, openID string) (auth.User, bool, error) {
+	f.record("UserByFeishuOpenID")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	user, ok := f.feishuIdentities[openID]
+	return user, ok, nil
+}
+
+// CreateFeishuUser inserts an account without a local password.
+func (f *authFakeStore) CreateFeishuUser(ctx context.Context, email string) (auth.User, error) {
+	f.record("CreateFeishuUser")
+	if f.failures.create != nil {
+		return auth.User{}, f.failures.create
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.users[email]; exists {
+		return auth.User{}, auth.ErrEmailUnavailable
+	}
+	user := auth.User{ID: f.identifier(), Email: email}
+	f.users[email] = auth.Credential{User: user}
+	return user, nil
+}
+
+// UpsertFeishuIdentity writes the binding once per (user, provider) and reports
+// an open_id already owned by another account.
+func (f *authFakeStore) UpsertFeishuIdentity(ctx context.Context, userID auth.ID, identity auth.FeishuIdentity) error {
+	f.record("UpsertFeishuIdentity")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if owner, exists := f.feishuIdentities[identity.OpenID]; exists && owner.ID != userID {
+		return auth.ErrFeishuIdentityConflict
+	}
+	var user auth.User
+	for _, credential := range f.users {
+		if credential.User.ID == userID {
+			user = credential.User
+			break
+		}
+	}
+	if user.ID != (auth.ID{}) {
+		f.feishuIdentities[identity.OpenID] = user
+	}
+	f.identities[userID] = identity
+	return nil
 }
 
 func (f *authFakeStore) CreateSession(ctx context.Context, userID auth.ID, tokenHash []byte) (time.Time, error) {
@@ -857,4 +936,490 @@ func TestAuthRoutesAbsentWithoutAuth(t *testing.T) {
 func digest(token string) []byte {
 	sum := sha256.Sum256([]byte(token))
 	return sum[:]
+}
+
+// feishuHTTPStub fakes the Feishu open platform for the HTTP-level tests. Every
+// value is synthetic and no test contacts the real provider.
+type feishuHTTPStub struct {
+	server *httptest.Server
+	openID string
+	email  string
+	// fail makes the token exchange report a provider error.
+	fail bool
+}
+
+func newFeishuHTTPStub(t *testing.T) *feishuHTTPStub {
+	t.Helper()
+	stub := &feishuHTTPStub{openID: "ou_synthetic_open_id", email: "synthetic@example.com"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /open-apis/auth/v3/app_access_token/internal", func(w http.ResponseWriter, r *http.Request) {
+		writeFeishuStubJSON(w, http.StatusOK, map[string]any{"code": 0, "app_access_token": "synthetic-app-token"})
+	})
+	mux.HandleFunc("POST /open-apis/authen/v1/oidc/access_token", func(w http.ResponseWriter, r *http.Request) {
+		if stub.fail {
+			writeFeishuStubJSON(w, http.StatusOK, map[string]any{"code": 20001, "msg": "synthetic provider failure"})
+			return
+		}
+		writeFeishuStubJSON(w, http.StatusOK, map[string]any{"code": 0, "data": map[string]any{"user_access_token": "synthetic-user-token"}})
+	})
+	mux.HandleFunc("GET /open-apis/authen/v1/user_info", func(w http.ResponseWriter, r *http.Request) {
+		writeFeishuStubJSON(w, http.StatusOK, map[string]any{"code": 0, "data": map[string]any{
+			"open_id":    stub.openID,
+			"union_id":   "on_synthetic_union",
+			"tenant_key": "tk_synthetic_tenant",
+			"email":      stub.email,
+			"name":       "Synthetic User",
+		}})
+	})
+	stub.server = httptest.NewServer(mux)
+	t.Cleanup(stub.server.Close)
+	return stub
+}
+
+func writeFeishuStubJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// newFeishuTestHandler builds the full handler with Feishu configured against the
+// stub.
+func newFeishuTestHandler(t *testing.T, stub *feishuHTTPStub, registrationOpen, autoProvision bool) (*Auth, *authFakeStore, http.Handler) {
+	t.Helper()
+	store := newAuthFakeStore()
+	origin, err := config.ParseOrigin(testOrigin, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := auth.New(store, store, auth.NewLimiter(nil), registrationOpen)
+	service.EnableFeishu(auth.FeishuConfig{
+		AppID:         "cli_synthetic_app",
+		AppSecret:     "synthetic-secret",
+		RedirectURI:   testOrigin + feishuCallbackPath,
+		BaseURL:       stub.server.URL,
+		AutoProvision: autoProvision,
+		HTTPClient:    stub.server.Client(),
+	})
+	adapter := NewAuth(service, origin)
+	return adapter, store, NewHandler(Options{CheckReady: func(context.Context) error { return nil }, Auth: adapter})
+}
+
+// doFeishuGet performs one browser navigation without Origin, which is what the
+// authorize and callback endpoints require.
+func doFeishuGet(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.RemoteAddr = "127.0.0.1:40000"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// feishuCookie returns one cookie of the response, or nil.
+func feishuCookie(w *httptest.ResponseRecorder, name string) *http.Cookie {
+	for _, cookie := range w.Result().Cookies() {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
+// mustFeishuCookie returns one cookie or fails the test.
+func mustFeishuCookie(t *testing.T, w *httptest.ResponseRecorder, name string) *http.Cookie {
+	t.Helper()
+	cookie := feishuCookie(w, name)
+	if cookie == nil {
+		t.Fatalf("response did not set %s", name)
+	}
+	return cookie
+}
+
+// authorizeFeishu runs the authorize query and returns the state it issued plus
+// the state cookie.
+func authorizeFeishu(t *testing.T, h http.Handler) (string, *http.Cookie) {
+	t.Helper()
+	w := doFeishuGet(t, h, feishuAuthorizePath)
+	if w.Code != http.StatusOK {
+		t.Fatalf("authorize status = %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Enabled          bool    `json:"enabled"`
+		AuthorizeURL     *string `json:"authorize_url"`
+		ExpiresInSeconds int     `json:"expires_in_seconds"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("authorize body = %s", w.Body.String())
+	}
+	if !body.Enabled || body.AuthorizeURL == nil || body.ExpiresInSeconds != 180 {
+		t.Fatalf("authorize body = %s", w.Body.String())
+	}
+	parsed, err := url.Parse(*body.AuthorizeURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := parsed.Query().Get("state")
+	if state == "" {
+		t.Fatalf("authorize URL has no state: %s", *body.AuthorizeURL)
+	}
+	return state, mustFeishuCookie(t, w, feishuStateCookieName)
+}
+
+// doFeishuCallback performs one callback navigation, optionally with the state
+// cookie.
+func doFeishuCallback(t *testing.T, h http.Handler, code, state string, stateCookie *http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	path := feishuCallbackPath + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.RemoteAddr = "127.0.0.1:40000"
+	if stateCookie != nil {
+		req.AddCookie(&http.Cookie{Name: stateCookie.Name, Value: stateCookie.Value})
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// doFeishuBind performs one bind request with the trusted Origin and JSON body.
+func doFeishuBind(t *testing.T, h http.Handler, cookie *http.Cookie, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, feishuBindPath, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testOrigin)
+	req.RemoteAddr = "127.0.0.1:40000"
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// TestFeishuAuthorizeDisabledIsNotAnError proves an instance without Feishu
+// credentials still answers 200 and says so, without setting a state cookie.
+func TestFeishuAuthorizeDisabledIsNotAnError(t *testing.T) {
+	_, _, h := authHandler(t)
+	w := doFeishuGet(t, h, feishuAuthorizePath)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	var body struct {
+		Enabled          bool    `json:"enabled"`
+		AuthorizeURL     *string `json:"authorize_url"`
+		ExpiresInSeconds int     `json:"expires_in_seconds"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	if body.Enabled || body.AuthorizeURL != nil || body.ExpiresInSeconds != 0 {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"authorize_url":null`) {
+		t.Fatalf("disabled authorize_url is not null: %s", w.Body.String())
+	}
+	if len(w.Result().Cookies()) != 0 {
+		t.Fatal("a disabled instance set a cookie")
+	}
+}
+
+// TestFeishuAuthorizeStoresOnlyTheStateDigest proves the state cookie carries the
+// SHA-256 digest with the documented attributes, so page script cannot read a
+// reusable state.
+func TestFeishuAuthorizeStoresOnlyTheStateDigest(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, _, h := newFeishuTestHandler(t, stub, true, true)
+	state, cookie := authorizeFeishu(t, h)
+	if cookie.Path != feishuCookiePath || cookie.MaxAge != 180 || !cookie.HttpOnly || cookie.Domain != "" || cookie.Secure || cookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("unexpected state cookie: %+v", cookie)
+	}
+	if len(cookie.Value) != 64 || cookie.Value != hex.EncodeToString(digest(state)) {
+		t.Fatalf("state cookie does not carry the SHA-256 digest")
+	}
+	if strings.Contains(cookie.Value, state) {
+		t.Fatal("state cookie carries the plaintext state")
+	}
+}
+
+func TestFeishuCallbackRejectsInvalidState(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, store, h := newFeishuTestHandler(t, stub, true, true)
+	state, cookie := authorizeFeishu(t, h)
+	for name, tc := range map[string]struct {
+		code        string
+		state       string
+		stateCookie *http.Cookie
+	}{
+		"missing cookie": {code: "synthetic-code", state: state},
+		"empty state":    {code: "synthetic-code", state: "", stateCookie: cookie},
+		"missing code":   {code: "", state: state, stateCookie: cookie},
+		"wrong state":    {code: "synthetic-code", state: state + "-tampered", stateCookie: cookie},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := doFeishuCallback(t, h, tc.code, tc.state, tc.stateCookie)
+			if w.Code != http.StatusFound || w.Header().Get("Location") != loginPagePath+"?error=FEISHU_STATE_INVALID" {
+				t.Fatalf("status/location = %d %q", w.Code, w.Header().Get("Location"))
+			}
+			cleared := mustFeishuCookie(t, w, feishuStateCookieName)
+			if cleared.Value != "" || cleared.MaxAge != -1 || cleared.Path != feishuCookiePath {
+				t.Fatalf("state cookie was not cleared: %+v", cleared)
+			}
+			if sessionCookieOrNil(w) != nil {
+				t.Fatal("a rejected callback issued a session")
+			}
+		})
+	}
+	if calls := store.callCount("UserByFeishuOpenID"); calls != 0 {
+		t.Fatalf("rejected callbacks reached the store %d times", calls)
+	}
+}
+
+// sessionCookieOrNil returns the session cookie of a recorder, or nil.
+func sessionCookieOrNil(w *httptest.ResponseRecorder) *http.Cookie {
+	return feishuCookie(w, sessionCookieName)
+}
+
+// TestFeishuCallbackSignsInBoundIdentity covers branch A: a bound open_id gets a
+// session directly, without a bind step.
+func TestFeishuCallbackSignsInBoundIdentity(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, store, h := newFeishuTestHandler(t, stub, true, true)
+	user := store.seedUser(t, "synthetic@example.com", "synthetic-password")
+	store.seedFeishuBinding(stub.openID, user)
+
+	state, cookie := authorizeFeishu(t, h)
+	w := doFeishuCallback(t, h, "synthetic-code", state, cookie)
+	if w.Code != http.StatusFound || w.Header().Get("Location") != "/" {
+		t.Fatalf("status/location = %d %q", w.Code, w.Header().Get("Location"))
+	}
+	session := mustFeishuCookie(t, w, sessionCookieName)
+	if session.Value == "" || session.Path != "/" || !session.HttpOnly {
+		t.Fatalf("unexpected session cookie: %+v", session)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("callback wrote a body: %q", w.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodGet, sessionPath, nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Value})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "synthetic@example.com") {
+		t.Fatalf("session status/body = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestFeishuSameEmailBindFlow covers branch B end to end: the callback asks for
+// the account password, a wrong password is refused without consuming the
+// pending binding, and the right password writes the identity and signs in.
+func TestFeishuSameEmailBindFlow(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, store, h := newFeishuTestHandler(t, stub, true, true)
+	user := store.seedUser(t, "synthetic@example.com", "synthetic-password")
+
+	state, cookie := authorizeFeishu(t, h)
+	w := doFeishuCallback(t, h, "synthetic-code", state, cookie)
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback status = %d: %s", w.Code, w.Body.String())
+	}
+	location := w.Header().Get("Location")
+	if !strings.HasPrefix(location, loginPagePath+"?feishu_bind=1&email=") || !strings.Contains(location, "synthetic%40example.com") {
+		t.Fatalf("location = %q", location)
+	}
+	if sessionCookieOrNil(w) != nil {
+		t.Fatal("an unconfirmed same-email callback issued a session")
+	}
+	bindCookie := mustFeishuCookie(t, w, feishuBindCookieName)
+	if bindCookie.Path != feishuCookiePath || bindCookie.MaxAge != 600 || !bindCookie.HttpOnly || bindCookie.Secure {
+		t.Fatalf("unexpected bind cookie: %+v", bindCookie)
+	}
+	if !strings.HasPrefix(bindCookie.Value, "tpb_") {
+		t.Fatalf("bind cookie = %q", bindCookie.Value)
+	}
+
+	// The bind write requires the trusted Origin like every browser write.
+	req := httptest.NewRequest(http.MethodPost, feishuBindPath, strings.NewReader(`{"password":"synthetic-password"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: bindCookie.Name, Value: bindCookie.Value})
+	originless := httptest.NewRecorder()
+	h.ServeHTTP(originless, req)
+	if originless.Code != http.StatusForbidden || !strings.Contains(originless.Body.String(), "PERMISSION_DENIED") {
+		t.Fatalf("originless bind = %d %s", originless.Code, originless.Body.String())
+	}
+
+	wrong := doFeishuBind(t, h, &http.Cookie{Name: bindCookie.Name, Value: bindCookie.Value}, `{"password":"synthetic-wrong-password"}`)
+	if wrong.Code != http.StatusUnauthorized || !strings.Contains(wrong.Body.String(), "INVALID_CREDENTIALS") {
+		t.Fatalf("wrong password = %d %s", wrong.Code, wrong.Body.String())
+	}
+	if feishuCookie(wrong, feishuBindCookieName) != nil {
+		t.Fatal("a wrong password cleared the pending binding cookie")
+	}
+	if len(store.identities) != 0 {
+		t.Fatal("a wrong password wrote an identity")
+	}
+
+	ok := doFeishuBind(t, h, &http.Cookie{Name: bindCookie.Name, Value: bindCookie.Value}, `{"password":"synthetic-password"}`)
+	if ok.Code != http.StatusOK {
+		t.Fatalf("bind status = %d: %s", ok.Code, ok.Body.String())
+	}
+	session := mustFeishuCookie(t, ok, sessionCookieName)
+	if session.Value == "" {
+		t.Fatal("bind did not issue a session")
+	}
+	cleared := mustFeishuCookie(t, ok, feishuBindCookieName)
+	if cleared.MaxAge != -1 || cleared.Value != "" {
+		t.Fatalf("bind cookie was not cleared: %+v", cleared)
+	}
+	identity, found := store.identities[user.ID]
+	if !found || identity.OpenID != stub.openID {
+		t.Fatalf("stored identity = %+v", identity)
+	}
+	if !strings.Contains(ok.Body.String(), `"email":"synthetic@example.com"`) {
+		t.Fatalf("bind body = %s", ok.Body.String())
+	}
+}
+
+func TestFeishuBindRequiresPendingCredential(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, _, h := newFeishuTestHandler(t, stub, true, true)
+	w := doFeishuBind(t, h, nil, `{"password":"synthetic-password"}`)
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "UNAUTHENTICATED") {
+		t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
+	}
+	cleared := mustFeishuCookie(t, w, feishuBindCookieName)
+	if cleared.MaxAge != -1 {
+		t.Fatalf("bind cookie was not cleared: %+v", cleared)
+	}
+}
+
+func TestFeishuBindRejectsUnknownBodyFields(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, store, h := newFeishuTestHandler(t, stub, true, true)
+	store.seedUser(t, "synthetic@example.com", "synthetic-password")
+	state, cookie := authorizeFeishu(t, h)
+	callback := doFeishuCallback(t, h, "synthetic-code", state, cookie)
+	bindCookie := mustFeishuCookie(t, callback, feishuBindCookieName)
+
+	for name, body := range map[string]string{
+		"email field":      `{"password":"synthetic-password","email":"other@example.com"}`,
+		"duplicate key":    `{"password":"synthetic-password","password":"synthetic-password"}`,
+		"wrong value type": `{"password":12345678}`,
+		"trailing content": `{"password":"synthetic-password"} {}`,
+		"empty object":     `{}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := doFeishuBind(t, h, &http.Cookie{Name: bindCookie.Name, Value: bindCookie.Value}, body)
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "INVALID_ARGUMENT") {
+				t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
+			}
+			if feishuCookie(w, feishuBindCookieName) != nil {
+				t.Fatal("a rejected body cleared the pending binding")
+			}
+		})
+	}
+}
+
+// TestFeishuClosedRegistrationAllowsAutoProvision pins decision 3.A: closing
+// ordinary registration does not close Feishu provisioning, and the created
+// account has no local password.
+func TestFeishuClosedRegistrationAllowsAutoProvision(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, store, h := newFeishuTestHandler(t, stub, false, true)
+	store.seedUser(t, "existing@example.com", "synthetic-password")
+
+	closed := doAuthRequest(t, h, http.MethodPost, registerPath, `{"email":"synthetic@example.com","password":"synthetic-password"}`)
+	if closed.Code != http.StatusForbidden || !strings.Contains(closed.Body.String(), "REGISTRATION_CLOSED") {
+		t.Fatalf("closed registration = %d %s", closed.Code, closed.Body.String())
+	}
+
+	state, cookie := authorizeFeishu(t, h)
+	w := doFeishuCallback(t, h, "synthetic-code", state, cookie)
+	if w.Code != http.StatusFound || w.Header().Get("Location") != "/" {
+		t.Fatalf("status/location = %d %q (%s)", w.Code, w.Header().Get("Location"), w.Body.String())
+	}
+	mustFeishuCookie(t, w, sessionCookieName)
+	credential, ok := store.users["synthetic@example.com"]
+	if !ok || credential.PasswordHash != "" {
+		t.Fatalf("created account = %+v, want no local password", credential)
+	}
+	if identity := store.identities[credential.User.ID]; identity.OpenID != stub.openID {
+		t.Fatalf("stored identity = %+v", identity)
+	}
+
+	// A password-less account cannot be signed in with an email and password.
+	login := doAuthRequest(t, h, http.MethodPost, loginPath, `{"email":"synthetic@example.com","password":"synthetic-password"}`)
+	if login.Code != http.StatusUnauthorized || !strings.Contains(login.Body.String(), "INVALID_CREDENTIALS") {
+		t.Fatalf("passwordless login = %d %s", login.Code, login.Body.String())
+	}
+}
+
+// TestFeishuClosedRegistrationRefusesProvisioningOff proves both switches off and
+// a non-empty database refuse a new Feishu user with the documented redirect.
+func TestFeishuClosedRegistrationRefusesProvisioningOff(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, store, h := newFeishuTestHandler(t, stub, false, false)
+	store.seedUser(t, "existing@example.com", "synthetic-password")
+
+	state, cookie := authorizeFeishu(t, h)
+	w := doFeishuCallback(t, h, "synthetic-code", state, cookie)
+	if w.Code != http.StatusFound || w.Header().Get("Location") != loginPagePath+"?error=REGISTRATION_CLOSED" {
+		t.Fatalf("status/location = %d %q", w.Code, w.Header().Get("Location"))
+	}
+	if _, ok := store.users["synthetic@example.com"]; ok {
+		t.Fatal("a refused callback created an account")
+	}
+	if sessionCookieOrNil(w) != nil {
+		t.Fatal("a refused callback issued a session")
+	}
+}
+
+func TestFeishuCallbackReportsProviderFailure(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	stub.fail = true
+	_, _, h := newFeishuTestHandler(t, stub, true, true)
+
+	state, cookie := authorizeFeishu(t, h)
+	w := doFeishuCallback(t, h, "synthetic-code", state, cookie)
+	if w.Code != http.StatusFound || w.Header().Get("Location") != loginPagePath+"?error=FEISHU_AUTH_FAILED" {
+		t.Fatalf("status/location = %d %q", w.Code, w.Header().Get("Location"))
+	}
+	if sessionCookieOrNil(w) != nil {
+		t.Fatal("a failed exchange issued a session")
+	}
+}
+
+func TestFeishuCallbackRateLimited(t *testing.T) {
+	stub := newFeishuHTTPStub(t)
+	_, store, h := newFeishuTestHandler(t, stub, true, true)
+	user := store.seedUser(t, "synthetic@example.com", "synthetic-password")
+	store.seedFeishuBinding(stub.openID, user)
+
+	for attempt := range 5 {
+		state := "synthetic-state-" + strconv.Itoa(attempt)
+		cookie := &http.Cookie{Name: feishuStateCookieName, Value: hex.EncodeToString(digest(state))}
+		if w := doFeishuCallback(t, h, "synthetic-code", state, cookie); w.Code != http.StatusFound || w.Header().Get("Location") != "/" {
+			t.Fatalf("attempt status/location = %d %q", w.Code, w.Header().Get("Location"))
+		}
+	}
+	state := "synthetic-state-final"
+	cookie := &http.Cookie{Name: feishuStateCookieName, Value: hex.EncodeToString(digest(state))}
+	w := doFeishuCallback(t, h, "synthetic-code", state, cookie)
+	if w.Code != http.StatusFound || w.Header().Get("Location") != loginPagePath+"?error=RATE_LIMITED" {
+		t.Fatalf("limited status/location = %d %q", w.Code, w.Header().Get("Location"))
+	}
+}
+
+func TestFeishuBindUnavailableWhenNotConfigured(t *testing.T) {
+	adapter, _, h := authHandler(t)
+	w := doFeishuBind(t, h, nil, `{"password":"synthetic-password"}`)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "UNAVAILABLE") {
+		t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if adapter.Service.FeishuEnabled() {
+		t.Fatal("the default test service reports Feishu as enabled")
+	}
 }

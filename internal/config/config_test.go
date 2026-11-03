@@ -445,3 +445,220 @@ func TestDisableOriginCheckSetting(t *testing.T) {
 		}
 	}
 }
+
+// unsetFeishuEnv removes every Feishu setting, so a test starts from the
+// "not configured" deployment without depending on the host environment.
+func unsetFeishuEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"TOKENPIVOT_FEISHU_APP_ID",
+		"TOKENPIVOT_FEISHU_APP_SECRET",
+		"TOKENPIVOT_FEISHU_REDIRECT_URI",
+		"TOKENPIVOT_FEISHU_AUTO_PROVISION",
+		"TOKENPIVOT_FEISHU_BASE_URL",
+	} {
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestFeishuDefaultsToDisabled pins the deployment default: no credentials means
+// the login page is told the instance has no Feishu application.
+func TestFeishuDefaultsToDisabled(t *testing.T) {
+	setLoadableEnv(t)
+	unsetFeishuEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FeishuEnabled() {
+		t.Fatal("Feishu is enabled without credentials")
+	}
+	if want := "http://127.0.0.1:5173/api/v1/auth/feishu/callback"; cfg.Feishu.RedirectURI != want {
+		t.Fatalf("RedirectURI = %q, want %q", cfg.Feishu.RedirectURI, want)
+	}
+	if cfg.Feishu.BaseURL != "https://open.feishu.cn" {
+		t.Fatalf("BaseURL = %q", cfg.Feishu.BaseURL)
+	}
+	if !cfg.Feishu.AutoProvision {
+		t.Fatal("AutoProvision defaults to false, want true")
+	}
+	if cfg.Feishu.AppSecret != "" || cfg.Feishu.AppID != "" {
+		t.Fatal("an unset deployment kept a credential")
+	}
+}
+
+func TestFeishuCredentialsEnableTheProvider(t *testing.T) {
+	setLoadableEnv(t)
+	unsetFeishuEnv(t)
+	t.Setenv("TOKENPIVOT_FEISHU_APP_ID", "cli_synthetic_app")
+	t.Setenv("TOKENPIVOT_FEISHU_APP_SECRET", "synthetic-secret")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.FeishuEnabled() {
+		t.Fatal("both credentials set but Feishu reports disabled")
+	}
+	if cfg.Feishu.AppID != "cli_synthetic_app" || cfg.Feishu.AppSecret != "synthetic-secret" {
+		t.Fatal("credentials were not read")
+	}
+}
+
+// TestFeishuHalfConfigurationFails proves one credential alone stops startup and
+// the error names the pair without echoing the value that was supplied.
+func TestFeishuHalfConfigurationFails(t *testing.T) {
+	for name, set := range map[string]map[string]string{
+		"app id only":     {"TOKENPIVOT_FEISHU_APP_ID": "synthetic-sensitive-marker"},
+		"app secret only": {"TOKENPIVOT_FEISHU_APP_SECRET": "synthetic-sensitive-marker"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setLoadableEnv(t)
+			unsetFeishuEnv(t)
+			for key, value := range set {
+				t.Setenv(key, value)
+			}
+			_, err := Load()
+			if err == nil {
+				t.Fatal("half configuration loaded")
+			}
+			message := err.Error()
+			if !strings.Contains(message, "TOKENPIVOT_FEISHU_APP_ID") || !strings.Contains(message, "TOKENPIVOT_FEISHU_APP_SECRET") {
+				t.Fatalf("error does not name both settings: %s", message)
+			}
+			if strings.Contains(message, "synthetic-sensitive-marker") {
+				t.Fatal("the error repeats a configured value")
+			}
+		})
+	}
+}
+
+func TestFeishuAutoProvisionAcceptsStrictBooleans(t *testing.T) {
+	for value, want := range map[string]bool{"true": true, "false": false} {
+		t.Run(value, func(t *testing.T) {
+			setLoadableEnv(t)
+			unsetFeishuEnv(t)
+			t.Setenv("TOKENPIVOT_FEISHU_AUTO_PROVISION", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Feishu.AutoProvision != want {
+				t.Fatalf("AutoProvision = %t, want %t", cfg.Feishu.AutoProvision, want)
+			}
+		})
+	}
+}
+
+func TestFeishuAutoProvisionRejectsOtherSpellings(t *testing.T) {
+	for name, value := range map[string]string{
+		"empty":             "",
+		"blank":             " ",
+		"surrounding space": " true ",
+		"uppercase":         "TRUE",
+		"numeric":           "1",
+		"yes":               "yes",
+	} {
+		t.Run(name, func(t *testing.T) {
+			setLoadableEnv(t)
+			unsetFeishuEnv(t)
+			t.Setenv("TOKENPIVOT_FEISHU_AUTO_PROVISION", value)
+			if value == "" {
+				if err := os.Unsetenv("TOKENPIVOT_FEISHU_AUTO_PROVISION"); err != nil {
+					t.Fatal(err)
+				}
+				cfg, err := Load()
+				if err != nil || !cfg.Feishu.AutoProvision {
+					t.Fatalf("unset must default to true: %v %+v", err, cfg.Feishu)
+				}
+				return
+			}
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("%q was accepted", value)
+			}
+			if !strings.Contains(err.Error(), "TOKENPIVOT_FEISHU_AUTO_PROVISION") {
+				t.Fatalf("error = %s", err.Error())
+			}
+			if strings.Contains(err.Error(), "synthetic-sensitive-marker") {
+				t.Fatal("the error repeats a configured value")
+			}
+		})
+	}
+}
+
+func TestFeishuRedirectURIOverride(t *testing.T) {
+	setLoadableEnv(t)
+	unsetFeishuEnv(t)
+	t.Setenv("TOKENPIVOT_FEISHU_REDIRECT_URI", "https://tokenpivot.example.com/feishu/callback")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Feishu.RedirectURI != "https://tokenpivot.example.com/feishu/callback" {
+		t.Fatalf("RedirectURI = %q", cfg.Feishu.RedirectURI)
+	}
+}
+
+func TestFeishuRedirectURIRejected(t *testing.T) {
+	for name, value := range map[string]string{
+		"not a URL":          "synthetic-sensitive-marker",
+		"relative":           "/feishu/callback",
+		"fragment":           "https://tokenpivot.example.com/cb#synthetic-sensitive-marker",
+		"query":              "https://tokenpivot.example.com/cb?x=1",
+		"user information":   "https://user:pass@tokenpivot.example.com/cb",
+		"non http scheme":    "ftp://tokenpivot.example.com/cb",
+		"surrounding spaces": " https://tokenpivot.example.com/cb",
+	} {
+		t.Run(name, func(t *testing.T) {
+			setLoadableEnv(t)
+			unsetFeishuEnv(t)
+			t.Setenv("TOKENPIVOT_FEISHU_REDIRECT_URI", value)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("%q was accepted", value)
+			}
+			if !strings.Contains(err.Error(), "TOKENPIVOT_FEISHU_REDIRECT_URI") || strings.Contains(err.Error(), "synthetic-sensitive-marker") {
+				t.Fatalf("error = %s", err.Error())
+			}
+		})
+	}
+}
+
+func TestFeishuBaseURLOverrideTrimsTrailingSlash(t *testing.T) {
+	setLoadableEnv(t)
+	unsetFeishuEnv(t)
+	t.Setenv("TOKENPIVOT_FEISHU_BASE_URL", "http://127.0.0.1:9099/")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Feishu.BaseURL != "http://127.0.0.1:9099" {
+		t.Fatalf("BaseURL = %q", cfg.Feishu.BaseURL)
+	}
+}
+
+func TestFeishuBaseURLRejected(t *testing.T) {
+	for name, value := range map[string]string{
+		"not a URL":        "synthetic-sensitive-marker",
+		"fragment":         "http://127.0.0.1:9099/#synthetic-sensitive-marker",
+		"non http scheme":  "ftp://127.0.0.1:9099",
+		"missing host":     "http://",
+		"user information": "http://user:pass@127.0.0.1:9099",
+	} {
+		t.Run(name, func(t *testing.T) {
+			setLoadableEnv(t)
+			unsetFeishuEnv(t)
+			t.Setenv("TOKENPIVOT_FEISHU_BASE_URL", value)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("%q was accepted", value)
+			}
+			if !strings.Contains(err.Error(), "TOKENPIVOT_FEISHU_BASE_URL") || strings.Contains(err.Error(), "synthetic-sensitive-marker") {
+				t.Fatalf("error = %s", err.Error())
+			}
+		})
+	}
+}
