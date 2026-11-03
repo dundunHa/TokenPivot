@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { sessionKey } from "./queries";
@@ -16,7 +16,14 @@ const SESSION = "/api/v1/auth/session";
 const LOGIN = "/api/v1/auth/login";
 const REGISTER = "/api/v1/auth/register";
 const LOGOUT = "/api/v1/auth/logout";
+const AUTHORIZE = "/api/v1/auth/feishu/authorize";
 const FUTURE = "2999-01-01T00:00:00Z";
+
+// 飞书授权地址是公开登录页的初始化请求：这里直接让它在服务端失败，
+// 页面必须进入“二维码已过期”的可刷新状态，不产生未捕获异常，也不打断认证流程。
+beforeEach(() => {
+  server.use(http.get(AUTHORIZE, () => errorResponse(500, "INTERNAL")));
+});
 
 function countSessionGets() {
   const counter = { count: 0 };

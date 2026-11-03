@@ -62,9 +62,10 @@ func UserFromContext(ctx context.Context) (auth.User, bool) {
 	return identity.user, ok
 }
 
-// routes registers the four authentication endpoints on mux. Every response,
+// routes registers the browser authentication endpoints on mux. Every response,
 // including Origin and session failures, is marked no-store by wrapping the
-// whole path.
+// whole path. The two Feishu reads are navigations and need no Origin; the bind
+// write is an XHR and keeps the Origin gate like login.
 func (a *Auth) routes(mux *http.ServeMux) {
 	if a == nil || a.Service == nil {
 		return
@@ -73,6 +74,9 @@ func (a *Auth) routes(mux *http.ServeMux) {
 	mux.Handle("POST "+loginPath, a.noStore(a.RequireOrigin(http.HandlerFunc(a.handleLogin))))
 	mux.Handle("GET "+sessionPath, a.noStore(a.RequireSession(http.HandlerFunc(a.handleSession))))
 	mux.Handle("POST "+logoutPath, a.noStore(a.RequireOrigin(http.HandlerFunc(a.handleLogout))))
+	mux.Handle("GET "+feishuAuthorizePath, a.noStore(http.HandlerFunc(a.handleFeishuAuthorize)))
+	mux.Handle("GET "+feishuCallbackPath, a.noStore(http.HandlerFunc(a.handleFeishuCallback)))
+	mux.Handle("POST "+feishuBindPath, a.noStore(a.RequireOrigin(http.HandlerFunc(a.handleFeishuBind))))
 }
 
 // noStore marks a response as uncacheable before the wrapped handler runs.

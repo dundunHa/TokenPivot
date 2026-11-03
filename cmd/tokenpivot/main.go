@@ -49,6 +49,13 @@ func run(logger *slog.Logger) error {
 	}
 	authStore := auth.NewPostgres(pool)
 	authService := auth.New(authStore, authStore, auth.NewLimiter(nil), cfg.RegistrationOpen)
+	authService.EnableFeishu(auth.FeishuConfig{
+		AppID:         cfg.Feishu.AppID,
+		AppSecret:     cfg.Feishu.AppSecret,
+		RedirectURI:   cfg.Feishu.RedirectURI,
+		BaseURL:       cfg.Feishu.BaseURL,
+		AutoProvision: cfg.Feishu.AutoProvision,
+	})
 	credentialService := credentials.New(credentials.NewPostgres(pool))
 	workspacePostgres := workspaces.NewPostgres(pool)
 	workspaceService := workspaces.New(workspacePostgres, workspacePostgres)

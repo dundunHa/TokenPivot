@@ -25,7 +25,44 @@ type Config struct {
 	// an explicitly approved exception for the BF deployment, read once at startup;
 	// session authentication and the Secure cookie attribute are unaffected.
 	DisableOriginCheck bool
+	// Feishu is the startup configuration of Feishu sign-in. A zero value keeps
+	// the provider disabled.
+	Feishu FeishuConfig
 }
+
+// FeishuConfig is the startup configuration of Feishu (Lark) sign-in. AppSecret
+// is used only in requests to the Feishu open platform and must never be logged.
+type FeishuConfig struct {
+	AppID         string
+	AppSecret     string
+	RedirectURI   string
+	BaseURL       string
+	AutoProvision bool
+}
+
+// Feishu environment variable names.
+const (
+	feishuAppIDSetting         = "TOKENPIVOT_FEISHU_APP_ID"
+	feishuAppSecretSetting     = "TOKENPIVOT_FEISHU_APP_SECRET"
+	feishuRedirectURISetting   = "TOKENPIVOT_FEISHU_REDIRECT_URI"
+	feishuAutoProvisionSetting = "TOKENPIVOT_FEISHU_AUTO_PROVISION"
+	feishuBaseURLSetting       = "TOKENPIVOT_FEISHU_BASE_URL"
+)
+
+// defaultFeishuBaseURL is the Feishu open platform origin. A deployment only
+// overrides it to point at a local stub service.
+const defaultFeishuBaseURL = "https://open.feishu.cn"
+
+// feishuCallbackPath is appended to the trusted Web origin when no explicit
+// redirect URI is configured.
+const feishuCallbackPath = "/api/v1/auth/feishu/callback"
+
+// Enabled reports whether the instance may offer Feishu sign-in. Both
+// application credentials must be present; neither one alone enables it.
+func (f FeishuConfig) Enabled() bool { return f.AppID != "" && f.AppSecret != "" }
+
+// FeishuEnabled reports the Feishu availability of one loaded configuration.
+func (c Config) FeishuEnabled() bool { return c.Feishu.Enabled() }
 
 // Load reads the service's environment once and validates it. Invalid values are
 // never included in returned errors.
@@ -65,7 +102,73 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{HTTPAddr: addr, DatabaseURL: databaseURL, WebOrigin: origin, RegistrationOpen: registrationOpen, DisableOriginCheck: disableOriginCheck}, nil
+	feishu, err := loadFeishu(origin)
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{HTTPAddr: addr, DatabaseURL: databaseURL, WebOrigin: origin, RegistrationOpen: registrationOpen, DisableOriginCheck: disableOriginCheck, Feishu: feishu}, nil
+}
+
+// loadFeishu reads the five Feishu settings. The two credentials are all or
+// nothing: a half-configured application fails startup instead of silently
+// offering a broken button. The redirect URI defaults to the trusted Web origin
+// plus the callback path, so an operator setting only the credentials gets a
+// working address. Returned errors name the variable and never repeat a value,
+// because one of the values is the application secret.
+func loadFeishu(origin Origin) (FeishuConfig, error) {
+	appID := strings.TrimSpace(os.Getenv(feishuAppIDSetting))
+	appSecret := strings.TrimSpace(os.Getenv(feishuAppSecretSetting))
+	if (appID == "") != (appSecret == "") {
+		return FeishuConfig{}, errors.New("TOKENPIVOT_FEISHU_APP_ID and TOKENPIVOT_FEISHU_APP_SECRET must be set together")
+	}
+	redirectRaw := os.Getenv(feishuRedirectURISetting)
+	redirectURI := strings.TrimSpace(redirectRaw)
+	if redirectRaw != redirectURI {
+		return FeishuConfig{}, errors.New("TOKENPIVOT_FEISHU_REDIRECT_URI must not have surrounding whitespace")
+	}
+	if redirectURI == "" {
+		redirectURI = origin.String() + feishuCallbackPath
+	} else if err := validateFeishuURL(feishuRedirectURISetting, redirectURI); err != nil {
+		return FeishuConfig{}, err
+	}
+	autoProvision, err := strictBoolSettingDefault(feishuAutoProvisionSetting, true)
+	if err != nil {
+		return FeishuConfig{}, err
+	}
+	baseRaw := os.Getenv(feishuBaseURLSetting)
+	baseURL := strings.TrimSpace(baseRaw)
+	if baseRaw != baseURL {
+		return FeishuConfig{}, errors.New("TOKENPIVOT_FEISHU_BASE_URL must not have surrounding whitespace")
+	}
+	if baseURL == "" {
+		baseURL = defaultFeishuBaseURL
+	} else {
+		baseURL = strings.TrimRight(baseURL, "/")
+	}
+	if err := validateFeishuURL(feishuBaseURLSetting, baseURL); err != nil {
+		return FeishuConfig{}, err
+	}
+	return FeishuConfig{AppID: appID, AppSecret: appSecret, RedirectURI: redirectURI, BaseURL: baseURL, AutoProvision: autoProvision}, nil
+}
+
+// validateFeishuURL accepts only one absolute http(s) URL with a host and
+// without user information, query or fragment, so a configured endpoint can
+// never smuggle credentials or a second target. The rejected value is not part
+// of the error.
+func validateFeishuURL(name, value string) error {
+	if value == "" || strings.TrimSpace(value) != value || strings.ContainsAny(value, " \t\r\n") {
+		return errors.New(name + " must be one absolute http(s) URL without whitespace")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New(name + " must be one absolute http(s) URL without user information, query or fragment")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		return nil
+	default:
+		return errors.New(name + " scheme must be http or https")
+	}
 }
 
 // strictBoolSetting reads a boolean environment variable once. Unset means
@@ -74,9 +177,16 @@ func Load() (Config, error) {
 // instead of being interpreted differently by two deployments. The returned error
 // names the variable and its allowed values and never repeats the rejected value.
 func strictBoolSetting(name string) (bool, error) {
+	return strictBoolSettingDefault(name, false)
+}
+
+// strictBoolSettingDefault is strictBoolSetting with an explicit unset value, so
+// a setting whose documented default is on does not have to spell that out at
+// every call site.
+func strictBoolSettingDefault(name string, defaultValue bool) (bool, error) {
 	value, ok := os.LookupEnv(name)
 	if !ok {
-		return false, nil
+		return defaultValue, nil
 	}
 	switch value {
 	case "true":
