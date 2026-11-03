@@ -117,20 +117,17 @@ type Store interface {
 }
 
 // RegistrationStore is the transaction-bound write surface of registration. It
-// extends Store with the three ordered steps of one account creation plus the two
+// extends Store with the two ordered writes of one account creation plus the two
 // statements that decide whether a closed deployment may accept its first user.
 // A store handed to TxRunner.InTx is bound to one database transaction, so the
-// account, its personal workspace, the owner membership and the first session
-// commit or roll back together.
+// account and its first session commit or roll back together. Registration writes
+// nothing outside users and sessions: a new account starts with no workspace and
+// no membership, and the user creates workspaces explicitly afterwards.
 type RegistrationStore interface {
 	Store
 	// CreateUser inserts the account and returns its database identity. Only the
 	// email unique index conflict becomes ErrEmailUnavailable.
 	CreateUser(ctx context.Context, email, passwordHash string) (User, error)
-	// CreatePersonal creates the initial personal workspace of the user and its
-	// owner membership through the workspaces transaction adapter. It never
-	// starts a transaction of its own.
-	CreatePersonal(ctx context.Context, userID ID) error
 	// LockRegistration takes the exclusive registration lock for the rest of the
 	// transaction, so at most one first-user decision runs at a time.
 	LockRegistration(ctx context.Context) error
@@ -141,8 +138,8 @@ type RegistrationStore interface {
 
 // TxRunner runs a function inside one database transaction. The store handed to
 // the function is bound to that transaction, so every write it performs commits
-// or rolls back as a unit. Registration creates the account, its personal
-// workspace and its first session inside this single transaction.
+// or rolls back as a unit. Registration creates the account and its first session
+// inside this single transaction.
 type TxRunner interface {
 	InTx(ctx context.Context, fn func(context.Context, RegistrationStore) error) error
 }
@@ -158,17 +155,18 @@ type Service struct {
 }
 
 // New returns a Service. Store reads outside a transaction use store; Register
-// uses tx so the account, its personal workspace and its first session are one
-// atomic unit. registrationOpen is the startup configuration and is never read
-// again, so a handler can never change it per request.
+// uses tx so the account and its first session are one atomic unit.
+// registrationOpen is the startup configuration and is never read again, so a
+// handler can never change it per request.
 func New(store Store, tx TxRunner, limiter *Limiter, registrationOpen bool) *Service {
 	return &Service{store: store, tx: tx, limiter: limiter, registrationOpen: registrationOpen}
 }
 
 // Register validates the account input, reserves one rate-limit slot in both
-// windows, hashes the password outside the transaction, then creates the account,
-// its personal workspace, the owner membership and its first session in one
-// transaction. The new session is returned so the caller can set a cookie.
+// windows, hashes the password outside the transaction, then creates the account
+// and its first session in one transaction. It creates no workspace and no
+// membership: a new account starts with zero workspaces and the user creates the
+// first one explicitly. The new session is returned so the caller can set a cookie.
 func (s *Service) Register(ctx context.Context, email, password, remoteIP string) (Session, error) {
 	normalized, err := normalizeEmail(email)
 	if err != nil {
@@ -205,9 +203,6 @@ func (s *Service) Register(ctx context.Context, email, password, remoteIP string
 		}
 		user, err := tx.CreateUser(ctx, normalized, passwordHash)
 		if err != nil {
-			return err
-		}
-		if err := tx.CreatePersonal(ctx, user.ID); err != nil {
 			return err
 		}
 		expiresAt, err := tx.CreateSession(ctx, user.ID, sessionTokenHash(token))
