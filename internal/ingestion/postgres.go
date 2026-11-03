@@ -9,6 +9,7 @@ import (
 	"github.com/dundunHa/TokenPivot/internal/credentials"
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -82,15 +83,86 @@ func (p *Postgres) TouchSource(ctx context.Context, workspaceID, sourceID creden
 	return nil
 }
 
-// postgresTx is the per-item transaction wrapper. Each method runs one statement in
-// the caller's transaction and never commits on its own.
+// projectLookup is the ownership query one prefetch hint asks for.
+type projectLookup struct {
+	workspaceID credentials.ID
+	projectID   credentials.ID
+}
+
+// projectCheckResult is the ownership answer read from a prefetched round trip and
+// held until ProjectExists consumes it.
+type projectCheckResult struct {
+	lookup projectLookup
+	exists bool
+	err    error
+}
+
+// sampledTime is a server time read from the second statement of a pipelined write
+// and held until the following Now consumes it.
+type sampledTime struct {
+	at  time.Time
+	err error
+}
+
+// postgresTx is the per-item transaction wrapper. Each method runs in the caller's
+// transaction, never commits on its own, and merges its own statement with the
+// adjacent independent statement into one pipelined round trip. The pending and
+// buffered fields hold the pipelined answers until their consumer asks for them.
 type postgresTx struct {
-	tx pgx.Tx
+	tx              pgx.Tx
+	pendingProject  *projectLookup
+	bufferedProject *projectCheckResult
+	sampledNow      *sampledTime
+}
+
+// PrefetchProject announces that the next server time sample may be sent together
+// with this ownership query. It only records the hint: the query is queued by Now,
+// so a window that ends the item early never adds it to the batch.
+func (t *postgresTx) PrefetchProject(workspaceID, projectID credentials.ID) {
+	t.pendingProject = &projectLookup{workspaceID: workspaceID, projectID: projectID}
+	t.bufferedProject = nil
 }
 
 // Now reads the server time from the database. It is a statement, not a
 // transaction-start constant, so a wait on a lock is visible to the next sample.
+// A pending project prefetch turns this sample and the ownership query into one
+// round trip; a time already sampled by the previous write is returned without any
+// round trip.
 func (t *postgresTx) Now(ctx context.Context) (time.Time, error) {
+	if sampled := t.sampledNow; sampled != nil {
+		t.sampledNow = nil
+		return sampled.at, sampled.err
+	}
+	if t.pendingProject != nil {
+		lookup := *t.pendingProject
+		t.pendingProject = nil
+		var batch pgx.Batch
+		batch.Queue(nowQuery)
+		batch.Queue(projectExistsQuery, lookup.workspaceID, lookup.projectID)
+		br := t.tx.SendBatch(ctx, &batch)
+		defer func() { _ = br.Close() }()
+
+		var now time.Time
+		if err := br.QueryRow().Scan(&now); err != nil {
+			return time.Time{}, database.SafeError("ingestion server time", err)
+		}
+		// The ownership answer is buffered, including its failure: an item that the
+		// window already ended must report expired or FUTURE_EVENT, never a project
+		// lookup error.
+		var found int
+		switch err := br.QueryRow().Scan(&found); {
+		case err == nil:
+			t.bufferedProject = &projectCheckResult{lookup: lookup, exists: true}
+		case errors.Is(err, pgx.ErrNoRows):
+			t.bufferedProject = &projectCheckResult{lookup: lookup}
+		default:
+			t.bufferedProject = &projectCheckResult{lookup: lookup, err: database.SafeError("ingestion project", err)}
+		}
+		if closeErr := br.Close(); closeErr != nil && t.bufferedProject.err == nil {
+			return time.Time{}, database.SafeError("ingestion server time", closeErr)
+		}
+		return now, nil
+	}
 	var now time.Time
 	if err := t.tx.QueryRow(ctx, nowQuery).Scan(&now); err != nil {
 		return time.Time{}, database.SafeError("ingestion server time", err)
@@ -100,8 +172,16 @@ func (t *postgresTx) Now(ctx context.Context) (time.Time, error) {
 
 // ProjectExists reports whether the project belongs to the workspace. Archived
 // projects still belong to it: archiving does not change the event's business
-// identity.
+// identity. A prefetched answer for exactly this pair is used as is; every other
+// call runs the query on its own.
 func (t *postgresTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
+	t.pendingProject = nil
+	if buffered := t.bufferedProject; buffered != nil {
+		t.bufferedProject = nil
+		if buffered.lookup.workspaceID == workspaceID && buffered.lookup.projectID == projectID {
+			return buffered.exists, buffered.err
+		}
+	}
 	var found int
 	if err := t.tx.QueryRow(ctx, projectExistsQuery, workspaceID, projectID).Scan(&found); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -113,39 +193,101 @@ func (t *postgresTx) ProjectExists(ctx context.Context, workspaceID, projectID c
 }
 
 // InsertEvent inserts the detail row once. A false result means this identity
-// already exists; any other failure is a real storage failure.
+// already exists; any other failure is a real storage failure. The clock sample
+// queued right behind the insert therefore observes the server time after the
+// insert's lock wait, not before it.
 func (t *postgresTx) InsertEvent(ctx context.Context, event storedEvent) (bool, error) {
+	t.sampledNow = nil
+	var batch pgx.Batch
+	batch.Queue(insertEventQuery, eventArgs(event)...)
+	batch.Queue(nowQuery)
+	br := t.tx.SendBatch(ctx, &batch)
+	defer func() { _ = br.Close() }()
+
+	inserted := true
 	var found int
-	err := t.tx.QueryRow(ctx, insertEventQuery, eventArgs(event)...).Scan(&found)
+	err := br.QueryRow().Scan(&found)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// ON CONFLICT DO NOTHING RETURNING yields no row when the identity exists.
-		return false, nil
-	}
-	if err != nil {
+		inserted = false
+	} else if err != nil {
 		return false, database.SafeError("ingestion insert event", err)
 	}
-	return true, nil
+	t.captureSampledNow(br)
+	return inserted, nil
 }
 
-// ExistingEvent reads the stored comparison basis of one identity, if any.
+// ExistingEvent reads the stored comparison basis of one identity, if any. The
+// clock sample of the same round trip feeds the window re-check that follows the
+// read.
 func (t *postgresTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
+	t.sampledNow = nil
+	var batch pgx.Batch
+	batch.Queue(existingEventQuery, workspaceID, sourceID, sourceEventID)
+	batch.Queue(nowQuery)
+	br := t.tx.SendBatch(ctx, &batch)
+	defer func() { _ = br.Close() }()
+
 	var existing storedEvent
-	err := t.tx.QueryRow(ctx, existingEventQuery, workspaceID, sourceID, sourceEventID).Scan(
-		&existing.NormalizationVersion, &existing.PayloadHash,
-	)
+	found := true
+	err := br.QueryRow().Scan(&existing.NormalizationVersion, &existing.PayloadHash)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return storedEvent{}, false, nil
-	}
-	if err != nil {
+		existing = storedEvent{}
+		found = false
+	} else if err != nil {
 		return storedEvent{}, false, database.SafeError("ingestion existing event", err)
 	}
-	return existing, true, nil
+	t.captureSampledNow(br)
+	return existing, found, nil
 }
 
 // ApplyMinute writes the minute increment through the aggregation package, inside
-// this same transaction, so both writes commit or roll back together.
+// this same transaction, so both writes commit or roll back together. The write is
+// pipelined with the following clock sample by minuteBatchTx.
 func (t *postgresTx) ApplyMinute(ctx context.Context, input aggregation.MinuteInput) error {
-	return aggregation.ApplyRequest(ctx, t.tx, input)
+	t.sampledNow = nil
+	return aggregation.ApplyRequest(ctx, &minuteBatchTx{Tx: t.tx, parent: t}, input)
+}
+
+// minuteBatchTx is the aggregation writer's transaction view for one item: it
+// forwards every method to the item transaction and turns its single Exec into a
+// pipelined round trip that also samples the server time after the statement.
+type minuteBatchTx struct {
+	pgx.Tx
+	parent *postgresTx
+}
+
+// Exec runs the minute upsert and the clock sample as one round trip. Any failure
+// of the statement is returned as is, so the aggregation package still owns its
+// stage name; the sample is only read once the statement itself succeeded.
+func (m *minuteBatchTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	var batch pgx.Batch
+	batch.Queue(sql, arguments...)
+	batch.Queue(nowQuery)
+	br := m.Tx.SendBatch(ctx, &batch)
+	defer func() { _ = br.Close() }()
+	tag, err := br.Exec()
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	m.parent.captureSampledNow(br)
+	return tag, nil
+}
+
+// captureSampledNow reads the clock sample queued behind a pipelined statement and
+// holds its value or its sanitized error for the next Now.
+func (t *postgresTx) captureSampledNow(br pgx.BatchResults) {
+	var now time.Time
+	if err := br.QueryRow().Scan(&now); err != nil {
+		t.sampledNow = &sampledTime{err: database.SafeError("ingestion server time", err)}
+		_ = br.Close()
+		return
+	}
+	if err := br.Close(); err != nil {
+		t.sampledNow = &sampledTime{err: database.SafeError("ingestion server time", err)}
+		return
+	}
+	t.sampledNow = &sampledTime{at: now}
 }
 
 // Commit commits the item. Its error is reported as indeterminate by the caller
@@ -196,6 +338,7 @@ func metricValue(metric aggregation.Metric) any {
 // Ensure the store and transaction wrappers satisfy the narrow interfaces the
 // service declares.
 var (
-	_ store  = (*Postgres)(nil)
-	_ itemTx = (*postgresTx)(nil)
+	_ store             = (*Postgres)(nil)
+	_ itemTx            = (*postgresTx)(nil)
+	_ projectPrefetcher = (*postgresTx)(nil)
 )
