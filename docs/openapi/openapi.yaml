@@ -8,7 +8,7 @@ info:
 
     本文冻结 TokenPivot 首版三组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）、**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）与 **owner 凭证管理**（列表、签发、轮换、撤销，以及会话、`Origin`、owner 准入与错误码）。
 
-    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`workspaces/current`、`usage/options`，T-057）与请求明细/60 秒速率接口（`usage-events`、`usage-rate`，T-058）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
+    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`usage/options`，T-057）与请求明细/60 秒速率接口（`usage-events`、`usage-rate`，T-058）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作区列表、创建与详情接口见 `workspaces` 标签（T-064），注册不再创建工作区，零空间是正常状态；成员邀请、成员列表与角色管理属 T-020，不在本文。
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
@@ -51,7 +51,7 @@ info:
     - 只认 `cookieAuth`（`tokenpivot_session`）。明文为 `tps_` + `crypto/rand.Text()`，数据库只存完整令牌的 SHA-256 原始 32 字节摘要；`tpk_` 插件令牌在这里不被接受，Bearer 头也不建立浏览器身份。
     - 会话 30 天精确滑动：每次有效认证都用一条 `UPDATE ... FROM ... RETURNING` 续期并返回到期时间，无刷新阈值、无绝对截止；数据库返回 0 行即 `401 UNAUTHENTICATED`。四个端点的所有响应都带 `Cache-Control: no-store`。
     - 写请求（注册、登录、登出）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。`GET /api/v1/auth/session` 是读请求，不要求 `Origin`。例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true`（BF 经用户明确批准）时完全不做 Origin 校验，缺失或不等不再 403，会话认证与权限不变。
-    - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。owner 与工作空间成员判断属 T-019，本文不定义；注册时会为每个新用户创建展示名固定为 `Personal` 的个人空间并写入其 `owner` 成员关系，但响应不返回工作空间字段，也没有工作空间 HTTP 接口。
+    - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。工作区成员判断（owner/member）只来自 `workspace_memberships`，由 `workspaces` 标签下各工作区端点统一校验。注册只创建 `users` 行与首个 `sessions` 行，**不创建工作区或成员关系**，因此注册后是零工作区状态：前端调用工作区列表拿到 `[]` 后再引导用户创建第一个工作区。成员邀请、成员列表与角色管理属 T-020，本文不定义。
     - 注册与登录限流为单进程内存固定窗口（每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次），所有合法尝试都占额度、成功不返还；达到上限的请求不执行密码哈希或写库。
     - 注册开关由部署环境变量 `TOKENPIVOT_REGISTRATION_OPEN` 决定，启动时读取一次，未设置等同 `false`，只接受精确的 `true`/`false`。关闭时仅空库的首个用户可注册，其余一律 `403 REGISTRATION_CLOSED`；空库判定与首个用户写入在同一 `READ COMMITTED` 事务内，并在事务级排他 advisory lock 之后进行。没有查询注册状态的端点。
 
@@ -455,6 +455,8 @@ tags:
     description: '插件凭证认证的同步批量采集端点。只接受 `Authorization: Bearer`，不回退 Cookie。'
   - name: browser-auth
     description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出这些写操作必须携带与可信 Web origin 完全一致的 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。'
+  - name: workspaces
+    description: '工作区列表、创建与详情端点。只认浏览器会话 Cookie：列表与详情是读请求、不要求 `Origin`；创建是写请求，必须携带可信 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验；默认 `false` 时按本文所述执行）。任何已登录用户都可创建并成为新工作区的 owner，单账户最多 2 个。'
   - name: credentials
     description: 'owner 管理接入凭证的端点。只认浏览器会话 Cookie 且要求 workspace owner；列表是读请求、不要求 `Origin`，签发、轮换、撤销三个写操作必须携带可信 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。插件令牌 `tpk_` 不能用于这些路径。'
   - name: usage
@@ -644,7 +646,7 @@ paths:
       operationId: registerBrowserAccount
       summary: 直接注册账号并创建首个会话
       description: |
-        用邮箱和密码直接创建账号，不需要邮箱验证。注册成功在**同一事务**内写入四部分数据：`users` 行、该用户展示名固定为 `Personal` 的个人空间、这条空间的 `owner` 成员关系，以及首个 `sessions` 行；然后返回 `201`、`{user, expires_at}` 和新的会话 Cookie，因此刚注册的用户无需再次输入密码。任一步失败整体回滚，不会出现只有用户没有个人空间或没有会话的半套数据。
+        用邮箱和密码直接创建账号，不需要邮箱验证。注册成功在**同一事务**内写入两部分数据：`users` 行与首个 `sessions` 行；然后返回 `201`、`{user, expires_at}` 和新的会话 Cookie，因此刚注册的用户无需再次输入密码。任一步失败整体回滚，不会出现只有用户没有会话的半套数据。**注册不创建工作区或成员关系**：新账号处于零工作区状态，需先调用 `POST /api/v1/workspaces` 创建第一个工作区。
 
         **写请求默认必须携带 `Origin`**（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 的 BF 例外下不校验）：恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等。缺失、空白、`null`、多值或不等一律 `403 PERMISSION_DENIED`，且不产生任何数据库写入。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。
 
@@ -670,7 +672,7 @@ paths:
               $ref: '#/components/schemas/AuthRequest'
       responses:
         '201':
-          description: '账号、个人空间、owner 成员关系与首个会话已创建并提交；`Set-Cookie` 下发 `tokenpivot_session`。'
+          description: '账号与首个会话已创建并提交；不创建工作区。`Set-Cookie` 下发 `tokenpivot_session`。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -858,34 +860,140 @@ paths:
           $ref: '#/components/responses/AuthInternal'
         '503':
           $ref: '#/components/responses/AuthUnavailable'
-  /api/v1/workspaces/current:
+  /api/v1/workspaces:
     get:
       tags:
-        - usage
-      operationId: getCurrentWorkspace
-      summary: 读取当前用户的个人空间
+        - workspaces
+      operationId: listWorkspaces
+      summary: 列出当前用户可访问的工作区
       description: |
-        返回会话用户创建最早的 owner 空间（`joined_at, id` 升序第一个）的 `workspace_id` 与 `name`。身份只来自会话，不接受任何查询参数或 body 指定用户或空间。读请求，不要求 `Origin`。
+        返回会话用户作为成员可访问的全部工作区，按 `name` 的 C 排序（逐字节）升序、相同名称再按 `workspace_id` 升序。排序完全由服务端决定，客户端不再重排。身份只来自会话，不接受查询参数指定用户或工作区。读请求，不要求 `Origin`。
 
-        **仅限当前阶段**：每个用户只有一个注册时创建的 Personal 空间。它不是空间列表，也不是切换接口；多空间上线时必须重新设计。
-        找不到空间属于数据完整性故障，返回 `500 INTERNAL`，**不创建空间、不返回占位值**。所有响应 `Cache-Control: no-store`。
+        没有成员关系是正常状态：返回空数组 `[]`，不是错误，也不创建任何占位工作区。列表不分页，因为单账户本期最多手动创建 2 个工作区。
       security:
         - cookieAuth: []
       responses:
         '200':
-          description: '当前个人空间。'
+          description: '工作区数组（顶层即数组）；没有成员关系时为 `[]`。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CurrentWorkspace'
+                $ref: '#/components/schemas/WorkspaceList'
               example:
-                workspace_id: 0199a0b0-0000-7000-8000-00000000000a
-                name: Personal
+                - workspace_id: 018f2f2a-0000-7000-8000-000000000000
+                  name: Alpha
         '401':
           $ref: '#/components/responses/ManagementUnauthenticated'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+    post:
+      tags:
+        - workspaces
+      operationId: createWorkspace
+      summary: 手动创建一个工作区
+      description: |
+        当前会话用户创建一个工作区，并在同一事务内成为它的 owner。身份只来自会话：`workspace_id`、`created_by_user_id`、`role` 都不被接受，出现即按未知字段 `400 INVALID_ARGUMENT` 拒绝且不写库。
+
+        写操作默认必须携带与可信 Web origin 完全一致的 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验；默认 `false` 时按本文所述执行）。准入顺序固定为 **`Origin` → 会话 → 请求体 → 数据库**。
+
+        **名称规则**：首尾 Unicode 空白先被修剪，数据库只保存修剪后的名称；修剪后为空、超过 80 个 Unicode code point、UTF-8 编码超过 256 字节，或包含 Unicode control character，均为 `400 INVALID_ARGUMENT`。名称中间的普通空白允许。不做大小写折叠，也不做 Unicode 规范化，因此 `Alpha` 与 `alpha` 是两个可共存的名称，只有修剪后字节完全相同才算重名。
+
+        **额度**：每个账户最多成功创建 2 个工作区，第一个同样计入。创建事务先锁定该账户的 `users` 行，再统计它已创建的工作区数，最后插入工作区与 owner 成员关系；同一账户的并发创建因此串行，最多两个成功。同账户重名由唯一索引 `(created_by_user_id, name)` 裁决。
+
+        创建**不是幂等操作**：`POST` 没有幂等键，响应丢失后重试会再次计数；同名重试得到 `409 WORKSPACE_NAME_CONFLICT`，超额得到 `409 WORKSPACE_LIMIT_REACHED`。成员表等其他唯一冲突与查询失败都是 `500 INTERNAL`，不会伪装成重名。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspaceCreateRequest'
+            example:
+              name: Alpha
+      responses:
+        '201':
+          description: '已创建的工作区；返回修剪后的名称与数据库生成的 UUID。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+              example:
+                workspace_id: 018f2f2a-0000-7000-8000-000000000000
+                name: Alpha
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '409':
+          description: '`WORKSPACE_NAME_CONFLICT`：该账户已有同名工作区；`WORKSPACE_LIMIT_REACHED`：该账户已创建 2 个工作区。两种情况都不写入任何行。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagementError'
+              examples:
+                nameConflict:
+                  value:
+                    error:
+                      code: WORKSPACE_NAME_CONFLICT
+                      message: workspace name already exists
+                limitReached:
+                  value:
+                    error:
+                      code: WORKSPACE_LIMIT_REACHED
+                      message: workspace limit reached
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+  /api/v1/workspaces/{workspaceID}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - workspaces
+      operationId: getWorkspace
+      summary: 读取工作区详情并验证成员资格
+      description: |
+        返回路径工作区的 `workspace_id` 与 `name`，用于切换前验证目标可访问。身份只来自会话；读请求不要求 `Origin`。
+
+        授权与工作区资源一致：会话有效且当前用户是该工作区成员（owner 或 member）时 `200`。不是成员与工作区不存在都返回 `403 PERMISSION_DENIED`，不区分二者，也不返回任何资源内容。切换没有服务端会话写入：成功只表示目标可访问，前端随后修改 URL 中的 `workspace` 参数。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '目标工作区身份与名称。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+              example:
+                workspace_id: 018f2f2a-0000-7000-8000-000000000000
+                name: Alpha
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
         '500':
           $ref: '#/components/responses/ManagementInternal'
         '503':
@@ -3287,6 +3395,8 @@ components:
                 - PERMISSION_DENIED
                 - NOT_FOUND
                 - CONFLICT
+                - WORKSPACE_NAME_CONFLICT
+                - WORKSPACE_LIMIT_REACHED
                 - BODY_TOO_LARGE
                 - UNSUPPORTED_MEDIA_TYPE
                 - INTERNAL
@@ -3296,7 +3406,7 @@ components:
               type: string
               description: 面向人的短说明，固定文案，不含 SQL、约束细节、令牌或请求值。
       description: |
-        项目与来源管理端点的错误体：
+        工作区、项目与来源管理端点的错误体：
 
         | code | 状态码 |
         |---|---|
@@ -3305,9 +3415,11 @@ components:
         | `PERMISSION_DENIED` | 403 |
         | `NOT_FOUND` | 404 |
         | `CONFLICT` | 409 |
+        | `WORKSPACE_NAME_CONFLICT` | 409（固定 message `workspace name already exists`） |
+        | `WORKSPACE_LIMIT_REACHED` | 409（固定 message `workspace limit reached`） |
         | `BODY_TOO_LARGE` | 413 |
         | `UNSUPPORTED_MEDIA_TYPE` | 415 |
-        | `INTERNAL` | 500（成员角色或资源数据库故障） |
+        | `INTERNAL` | 500（成员角色、工作区或资源数据库故障） |
         | `UNAVAILABLE` | 503（仅会话存储/续期故障） |
 
         所有响应带 `Cache-Control: no-store`。
@@ -3330,7 +3442,7 @@ components:
           description: '`null` 表示 active；否则为首次归档时间（RFC 3339），重复归档不改变它。'
       description: 一个项目。
 
-    CurrentWorkspace:
+    Workspace:
       type: object
       additionalProperties: false
       required: [workspace_id, name]
@@ -3340,7 +3452,26 @@ components:
           format: uuid
         name:
           type: string
-      description: 当前用户的个人空间身份。
+          minLength: 1
+          maxLength: 80
+          description: '已修剪的展示名称；大小写敏感，不做 Unicode 规范化。'
+      description: 一个工作区的身份与展示名称。
+
+    WorkspaceList:
+      type: array
+      items:
+        $ref: '#/components/schemas/Workspace'
+      description: '工作区数组（顶层即数组），按 `name` 的 C 排序升序、相同名称再按 `workspace_id` 升序；没有成员关系时为空数组。'
+
+    WorkspaceCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: '1–80 个 Unicode code point 且不超过 256 个 UTF-8 字节；首尾空白先被修剪，不能包含 control character。'
+      description: 创建工作区的请求体；只接受 `name`，归属与角色全部来自会话和数据库。
 
     UsageOptions:
       type: object
