@@ -202,15 +202,18 @@ func (s *Service) FeishuLogin(ctx context.Context, code, remoteIP string) (Feish
 }
 
 // FeishuBind confirms a pending same-email binding with the account password and
-// issues the first real session. The token is claimed before any check runs, so
-// concurrent requests carrying the same token cannot both complete it; a failure
-// that the user may retry releases the claim, while a completed or unusable
-// binding is deleted. A wrong password therefore leaves the pending binding in
-// place (until it expires or the window is exhausted). A password-less account
-// fails exactly like a wrong password and never gains a binding this way.
+// issues the first real session. The token is claimed before any check runs, and
+// a request arriving while another one holds the claim waits for that request
+// instead of being refused: a wrong password on the first attempt must not cancel
+// the browser's pending binding. A check the user may retry releases the claim,
+// while a completed or unusable binding is deleted. Once the password is verified
+// the token is spent whether or not the transaction reports success, because a
+// commit whose outcome is unknown must never be retried into a second session. A
+// password-less account fails exactly like a wrong password and never gains a
+// binding this way.
 func (s *Service) FeishuBind(ctx context.Context, bindToken, password, remoteIP string) (Session, error) {
 	key := feishuBindKey(bindToken)
-	pending, found := s.bindings.claim(key, s.clock())
+	pending, found := s.bindings.claim(ctx, key, s.clock)
 	if !found {
 		return Session{}, ErrUnauthenticated
 	}
@@ -250,19 +253,19 @@ func (s *Service) FeishuBind(ctx context.Context, bindToken, password, remoteIP 
 		issued = IssuedSession{User: credential.User, ExpiresAt: expiresAt}
 		return nil
 	})
+	// The transaction has been attempted, so the token is spent whatever it
+	// returns: a connection that fails after the commit reports an error for a
+	// transaction that did commit, and retrying that token would create a second
+	// session for the same binding.
+	s.bindings.delete(key)
 	if err != nil {
 		if errors.Is(err, ErrFeishuIdentityConflict) {
 			// The open_id belongs to another account now, so this pending binding
 			// can never be completed and must not stay usable.
-			s.bindings.delete(key)
 			return Session{}, ErrUnauthenticated
 		}
-		// Every other failure is retryable: the account and the binding are
-		// unchanged, so the token stays usable with another password attempt.
-		s.bindings.release(key)
 		return Session{}, err
 	}
-	s.bindings.delete(key)
 	return Session{Token: token, User: issued.User, ExpiresAt: issued.ExpiresAt}, nil
 }
 
@@ -531,14 +534,15 @@ func firstNonEmpty(values ...string) string {
 
 // feishuPending is one same-email binding waiting for the account password. It
 // keeps the verified profile so the bind request needs no second Feishu call.
-// InFlight marks a token one request is already spending, so a second request
-// carrying the same token is refused instead of issuing a second session.
+// A non-nil wait channel means one request is spending the token; other requests
+// carrying the same token block on that channel and retry once the holder is done,
+// so a wrong password on one attempt does not discard the browser's binding.
 type feishuPending struct {
 	UserID    ID
 	Email     string
 	Identity  FeishuIdentity
 	ExpiresAt time.Time
-	InFlight  bool
+	wait      chan struct{}
 }
 
 // feishuBindings is the per-process store of pending bindings. Keys are SHA-256
@@ -563,49 +567,79 @@ func (b *feishuBindings) put(key string, pending feishuPending, now time.Time) {
 	b.entries[key] = pending
 }
 
-// claim marks one live pending binding as in flight and returns it. It reports
-// false for an unknown, expired or already claimed token, so exactly one of
-// several concurrent requests carrying the same token can proceed.
-func (b *feishuBindings) claim(key string, now time.Time) (feishuPending, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.prune(now)
-	pending, ok := b.entries[key]
-	if !ok || pending.InFlight {
-		return feishuPending{}, false
+// claim marks one live pending binding as in flight and returns it. A request that
+// finds the binding already claimed waits for the holder to finish and then looks
+// again, so concurrent requests carrying the same token run one at a time instead
+// of failing each other. It reports false for an unknown or expired token, and for
+// a caller whose context ended while waiting.
+func (b *feishuBindings) claim(ctx context.Context, key string, now func() time.Time) (feishuPending, bool) {
+	for {
+		b.mu.Lock()
+		b.prune(now())
+		pending, ok := b.entries[key]
+		if !ok {
+			b.mu.Unlock()
+			return feishuPending{}, false
+		}
+		if pending.wait != nil {
+			wait := pending.wait
+			b.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return feishuPending{}, false
+			}
+		}
+		pending.wait = make(chan struct{})
+		b.entries[key] = pending
+		b.mu.Unlock()
+		return pending, true
 	}
-	pending.InFlight = true
-	b.entries[key] = pending
-	return pending, true
 }
 
 // release gives a claimed binding back after a retryable failure, so the same
-// token may be used again until it expires.
+// token may be used again until it expires. Waiting requests are woken and one of
+// them may take the claim.
 func (b *feishuBindings) release(key string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pending, ok := b.entries[key]
+	if !ok || pending.wait == nil {
+		return
+	}
+	close(pending.wait)
+	pending.wait = nil
+	b.entries[key] = pending
+}
+
+// delete removes one pending binding after it was completed or became unusable,
+// waking every request waiting on it so they see the spent token.
+func (b *feishuBindings) delete(key string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	pending, ok := b.entries[key]
 	if !ok {
 		return
 	}
-	pending.InFlight = false
-	b.entries[key] = pending
-}
-
-// delete removes one pending binding after it was completed or became unusable.
-func (b *feishuBindings) delete(key string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	if pending.wait != nil {
+		close(pending.wait)
+	}
 	delete(b.entries, key)
 }
 
 // prune drops every expired entry. It runs under the same mutex that guards the
-// map, so the map cannot grow with tokens that are never looked up again.
+// map, so the map cannot grow with tokens that are never looked up again. A waiter
+// of an expired entry is released instead of blocking until its context ends.
 func (b *feishuBindings) prune(now time.Time) {
 	for key, pending := range b.entries {
-		if !pending.ExpiresAt.After(now) {
-			delete(b.entries, key)
+		if pending.ExpiresAt.After(now) {
+			continue
 		}
+		if pending.wait != nil {
+			close(pending.wait)
+		}
+		delete(b.entries, key)
 	}
 }
 

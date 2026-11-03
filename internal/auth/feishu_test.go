@@ -388,6 +388,156 @@ func TestFeishuBindConcurrentSingleUse(t *testing.T) {
 	}
 }
 
+// gatedStore blocks the first credential read until the test allows it, so a test
+// can hold one bind request inside its checks while another one arrives.
+type gatedStore struct {
+	*fakeStore
+	gateMu  sync.Mutex
+	calls   int
+	entered chan struct{}
+	allow   chan struct{}
+}
+
+func newGatedStore(store *fakeStore) *gatedStore {
+	return &gatedStore{fakeStore: store, entered: make(chan struct{}), allow: make(chan struct{})}
+}
+
+// UserCredential reports the first read on entered and waits for allow, then reads
+// through to the in-memory store.
+func (g *gatedStore) UserCredential(ctx context.Context, email string) (Credential, bool, error) {
+	g.gateMu.Lock()
+	g.calls++
+	first := g.calls == 1
+	g.gateMu.Unlock()
+	if first {
+		close(g.entered)
+		<-g.allow
+	}
+	return g.fakeStore.UserCredential(ctx, email)
+}
+
+// readCalls reports how many credential reads started.
+func (g *gatedStore) readCalls() int {
+	g.gateMu.Lock()
+	defer g.gateMu.Unlock()
+	return g.calls
+}
+
+// failAfterCommitRunner reports an error for a transaction that already ran, the
+// shape a lost connection gives a commit that did land: the writes exist but the
+// caller cannot tell them apart from a rollback.
+type failAfterCommitRunner struct {
+	*fakeTxRunner
+	err error
+}
+
+func (r failAfterCommitRunner) InTx(ctx context.Context, fn func(context.Context, RegistrationStore) error) error {
+	if err := r.fakeTxRunner.InTx(ctx, fn); err != nil {
+		return err
+	}
+	return r.err
+}
+
+// TestFeishuBindWaitsForConcurrentRequest proves a request carrying a token that
+// another request is already spending waits for it instead of being refused: the
+// first attempt fails a wrong password and releases the claim, and the waiting
+// attempt then completes the binding with the correct one.
+func TestFeishuBindWaitsForConcurrentRequest(t *testing.T) {
+	stub := newFeishuStub(t)
+	service, store, runner, _ := newFeishuService(t, stub, true, true)
+	store.seedUser("synthetic@example.com", "synthetic-password")
+	result, err := service.FeishuLogin(context.Background(), "synthetic-code", "127.0.0.1")
+	if err != nil || result.BindToken == "" {
+		t.Fatalf("login result = %+v err = %v, want a pending bind token", result, err)
+	}
+	gate := newGatedStore(store)
+	service.store = gate
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := service.FeishuBind(context.Background(), result.BindToken, "synthetic-wrong-password", "127.0.0.1")
+		firstErr <- err
+	}()
+	<-gate.entered // the first request holds the claim and is inside the checks
+
+	type outcome struct {
+		session Session
+		err     error
+	}
+	second := make(chan outcome, 1)
+	go func() {
+		session, err := service.FeishuBind(context.Background(), result.BindToken, "synthetic-password", "127.0.0.1")
+		second <- outcome{session: session, err: err}
+	}()
+
+	// The waiting request must not return while the holder is still running, and it
+	// must not read the credential either: it is blocked on the claim.
+	select {
+	case got := <-second:
+		t.Fatalf("a concurrent bind returned before the holder finished: %+v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if calls := gate.readCalls(); calls != 1 {
+		t.Fatalf("credential reads = %d while the claim was held, want 1", calls)
+	}
+
+	close(gate.allow)
+	if err := <-firstErr; !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("first bind error = %v, want ErrInvalidCredentials", err)
+	}
+	got := <-second
+	if got.err != nil {
+		t.Fatalf("waiting bind error = %v, want success once the claim was released", got.err)
+	}
+	if !strings.HasPrefix(got.session.Token, sessionTokenPrefix) {
+		t.Fatalf("waiting bind session = %+v", got.session)
+	}
+	if runner.inTxCall != 1 {
+		t.Fatalf("bind transactions = %d, want 1", runner.inTxCall)
+	}
+	if len(store.sessions) != 1 {
+		t.Fatalf("stored sessions = %d, want exactly 1", len(store.sessions))
+	}
+	if _, ok := service.bindings.entries[feishuBindKey(result.BindToken)]; ok {
+		t.Fatal("a completed bind kept the pending token")
+	}
+}
+
+// TestFeishuBindSpendsTokenWhenCommitOutcomeIsUnknown proves the pending token is
+// destroyed once the transaction ran, even when it reports an error: a commit that
+// did land must not be retried into a second session.
+func TestFeishuBindSpendsTokenWhenCommitOutcomeIsUnknown(t *testing.T) {
+	stub := newFeishuStub(t)
+	service, store, runner, _ := newFeishuService(t, stub, true, true)
+	store.seedUser("synthetic@example.com", "synthetic-password")
+	result, err := service.FeishuLogin(context.Background(), "synthetic-code", "127.0.0.1")
+	if err != nil || result.BindToken == "" {
+		t.Fatalf("login result = %+v err = %v, want a pending bind token", result, err)
+	}
+	service.tx = failAfterCommitRunner{fakeTxRunner: runner, err: ErrUnavailable}
+
+	if _, err := service.FeishuBind(context.Background(), result.BindToken, "synthetic-password", "127.0.0.1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("bind error = %v, want the reported storage failure", err)
+	}
+	// The transaction ran, so its write exists even though the caller saw a failure.
+	if len(store.sessions) != 1 {
+		t.Fatalf("stored sessions = %d, want the committed session", len(store.sessions))
+	}
+	if _, ok := service.bindings.entries[feishuBindKey(result.BindToken)]; ok {
+		t.Fatal("a transaction that reported a failure kept the pending token")
+	}
+
+	if _, err := service.FeishuBind(context.Background(), result.BindToken, "synthetic-password", "127.0.0.1"); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("retry error = %v, want ErrUnauthenticated", err)
+	}
+	if runner.inTxCall != 1 {
+		t.Fatalf("bind transactions = %d, want the token to be spent after one", runner.inTxCall)
+	}
+	if len(store.sessions) != 1 {
+		t.Fatalf("stored sessions after the retry = %d, want exactly 1", len(store.sessions))
+	}
+}
+
 // TestFeishuBindRefusesSecondOpenIDForBoundAccount proves an account that already
 // holds a Feishu open_id cannot be rebound to a different one: the bind fails as
 // unauthenticated, keeps the original binding, spends the pending token and issues

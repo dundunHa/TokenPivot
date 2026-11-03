@@ -225,6 +225,10 @@ export function FeishuCabin() {
     const ttl =
       info.expiresInSeconds > 0 ? info.expiresInSeconds : DEFAULT_TTL_SECONDS;
     const now = Date.now();
+    // 刷新请求在途期间没有有效地址：旧地址的 `state` Cookie 已被前一次回调消费，
+    // 留着它会让按钮和 `F` 继续跳向一个必然被拒的地址。只有新响应带回地址后
+    // `canLaunch` 才重新为真。
+    setInfo((current) => ({ ...current, authorizeUrl: null }));
     setClock(now);
     setDeadline(now + ttl * 1000);
     setGeneration((value) => value + 1);
