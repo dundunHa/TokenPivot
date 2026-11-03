@@ -50,23 +50,24 @@ func run(logger *slog.Logger) error {
 	authStore := auth.NewPostgres(pool)
 	authService := auth.New(authStore, authStore, auth.NewLimiter(nil), cfg.RegistrationOpen)
 	credentialService := credentials.New(credentials.NewPostgres(pool))
-	workspaceService := workspaces.New(workspaces.NewPostgres(pool))
+	workspacePostgres := workspaces.NewPostgres(pool)
+	workspaceService := workspaces.New(workspacePostgres, workspacePostgres)
 	usageService := usage.New(usage.NewPostgres(pool))
 	ingestionService := ingestion.New(ingestion.NewPostgres(pool), credentialService, logger)
 	webAuth := server.NewAuth(authService, cfg.WebOrigin)
 	webAuth.DisableOriginCheck = cfg.DisableOriginCheck
 	srv := &http.Server{
 		Handler: server.NewHandler(server.Options{
-			CheckReady:       pool.Ping,
-			Frontend:         frontend,
-			Auth:             webAuth,
-			Credentials:      server.NewCredentials(credentialService, workspaceService),
-			Usage:            server.NewUsage(usageService, workspaceService),
-			RequestDetails:   server.NewRequestDetails(requestdetails.New(requestdetails.NewPostgres(pool)), workspaceService),
-			CurrentWorkspace: server.NewCurrentWorkspace(workspaceService),
-			Projects:         server.NewProjects(projects.New(projects.NewPostgres(pool)), workspaceService),
-			Sources:          server.NewSources(sources.New(sources.NewPostgres(pool)), workspaceService),
-			Ingestion:        ingestion.NewHandler(ingestionService),
+			CheckReady:     pool.Ping,
+			Frontend:       frontend,
+			Auth:           webAuth,
+			Credentials:    server.NewCredentials(credentialService, workspaceService),
+			Usage:          server.NewUsage(usageService, workspaceService),
+			RequestDetails: server.NewRequestDetails(requestdetails.New(requestdetails.NewPostgres(pool)), workspaceService),
+			Workspaces:     server.NewWorkspaces(workspaceService),
+			Projects:       server.NewProjects(projects.New(projects.NewPostgres(pool)), workspaceService),
+			Sources:        server.NewSources(sources.New(sources.NewPostgres(pool)), workspaceService),
+			Ingestion:      ingestion.NewHandler(ingestionService),
 		}),
 		ReadHeaderTimeout: server.ReadHeaderTimeout,
 		ReadTimeout:       server.ReadTimeout,
