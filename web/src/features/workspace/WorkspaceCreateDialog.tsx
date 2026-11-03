@@ -34,17 +34,33 @@ function createErrorMessage(error: unknown): string | null {
   }
 }
 
+/** 提交瞬间的选择与位置；父容器据此判断创建返回后是否仍可导航。 */
+export interface CreateSubmitScope {
+  /** 提交瞬间的容器身份。 */
+  userId: string;
+  /** 提交瞬间的选择序号；之后任何更新选择都会让它失效。 */
+  ticket: number;
+  /** 提交瞬间 URL 上的工作区选择；用于识别提交之后的外部导航。 */
+  urlWorkspaceId: string | null;
+}
+
 export function WorkspaceCreateDialog({
   userId,
   required,
   onClose,
+  captureScope,
   onCreated,
 }: {
   userId: string;
   /** 零空间时不可关闭：没有关闭按钮，Escape 与遮罩也不生效。 */
   required: boolean;
   onClose: () => void;
-  onCreated: (workspace: Workspace) => void | Promise<void>;
+  /** 在提交瞬间调用，捕获本次创建归属的选择与位置。 */
+  captureScope: () => CreateSubmitScope;
+  onCreated: (
+    workspace: Workspace,
+    scope: CreateSubmitScope,
+  ) => void | Promise<void>;
 }) {
   const create = useCreateWorkspace(userId);
   const client = useQueryClient();
@@ -84,11 +100,13 @@ export function WorkspaceCreateDialog({
     }
     inFlight.current = true;
     setProblem(null);
+    // 提交瞬间捕获归属；弹层打开时间或创建返回时间都不能替代它。
+    const scope = captureScope();
     try {
       const created = await create.mutateAsync(trimWorkspaceName(name));
       // 卸载或换号后的迟到成功不再交给父容器导航；成功本身不改成错误显示。
-      if (!live.current || !isCurrentSessionUser(client, userId)) return;
-      await onCreated(created);
+      if (!live.current || !isCurrentSessionUser(client, scope.userId)) return;
+      await onCreated(created, scope);
     } catch {
       // 失败原因由 mutation.error 渲染；输入与 modal 在此保留。
     } finally {

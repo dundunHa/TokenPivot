@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { type ReactNode } from "react";
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
@@ -25,6 +25,7 @@ import { WorkspaceHome } from "./WorkspaceHome";
 const WS_A = "0198f2b0-0000-7000-8000-0000000000aa";
 const WS_B = "0198f2b0-0000-7000-8000-0000000000bb";
 const WS_C = "0198f2b0-0000-7000-8000-0000000000cc";
+const WS_D = "0198f2b0-0000-7000-8000-0000000000dd";
 const USER = "user-a";
 const SESSION: AuthSession = {
   user: { id: USER, email: "a@example.com" },
@@ -639,9 +640,11 @@ describe("workspace home", () => {
       workspace(WS_B, "Beta"),
     ]);
     const gate = deferred<Response>();
+    let signalB: AbortSignal | undefined;
     server.use(
-      http.get(`/api/v1/workspaces/${WS_B}`, () => {
+      http.get(`/api/v1/workspaces/${WS_B}`, ({ request }) => {
         backend.calls.detail.push(WS_B);
+        signalB = request.signal;
         return gate.promise;
       }),
     );
@@ -661,10 +664,15 @@ describe("workspace home", () => {
 
     view.rerender(homeTree(client, `/?workspace=${WS_A}&tz=UTC`, null));
     expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
+    // 卸载即取消本容器发起的详情验证：请求被 abort，晚到的成功不写详情缓存。
+    await waitFor(() => expect(signalB?.aborted).toBe(true));
 
     gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
     await new Promise((r) => setTimeout(r, 50));
     expect(search().get("workspace")).toBe(WS_A);
+    expect(
+      client.getQueryData(["workspace", "detail", USER, WS_B]),
+    ).toBeUndefined();
   });
 
   it("a late switch success from the previous identity cannot change the URL", async () => {
@@ -857,5 +865,183 @@ describe("workspace home", () => {
     );
     expect(client.getQueryData(sessionKey)).toEqual(SESSION_B);
     expect(client.getQueryData(keyB)).toEqual([workspace(WS_B, "Beta")]);
+  });
+
+  it("a switch superseded during the old-workspace cancel cannot clear the newer selection", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+    ]);
+    const gateB = deferred<Response>();
+    const gateC = deferred<Response>();
+    const gateCancel = deferred();
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_B}`, () => {
+        backend.calls.detail.push(WS_B);
+        return gateB.promise;
+      }),
+      http.get(`/api/v1/workspaces/${WS_C}`, () => {
+        backend.calls.detail.push(WS_C);
+        return gateC.promise;
+      }),
+    );
+    const client = createAppQueryClient();
+    // 给“取消旧空间业务请求”一个可控等待窗口：取消已真实发出，恢复由测试放行。
+    const cancelQueries = client.cancelQueries.bind(client);
+    const held: string[] = [];
+    vi.spyOn(client, "cancelQueries").mockImplementation((filters, options) => {
+      const done = cancelQueries(filters, options);
+      if (filters !== undefined && "predicate" in filters) {
+        held.push("business");
+        return done.then(() => gateCancel.promise);
+      }
+      return done;
+    });
+    const user = userEvent.setup();
+    renderHome(client, `/?workspace=${WS_A}&tz=UTC`);
+    await screen.findByTestId("metric-total");
+
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
+    gateB.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
+    // B 的详情已成功，正卡在取消 A 业务请求的等待窗口里。
+    await waitFor(() => expect(held).toHaveLength(1));
+
+    // 窗口里用户选择 C：C 成为最新的 pending 选择。
+    await user.click(screen.getByRole("button", { name: "Gamma" }));
+    await waitFor(() => expect(backend.calls.detail).toContain(WS_C));
+    expect(
+      screen.getByRole("button", { name: /Gamma/ }).hasAttribute("disabled"),
+    ).toBe(true);
+
+    // B 恢复：它已不是最新选择，只能返回；C 的 pending 与 ticket 保持有效。
+    gateCancel.resolve();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(
+      screen.getByRole("button", { name: /Gamma/ }).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(search().get("workspace")).toBe(WS_A);
+
+    gateC.resolve(HttpResponse.json(body(workspace(WS_C, "Gamma"))));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+    expect(search().get("tz")).toBe("UTC");
+  });
+
+  it("a create whose list refetch lands after an external navigation keeps the newer workspace", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+    ]);
+    const created = workspace(WS_D, "Delta");
+    const listGate = deferred<Response>();
+    let listCalls = 0;
+    server.use(
+      http.get("/api/v1/workspaces", () => {
+        listCalls += 1;
+        return listCalls === 1
+          ? HttpResponse.json(backend.state.workspaces.map(body))
+          : listGate.promise;
+      }),
+      http.post("/api/v1/workspaces", async ({ request }) => {
+        backend.calls.posts.push(await request.json());
+        return HttpResponse.json(body(created), { status: 201 });
+      }),
+      http.get("/api/v1/workspaces/:id/usage/aggregate", ({ params }) =>
+        HttpResponse.json(aggregateBody(params.id === WS_C ? "3333" : "4444")),
+      ),
+    );
+    const user = userEvent.setup();
+    renderHome(
+      createAppQueryClient(),
+      `/?workspace=${WS_A}&tz=UTC`,
+      <NavigateTo to={`/?workspace=${WS_C}&tz=UTC`} />,
+    );
+    await screen.findByTestId("metric-total");
+
+    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText("名称"), "Delta");
+    await user.click(within(dialog).getByRole("button", { name: "创建" }));
+    // 201 已返回，列表重查仍被挂起。
+    await waitFor(() => expect(listCalls).toBe(2));
+
+    // 重查窗口里路由把 URL 改到 C。
+    await user.click(screen.getByRole("button", { name: "外部导航" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("3.3K"),
+    );
+
+    backend.state.workspaces = [
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+      created,
+    ];
+    listGate.resolve(HttpResponse.json(backend.state.workspaces.map(body)));
+    await new Promise((r) => setTimeout(r, 50));
+
+    // 创建本身成功，但不得覆盖更晚的 URL 选择与可见数据。
+    expect(search().get("workspace")).toBe(WS_C);
+    expect(screen.getByTestId("metric-total").textContent).toContain("3.3K");
+    expect(screen.getByTestId("metric-total").textContent).not.toContain(
+      "4.4K",
+    );
+  });
+
+  it("a selection made while a create list refetch is pending wins over the created workspace", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+    ]);
+    const created = workspace(WS_D, "Delta");
+    const listGate = deferred<Response>();
+    let listCalls = 0;
+    server.use(
+      http.get("/api/v1/workspaces", () => {
+        listCalls += 1;
+        return listCalls === 1
+          ? HttpResponse.json(backend.state.workspaces.map(body))
+          : listGate.promise;
+      }),
+      http.post("/api/v1/workspaces", async ({ request }) => {
+        backend.calls.posts.push(await request.json());
+        return HttpResponse.json(body(created), { status: 201 });
+      }),
+      http.get("/api/v1/workspaces/:id/usage/aggregate", ({ params }) =>
+        HttpResponse.json(aggregateBody(params.id === WS_C ? "3333" : "4444")),
+      ),
+    );
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    await screen.findByTestId("metric-total");
+
+    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText("名称"), "Delta");
+    await user.click(within(dialog).getByRole("button", { name: "创建" }));
+    await waitFor(() => expect(listCalls).toBe(2));
+
+    // 同一个重查窗口里用户选择 C：最新选择必须赢。
+    await user.click(screen.getByRole("button", { name: "Gamma" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+
+    backend.state.workspaces = [
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+      created,
+    ];
+    listGate.resolve(HttpResponse.json(backend.state.workspaces.map(body)));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(search().get("workspace")).toBe(WS_C);
+    expect(screen.getByTestId("metric-total").textContent).toContain("3.3K");
+    expect(screen.getByTestId("metric-total").textContent).not.toContain(
+      "4.4K",
+    );
   });
 });
