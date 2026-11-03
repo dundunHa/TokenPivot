@@ -8,25 +8,26 @@
   --bg: #0b0a08;
   --panel: #120f0a;
   --panel-focus: #16120c;
-  --panel-edge: rgba(224, 166, 75, 0.13);
-  --panel-edge-faint: rgba(224, 166, 75, 0.08);
+  --panel-edge: rgba(224, 166, 75, 0.22);
+  --panel-edge-faint: rgba(224, 166, 75, 0.12);
   --panel-edge-focus: rgba(224, 166, 75, 0.5);
   --text: #f4f1ea;
   --text-soft: #cfc9bc;
   --amber: #e0a64b;
   --amber-bright: #ecb55c;
-  --amber-dim: #7a6435;
+  --amber-dim: #b08a4a;
   --amber-faint: #463a20;
   --amber-glow: rgba(224, 166, 75, 0.11);
   --copper: #d1604f;
   --copper-bg: rgba(209, 96, 79, 0.12);
-  --olive: #8a8672;
-  --olive-dim: #5c5849;
+  --olive: #b3ab98;
+  --olive-dim: #8f8673;
   --green: #7fb069;
   --green-bg: rgba(127, 176, 105, 0.12);
 
   display: flex;
   min-height: 100vh;
+  min-height: 100dvh;
   flex-direction: column;
   background:
     radial-gradient(
@@ -348,17 +349,18 @@
 .ds-rank-tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
+  gap: 8px;
   margin-bottom: 8px;
 }
 
 .ds-rank-tab {
-  padding: 1px 8px;
+  min-height: 44px;
+  padding: 8px 12px;
   border: 1px solid var(--panel-edge-faint);
   border-radius: 2px;
   background: transparent;
   color: var(--olive);
-  font-size: 9px;
+  font-size: 11px;
   cursor: pointer;
   transition:
     color 160ms ease,
@@ -422,7 +424,7 @@
 .login-spotlight-wrap {
   position: relative;
   width: 100%;
-  max-width: 680px;
+  max-width: 720px;
   min-width: 0;
   margin: 0 auto;
 }
@@ -464,16 +466,16 @@
 
 .lc-eyebrow {
   margin: 0;
-  font-size: 9px;
-  letter-spacing: 0.24em;
+  font-size: 10px;
+  letter-spacing: 0.2em;
   color: var(--amber-dim);
 }
 
 .lc-title {
-  margin: 6px 0 6px;
-  font-size: 26px;
+  margin: 8px 0;
+  font-size: 32px;
   font-weight: 600;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   line-height: 1.2;
   color: var(--text);
 }
@@ -481,7 +483,7 @@
 .lc-desc {
   max-width: 46ch;
   margin: 0 auto;
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.65;
   color: var(--olive);
 }
@@ -491,7 +493,7 @@
   align-items: center;
   justify-content: center;
   gap: 4px;
-  margin-top: 14px;
+  margin-top: 16px;
   padding: 3px;
   border: 1px solid var(--panel-edge);
   border-radius: 999px;
@@ -499,12 +501,16 @@
 }
 
 .mode-pill {
-  min-width: 84px;
-  padding: 4px 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 88px;
+  min-height: 44px;
+  padding: 8px 18px;
   border: 1px solid transparent;
   border-radius: 999px;
   color: var(--olive);
-  font-size: 10px;
+  font-size: 12px;
   letter-spacing: 0.12em;
   text-align: center;
   text-decoration: none;
@@ -578,10 +584,10 @@
 
 .lc-cabins {
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr);
-  gap: 28px;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 32px;
   align-items: stretch;
-  margin-top: 22px;
+  margin-top: 24px;
 }
 
 .lc-cabin {
@@ -593,7 +599,7 @@
 .lc-cabin-feishu {
   align-items: center;
   justify-content: space-between;
-  padding-right: 28px;
+  padding-right: 32px;
   border-right: 1px dashed var(--panel-edge);
   text-align: center;
 }
@@ -612,19 +618,19 @@
 
 .lc-cabin-title {
   margin: 0;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.16em;
   color: var(--amber);
 }
 
 .lc-badge {
-  padding: 0 6px;
+  padding: 1px 6px;
   border: 1px solid var(--amber-dim);
   border-radius: 2px;
   background: var(--amber-glow);
   color: var(--amber);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.08em;
 }
 
@@ -635,16 +641,16 @@
 }
 
 .lc-cabin-note {
-  margin: 6px 0 12px;
-  font-size: 10px;
-  line-height: 1.5;
+  margin: 8px 0 14px;
+  font-size: 12px;
+  line-height: 1.6;
   color: var(--olive);
   text-align: center;
 }
 
 .lc-cabin-foot {
-  margin: 8px 0 0;
-  font-size: 9px;
+  margin: 10px 0 0;
+  font-size: 11px;
   line-height: 1.5;
   color: var(--olive-dim);
   text-align: center;
@@ -721,12 +727,13 @@
 }
 
 .qr-refresh {
-  padding: 3px 8px;
+  min-height: 44px;
+  padding: 6px 10px;
   border: 1px solid var(--amber-dim);
   border-radius: 2px;
   background: transparent;
   color: var(--amber);
-  font-size: 9px;
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -737,7 +744,7 @@
 
 .qr-ttl {
   margin: 0 0 10px;
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.1em;
   color: var(--olive-dim);
   text-align: center;
@@ -745,12 +752,13 @@
 
 .btn-feishu-hero {
   width: 100%;
-  padding: 9px 8px;
+  min-height: 46px;
+  padding: 10px 12px;
   border: 1px solid var(--amber-bright);
   border-radius: 2px;
   background: linear-gradient(180deg, var(--amber-bright), var(--amber));
   color: #0b0a08;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.06em;
   cursor: pointer;
@@ -764,7 +772,7 @@
 .btn-feishu-hero:disabled {
   border-color: var(--amber-faint);
   background: var(--amber-faint);
-  color: rgba(11, 10, 8, 0.6);
+  color: var(--text-soft);
   cursor: not-allowed;
 }
 
@@ -788,14 +796,15 @@
 }
 
 .cf-label {
-  font-size: 10px;
-  letter-spacing: 0.16em;
+  font-size: 12px;
+  letter-spacing: 0.12em;
   color: var(--olive);
 }
 
 .cf-input-row {
   display: flex;
   align-items: stretch;
+  min-height: 48px;
   border: 1px solid var(--panel-edge);
   border-radius: 2px;
   background: var(--panel-focus);
@@ -816,8 +825,8 @@
 .cf-prefix {
   display: flex;
   align-items: center;
-  padding: 0 8px 0 10px;
-  font-size: 12px;
+  padding: 0 8px 0 12px;
+  font-size: 13px;
   color: var(--amber-dim);
   user-select: none;
 }
@@ -825,12 +834,12 @@
 .cf-input {
   flex: 1;
   min-width: 0;
-  padding: 8px 4px;
+  padding: 10px 4px;
   border: 0;
   outline: none;
   background: transparent;
   color: var(--text);
-  font-size: 13px;
+  font-size: 14px;
   letter-spacing: 0.02em;
 }
 
@@ -843,12 +852,13 @@
 }
 
 .cf-reveal {
-  padding: 0 9px;
+  min-width: 52px;
+  padding: 0 12px;
   border: 0;
   border-left: 1px solid var(--panel-edge);
   background: transparent;
   color: var(--olive);
-  font-size: 10px;
+  font-size: 12px;
   cursor: pointer;
 }
 
@@ -858,21 +868,21 @@
 
 .cf-hint {
   margin: 0;
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.5;
   color: var(--olive-dim);
 }
 
 .cf-error {
   margin: 0;
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1.5;
   color: var(--copper);
 }
 
 .cf-caps {
   margin: 0;
-  font-size: 10px;
+  font-size: 11px;
   color: var(--copper);
 }
 
@@ -912,12 +922,13 @@
 
 .cf-submit {
   flex: 1;
-  padding: 10px 14px;
+  min-height: 46px;
+  padding: 10px 16px;
   border: 1px solid var(--amber);
   border-radius: 2px;
   background: transparent;
   color: var(--amber);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.1em;
   cursor: pointer;
@@ -942,10 +953,10 @@
 }
 
 .lc-foot {
-  margin: 18px 0 0;
-  padding-top: 12px;
+  margin: 20px 0 0;
+  padding-top: 14px;
   border-top: 1px dashed var(--panel-edge);
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.6;
   color: var(--olive-dim);
 }
@@ -990,7 +1001,6 @@
 
 @media (max-width: 1100px) {
   .split-workbench {
-    grid-template-columns: minmax(0, 1fr);
     gap: 34px;
   }
 
@@ -1004,39 +1014,92 @@
 }
 
 @media (max-width: 720px) {
+  .shell-bar,
+  .tmux-status,
+  .tmux-hint,
+  .dash-snapshot {
+    display: none;
+  }
+
   .main-stage {
-    padding: 20px 14px 28px;
+    justify-content: flex-start;
+    padding: 20px 12px 28px;
   }
 
   .login-card {
-    padding: 18px 16px 16px;
+    padding: 22px 18px 18px;
+  }
+
+  .login-spotlight-wrap::before {
+    inset: -24px -12px -32px;
+  }
+
+  .lc-title {
+    font-size: 30px;
   }
 
   .lc-cabins {
     grid-template-columns: minmax(0, 1fr);
-    gap: 18px;
+    gap: 20px;
   }
 
   .lc-cabin-feishu {
+    display: grid;
+    grid-template-areas:
+      "head head"
+      "note note"
+      "qr ttl"
+      "qr action"
+      "qr foot";
+    grid-template-columns: 136px minmax(0, 1fr);
+    gap: 10px 14px;
     padding-right: 0;
-    padding-bottom: 18px;
+    padding-bottom: 20px;
     border-right: 0;
     border-bottom: 1px dashed var(--panel-edge);
   }
 
-  .ds-metrics-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .lc-cabin-feishu .lc-cabin-head {
+    grid-area: head;
   }
 
-  .ds-rank-row {
-    grid-template-columns: minmax(0, 1fr) auto;
+  .lc-cabin-feishu .lc-cabin-note {
+    grid-area: note;
   }
 
-  .ds-rank-bar {
-    grid-column: 1 / -1;
+  .lc-cabin-feishu .qr-square {
+    grid-area: qr;
+    margin: 0;
   }
 
-  .tmux-hint {
+  .lc-cabin-feishu .qr-ttl {
+    grid-area: ttl;
+    align-self: end;
+    margin: 0;
+    text-align: left;
+  }
+
+  .lc-cabin-feishu .btn-feishu-hero {
+    grid-area: action;
+    padding: 8px;
+    font-size: 11px;
+  }
+
+  .lc-cabin-feishu .lc-cabin-foot {
+    grid-area: foot;
+    margin: 0;
+    text-align: left;
+  }
+
+  .cf-input {
+    font-size: 16px;
+  }
+
+  .cf-kbd {
     display: none;
+  }
+
+  .tmux-bar {
+    padding: 8px 12px;
   }
 }
