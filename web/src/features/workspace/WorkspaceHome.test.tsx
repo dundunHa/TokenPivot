@@ -67,11 +67,27 @@ function LocationProbe() {
 }
 
 /** 模拟浏览器前进/后退或其他入口改 URL。 */
-function NavigateTo({ to }: { to: string }) {
+function NavigateTo({
+  to,
+  label = "外部导航",
+}: {
+  to: string;
+  label?: string;
+}) {
   const navigate = useNavigate();
   return (
     <button type="button" onClick={() => navigate(to)}>
-      外部导航
+      {label}
+    </button>
+  );
+}
+
+/** 模拟浏览器后退到历史里的上一个位置。 */
+function NavigateBack({ label = "浏览器后退" }: { label?: string }) {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(-1)}>
+      {label}
     </button>
   );
 }
@@ -112,6 +128,30 @@ const aggregateBody = (total: string) => ({
   totals: { ...stats, total_tokens: metric(total) },
   points: [],
 });
+
+/** 每个空间返回可区分的总量，用来判断当前可见数据属于哪个空间。 */
+function aggregateByWorkspace(totals: Record<string, string>) {
+  return http.get("/api/v1/workspaces/:id/usage/aggregate", ({ params }) =>
+    HttpResponse.json(aggregateBody(totals[String(params.id)] ?? "0")),
+  );
+}
+
+/**
+ * 让“取消旧空间业务请求”真实发出后再停住：每次 predicate 取消各占一个 gate，
+ * 测试可逐个放行，观察等待窗口里迟到回调的行为。
+ */
+function holdBusinessCancels(client: QueryClient) {
+  const gates: Array<() => void> = [];
+  const cancelQueries = client.cancelQueries.bind(client);
+  vi.spyOn(client, "cancelQueries").mockImplementation((filters, options) => {
+    const done = cancelQueries(filters, options);
+    if (filters === undefined || !("predicate" in filters)) return done;
+    const gate = deferred();
+    gates.push(() => gate.resolve());
+    return done.then(() => gate.promise);
+  });
+  return gates;
+}
 
 function homeTree(
   client: QueryClient,
@@ -1043,5 +1083,308 @@ describe("workspace home", () => {
     expect(screen.getByTestId("metric-total").textContent).not.toContain(
       "4.4K",
     );
+  });
+
+  it("a create whose list refetch spans an external A→C→A navigation keeps the newest selection", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+    ]);
+    const created = workspace(WS_D, "Delta");
+    const listGate = deferred<Response>();
+    let listCalls = 0;
+    server.use(
+      http.get("/api/v1/workspaces", () => {
+        listCalls += 1;
+        return listCalls === 1
+          ? HttpResponse.json(backend.state.workspaces.map(body))
+          : listGate.promise;
+      }),
+      http.post("/api/v1/workspaces", async ({ request }) => {
+        backend.calls.posts.push(await request.json());
+        return HttpResponse.json(body(created), { status: 201 });
+      }),
+      aggregateByWorkspace({ [WS_A]: "4444", [WS_C]: "3333", [WS_D]: "9999" }),
+    );
+    const user = userEvent.setup();
+    const client = renderHome(
+      createAppQueryClient(),
+      `/?workspace=${WS_A}&tz=UTC`,
+      <>
+        <NavigateTo to={`/?workspace=${WS_C}&tz=UTC`} label="去 C" />
+        <NavigateTo to={`/?workspace=${WS_A}&tz=UTC`} label="回 A" />
+      </>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("4.4K"),
+    );
+
+    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText("名称"), "Delta");
+    await user.click(within(dialog).getByRole("button", { name: "创建" }));
+    // 201 已返回，列表重查仍挂起。
+    await waitFor(() => expect(listCalls).toBe(2));
+
+    // 重查窗口里先外部去 C、再外部回 A：两次导航都要真实落到 URL 与可见数据上。
+    await user.click(screen.getByRole("button", { name: "去 C" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("3.3K"),
+    );
+    await user.click(screen.getByRole("button", { name: "回 A" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("4.4K"),
+    );
+
+    backend.state.workspaces = [
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+      created,
+    ];
+    listGate.resolve(HttpResponse.json(backend.state.workspaces.map(body)));
+    await new Promise((r) => setTimeout(r, 50));
+
+    // 创建本身成功，但期间用户已把选择定回 A：不得改 URL 到 D，也不得上 D 的数据。
+    expect(search().get("workspace")).toBe(WS_A);
+    expect(screen.getByTestId("metric-total").textContent).toContain("4.4K");
+    expect(screen.getByTestId("metric-total").textContent).not.toContain(
+      "10.0K",
+    );
+    expect(
+      client.getQueryData<Workspace[]>(["workspace", "list", USER]),
+    ).toContainEqual(created);
+  });
+
+  it("a create in the zero-workspace window selects the new workspace before the list refetch returns", async () => {
+    const created = workspace(WS_B, "Beta");
+    useBackend([]);
+    const listGate = deferred<Response>();
+    let listCalls = 0;
+    server.use(
+      http.get("/api/v1/workspaces", () => {
+        listCalls += 1;
+        return listCalls === 1 ? HttpResponse.json([]) : listGate.promise;
+      }),
+      http.post("/api/v1/workspaces", () =>
+        HttpResponse.json(body(created), { status: 201 }),
+      ),
+      aggregateByWorkspace({ [WS_B]: "2222" }),
+    );
+    const user = userEvent.setup();
+    const client = renderHome(createAppQueryClient(), "/");
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText("名称"), "Beta");
+    await user.click(within(dialog).getByRole("button", { name: "创建" }));
+    await waitFor(() => expect(listCalls).toBe(2));
+
+    // 列表重查还挂着：新空间已写入缓存，Home 规范化 URL、旧 modal 卸载、业务数据跟上。
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("2.2K"),
+    );
+
+    listGate.resolve(HttpResponse.json([body(created)]));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(search().get("workspace")).toBe(WS_B);
+    expect(screen.getByTestId("metric-total").textContent).toContain("2.2K");
+    expect(client.getQueryData(["workspace", "list", USER])).toEqual([created]);
+  });
+
+  it.each(["external A→C→A", "new selection C"])(
+    "a create blocked while cancelling the old workspace data cannot override a newer selection (%s)",
+    async (variant) => {
+      const backend = useBackend([
+        workspace(WS_A, "Alpha"),
+        workspace(WS_B, "Beta"),
+        workspace(WS_C, "Gamma"),
+      ]);
+      const created = workspace(WS_D, "Delta");
+      server.use(
+        http.post("/api/v1/workspaces", async ({ request }) => {
+          backend.calls.posts.push(await request.json());
+          backend.state.workspaces = [...backend.state.workspaces, created];
+          return HttpResponse.json(body(created), { status: 201 });
+        }),
+        aggregateByWorkspace({
+          [WS_A]: "4444",
+          [WS_C]: "3333",
+          [WS_D]: "9999",
+        }),
+      );
+      const client = createAppQueryClient();
+      const gates = holdBusinessCancels(client);
+      const user = userEvent.setup();
+      const external = variant.startsWith("external");
+      renderHome(
+        client,
+        `/?workspace=${WS_A}&tz=UTC`,
+        external ? (
+          <>
+            <NavigateTo to={`/?workspace=${WS_C}&tz=UTC`} label="去 C" />
+            <NavigateTo to={`/?workspace=${WS_A}&tz=UTC`} label="回 A" />
+          </>
+        ) : undefined,
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId("metric-total").textContent).toContain(
+          "4.4K",
+        ),
+      );
+
+      await user.click(screen.getByRole("button", { name: "创建工作区" }));
+      const dialog = await screen.findByRole("dialog");
+      await user.type(within(dialog).getByLabelText("名称"), "Delta");
+      await user.click(within(dialog).getByRole("button", { name: "创建" }));
+      // 创建已成功、列表已重查，正卡在取消 A 业务请求的等待窗口里。
+      await waitFor(() => expect(gates).toHaveLength(1));
+
+      if (external) {
+        await user.click(screen.getByRole("button", { name: "去 C" }));
+        await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+        await waitFor(() =>
+          expect(screen.getByTestId("metric-total").textContent).toContain(
+            "3.3K",
+          ),
+        );
+        await user.click(screen.getByRole("button", { name: "回 A" }));
+        await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
+        await waitFor(() =>
+          expect(screen.getByTestId("metric-total").textContent).toContain(
+            "4.4K",
+          ),
+        );
+
+        gates[0]?.();
+        await new Promise((r) => setTimeout(r, 30));
+
+        // 旧创建晚到：不得导航到 D，不得关掉 modal，也不得清掉更晚的选择结果。
+        expect(search().get("workspace")).toBe(WS_A);
+        expect(screen.getByTestId("metric-total").textContent).toContain(
+          "4.4K",
+        );
+        expect(screen.getByTestId("metric-total").textContent).not.toContain(
+          "10.0K",
+        );
+        expect(screen.getByRole("dialog")).toBeTruthy();
+        expect(screen.queryByText(/切换失败/)).toBeNull();
+        expect(
+          client.getQueryData<Workspace[]>(["workspace", "list", USER]),
+        ).toContainEqual(created);
+        return;
+      }
+
+      // 窗口里用户选择 C：C 的详情成功，也在等它自己的旧业务取消窗口。
+      await user.click(screen.getByRole("button", { name: "Gamma" }));
+      await waitFor(() => expect(gates).toHaveLength(2));
+      expect(
+        screen.getByRole("button", { name: /Gamma/ }).hasAttribute("disabled"),
+      ).toBe(true);
+
+      // 先放行旧创建：它只能返回，不能清掉 C 的 pending、错误或 modal，也不能改 URL。
+      gates[0]?.();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(search().get("workspace")).toBe(WS_A);
+      expect(
+        screen.getByRole("button", { name: /Gamma/ }).hasAttribute("disabled"),
+      ).toBe(true);
+      expect(screen.getByRole("dialog")).toBeTruthy();
+      expect(screen.queryByText(/切换失败/)).toBeNull();
+      expect(screen.getByTestId("metric-total").textContent).toContain("4.4K");
+
+      gates[1]?.();
+      await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+      await waitFor(() =>
+        expect(screen.getByTestId("metric-total").textContent).toContain(
+          "3.3K",
+        ),
+      );
+      expect(screen.getByTestId("metric-total").textContent).not.toContain(
+        "10.0K",
+      );
+      expect(
+        client.getQueryData<Workspace[]>(["workspace", "list", USER]),
+      ).toContainEqual(created);
+    },
+  );
+
+  it("a create pending when the browser goes back to a normalized location keeps that location", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+    ]);
+    const created = workspace(WS_D, "Delta");
+    const listGate = deferred<Response>();
+    let listCalls = 0;
+    server.use(
+      http.get("/api/v1/workspaces", () => {
+        listCalls += 1;
+        return listCalls === 1
+          ? HttpResponse.json(backend.state.workspaces.map(body))
+          : listGate.promise;
+      }),
+      http.post("/api/v1/workspaces", async ({ request }) => {
+        backend.calls.posts.push(await request.json());
+        return HttpResponse.json(body(created), { status: 201 });
+      }),
+      aggregateByWorkspace({ [WS_A]: "4444", [WS_C]: "3333", [WS_D]: "9999" }),
+    );
+    const user = userEvent.setup();
+    const client = renderHome(
+      createAppQueryClient(),
+      "/?tz=UTC",
+      <>
+        <NavigateTo to={`/?workspace=${WS_C}&tz=UTC`} label="去 C" />
+        <NavigateBack />
+      </>,
+    );
+    // 首次规范化写出的 A 位置带系统标记；后退会回到这个位置本身。
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("4.4K"),
+    );
+
+    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText("名称"), "Delta");
+    await user.click(within(dialog).getByRole("button", { name: "创建" }));
+    await waitFor(() => expect(listCalls).toBe(2));
+
+    await user.click(screen.getByRole("button", { name: "去 C" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("3.3K"),
+    );
+
+    // 后退回到同一个 A 位置：这是外部路由事件，不能当成系统自己的写入。
+    await user.click(screen.getByRole("button", { name: "浏览器后退" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("4.4K"),
+    );
+
+    backend.state.workspaces = [
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+      created,
+    ];
+    listGate.resolve(HttpResponse.json(backend.state.workspaces.map(body)));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(search().get("workspace")).toBe(WS_A);
+    expect(screen.getByTestId("metric-total").textContent).toContain("4.4K");
+    expect(screen.getByTestId("metric-total").textContent).not.toContain(
+      "10.0K",
+    );
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(
+      client.getQueryData<Workspace[]>(["workspace", "list", USER]),
+    ).toContainEqual(created);
   });
 });
