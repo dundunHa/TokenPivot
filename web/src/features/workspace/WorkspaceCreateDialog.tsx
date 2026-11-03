@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -10,7 +11,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { ApiError } from "@/lib/api";
 import { trimWorkspaceName, workspaceNameProblem, type Workspace } from "./api";
-import { useCreateWorkspace } from "./queries";
+import { isCurrentSessionUser, useCreateWorkspace } from "./queries";
 
 function createErrorMessage(error: unknown): string | null {
   if (!(error instanceof ApiError)) return "请求失败，请重试。";
@@ -46,10 +47,20 @@ export function WorkspaceCreateDialog({
   onCreated: (workspace: Workspace) => void | Promise<void>;
 }) {
   const create = useCreateWorkspace(userId);
+  const client = useQueryClient();
   const [name, setName] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const inFlight = useRef(false);
+  /** 挂载状态：卸载后的迟到成功不再回调父容器。 */
+  const live = useRef(true);
+
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -75,6 +86,8 @@ export function WorkspaceCreateDialog({
     setProblem(null);
     try {
       const created = await create.mutateAsync(trimWorkspaceName(name));
+      // 卸载或换号后的迟到成功不再交给父容器导航；成功本身不改成错误显示。
+      if (!live.current || !isCurrentSessionUser(client, userId)) return;
       await onCreated(created);
     } catch {
       // 失败原因由 mutation.error 渲染；输入与 modal 在此保留。

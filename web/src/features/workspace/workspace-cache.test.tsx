@@ -61,6 +61,15 @@ function mount(client: QueryClient, userId: string | undefined) {
   );
 }
 
+function CreateProbe({ userId }: { userId: string }) {
+  const create = useCreateWorkspace(userId);
+  return (
+    <button type="button" onClick={() => create.mutate("New")}>
+      create
+    </button>
+  );
+}
+
 function mockWorkspace() {
   const hits = { list: 0, options: 0 };
   server.use(
@@ -429,18 +438,69 @@ describe("business cache cleanup", () => {
     expect(businessCount(client)).toBe(0);
     view.unmount();
   });
+
+  it("a create success that lands after logout and a new login cannot rebuild the old list cache", async () => {
+    const gate = deferred<Response>();
+    const client = createAppQueryClient();
+    seed(client, SESSION_A);
+    server.use(
+      http.post("/api/v1/workspaces", () => gate.promise),
+      http.post(
+        "/api/v1/auth/logout",
+        () => new HttpResponse(null, { status: 204 }),
+      ),
+      http.post("/api/v1/auth/login", () =>
+        HttpResponse.json({
+          user: SESSION_B.user,
+          expires_at: SESSION_B.expires_at,
+        }),
+      ),
+    );
+    render(
+      <QueryClientProvider client={client}>
+        <CreateProbe userId="user-a" />
+        <LogoutProbe />
+        <LoginProbe />
+      </QueryClientProvider>,
+    );
+    await act(async () => {
+      screen.getByRole("button", { name: "create" }).click();
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "out" }).click();
+    });
+    await waitFor(() => expect(client.getQueryData(sessionKey)).toBeNull());
+    await act(async () => {
+      screen.getByRole("button", { name: "in" }).click();
+    });
+    await waitFor(() =>
+      expect(client.getQueryData(sessionKey)).toEqual(SESSION_B),
+    );
+
+    // B 自己的业务缓存已经就绪。
+    const keyB = workspaceListQuery("user-b").queryKey;
+    client.setQueryData(keyB, [{ workspaceId: WS_B, name: "Beta" }]);
+
+    await act(async () => {
+      gate.resolve(
+        HttpResponse.json({ workspace_id: WS, name: "Alpha" }, { status: 201 }),
+      );
+      await Promise.resolve();
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // 旧身份的迟到成功不重建旧列表缓存，也不动新会话与 B 的业务数据。
+    expect(
+      client.getQueryData(workspaceListQuery("user-a").queryKey),
+    ).toBeUndefined();
+    expect(client.getQueryData(sessionKey)).toEqual(SESSION_B);
+    expect(client.getQueryData(keyB)).toEqual([
+      { workspaceId: WS_B, name: "Beta" },
+    ]);
+  });
 });
 
 describe("workspace create mutation errors", () => {
-  function CreateProbe({ userId }: { userId: string }) {
-    const create = useCreateWorkspace(userId);
-    return (
-      <button type="button" onClick={() => create.mutate("New")}>
-        create
-      </button>
-    );
-  }
-
   const businessCount = (client: QueryClient) =>
     client
       .getQueryCache()
