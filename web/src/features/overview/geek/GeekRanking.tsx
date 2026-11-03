@@ -50,8 +50,7 @@ export function GeekRanking({
         {items.map((item, i) => {
           const BAR_W = 28;
           const filled = Math.round((item.value / maxV) * BAR_W);
-          const bar =
-            "█".repeat(filled) + "░".repeat(BAR_W - filled);
+          const bar = "█".repeat(filled) + "░".repeat(BAR_W - filled);
           const isActive =
             activeFilter &&
             activeFilter.key === item.filterKey &&
@@ -69,14 +68,21 @@ export function GeekRanking({
               role={item.clickable ? "button" : undefined}
               tabIndex={item.clickable ? 0 : undefined}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && item.clickable && item.filterKey && item.filterVal) {
+                if (
+                  e.key === "Enter" &&
+                  item.clickable &&
+                  item.filterKey &&
+                  item.filterVal
+                ) {
                   onToggle(item.filterKey, item.filterVal.toLowerCase());
                 }
               }}
             >
               <span className="geek-rank-name">{item.name}</span>
               <span className="geek-rank-bar geek-amber">{bar}</span>
-              <span className="geek-rank-value geek-num">{fmt(item.value)}</span>
+              <span className="geek-rank-value geek-num">
+                {fmt(item.value)}
+              </span>
             </div>
           );
         })}

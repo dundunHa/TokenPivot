@@ -34,7 +34,11 @@ export function parseCommand(input: string): ParsedCommand {
   const updates: Partial<OverviewFilters> = {};
 
   if (!trimmed) {
-    return { updates: { providers: [], models: [], projects: [] }, errors, raw };
+    return {
+      updates: { providers: [], models: [], projects: [] },
+      errors,
+      raw,
+    };
   }
 
   const tokens = trimmed.split(/\s+/);

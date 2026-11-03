@@ -13,7 +13,9 @@ describe("parseCommand", () => {
   });
 
   it("parses multiple filters", () => {
-    const result = parseCommand("provider=openai model=gpt-5.2 project=tokenpivot");
+    const result = parseCommand(
+      "provider=openai model=gpt-5.2 project=tokenpivot",
+    );
     expect(result.errors).toHaveLength(0);
     expect(result.updates.providers).toEqual(["openai"]);
     expect(result.updates.models).toEqual(["gpt-5.2"]);

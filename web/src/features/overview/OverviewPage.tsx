@@ -225,7 +225,10 @@ function OverviewContent({
 
       {/* 可视化筛选栏（保留为可折叠入口） */}
       <details className="geek-filter-details">
-        <summary className="geek-dim" style={{ cursor: "pointer", fontSize: 12 }}>
+        <summary
+          className="geek-dim"
+          style={{ cursor: "pointer", fontSize: 12 }}
+        >
           ▾ 可视化筛选
         </summary>
         <OverviewFilterBar
@@ -234,7 +237,9 @@ function OverviewContent({
           modelOptions={(options.data?.models ?? []).map(asOption)}
           projectOptions={projectOptions}
           optionsError={
-            options.isError ? "筛选选项加载失败，暂时无法编辑供应商/模型。" : null
+            options.isError
+              ? "筛选选项加载失败，暂时无法编辑供应商/模型。"
+              : null
           }
           projectsError={
             projects.isError ? "项目列表加载失败，暂时无法编辑项目。" : null
@@ -249,11 +254,7 @@ function OverviewContent({
         <div className="flex flex-col gap-4">
           {/* Hero 指标 */}
           {data ? (
-            <GeekHeroMetrics
-              totals={data.totals}
-              rate60={null}
-              timezone={tz}
-            />
+            <GeekHeroMetrics totals={data.totals} rate60={null} timezone={tz} />
           ) : null}
 
           {/* 趋势图 */}
@@ -297,11 +298,17 @@ function OverviewContent({
               projectNames={projectNames}
               onToggle={(dim, val) => {
                 if (dim === "provider") {
-                  update({ ...filters, providers: toggle(filters.providers, val) });
+                  update({
+                    ...filters,
+                    providers: toggle(filters.providers, val),
+                  });
                 } else if (dim === "model") {
                   update({ ...filters, models: toggle(filters.models, val) });
                 } else if (dim === "project") {
-                  update({ ...filters, projects: toggle(filters.projects, val) });
+                  update({
+                    ...filters,
+                    projects: toggle(filters.projects, val),
+                  });
                 }
               }}
             />
