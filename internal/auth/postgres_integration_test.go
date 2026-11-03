@@ -375,8 +375,8 @@ func assertWaitingOnLockStatement(t *testing.T, ctx context.Context, observer *p
 // transaction, not of a transaction that only holds the lock.
 type pausingRegistrationTx struct {
 	inner TxRunner
-	// written is closed once the paused transaction has written the account, its
-	// personal workspace, the owner membership and the first session.
+	// written is closed once the paused transaction has written the account and
+	// its first session.
 	written chan struct{}
 	// outcome carries exactly one decision: nil commits, any error rolls back.
 	outcome chan error
@@ -424,7 +424,7 @@ func (s *pausingRegistrationStore) CreateSession(ctx context.Context, userID ID,
 }
 
 // waitForPausedRegistration waits until the wrapped registration transaction has
-// written all four rows and is stopped before its commit, so a test never guesses
+// written both rows and is stopped before its commit, so a test never guesses
 // that timing from a sleep.
 func waitForPausedRegistration(t *testing.T, ctx context.Context, gate *pausingRegistrationTx) {
 	t.Helper()
@@ -540,9 +540,6 @@ func TestConcurrentRegistrationCreatesOneAccount(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if err := tx.CreatePersonal(ctx, user.ID); err != nil {
-					return err
-				}
 				_, err = tx.CreateSession(ctx, user.ID, digest[:])
 				return err
 			})
@@ -598,9 +595,6 @@ func TestRegisterTransactionRollsBackUser(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := tx.CreatePersonal(ctx, user.ID); err != nil {
-			return err
-		}
 		_, err = tx.CreateSession(ctx, user.ID, colliding[:])
 		return err
 	})
@@ -615,8 +609,10 @@ func TestRegisterTransactionRollsBackUser(t *testing.T) {
 	if users != 0 {
 		t.Fatal("failed session insert left the account committed")
 	}
-	if workspaces != 1 || memberships != 1 {
-		t.Fatalf("workspaces=%d memberships=%d, want only the first account's set", workspaces, memberships)
+	// Registration writes no workspace and no membership at all, so the first
+	// account must not have left either behind.
+	if workspaces != 0 || memberships != 0 {
+		t.Fatalf("workspaces=%d memberships=%d, want none from registration", workspaces, memberships)
 	}
 	// A successful registration still commits both rows together.
 	if _, err := service.Register(ctx, "second@example.com", "synthetic-password", "127.0.0.2"); err != nil {
@@ -928,8 +924,9 @@ func TestRegisterSessionHasNoPlaintextToken(t *testing.T) {
 	}
 }
 
-// registrationCounts reads the four tables registration writes, so a test can
-// assert a whole commit or a whole rollback instead of one column.
+// registrationCounts reads the two tables registration writes plus the two it
+// must never write, so a test can assert a whole commit or a whole rollback
+// instead of one column.
 func registrationCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (users, workspaces, memberships, sessions int) {
 	t.Helper()
 	err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM users),
@@ -942,23 +939,22 @@ func registrationCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (
 	return users, workspaces, memberships, sessions
 }
 
-// assertCompleteAccount proves one registered email has exactly the four rows a
-// successful registration commits: one account, one personal workspace named
-// Personal, one owner membership in it and one session.
-func assertCompleteAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, email string) {
+// assertRegisteredAccount proves one registered email has exactly the rows a
+// successful registration commits: one account, one session, and no workspace or
+// membership, because registration deliberately starts every account at zero
+// workspaces.
+func assertRegisteredAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, email string) {
 	t.Helper()
-	var users, owned, sessions int
+	var users, sessions, workspaces, memberships int
 	err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM users u WHERE u.email = $1),
-       (SELECT count(*) FROM workspaces w
-          JOIN workspace_memberships m ON m.workspace_id = w.id
-          JOIN users u ON u.id = m.user_id
-         WHERE u.email = $1 AND m.role = 'owner' AND w.name = 'Personal'),
-       (SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = $1)`, email).Scan(&users, &owned, &sessions)
+       (SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = $1),
+       (SELECT count(*) FROM workspaces w JOIN users u ON u.id = w.created_by_user_id WHERE u.email = $1),
+       (SELECT count(*) FROM workspace_memberships m JOIN users u ON u.id = m.user_id WHERE u.email = $1)`, email).Scan(&users, &sessions, &workspaces, &memberships)
 	if err != nil {
 		t.Fatal(database.SafeError("load account rows", err))
 	}
-	if users != 1 || owned != 1 || sessions != 1 {
-		t.Fatalf("%s users=%d personal owner=%d sessions=%d, want 1/1/1", email, users, owned, sessions)
+	if users != 1 || sessions != 1 || workspaces != 0 || memberships != 0 {
+		t.Fatalf("%s users=%d sessions=%d workspaces=%d memberships=%d, want 1/1/0/0", email, users, sessions, workspaces, memberships)
 	}
 }
 
@@ -1003,11 +999,11 @@ func setInsertPrivilege(t *testing.T, ctx context.Context, ownerURL, appRole, ta
 	}
 }
 
-// TestRegisterOpenCreatesPersonalWorkspaceForEachAccount covers the open
-// deployment: consecutive registrations of different emails all succeed, each with
-// its own personal workspace, owner membership and first session, while a repeat
-// of an owned email is a conflict.
-func TestRegisterOpenCreatesPersonalWorkspaceForEachAccount(t *testing.T) {
+// TestRegisterOpenCreatesAccountWithoutWorkspace covers the open deployment:
+// consecutive registrations of different emails all succeed with one account and
+// one session each and no workspace or membership, while a repeat of an owned
+// email is a conflict.
+func TestRegisterOpenCreatesAccountWithoutWorkspace(t *testing.T) {
 	schema := newAuthSchema(t, true)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1017,23 +1013,24 @@ func TestRegisterOpenCreatesPersonalWorkspaceForEachAccount(t *testing.T) {
 		}
 	}
 	for _, email := range []string{"first@example.com", "second@example.com"} {
-		assertCompleteAccount(t, ctx, schema.pool, email)
+		assertRegisteredAccount(t, ctx, schema.pool, email)
 	}
 	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
-	if users != 2 || workspaces != 2 || memberships != 2 || sessions != 2 {
-		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 2 each", users, workspaces, memberships, sessions)
+	if users != 2 || workspaces != 0 || memberships != 0 || sessions != 2 {
+		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 2/0/0/2", users, workspaces, memberships, sessions)
 	}
 	if _, err := schema.service.Register(ctx, "FIRST@example.com", "synthetic-password", "127.0.0.9"); !errors.Is(err, ErrEmailUnavailable) {
 		t.Fatalf("repeat registration error = %v, want ErrEmailUnavailable", err)
 	}
-	if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 2 || workspaces != 2 || memberships != 2 || sessions != 2 {
+	if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 2 || workspaces != 0 || memberships != 0 || sessions != 2 {
 		t.Fatalf("a rejected repeat changed the rows: %d/%d/%d/%d", users, workspaces, memberships, sessions)
 	}
 }
 
 // TestRegisterClosedFirstUserThenRejected covers the closed deployment against a
-// real database: the first account of the empty database is created completely,
-// and every later registration of any email is refused without adding rows.
+// real database: the first account of the empty database is created with its
+// session and no workspace, and every later registration of any email is refused
+// without adding rows.
 func TestRegisterClosedFirstUserThenRejected(t *testing.T) {
 	schema := newAuthSchema(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1041,10 +1038,10 @@ func TestRegisterClosedFirstUserThenRejected(t *testing.T) {
 	if _, err := schema.service.Register(ctx, "first@example.com", "synthetic-password", "127.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
-	assertCompleteAccount(t, ctx, schema.pool, "first@example.com")
+	assertRegisteredAccount(t, ctx, schema.pool, "first@example.com")
 	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
-	if users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
-		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
+	if users != 1 || workspaces != 0 || memberships != 0 || sessions != 1 {
+		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1/0/0/1", users, workspaces, memberships, sessions)
 	}
 	for _, email := range []string{"first@example.com", "second@example.com"} {
 		_, err := schema.service.Register(ctx, email, "synthetic-password", "127.0.0.2")
@@ -1055,18 +1052,18 @@ func TestRegisterClosedFirstUserThenRejected(t *testing.T) {
 			t.Fatalf("%s leaked the email unique conflict", email)
 		}
 	}
-	if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
+	if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 1 || workspaces != 0 || memberships != 0 || sessions != 1 {
 		t.Fatalf("a refused registration added rows: %d/%d/%d/%d", users, workspaces, memberships, sessions)
 	}
 }
 
 // TestRegisterClosedConcurrentFirstRegistration proves the advisory lock decides
 // the empty-database case from the outcome of a real registration transaction: the
-// first registration writes its account, personal workspace, owner membership and
-// first session and is then stopped before its commit, the competitors are observed
-// queued on the registration advisory lock in pg_locks, and after the first one
-// commits exactly one registration exists while the others fail with the closed
-// error, not with an email conflict.
+// first registration writes its account and first session and is then stopped
+// before its commit, the competitors are observed queued on the registration
+// advisory lock in pg_locks, and after the first one commits exactly one
+// registration exists while the others fail with the closed error, not with an
+// email conflict.
 func TestRegisterClosedConcurrentFirstRegistration(t *testing.T) {
 	schema := newAuthSchema(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -1140,17 +1137,17 @@ func TestRegisterClosedConcurrentFirstRegistration(t *testing.T) {
 	if succeeded != 0 || len(refused) != competitors {
 		t.Fatalf("succeeded=%d refused=%d, want 0 and %d after a committed first user", succeeded, len(refused), competitors)
 	}
-	assertCompleteAccount(t, ctx, schema.pool, "race-winner@example.com")
+	assertRegisteredAccount(t, ctx, schema.pool, "race-winner@example.com")
 	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
-	if users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
-		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
+	if users != 1 || workspaces != 0 || memberships != 0 || sessions != 1 {
+		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1/0/0/1", users, workspaces, memberships, sessions)
 	}
 }
 
 // TestRegisterClosedWaiterSucceedsAfterRollback proves the waiter reads the lock
-// holder's outcome instead of assuming it: the first real registration writes all
-// four rows and is then rolled back, so the database is still empty when the waiter
-// acquires the lock and that waiter becomes the first user.
+// holder's outcome instead of assuming it: the first real registration writes its
+// account and first session and is then rolled back, so the database is still
+// empty when the waiter acquires the lock and that waiter becomes the first user.
 func TestRegisterClosedWaiterSucceedsAfterRollback(t *testing.T) {
 	schema := newAuthSchema(t, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -1195,17 +1192,17 @@ func TestRegisterClosedWaiterSucceedsAfterRollback(t *testing.T) {
 	if session.User.Email != "waiter@example.com" {
 		t.Fatalf("waiter session = %+v", session)
 	}
-	assertCompleteAccount(t, ctx, schema.pool, "waiter@example.com")
+	assertRegisteredAccount(t, ctx, schema.pool, "waiter@example.com")
 	users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool)
-	if users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
-		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
+	if users != 1 || workspaces != 0 || memberships != 0 || sessions != 1 {
+		t.Fatalf("users=%d workspaces=%d memberships=%d sessions=%d, want 1/0/0/1", users, workspaces, memberships, sessions)
 	}
 }
 
 // TestRegisterRollsBackAtEveryStage injects a real INSERT permission failure into
-// each of the four write stages in its own isolated schema. The effective
-// privilege is asserted to be gone before the attempt, the returned error must
-// name the intended stage, and no row of any table may survive the rollback.
+// each of the two write stages in its own isolated schema. The effective privilege
+// is asserted to be gone before the attempt, the returned error must name the
+// intended stage, and no row of any table may survive the rollback.
 func TestRegisterRollsBackAtEveryStage(t *testing.T) {
 	for _, stage := range []struct {
 		name  string
@@ -1215,8 +1212,6 @@ func TestRegisterRollsBackAtEveryStage(t *testing.T) {
 		wantStage string
 	}{
 		{"users", "users", "auth registration"},
-		{"workspaces", "workspaces", "workspaces insert"},
-		{"workspace_memberships", "workspace_memberships", "workspaces membership insert"},
 		{"sessions", "sessions", "auth session insert"},
 	} {
 		t.Run(stage.name, func(t *testing.T) {
@@ -1250,9 +1245,9 @@ func TestRegisterRollsBackAtEveryStage(t *testing.T) {
 			if _, err := schema.service.Register(ctx, "blocked@example.com", "synthetic-password", "127.0.0.4"); err != nil {
 				t.Fatalf("retry after restoring %s failed: %v", stage.table, err)
 			}
-			assertCompleteAccount(t, ctx, schema.pool, "blocked@example.com")
-			if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 1 || workspaces != 1 || memberships != 1 || sessions != 1 {
-				t.Fatalf("retry rows: users=%d workspaces=%d memberships=%d sessions=%d, want 1 each", users, workspaces, memberships, sessions)
+			assertRegisteredAccount(t, ctx, schema.pool, "blocked@example.com")
+			if users, workspaces, memberships, sessions := registrationCounts(t, ctx, schema.pool); users != 1 || workspaces != 0 || memberships != 0 || sessions != 1 {
+				t.Fatalf("retry rows: users=%d workspaces=%d memberships=%d sessions=%d, want 1/0/0/1", users, workspaces, memberships, sessions)
 			}
 		})
 	}
