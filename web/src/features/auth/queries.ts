@@ -11,7 +11,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { ApiError } from "@/lib/api";
-import { fetchSession, login, logout, register } from "./api";
+import { bindFeishu, fetchSession, login, logout, register } from "./api";
 import { expiresAtMs, type AuthCredentials, type AuthSession } from "./model";
 
 export const sessionKey = ["auth", "session"] as const;
@@ -144,6 +144,23 @@ export function useCredentialsMutation(kind: "login" | "register") {
     onMutate: () => cancelSession(client),
     onSuccess: async (session) => {
       // 先清旧身份的业务缓存，再写入新会话，防止跨账号残留。
+      await Promise.all([cancelSession(client), dropBusiness(client)]);
+      client.setQueryData<AuthSession | null>(sessionKey, session);
+    },
+  });
+}
+
+/**
+ * 同邮箱飞书绑定：提交一次原账号密码。
+ * 成功路径与邮箱登录一致：先清旧身份业务缓存，再写入新会话。
+ */
+export function useFeishuBindMutation() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationKey: writeKey,
+    mutationFn: (password: string) => bindFeishu(password),
+    onMutate: () => cancelSession(client),
+    onSuccess: async (session) => {
       await Promise.all([cancelSession(client), dropBusiness(client)]);
       client.setQueryData<AuthSession | null>(sessionKey, session);
     },

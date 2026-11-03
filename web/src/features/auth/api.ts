@@ -1,9 +1,11 @@
-import { ApiError, postResult, requestJson } from "@/lib/api";
+import { ApiError, getJson, postResult, requestJson } from "@/lib/api";
 import {
   AuthApiError,
   parseAuthSession,
+  parseFeishuAuthorize,
   type AuthCredentials,
   type AuthSession,
+  type FeishuAuthorizeInfo,
 } from "./model";
 
 const BASE = "/api/v1/auth";
@@ -74,4 +76,29 @@ export async function fetchSession(
 export async function logout(): Promise<void> {
   const { status } = await guarded(() => postResult(`${BASE}/logout`));
   if (status !== 204) throw new AuthApiError(status, "BAD_RESPONSE");
+}
+
+/**
+ * 取飞书授权地址与有效期。
+ * 未配置飞书应用凭证不是错误：服务端返回 200 + `enabled: false`。
+ */
+export async function fetchFeishuAuthorize(
+  signal?: AbortSignal,
+): Promise<FeishuAuthorizeInfo> {
+  return guarded(async () => {
+    const body = await getJson(`${BASE}/feishu/authorize`, signal);
+    const info = parseFeishuAuthorize(body);
+    if (info === undefined) throw new AuthApiError(200, "BAD_RESPONSE");
+    return info;
+  });
+}
+
+/** 同邮箱绑定确认：用一次原账号密码换取飞书身份绑定与正式会话。 */
+export async function bindFeishu(password: string): Promise<AuthSession> {
+  return guarded(async () => {
+    const { status, body } = await postResult(`${BASE}/feishu/bind`, {
+      password,
+    });
+    return toSession(status, body);
+  });
 }
