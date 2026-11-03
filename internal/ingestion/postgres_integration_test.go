@@ -1338,16 +1338,13 @@ func TestBatchPipelineSamplesClockAfterLockWait(t *testing.T) {
 		}
 		event := mustDecodeEvent(t, acceptedEventJSON("evt-batch-insert", occurredAt, projectID))
 
-		// The prefetch hint merges the initial sample with the ownership query, so
-		// the buffered answer must be consumed without a second statement.
-		postgresItem.PrefetchProject(credential.WorkspaceID, event.ProjectID)
 		receivedAt, window, err := sampleWindow(ctx, item, event)
 		if err != nil || window != verdictValid {
 			t.Fatalf("initial window err=%v verdict=%v want valid", err, window)
 		}
 		exists, err := item.ProjectExists(ctx, credential.WorkspaceID, event.ProjectID)
 		if err != nil || !exists {
-			t.Fatalf("prefetched project exists=%v err=%v want true", exists, err)
+			t.Fatalf("project exists=%v err=%v want true", exists, err)
 		}
 
 		release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
@@ -1418,102 +1415,63 @@ func TestBatchPipelineSamplesClockAfterLockWait(t *testing.T) {
 		}
 	})
 
-	// A failing ownership query must not outrank the window verdict: the time sample
-	// is produced before the server even parses the second statement, so an expired
-	// or future event keeps its own answer instead of becoming a storage failure.
-	t.Run("project query failure does not mask expired or future window", func(t *testing.T) {
-		// The table is renamed, so the ownership query fails while the server resolves
-		// it, which is the failure mode that used to abort the whole statement group
-		// before the time sample ran.
-		if _, err := e.owner.Exec(ctx, "ALTER TABLE projects RENAME TO projects_hidden"); err != nil {
-			t.Fatal(database.SafeError("hide projects table", err))
-		}
-		t.Cleanup(func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if _, err := e.owner.Exec(cleanupCtx, "ALTER TABLE projects_hidden RENAME TO projects"); err != nil {
-				t.Error("restore projects table failed")
-			}
-		})
+	// The window verdict is decided by the first sample, which is a statement of its
+	// own, so an expired or future event never reaches the ownership query. That
+	// ordering is covered by TestExpiryPrecedesAnyIdentityLookup.
 
-		now := time.Now().UTC()
-		expiredAt := now.Add(-retainedWindow - 24*time.Hour).Truncate(time.Microsecond)
-		futureAt := now.Add(10 * time.Minute).Truncate(time.Microsecond)
-		validAt := now.Add(-time.Hour).Truncate(time.Microsecond)
-		logs := &syncBuffer{}
-		hidden := e.service(t, pool, logs)
-		results := runBatch(t, hidden, credential, encodedBatch(t,
-			acceptedEventJSON("evt-hidden-expired", expiredAt, projectID),
-			acceptedEventJSON("evt-hidden-future", futureAt, projectID),
-			acceptedEventJSON("evt-hidden-valid", validAt, projectID),
-		))
-		// The window verdicts are decided before the ownership answer is consumed, so
-		// only the valid event ever reads it, and only that event fails.
-		requireResultStatuses(t, results, statusExpired, statusRejected, statusRetryable)
-		requireResultCodes(t, results, "", codeFutureEvent, codeUnavailable)
-		for _, sourceEventID := range []string{"evt-hidden-expired", "evt-hidden-future", "evt-hidden-valid"} {
-			if count := e.countRows(t, ctx, workspaceID, sourceID, sourceEventID); count != 0 {
-				t.Fatalf("%s stored %d detail rows under a failing ownership query", sourceEventID, count)
-			}
-		}
-		// A per-item failure is reported without a log line, so the stage that owned it
-		// is asserted where it is still visible: on the sanitized answer buffered by the
-		// pipelined sample. The sample must succeed and only the ownership query may
-		// carry the project stage.
-		item := beginItem(t, ctx, store)
-		defer rollbackItem(t, ctx, item)
-		postgresItem, ok := item.(*postgresTx)
-		if !ok {
-			t.Fatal("NewPostgres did not return its own item transaction")
-		}
-		event := mustDecodeEvent(t, acceptedEventJSON("evt-hidden-sample", validAt, projectID))
-		postgresItem.PrefetchProject(credential.WorkspaceID, event.ProjectID)
-		if _, err := item.Now(ctx); err != nil {
-			t.Fatalf("initial sample failed under a failing ownership query: %v", err)
-		}
-		buffered := postgresItem.bufferedProject
-		if buffered == nil || buffered.err == nil {
-			t.Fatalf("buffered ownership answer=%+v want the project stage failure", buffered)
-		}
-		if got, want := buffered.err.Error(), "ingestion project: database operation failed"; got != want {
-			t.Fatalf("buffered ownership stage=%q want=%q", got, want)
-		}
-		if _, err := item.ProjectExists(ctx, credential.WorkspaceID, event.ProjectID); err == nil || err.Error() != buffered.err.Error() {
-			t.Fatalf("consumed ownership answer err=%v want the buffered project stage failure", err)
-		}
-		if strings.Contains(logs.String(), "ingestion server time") {
-			t.Fatalf("a failing ownership query was blamed on the server time stage: %s", logs.String())
-		}
-	})
-
-	// Every item transaction keeps the documented five round trips whether the
-	// connection has seen a statement before or not, because each statement is sent as
-	// an unnamed extended-protocol message with a single Sync instead of being prepared
+	// The first sample and the ownership query are separate statements, so an item
+	// costs one round trip more when it carries a project. The counts are identical
+	// on a cold connection and on a warm one, because every statement is sent as an
+	// unnamed extended-protocol message with a single Sync instead of being prepared
 	// first.
-	t.Run("cold and warm connections both use five round trips per item", func(t *testing.T) {
-		// With a project: the sample and the ownership query share one round trip.
-		projectService, projectCounter := e.countedService(t)
-		requireItemRoundTrips(t, projectService, projectCounter, credential, "cold accepted item",
-			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusAccepted)
-		requireItemRoundTrips(t, projectService, projectCounter, credential, "warm accepted item",
-			acceptedEventJSON("evt-rtt-warm", occurredAt, projectID), statusAccepted)
-		// The duplicate and the conflict read the stored basis in their own statement,
-		// so they cost the same five round trips as the accepted item.
-		requireItemRoundTrips(t, projectService, projectCounter, credential, "duplicate item",
-			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusDuplicate)
-		conflict := fmt.Sprintf(`{"source_event_id":"evt-rtt-new","project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+	t.Run("cold and warm connections use five round trips without project and six with project", func(t *testing.T) {
+		conflictWithProject := fmt.Sprintf(`{"source_event_id":"evt-rtt-new","project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
 			uuidText(projectID), occurredAt.UTC().Format(microLayout))
-		requireItemRoundTrips(t, projectService, projectCounter, credential, "conflict item", conflict, statusConflict)
 
-		// Without a project: the first sample is a single statement of its own, and on a
-		// cold connection it must not pay a prepare round trip either.
+		// With a project: begin, first sample, ownership query, insert with its clock
+		// sample, minute increment or comparison read with its clock sample, and the
+		// end of the transaction are six round trips.
+		projectService, projectCounter := e.countedService(t)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "cold accepted item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusAccepted)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm accepted item",
+			acceptedEventJSON("evt-rtt-warm", occurredAt, projectID), statusAccepted)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm duplicate item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusDuplicate)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm conflict item",
+			conflictWithProject, statusConflict)
+
+		// A cold duplicate and a cold conflict are measured on their own connections.
+		// The identity is already stored by the previous service, so the insert
+		// conflicts and the comparison read replaces the aggregation write, but the
+		// number of round trips stays the same.
+		coldDuplicateService, coldDuplicateCounter := e.countedService(t)
+		requireItemRoundTrips(t, coldDuplicateService, coldDuplicateCounter, credential, 6, "cold duplicate item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusDuplicate)
+		coldConflictService, coldConflictCounter := e.countedService(t)
+		requireItemRoundTrips(t, coldConflictService, coldConflictCounter, credential, 6, "cold conflict item",
+			conflictWithProject, statusConflict)
+
+		// Without a project: the ownership query is skipped, so every path costs one
+		// round trip less.
+		bareConflict := fmt.Sprintf(`{"source_event_id":"evt-rtt-bare","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			occurredAt.UTC().Format(microLayout))
 		bareService, bareCounter := e.countedService(t)
-		requireItemRoundTrips(t, bareService, bareCounter, credential, "cold accepted item without project",
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "cold accepted item without project",
 			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusAccepted)
-		requireItemRoundTrips(t, bareService, bareCounter, credential, "warm accepted item without project",
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm accepted item without project",
 			acceptedEventJSON("evt-rtt-bare-warm", occurredAt, pgtype.UUID{}), statusAccepted)
-		requireItemRoundTrips(t, bareService, bareCounter, credential, "duplicate item without project",
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm duplicate item without project",
 			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusDuplicate)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm conflict item without project",
+			bareConflict, statusConflict)
+
+		bareColdDuplicateService, bareColdDuplicateCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareColdDuplicateService, bareColdDuplicateCounter, credential, 5, "cold duplicate item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusDuplicate)
+		bareColdConflictService, bareColdConflictCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareColdConflictService, bareColdConflictCounter, credential, 5, "cold conflict item without project",
+			bareConflict, statusConflict)
 	})
 }
 
@@ -1521,7 +1479,7 @@ func TestBatchPipelineSamplesClockAfterLockWait(t *testing.T) {
 // its status and its exact number of network round trips. One item transaction owns the
 // single pooled connection for its whole lifetime, so a counter reset belongs to
 // exactly one of them.
-func requireItemRoundTrips(t *testing.T, service *Service, counter *roundTripCounter, credential credentials.Credential, label, eventJSON, wantStatus string) {
+func requireItemRoundTrips(t *testing.T, service *Service, counter *roundTripCounter, credential credentials.Credential, wantRounds int64, label, eventJSON, wantStatus string) {
 	t.Helper()
 	event := mustDecodeEvent(t, eventJSON)
 	counter.reset()
@@ -1530,8 +1488,8 @@ func requireItemRoundTrips(t *testing.T, service *Service, counter *roundTripCou
 	if got.status != wantStatus {
 		t.Fatalf("%s status=%s code=%s want=%s", label, got.status, got.code, wantStatus)
 	}
-	if rounds != 5 {
-		t.Fatalf("%s round trips=%d want=5", label, rounds)
+	if rounds != wantRounds {
+		t.Fatalf("%s round trips=%d want=%d", label, rounds, wantRounds)
 	}
 }
 
@@ -1656,18 +1614,6 @@ func (t *hookTx) Now(ctx context.Context) (time.Time, error) {
 
 func (t *hookTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
 	return t.inner.ProjectExists(ctx, workspaceID, projectID)
-}
-
-// PrefetchProject forwards the optional hint only while the server time is real. A
-// scripted clock answers Now on this wrapper, so the inner transaction must not
-// queue the ownership query behind a sample its owner never reads.
-func (t *hookTx) PrefetchProject(workspaceID, projectID credentials.ID) {
-	if t.hooks.now != nil {
-		return
-	}
-	if prefetcher, ok := t.inner.(projectPrefetcher); ok {
-		prefetcher.PrefetchProject(workspaceID, projectID)
-	}
 }
 
 func (t *hookTx) InsertEvent(ctx context.Context, event storedEvent) (bool, error) {
