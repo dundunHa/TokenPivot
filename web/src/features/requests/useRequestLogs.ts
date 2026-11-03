@@ -27,7 +27,7 @@ export function eventsQuery(
       query,
     ] as const,
     queryFn: ({ signal }) => fetchRequests(scope.workspaceId, query, signal),
-    meta: { userId: scope.userId },
+    meta: { userId: scope.userId, workspaceId: scope.workspaceId },
   });
 }
 
@@ -42,7 +42,7 @@ export function rateQuery(scope: QueryScope, filters: OverviewFilters) {
       query,
     ] as const,
     queryFn: ({ signal }) => fetchRate(scope.workspaceId, query, signal),
-    meta: { userId: scope.userId },
+    meta: { userId: scope.userId, workspaceId: scope.workspaceId },
   });
 }
 

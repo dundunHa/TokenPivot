@@ -2,15 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import {
-  useCurrentWorkspace,
-  useUsageOptions,
-} from "@/features/workspace/queries";
+import { useUsageOptions } from "@/features/workspace/queries";
 import { RequestLogPanel } from "@/features/requests/RequestLogPanel";
 import { OverviewFilterBar } from "./OverviewFilterBar";
 import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
-import { describeError } from "./overviewApi";
 import { GeekShell } from "./geek/GeekShell";
 import { GeekCommandBar } from "./geek/GeekCommandBar";
 import { GeekHeroMetrics } from "./geek/GeekHeroMetrics";
@@ -59,38 +55,20 @@ function toggle(list: string[], value: string): string[] {
     : [...list, value];
 }
 
-export function OverviewPage({ userId }: { userId: string }) {
-  const workspace = useCurrentWorkspace(userId);
-  if (workspace.isPending) {
-    return (
-      <p role="status" className="text-muted-foreground text-sm">
-        正在加载空间…
-      </p>
-    );
-  }
-  if (workspace.isError) {
-    const { kind, message } = describeError(workspace.error);
-    return (
-      <div className="flex flex-col gap-2">
-        <Alert variant="destructive">
-          <AlertDescription>{message}</AlertDescription>
-        </Alert>
-        {kind === "forbidden" ? null : (
-          <Button
-            variant="outline"
-            className="self-start"
-            onClick={() => void workspace.refetch()}
-          >
-            重试
-          </Button>
-        )}
-      </div>
-    );
-  }
+/** 当前空间由工作区容器决定；本页只消费明确的 userId/workspaceId，不再查询 /current。 */
+export function OverviewPage({
+  userId,
+  workspaceId,
+  workspaceName,
+}: {
+  userId: string;
+  workspaceId: string;
+  workspaceName: string;
+}) {
   return (
     <OverviewBody
-      scope={{ userId, workspaceId: workspace.data.workspaceId }}
-      workspaceName={workspace.data.name}
+      scope={{ userId, workspaceId }}
+      workspaceName={workspaceName}
     />
   );
 }
@@ -254,7 +232,12 @@ function OverviewContent({
         <div className="flex flex-col gap-4">
           {/* Hero 指标 */}
           {data ? (
-            <GeekHeroMetrics totals={data.totals} rate60={null} timezone={tz} />
+            <GeekHeroMetrics
+              totals={data.totals}
+              rate60={null}
+              timezone={tz}
+              workspaceName={workspaceName}
+            />
           ) : null}
 
           {/* 趋势图 */}

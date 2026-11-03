@@ -1,7 +1,7 @@
 import { Navigate } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { OverviewPage } from "@/features/overview/OverviewPage";
+import { WorkspaceHome } from "@/features/workspace/WorkspaceHome";
 import { authErrorMessage } from "../model";
 import { useAuthSession, useLogoutMutation } from "../queries";
 
@@ -49,8 +49,6 @@ export function HomePage() {
             <dd className="text-success">已登录</dd>
             <dt className="text-subtle">用户</dt>
             <dd className="break-all">{auth.session.user.email}</dd>
-            <dt className="text-subtle">空间</dt>
-            <dd>Personal</dd>
           </dl>
           <Button
             variant="outline"
@@ -60,7 +58,7 @@ export function HomePage() {
             {logout.isPending ? "正在退出…" : "登出"}
           </Button>
           <div className="border-divider border-t" />
-          <OverviewPage userId={auth.session.user.id} />
+          <WorkspaceHome userId={auth.session.user.id} />
         </div>
       ) : null}
     </main>
