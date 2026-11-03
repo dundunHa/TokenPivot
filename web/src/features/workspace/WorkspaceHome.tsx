@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -8,7 +8,11 @@ import { ApiError } from "@/lib/api";
 import type { Workspace } from "./api";
 import { WorkspaceCreateDialog } from "./WorkspaceCreateDialog";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
-import { useWorkspaceList, workspaceDetailQuery } from "./queries";
+import {
+  isCurrentSessionUser,
+  useWorkspaceList,
+  workspaceDetailQuery,
+} from "./queries";
 
 function listErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
@@ -29,7 +33,19 @@ export function WorkspaceHome({ userId }: { userId: string }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [switchError, setSwitchError] = useState<string | null>(null);
+  /** 选择序号：每次最新选择自增，旧回调据此失效。 */
   const switchSeq = useRef(0);
+  /** 进行中切换的目标空间；URL 被外部改到别的空间时据此作废旧选择。 */
+  const switchTarget = useRef<string | null>(null);
+  /** 本容器实例当前的身份；身份变化后旧选择不得再导航。 */
+  const identity = useRef(userId);
+
+  /** 作废进行中的选择：递增序号、清掉 pending，旧回调此后一律提前返回。 */
+  const resetSelection = useCallback(() => {
+    switchSeq.current += 1;
+    switchTarget.current = null;
+    setPendingId(null);
+  }, []);
 
   const workspaces = useMemo(() => list.data ?? [], [list.data]);
   const urlWorkspaceId = params.get("workspace");
@@ -59,29 +75,69 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     );
   }, [current, setParams, urlWorkspaceId, workspaceParamCount]);
 
+  // 身份变化：旧身份进行中的选择作废，取消其详情验证，迟到的成功不得再改 URL。
+  useEffect(() => {
+    const previous = identity.current;
+    if (previous === userId) return;
+    identity.current = userId;
+    resetSelection();
+    setSwitchError(null);
+    void client.cancelQueries({ queryKey: ["workspace", "detail", previous] });
+  }, [client, resetSelection, userId]);
+
+  // 卸载后旧回调同样作废：离开的容器不得再设置 URL。
+  useEffect(
+    () => () => {
+      switchSeq.current += 1;
+      switchTarget.current = null;
+    },
+    [],
+  );
+
+  // URL 被浏览器前进/后退或其他入口改到别的空间：先到的新位置优先，进行中的切换作废。
+  useEffect(() => {
+    const target = switchTarget.current;
+    if (target === null || urlWorkspaceId === target) return;
+    resetSelection();
+    void client.cancelQueries({ queryKey: ["workspace", "detail", userId] });
+  }, [client, resetSelection, urlWorkspaceId, userId]);
+
   function cancelWorkspaceBusiness(workspaceId: string): Promise<void> {
     return client.cancelQueries({
       predicate: (query) => query.meta?.workspaceId === workspaceId,
     });
   }
 
+  /** 这次选择是否仍有效：序号未被作废，且发起身份仍是当前会话。 */
+  function isStillSelected(ticket: number): boolean {
+    return switchSeq.current === ticket && isCurrentSessionUser(client, userId);
+  }
+
   async function selectWorkspace(target: Workspace) {
-    if (!current || target.workspaceId === current.workspaceId) return;
+    if (!current) return;
     if (pendingId === target.workspaceId) return;
+    const selectingCurrent = target.workspaceId === current.workspaceId;
+    // 已在该空间且没有待处理的切换或错误时，没有可作废的选择。
+    if (selectingCurrent && pendingId === null && switchError === null) return;
+
+    // 选中当前空间也是一次最新选择：旧回调立即失效，pending 与错误一并清掉。
     const ticket = switchSeq.current + 1;
     switchSeq.current = ticket;
     setSwitchError(null);
-    setPendingId(target.workspaceId);
+    setPendingId(selectingCurrent ? null : target.workspaceId);
+    switchTarget.current = selectingCurrent ? null : target.workspaceId;
     // 取消上一个详情验证；新选择到来时旧请求不会再发或再写 URL。
     await client.cancelQueries({
       queryKey: ["workspace", "detail", userId],
     });
     if (switchSeq.current !== ticket) return;
+    if (selectingCurrent) return;
     try {
       await client.fetchQuery(workspaceDetailQuery(userId, target.workspaceId));
-      if (switchSeq.current !== ticket) return;
+      if (!isStillSelected(ticket)) return resetSelection();
       await cancelWorkspaceBusiness(current.workspaceId);
-      if (switchSeq.current !== ticket) return;
+      if (!isStillSelected(ticket)) return resetSelection();
+      switchTarget.current = null;
       setParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -93,6 +149,7 @@ export function WorkspaceHome({ userId }: { userId: string }) {
       setPendingId(null);
     } catch (error) {
       if (switchSeq.current !== ticket) return;
+      switchTarget.current = null;
       setPendingId(null);
       setSwitchError(
         error instanceof ApiError && error.status === 403
@@ -107,7 +164,8 @@ export function WorkspaceHome({ userId }: { userId: string }) {
     switchSeq.current = ticket;
     await client.cancelQueries({ queryKey: ["workspace", "detail", userId] });
     if (current) await cancelWorkspaceBusiness(current.workspaceId);
-    if (switchSeq.current !== ticket) return;
+    // 提交前确认仍是同一次有效选择，且容器身份未变。
+    if (!isStillSelected(ticket)) return resetSelection();
     setPendingId(null);
     setSwitchError(null);
     setCreateOpen(false);

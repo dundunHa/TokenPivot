@@ -1,9 +1,15 @@
 import { describe, expect, it } from "vitest";
+import { type ReactNode } from "react";
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, useLocation } from "react-router";
-import { createAppQueryClient, sessionKey } from "@/features/auth/queries";
+import { MemoryRouter, useLocation, useNavigate } from "react-router";
+import {
+  createAppQueryClient,
+  sessionKey,
+  useCredentialsMutation,
+  useLogoutMutation,
+} from "@/features/auth/queries";
 import type { AuthSession } from "@/features/auth/model";
 import {
   deferred,
@@ -13,6 +19,7 @@ import {
   server,
 } from "@/test/server";
 import { trimWorkspaceName, workspaceNameProblem, type Workspace } from "./api";
+import { workspaceListQuery } from "./queries";
 import { WorkspaceHome } from "./WorkspaceHome";
 
 const WS_A = "0198f2b0-0000-7000-8000-0000000000aa";
@@ -21,6 +28,10 @@ const WS_C = "0198f2b0-0000-7000-8000-0000000000cc";
 const USER = "user-a";
 const SESSION: AuthSession = {
   user: { id: USER, email: "a@example.com" },
+  expires_at: "2999-01-01T00:00:00Z",
+};
+const SESSION_B: AuthSession = {
+  user: { id: "user-b", email: "b@example.com" },
   expires_at: "2999-01-01T00:00:00Z",
 };
 
@@ -54,16 +65,73 @@ function LocationProbe() {
   );
 }
 
-function renderHome(client: QueryClient, path: string) {
-  client.setQueryData(sessionKey, SESSION);
-  render(
+/** 模拟浏览器前进/后退或其他入口改 URL。 */
+function NavigateTo({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(to)}>
+      外部导航
+    </button>
+  );
+}
+
+/** 真实认证 mutation：退出后换另一个账号登录。 */
+function SessionActions() {
+  const logout = useLogoutMutation();
+  const login = useCredentialsMutation("login");
+  return (
+    <>
+      <button type="button" onClick={() => logout.mutate()}>
+        退出
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          login.mutate({
+            email: "b@example.com",
+            password: "synthetic-password",
+          })
+        }
+      >
+        登录 B
+      </button>
+    </>
+  );
+}
+
+const aggregateBody = (total: string) => ({
+  range: {
+    start: "2026-10-28T00:00:00Z",
+    end: "2026-10-28T01:00:00Z",
+    as_of: "2026-10-28T01:00:00Z",
+    retention_cutoff: "2025-10-28T00:00:00Z",
+    timezone: "UTC",
+    granularity: "hour",
+  },
+  totals: { ...stats, total_tokens: metric(total) },
+  points: [],
+});
+
+function homeTree(
+  client: QueryClient,
+  path: string,
+  home: ReactNode,
+  extra?: ReactNode,
+) {
+  return (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
         <LocationProbe />
-        <WorkspaceHome userId={USER} />
+        {extra}
+        {home}
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+}
+
+function renderHome(client: QueryClient, path: string, extra?: ReactNode) {
+  client.setQueryData(sessionKey, SESSION);
+  render(homeTree(client, path, <WorkspaceHome userId={USER} />, extra));
   return client;
 }
 
@@ -500,22 +568,198 @@ describe("workspace home", () => {
     expect(search().get("workspace")).toBe(WS_C);
   });
 
-  it("cancels the old workspace's business requests after a successful switch", async () => {
-    useBackend([workspace(WS_A, "Alpha"), workspace(WS_B, "Beta")]);
-    const optionGate = deferred<Response>();
-    let oldSignal: AbortSignal | undefined;
+  it("selecting the current workspace again cancels the pending switch and keeps its URL", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+    ]);
+    const gate = deferred<Response>();
+    let signalB: AbortSignal | undefined;
     server.use(
-      http.get(`/api/v1/workspaces/${WS_A}/usage/options`, ({ request }) => {
-        oldSignal = request.signal;
-        return optionGate.promise;
+      http.get(`/api/v1/workspaces/${WS_B}`, ({ request }) => {
+        backend.calls.detail.push(WS_B);
+        signalB = request.signal;
+        return gate.promise;
       }),
     );
     const user = userEvent.setup();
     renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
-    await waitFor(() => expect(oldSignal).toBeInstanceOf(AbortSignal));
+    await screen.findByTestId("metric-total");
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(signalB).toBeInstanceOf(AbortSignal));
+
+    // 当前空间按钮可点：选它就是最新选择，先前的 B 随之作废。
+    await user.click(screen.getByRole("button", { name: "Alpha" }));
+    await waitFor(() => expect(signalB?.aborted).toBe(true));
+    expect(screen.getByRole("button", { name: "Beta" })).toBeTruthy();
+    expect(search().get("workspace")).toBe(WS_A);
+
+    gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(search().get("workspace")).toBe(WS_A);
+    expect(backend.calls.aggregate).not.toContain(WS_B);
+  });
+
+  it("an external URL change wins over a pending switch's late success", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+    ]);
+    const gate = deferred<Response>();
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_B}`, () => {
+        backend.calls.detail.push(WS_B);
+        return gate.promise;
+      }),
+    );
+    const user = userEvent.setup();
+    renderHome(
+      createAppQueryClient(),
+      `/?workspace=${WS_A}&tz=UTC`,
+      <NavigateTo to={`/?workspace=${WS_C}&tz=UTC`} />,
+    );
+    await screen.findByTestId("metric-total");
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
+
+    // 浏览器/路由在切换途中把 URL 改到 C。
+    await user.click(screen.getByRole("button", { name: "外部导航" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+
+    gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(search().get("workspace")).toBe(WS_C);
+    expect(screen.getByRole("button", { name: "Beta" })).toBeTruthy();
+  });
+
+  it("a late switch success cannot navigate after the container unmounts", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+    ]);
+    const gate = deferred<Response>();
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_B}`, () => {
+        backend.calls.detail.push(WS_B);
+        return gate.promise;
+      }),
+    );
+    const client = createAppQueryClient();
+    client.setQueryData(sessionKey, SESSION);
+    const view = render(
+      homeTree(
+        client,
+        `/?workspace=${WS_A}&tz=UTC`,
+        <WorkspaceHome userId={USER} />,
+      ),
+    );
+    await screen.findByTestId("metric-total");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
+
+    view.rerender(homeTree(client, `/?workspace=${WS_A}&tz=UTC`, null));
+    expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
+
+    gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(search().get("workspace")).toBe(WS_A);
+  });
+
+  it("a late switch success from the previous identity cannot change the URL", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+    ]);
+    const gate = deferred<Response>();
+    let signalB: AbortSignal | undefined;
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_B}`, ({ request }) => {
+        backend.calls.detail.push(WS_B);
+        signalB = request.signal;
+        return gate.promise;
+      }),
+    );
+    const client = createAppQueryClient();
+    client.setQueryData(sessionKey, SESSION);
+    const view = render(
+      homeTree(
+        client,
+        `/?workspace=${WS_A}&tz=UTC`,
+        <WorkspaceHome userId={USER} />,
+      ),
+    );
+    await screen.findByTestId("metric-total");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
+
+    client.setQueryData(sessionKey, SESSION_B);
+    view.rerender(
+      homeTree(
+        client,
+        `/?workspace=${WS_A}&tz=UTC`,
+        <WorkspaceHome userId={SESSION_B.user.id} />,
+      ),
+    );
+    // 换号后旧身份的详情验证被取消，pending 也不再保留。
+    await waitFor(() => expect(signalB?.aborted).toBe(true));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Beta" })).toBeTruthy(),
+    );
+
+    gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(search().get("workspace")).toBe(WS_A);
+  });
+
+  it("lets the new workspace's metrics win when the old workspace's response arrives later", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+    ]);
+    const gates = new Map<string, ReturnType<typeof deferred<Response>>>();
+    const signals = new Map<string, AbortSignal>();
+    for (const id of [WS_A, WS_B]) gates.set(id, deferred<Response>());
+    server.use(
+      http.get(
+        `/api/v1/workspaces/:id/usage/aggregate`,
+        ({ params, request }) => {
+          const id = String(params.id);
+          backend.calls.aggregate.push(id);
+          signals.set(id, request.signal);
+          return (
+            gates.get(id)?.promise ?? HttpResponse.json(aggregateBody("0"))
+          );
+        },
+      ),
+    );
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    await waitFor(() => expect(backend.calls.aggregate).toContain(WS_A));
+    expect(signals.get(WS_A)).toBeInstanceOf(AbortSignal);
+
+    // A 的业务响应仍未返回就切到 B。
     await user.click(screen.getByRole("button", { name: "Beta" }));
     await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
-    await waitFor(() => expect(oldSignal?.aborted).toBe(true));
+    await waitFor(() => expect(backend.calls.aggregate).toContain(WS_B));
+
+    // 先完成 B：B 的指标可见，A 的请求已被取消。
+    gates.get(WS_B)?.resolve(HttpResponse.json(aggregateBody("2222")));
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total").textContent).toContain("2.2K"),
+    );
+    expect(signals.get(WS_A)?.aborted).toBe(true);
+
+    // A 的响应最后才到：不得覆盖 B 的指标，也不得改回 URL。
+    gates.get(WS_A)?.resolve(HttpResponse.json(aggregateBody("1111")));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByTestId("metric-total").textContent).toContain("2.2K");
+    expect(screen.getByTestId("metric-total").textContent).not.toContain(
+      "1.1K",
+    );
+    expect(search().get("workspace")).toBe(WS_B);
   });
 
   it("does not use the old workspace data as a placeholder for the new one", async () => {
@@ -552,5 +796,66 @@ describe("workspace home", () => {
       }),
     );
     await screen.findByTestId("metric-total");
+  });
+
+  it("a create success that lands after logout and a new login cannot navigate the old container", async () => {
+    const created = workspace(WS_C, "Gamma");
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+    ]);
+    const gate = deferred<Response>();
+    server.use(
+      http.post("/api/v1/workspaces", async ({ request }) => {
+        backend.calls.posts.push(await request.json());
+        return gate.promise;
+      }),
+      http.post(
+        "/api/v1/auth/logout",
+        () => new HttpResponse(null, { status: 204 }),
+      ),
+      http.post("/api/v1/auth/login", () =>
+        HttpResponse.json({
+          user: SESSION_B.user,
+          expires_at: SESSION_B.expires_at,
+        }),
+      ),
+    );
+    const client = renderHome(
+      createAppQueryClient(),
+      `/?workspace=${WS_A}&tz=UTC`,
+      <SessionActions />,
+    );
+    await screen.findByTestId("metric-total");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText("名称"), "Gamma");
+    await user.click(within(dialog).getByRole("button", { name: "创建" }));
+    await within(dialog).findByRole("button", { name: "正在创建…" });
+    expect(backend.calls.posts).toEqual([{ name: "Gamma" }]);
+
+    // 创建还没返回：退出并换成 B 登录。
+    await user.click(screen.getByRole("button", { name: "退出" }));
+    await waitFor(() => expect(client.getQueryData(sessionKey)).toBeNull());
+    await user.click(screen.getByRole("button", { name: "登录 B" }));
+    await waitFor(() =>
+      expect(client.getQueryData(sessionKey)).toEqual(SESSION_B),
+    );
+    const keyB = workspaceListQuery(SESSION_B.user.id).queryKey;
+    client.setQueryData(keyB, [workspace(WS_B, "Beta")]);
+    // 服务端列表此后包含新空间，迟到的导航会真实落到 URL 上，不会被规范化掩盖。
+    backend.state.workspaces = [created];
+
+    gate.resolve(HttpResponse.json(body(created), { status: 201 }));
+    await new Promise((r) => setTimeout(r, 50));
+
+    // 旧身份的迟到成功不让旧容器导航，也不清掉新会话与 B 的业务数据。
+    expect(search().get("workspace")).toBe(WS_A);
+    await waitFor(() =>
+      expect(screen.getByTestId("metric-total")).toBeTruthy(),
+    );
+    expect(client.getQueryData(sessionKey)).toEqual(SESSION_B);
+    expect(client.getQueryData(keyB)).toEqual([workspace(WS_B, "Beta")]);
   });
 });

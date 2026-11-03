@@ -3,8 +3,13 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type QueryClient,
 } from "@tanstack/react-query";
-import { handleMutationUnauthenticated } from "@/features/auth/queries";
+import {
+  handleMutationUnauthenticated,
+  sessionKey,
+} from "@/features/auth/queries";
+import type { AuthSession } from "@/features/auth/model";
 import {
   createWorkspace,
   fetchUsageOptions,
@@ -86,6 +91,19 @@ function compareWorkspaces(left: Workspace, right: Workspace): number {
 }
 
 /**
+ * 发起请求或写入时的身份是否仍是当前会话身份。退出或换号后返回 false，
+ * 用于丢弃旧身份的迟到成功，避免重建旧缓存或让旧容器继续导航。
+ */
+export function isCurrentSessionUser(
+  client: QueryClient,
+  userId: string,
+): boolean {
+  return (
+    client.getQueryData<AuthSession | null>(sessionKey)?.user.id === userId
+  );
+}
+
+/**
  * 创建成功后先把新空间按服务端顺序写入列表缓存，避免列表重查返回前 URL 选择回落到旧首项；
  * 随后失效列表，以服务端结果为准。401 不在 QueryCache 的处理范围内，这里显式清理。
  */
@@ -97,6 +115,8 @@ export function useCreateWorkspace(userId: string) {
       await handleMutationUnauthenticated(client, error, userId);
     },
     onSuccess: async (created) => {
+      // 发起身份已退出或换号：不重建旧身份列表缓存，也不失效新会话的业务数据。
+      if (!isCurrentSessionUser(client, userId)) return;
       const key = workspaceListQuery(userId).queryKey;
       client.setQueryData<Workspace[]>(key, (old) => {
         if (!old) return [created];
