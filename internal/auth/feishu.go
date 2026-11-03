@@ -213,9 +213,9 @@ func (s *Service) FeishuLogin(ctx context.Context, code, remoteIP string) (Feish
 // binding this way.
 func (s *Service) FeishuBind(ctx context.Context, bindToken, password, remoteIP string) (Session, error) {
 	key := feishuBindKey(bindToken)
-	pending, found := s.bindings.claim(ctx, key, s.clock)
-	if !found {
-		return Session{}, ErrUnauthenticated
+	pending, err := s.bindings.claim(ctx, key, s.clock)
+	if err != nil {
+		return Session{}, err
 	}
 	if err := validatePassword(password); err != nil {
 		s.bindings.release(key)
@@ -570,16 +570,18 @@ func (b *feishuBindings) put(key string, pending feishuPending, now time.Time) {
 // claim marks one live pending binding as in flight and returns it. A request that
 // finds the binding already claimed waits for the holder to finish and then looks
 // again, so concurrent requests carrying the same token run one at a time instead
-// of failing each other. It reports false for an unknown or expired token, and for
-// a caller whose context ended while waiting.
-func (b *feishuBindings) claim(ctx context.Context, key string, now func() time.Time) (feishuPending, bool) {
+// of failing each other. An unknown or expired token reports ErrUnauthenticated. A
+// caller whose context ended while waiting reports the context error instead, so a
+// canceled or timed-out request is not mistaken for a spent token and does not
+// make the caller drop the browser's pending binding.
+func (b *feishuBindings) claim(ctx context.Context, key string, now func() time.Time) (feishuPending, error) {
 	for {
 		b.mu.Lock()
 		b.prune(now())
 		pending, ok := b.entries[key]
 		if !ok {
 			b.mu.Unlock()
-			return feishuPending{}, false
+			return feishuPending{}, ErrUnauthenticated
 		}
 		if pending.wait != nil {
 			wait := pending.wait
@@ -588,13 +590,13 @@ func (b *feishuBindings) claim(ctx context.Context, key string, now func() time.
 			case <-wait:
 				continue
 			case <-ctx.Done():
-				return feishuPending{}, false
+				return feishuPending{}, ctx.Err()
 			}
 		}
 		pending.wait = make(chan struct{})
 		b.entries[key] = pending
 		b.mu.Unlock()
-		return pending, true
+		return pending, nil
 	}
 }
 
