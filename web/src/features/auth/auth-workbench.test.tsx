@@ -144,7 +144,7 @@ describe("feishu cabin", () => {
     expect(screen.getByText("未启用")).toBeTruthy();
   });
 
-  it("refreshes an expired code through the authorize endpoint", async () => {
+  it("keeps the feishu entry disabled while the code is expired and restores it after refresh", async () => {
     let calls = 0;
     server.use(
       http.get(AUTHORIZE, () => {
@@ -160,22 +160,30 @@ describe("feishu cabin", () => {
     renderApp("/login");
 
     await screen.findByText("二维码已过期");
+    const launch = screen.getByRole("button", {
+      name: "一键唤起飞书授权 [F]",
+    });
+    expect(launch.hasAttribute("disabled")).toBe(true);
+
     await user.click(screen.getByRole("button", { name: "点击刷新 [R]" }));
     await waitFor(() => expect(screen.queryByText("二维码已过期")).toBeNull());
     await waitFor(() => expect(calls).toBe(2));
+    await waitFor(() => expect(launch.hasAttribute("disabled")).toBe(false));
   });
 
-  it("falls back to the demo authorize url when the endpoint fails", async () => {
+  it("shows the expired mask and keeps the entry disabled when the endpoint fails", async () => {
     server.use(http.get(AUTHORIZE, () => errorResponse(500, "INTERNAL")));
     renderApp("/login");
 
-    expect(screen.getByTestId("feishu-qr")).toBeTruthy();
-    await waitFor(() => expect(screen.getByText(/^有效期 \d+s$/)).toBeTruthy());
+    await screen.findByText("二维码已过期");
     expect(
       screen
         .getByRole("button", { name: "一键唤起飞书授权 [F]" })
         .hasAttribute("disabled"),
-    ).toBe(false);
+    ).toBe(true);
+    // 不暴露任何无效跳转入口：点阵仍在，但没有授权地址可去。
+    expect(screen.getByTestId("feishu-qr")).toBeTruthy();
+    expect(screen.getByText("有效期 0s")).toBeTruthy();
   });
 });
 

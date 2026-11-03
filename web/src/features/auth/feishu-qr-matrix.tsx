@@ -15,13 +15,12 @@ const DEFAULT_TTL_SECONDS = 180;
 const FINDER_SIZE = 7;
 
 /**
- * 服务端未注册该端点、未实现或请求失败时的本地演示授权地址。
- * 公开登录页不因飞书不可用而报错，二维码仍然可见可控。
+ * 加载中的初始状态：授权地址在拿到服务端响应之前为 `null`，
+ * 唤起入口保持禁用，避免跳到没有有效 `state` Cookie 的地址。
  */
-const FALLBACK_INFO: FeishuAuthorizeInfo = {
+const LOADING_INFO: FeishuAuthorizeInfo = {
   enabled: true,
-  authorizeUrl:
-    "https://open.feishu.cn/open-apis/authen/v1/authorize?app_id=cli_tokenpivot&state=ready",
+  authorizeUrl: null,
   expiresInSeconds: DEFAULT_TTL_SECONDS,
 };
 
@@ -180,7 +179,7 @@ export function FeishuQrMatrix({
  * 公开登录页不创建任何 `["auth", ...]` 会话查询。
  */
 export function FeishuCabin() {
-  const [info, setInfo] = useState<FeishuAuthorizeInfo>(FALLBACK_INFO);
+  const [info, setInfo] = useState<FeishuAuthorizeInfo>(LOADING_INFO);
   const [deadline, setDeadline] = useState(
     () => Date.now() + DEFAULT_TTL_SECONDS * 1000,
   );
@@ -198,7 +197,13 @@ export function FeishuCabin() {
         setClock(Date.now());
       })
       .catch(() => {
-        // 静默回退：端点缺失、网络失败或响应不合法时继续用本地演示地址。
+        // 请求失败（端点缺失、网络错误或 5xx）时不回退到演示地址：没有有效
+        // `state` Cookie 的地址只会被回调拒绝，因此按二维码已过期处理，
+        // 让用户点刷新重新取一次。
+        if (!alive) return;
+        setInfo({ enabled: true, authorizeUrl: null, expiresInSeconds: 0 });
+        setDeadline(0);
+        setClock(Date.now());
       });
     return () => {
       alive = false;
@@ -213,6 +218,8 @@ export function FeishuCabin() {
 
   const remaining = Math.max(0, Math.ceil((deadline - clock) / 1000));
   const expired = info.enabled && remaining <= 0;
+  const authorizeUrl = info.authorizeUrl;
+  const canLaunch = info.enabled && !expired && authorizeUrl !== null;
 
   const refresh = useCallback(() => {
     const ttl =
@@ -224,9 +231,9 @@ export function FeishuCabin() {
   }, [info.expiresInSeconds]);
 
   const launch = useCallback(() => {
-    if (!info.enabled || info.authorizeUrl === null) return;
-    window.location.assign(info.authorizeUrl);
-  }, [info.authorizeUrl, info.enabled]);
+    if (!canLaunch || authorizeUrl === null) return;
+    window.location.assign(authorizeUrl);
+  }, [authorizeUrl, canLaunch]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -249,13 +256,15 @@ export function FeishuCabin() {
         refresh();
       }
       if (event.key === "f" || event.key === "F") {
+        // 过期或没有授权地址时 F 与按钮同样不生效，避免跳到无效地址。
+        if (!canLaunch) return;
         event.preventDefault();
         launch();
       }
     }
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [launch, refresh]);
+  }, [canLaunch, launch, refresh]);
 
   return (
     <section
@@ -281,7 +290,7 @@ export function FeishuCabin() {
       <button
         type="button"
         className="btn-feishu-hero"
-        disabled={!info.enabled}
+        disabled={!canLaunch}
         onClick={launch}
       >
         一键唤起飞书授权 [F]

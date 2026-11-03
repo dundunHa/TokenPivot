@@ -202,31 +202,39 @@ func (s *Service) FeishuLogin(ctx context.Context, code, remoteIP string) (Feish
 }
 
 // FeishuBind confirms a pending same-email binding with the account password and
-// issues the first real session. A wrong password leaves the pending binding in
-// place (until it expires or the window is exhausted), so the user may retry. A
-// password-less account fails exactly like a wrong password and never gains a
-// binding this way.
+// issues the first real session. The token is claimed before any check runs, so
+// concurrent requests carrying the same token cannot both complete it; a failure
+// that the user may retry releases the claim, while a completed or unusable
+// binding is deleted. A wrong password therefore leaves the pending binding in
+// place (until it expires or the window is exhausted). A password-less account
+// fails exactly like a wrong password and never gains a binding this way.
 func (s *Service) FeishuBind(ctx context.Context, bindToken, password, remoteIP string) (Session, error) {
-	pending, found := s.bindings.lookup(feishuBindKey(bindToken), s.clock())
+	key := feishuBindKey(bindToken)
+	pending, found := s.bindings.claim(key, s.clock())
 	if !found {
 		return Session{}, ErrUnauthenticated
 	}
 	if err := validatePassword(password); err != nil {
+		s.bindings.release(key)
 		return Session{}, err
 	}
 	if retryAfter, ok := s.limiter.Take(pending.Email, remoteIP); !ok {
+		s.bindings.release(key)
 		return Session{}, RateLimitedError{RetryAfter: retryAfter}
 	}
 	credential, found, err := s.store.UserCredential(ctx, pending.Email)
 	if err != nil {
+		s.bindings.release(key)
 		return Session{}, err
 	}
 	if !found || credential.User.ID != pending.UserID {
 		// The account the callback saw no longer exists, so this pending binding
 		// cannot be completed.
+		s.bindings.delete(key)
 		return Session{}, ErrUnauthenticated
 	}
 	if err := verifyStoredPassword(credential.PasswordHash, password); err != nil {
+		s.bindings.release(key)
 		return Session{}, err
 	}
 	token := newSessionToken()
@@ -246,12 +254,15 @@ func (s *Service) FeishuBind(ctx context.Context, bindToken, password, remoteIP 
 		if errors.Is(err, ErrFeishuIdentityConflict) {
 			// The open_id belongs to another account now, so this pending binding
 			// can never be completed and must not stay usable.
-			s.bindings.delete(feishuBindKey(bindToken))
+			s.bindings.delete(key)
 			return Session{}, ErrUnauthenticated
 		}
+		// Every other failure is retryable: the account and the binding are
+		// unchanged, so the token stays usable with another password attempt.
+		s.bindings.release(key)
 		return Session{}, err
 	}
-	s.bindings.delete(feishuBindKey(bindToken))
+	s.bindings.delete(key)
 	return Session{Token: token, User: issued.User, ExpiresAt: issued.ExpiresAt}, nil
 }
 
@@ -266,24 +277,32 @@ func (s *Service) issueFeishuSession(ctx context.Context, user User) (Session, e
 }
 
 // createFeishuAccount creates a password-less account, its Feishu binding and its
-// first session in one transaction. The closed-registration decision uses the
-// same lock and empty-database check as registration: automatic provisioning
-// bypasses it, because the Feishu tenant has already verified the person. Like
-// registration it writes no workspace and no membership.
+// first session in one transaction. A closed deployment takes the same
+// registration lock and empty-database check as registration: automatic
+// provisioning holds the lock too, because it also inserts the account that makes
+// the database non-empty, but it skips the check itself since the Feishu tenant
+// has already verified the person. Like registration it writes no workspace and
+// no membership.
 func (s *Service) createFeishuAccount(ctx context.Context, identity FeishuIdentity) (Session, error) {
 	token := newSessionToken()
 	var issued IssuedSession
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx RegistrationStore) error {
-		if !s.registrationOpen && !s.feishu.AutoProvision {
+		if !s.registrationOpen {
+			// The lock is taken whenever registration is closed, including the
+			// auto-provisioning path: otherwise a concurrent ordinary registration
+			// could pass the empty-database check while this transaction inserts a
+			// user, and both would be accepted as the first account.
 			if err := tx.LockRegistration(ctx); err != nil {
 				return err
 			}
-			taken, err := tx.HasUsers(ctx)
-			if err != nil {
-				return err
-			}
-			if taken {
-				return ErrRegistrationClosed
+			if !s.feishu.AutoProvision {
+				taken, err := tx.HasUsers(ctx)
+				if err != nil {
+					return err
+				}
+				if taken {
+					return ErrRegistrationClosed
+				}
 			}
 		}
 		user, err := tx.CreateFeishuUser(ctx, identity.Email)
@@ -512,11 +531,14 @@ func firstNonEmpty(values ...string) string {
 
 // feishuPending is one same-email binding waiting for the account password. It
 // keeps the verified profile so the bind request needs no second Feishu call.
+// InFlight marks a token one request is already spending, so a second request
+// carrying the same token is refused instead of issuing a second session.
 type feishuPending struct {
 	UserID    ID
 	Email     string
 	Identity  FeishuIdentity
 	ExpiresAt time.Time
+	InFlight  bool
 }
 
 // feishuBindings is the per-process store of pending bindings. Keys are SHA-256
@@ -541,17 +563,36 @@ func (b *feishuBindings) put(key string, pending feishuPending, now time.Time) {
 	b.entries[key] = pending
 }
 
-// lookup returns a live pending binding and prunes every expired entry. It does
-// not consume the entry: a wrong password may retry.
-func (b *feishuBindings) lookup(key string, now time.Time) (feishuPending, bool) {
+// claim marks one live pending binding as in flight and returns it. It reports
+// false for an unknown, expired or already claimed token, so exactly one of
+// several concurrent requests carrying the same token can proceed.
+func (b *feishuBindings) claim(key string, now time.Time) (feishuPending, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.prune(now)
 	pending, ok := b.entries[key]
-	return pending, ok
+	if !ok || pending.InFlight {
+		return feishuPending{}, false
+	}
+	pending.InFlight = true
+	b.entries[key] = pending
+	return pending, true
 }
 
-// delete removes one pending binding after a successful bind.
+// release gives a claimed binding back after a retryable failure, so the same
+// token may be used again until it expires.
+func (b *feishuBindings) release(key string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pending, ok := b.entries[key]
+	if !ok {
+		return
+	}
+	pending.InFlight = false
+	b.entries[key] = pending
+}
+
+// delete removes one pending binding after it was completed or became unusable.
 func (b *feishuBindings) delete(key string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
