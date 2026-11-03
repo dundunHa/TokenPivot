@@ -503,6 +503,84 @@ func TestFeishuBindWaitsForConcurrentRequest(t *testing.T) {
 	}
 }
 
+// TestFeishuBindCanceledWaitKeepsToken proves a request that gives up waiting for
+// the claim reports its context error rather than an unauthenticated token, and
+// that it leaves the pending binding usable: the holder's retryable failure is
+// released and a later request with the correct password still completes the bind.
+func TestFeishuBindCanceledWaitKeepsToken(t *testing.T) {
+	stub := newFeishuStub(t)
+	service, store, runner, _ := newFeishuService(t, stub, true, true)
+	store.seedUser("synthetic@example.com", "synthetic-password")
+	result, err := service.FeishuLogin(context.Background(), "synthetic-code", "127.0.0.1")
+	if err != nil || result.BindToken == "" {
+		t.Fatalf("login result = %+v err = %v, want a pending bind token", result, err)
+	}
+	gate := newGatedStore(store)
+	service.store = gate
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := service.FeishuBind(context.Background(), result.BindToken, "synthetic-wrong-password", "127.0.0.1")
+		firstErr <- err
+	}()
+	<-gate.entered // the first request holds the claim and is inside the checks
+
+	type outcome struct {
+		session Session
+		err     error
+	}
+	waitCtx, cancel := context.WithCancel(context.Background())
+	second := make(chan outcome, 1)
+	go func() {
+		session, err := service.FeishuBind(waitCtx, result.BindToken, "synthetic-password", "127.0.0.1")
+		second <- outcome{session: session, err: err}
+	}()
+
+	// The waiting request must block on the claim instead of reading the store.
+	select {
+	case got := <-second:
+		t.Fatalf("a concurrent bind returned before the holder finished: %+v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if calls := gate.readCalls(); calls != 1 {
+		t.Fatalf("credential reads = %d while the claim was held, want 1", calls)
+	}
+
+	cancel()
+	got := <-second
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("canceled wait error = %v, want context.Canceled", got.err)
+	}
+	if errors.Is(got.err, ErrUnauthenticated) {
+		t.Fatal("a canceled wait reported ErrUnauthenticated, which would drop the bind cookie")
+	}
+	if _, ok := service.bindings.entries[feishuBindKey(result.BindToken)]; !ok {
+		t.Fatal("a canceled wait discarded the pending token")
+	}
+
+	close(gate.allow)
+	if err := <-firstErr; !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("first bind error = %v, want ErrInvalidCredentials", err)
+	}
+
+	session, err := service.FeishuBind(context.Background(), result.BindToken, "synthetic-password", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("retry bind error = %v, want success after the claim was released", err)
+	}
+	if !strings.HasPrefix(session.Token, sessionTokenPrefix) {
+		t.Fatalf("retry bind session = %+v", session)
+	}
+	if runner.inTxCall != 1 {
+		t.Fatalf("bind transactions = %d, want 1", runner.inTxCall)
+	}
+	if len(store.sessions) != 1 {
+		t.Fatalf("stored sessions = %d, want exactly 1", len(store.sessions))
+	}
+	if _, ok := service.bindings.entries[feishuBindKey(result.BindToken)]; ok {
+		t.Fatal("a completed bind kept the pending token")
+	}
+}
+
 // TestFeishuBindSpendsTokenWhenCommitOutcomeIsUnknown proves the pending token is
 // destroyed once the transaction ran, even when it reports an error: a commit that
 // did land must not be retried into a second session.
