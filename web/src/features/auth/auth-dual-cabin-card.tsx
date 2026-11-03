@@ -24,6 +24,11 @@ export function AuthDualCabinCard({
   return (
     <section className="login-card" aria-labelledby="auth-card-title">
       <div className="lc-head">
+        <p className="lc-eyebrow">// TOKENPIVOT · AUTH GATE</p>
+        <h1 className="lc-title" id="auth-card-title">
+          {title}
+        </h1>
+        <p className="lc-desc">{description}</p>
         <div className="lc-mode-pills" role="group" aria-label="登录与注册切换">
           {isLogin ? (
             <>
@@ -45,16 +50,24 @@ export function AuthDualCabinCard({
             </>
           )}
         </div>
-        <p className="lc-eyebrow">// TOKENPIVOT · AUTH GATE</p>
-        <h1 className="lc-title" id="auth-card-title">
-          {title}
-        </h1>
-        <p className="lc-desc">{description}</p>
       </div>
       {notice}
       <div className="lc-cabins">
         <FeishuCabin />
-        <div className="lc-cabin lc-cabin-cred">{children}</div>
+        <div className="lc-cabin lc-cabin-cred">
+          <div className="lc-cabin-head">
+            <h3 className="lc-cabin-title" id="cred-cabin-title">
+              EMAIL &amp; PASSWORD
+            </h3>
+            <span className="lc-badge lc-badge-subtle">快捷键 /</span>
+          </div>
+          <p className="lc-cabin-note">
+            {isLogin
+              ? "输入本地账号邮箱与密码进入工作空间。"
+              : "填写企业或个人邮箱与密码创建新账号。"}
+          </p>
+          {children}
+        </div>
       </div>
       <p className="lc-foot">
         {isLogin

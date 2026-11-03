@@ -1,0 +1,1006 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenPivot · G 编辑数据版</title>
+<style>
+/* ============================================================
+   G 浅色编辑数据版 — 设计假设
+   · 气质：NYT Graphics / Bloomberg 数据编辑版面，纸质感可印刷
+   · 单 accent 红(当前/峰值/异常) + 单 accent 蓝(对比/昨日基线)
+   · 衬线 display + sans 正文 + tabular 数字；发丝线代替色块
+   · 反 slop：零渐变、零玻璃、零装饰 icon、圆角 ≤4px
+   ============================================================ */
+:root{
+  --paper:#f7f4ef;
+  --paper-2:#efebe2;
+  --ink:#1d1b16;
+  --ink-2:#6f6a5f;
+  --ink-3:#a39d8f;
+  --hairline:rgba(29,27,22,.14);
+  --hairline-2:rgba(29,27,22,.08);
+  --red:#b7372a;
+  --blue:#2453a6;
+  --red-soft:rgba(183,55,42,.10);
+  --blue-soft:rgba(36,83,166,.10);
+  --serif:Georgia,"Times New Roman","Songti SC","STSong",serif;
+  --sans:-apple-system,BlinkMacSystemFont,"Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--paper);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:13px;
+  line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+  font-variant-numeric:tabular-nums;
+}
+a{color:inherit}
+
+/* folio 页眉 ------------------------------------------------ */
+.folio{
+  max-width:1480px;margin:0 auto;padding:22px 32px 0;
+}
+.folio-rule{
+  display:flex;align-items:baseline;gap:18px;
+  border-top:1px solid var(--ink);
+  border-bottom:1px solid var(--ink);
+  padding:6px 0;
+  font-size:10.5px;letter-spacing:.18em;text-transform:uppercase;
+}
+.folio-rule .brand{
+  display:flex;align-items:center;gap:10px;font-weight:600;
+}
+.folio-rule .brand i{
+  display:inline-block;width:9px;height:9px;
+  background:linear-gradient(135deg,var(--ink),var(--red) 60%,var(--blue));
+}
+.folio-rule .tag-g{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:18px;height:18px;border:1px solid var(--ink);
+  font-family:var(--serif);font-size:11px;letter-spacing:0;
+}
+.folio-rule .meta{margin-left:auto;color:var(--ink-2);letter-spacing:.12em}
+.folio-rule .meta em{font-style:normal;color:var(--red)}
+
+.masthead{
+  display:flex;align-items:flex-end;gap:24px;flex-wrap:wrap;
+  padding:26px 0 18px;
+  border-bottom:1px solid var(--hairline);
+}
+.masthead h1{
+  font-family:var(--serif);
+  font-size:34px;font-weight:400;letter-spacing:-.01em;
+  margin:0;line-height:1.1;
+}
+.masthead h1 em{font-style:italic;color:var(--red)}
+.masthead .lede{
+  max-width:520px;color:var(--ink-2);font-size:12.5px;line-height:1.7;
+  margin:8px 0 0;
+}
+  .masthead .controls{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:10px;padding-bottom:4px}
+.window-switch{display:flex;gap:0;border-bottom:1px solid var(--ink)}
+.window-switch button{
+  appearance:none;background:none;border:0;cursor:pointer;
+  font-family:var(--sans);font-size:11px;letter-spacing:.14em;
+  padding:6px 14px;color:var(--ink-2);
+  text-transform:uppercase;
+  border-bottom:2px solid transparent;
+  margin-bottom:-1px;
+  transition:color .15s,border-color .15s;
+}
+.window-switch button:hover{color:var(--ink)}
+.window-switch button.on{color:var(--red);border-bottom-color:var(--red)}
+
+/* 栅格 ------------------------------------------------------- */
+.wrap{max-width:1480px;margin:0 auto;padding:0 32px 56px}
+.grid-12{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:0 28px;row-gap:34px}
+section.block{
+  padding:0 0 26px;
+  position:relative;
+}
+section.block::after{
+  content:"";position:absolute;left:0;right:0;bottom:0;
+  border-bottom:1px solid var(--hairline);
+}
+.block-head{
+  display:flex;align-items:baseline;gap:12px;
+  margin-bottom:14px;
+}
+.folio-no{
+  font-family:var(--serif);font-style:italic;
+  font-size:15px;color:var(--ink-2);
+}
+.block-title{
+  font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;
+  color:var(--ink-2);
+}
+.block-aside{margin-left:auto;font-size:11px;color:var(--ink-3)}
+
+/* hero ------------------------------------------------------- */
+.hero{grid-column:1/span 7;padding-right:24px;border-right:1px solid var(--hairline);padding-top:0}
+.hero .block-head{margin-top:0}
+.hero-kicker{font-size:10.5px;letter-spacing:.22em;color:var(--ink-2);text-transform:uppercase}
+.hero-num{
+  font-family:var(--serif);font-weight:400;
+  font-size:88px;line-height:1;letter-spacing:-.02em;
+  margin:6px 0 0;
+}
+.hero-num .unit{font-size:32px;color:var(--ink-2);margin-left:6px;font-style:italic}
+.hero-delta{
+  margin-top:10px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+  font-size:12.5px;
+}
+.hero-delta .vs{color:var(--ink-2)}
+.hero-delta .up{color:var(--red)}
+.hero-delta .down{color:var(--blue)}
+.hero-spark{margin-top:18px}
+.hero-spark .cap{font-size:10.5px;letter-spacing:.16em;color:var(--ink-2);text-transform:uppercase;display:flex;justify-content:space-between}
+.hero-spark svg{display:block;width:100%;height:56px;margin-top:6px}
+
+/* kpi 边栏 ---------------------------------------------------- */
+.kpi-rail{grid-column:8/span 5;display:grid;grid-template-columns:1fr 1fr;gap:0}
+.kpi{
+  padding:6px 0 14px;
+  border-bottom:1px solid var(--hairline-2);
+}
+.kpi:nth-child(odd){padding-right:18px;border-right:1px solid var(--hairline-2)}
+.kpi:nth-child(even){padding-left:18px}
+.kpi:nth-last-child(-n+2){border-bottom:0}
+.kpi .k{font-size:10px;letter-spacing:.18em;color:var(--ink-2);text-transform:uppercase}
+.kpi .v{font-family:var(--serif);font-size:26px;line-height:1.15;margin-top:4px}
+.kpi .v small{font-size:14px;color:var(--ink-2);font-style:italic;margin-left:4px}
+.kpi .s{font-size:11px;color:var(--ink-2);margin-top:2px}
+.kpi .s em{font-style:normal;color:var(--red)}
+
+/* 主趋势 ------------------------------------------------------ */
+.trend{grid-column:1/span 8;border-right:1px solid var(--hairline);padding-right:24px}
+.trend-canvas{position:relative}
+.trend-canvas svg{display:block;width:100%;height:280px}
+.trend-tip{
+  position:absolute;pointer-events:none;
+  background:var(--ink);color:var(--paper);
+  font-family:var(--serif);font-size:12px;
+  padding:8px 12px;border-radius:2px;
+  box-shadow:0 2px 0 rgba(29,27,22,.2);
+  opacity:0;transition:opacity .12s;
+  min-width:140px;z-index:5;
+}
+.trend-tip .t{font-style:italic;color:#e8e2d4;font-size:11px;letter-spacing:.06em;margin-bottom:4px}
+.trend-tip .r{display:flex;justify-content:space-between;gap:14px;font-size:12px}
+.trend-tip .r b{font-weight:400}
+.trend-tip .r.cur b{color:#ffd9a0}
+.trend-tip .r.prev b{color:#bcd0ff}
+
+/* 占比 -------------------------------------------------------- */
+.share{grid-column:9/span 4}
+.share-row{margin-bottom:14px}
+.share-row .lab{display:flex;justify-content:space-between;font-size:11.5px;color:var(--ink-2);margin-bottom:4px}
+.share-row .lab b{color:var(--ink);font-weight:500}
+.stackbar{display:flex;height:14px;width:100%;border:1px solid var(--ink);overflow:hidden}
+.stackbar i{display:block;height:100%;border-right:1px solid var(--paper)}
+.stackbar i:last-child{border-right:0}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:10px;font-size:11px;color:var(--ink-2)}
+.legend span{display:inline-flex;align-items:center;gap:6px;cursor:pointer;padding:2px 0;border-bottom:1px solid transparent}
+.legend span:hover{color:var(--ink);border-bottom-color:var(--ink)}
+.legend span.off{color:var(--ink-3);text-decoration:line-through}
+.legend i{width:9px;height:9px;display:inline-block;border:1px solid var(--ink)}
+
+/* 直方图 ------------------------------------------------------ */
+.hist{grid-column:1/span 8;border-right:1px solid var(--hairline);padding-right:24px}
+.hist svg{display:block;width:100%;height:110px}
+
+/* 排名 -------------------------------------------------------- */
+.rank{grid-column:9/span 4}
+.rank-tabs{display:flex;gap:14px;margin-bottom:10px;border-bottom:1px solid var(--hairline)}
+.rank-tabs button{
+  appearance:none;background:none;border:0;cursor:pointer;
+  font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  padding:5px 0 7px;color:var(--ink-2);
+  border-bottom:2px solid transparent;margin-bottom:-1px;
+}
+.rank-tabs button.on{color:var(--red);border-bottom-color:var(--red)}
+.rank-list{display:flex;flex-direction:column}
+.rank-item{
+  display:grid;grid-template-columns:18px 1fr auto;gap:10px;align-items:baseline;
+  padding:7px 0;border-bottom:1px solid var(--hairline-2);
+}
+.rank-item:last-child{border-bottom:0}
+.rank-item .no{font-family:var(--serif);font-style:italic;color:var(--ink-2);font-size:13px}
+.rank-item .nm{font-size:12.5px}
+.rank-item .nm small{display:block;font-size:10.5px;color:var(--ink-3)}
+.rank-item .val{font-family:var(--serif);font-size:16px}
+.rank-item .bar{grid-column:2/span 2;height:3px;background:var(--paper-2);position:relative;margin-top:2px}
+.rank-item .bar i{position:absolute;left:0;top:0;bottom:0;background:var(--ink)}
+.rank-item:first-child .bar i{background:var(--red)}
+.rank-item:first-child .val{color:var(--red)}
+
+/* 质量 -------------------------------------------------------- */
+.quality{grid-column:1/span 8;border-right:1px solid var(--hairline);padding-right:24px}
+.lat-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:18px;margin-bottom:14px}
+.lat-cell .k{font-size:10px;letter-spacing:.16em;color:var(--ink-2);text-transform:uppercase}
+.lat-cell .v{font-family:var(--serif);font-size:22px;margin-top:2px}
+.lat-cell .v small{font-size:12px;color:var(--ink-2);font-style:italic}
+.lat-svg svg{display:block;width:100%;height:96px}
+.codes{display:flex;gap:22px;margin-top:14px;flex-wrap:wrap}
+.code-cell{min-width:120px}
+.code-cell .k{font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:var(--ink-2)}
+.code-cell .bar{height:8px;margin:6px 0 4px;background:var(--paper-2);position:relative}
+.code-cell .bar i{position:absolute;left:0;top:0;bottom:0;background:var(--ink)}
+.code-cell.c429 .bar i{background:var(--red)}
+.code-cell.c5xx .bar i{background:var(--red)}
+.code-cell .v{font-size:11px;color:var(--ink-2)}
+
+/* 预算 -------------------------------------------------------- */
+.budget{grid-column:9/span 4}
+.budget-num{font-family:var(--serif);font-size:34px;line-height:1.1}
+.budget-num small{font-size:14px;color:var(--ink-2);font-style:italic;margin-left:6px}
+.bullet{position:relative;height:26px;margin:14px 0 6px;background:var(--paper-2);border:1px solid var(--ink)}
+.bullet .fill{position:absolute;left:0;top:0;bottom:0;background:var(--ink)}
+.bullet .target{position:absolute;top:-5px;bottom:-5px;width:2px;background:var(--red)}
+.budget-cap{display:flex;justify-content:space-between;font-size:11px;color:var(--ink-2)}
+.budget-note{margin-top:10px;font-size:11.5px;color:var(--ink-2);line-height:1.6}
+.budget-note em{font-style:normal;color:var(--red)}
+
+/* 请求流 ------------------------------------------------------ */
+.feed{grid-column:1/span 12}
+.feed-head{display:flex;align-items:baseline;gap:14px;margin-bottom:10px}
+.feed-head .cmd{font-family:var(--mono);font-size:11.5px;color:var(--ink-2)}
+.feed-head .cmd em{font-style:normal;color:var(--red)}
+.feed-filter{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap;font-size:11px}
+.feed-filter button{
+  appearance:none;background:none;border:1px solid var(--hairline);cursor:pointer;
+  padding:3px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);
+  border-radius:2px;transition:all .12s;
+}
+.feed-filter button:hover{border-color:var(--ink);color:var(--ink)}
+.feed-filter button.on{border-color:var(--red);color:var(--red);background:var(--red-soft)}
+.feed-table{
+  border-top:1px solid var(--ink);
+  font-family:var(--mono);font-size:11px;
+  height:288px;overflow:hidden;position:relative;
+}
+.feed-table .row{
+  display:grid;grid-template-columns:86px 1.1fr 1.6fr 1fr 1fr .8fr .8fr .7fr;gap:12px;
+  padding:5px 0;border-bottom:1px solid var(--hairline-2);
+  color:var(--ink-2);
+}
+.feed-table .row.head{
+  color:var(--ink);border-bottom:1px solid var(--ink);
+  font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+}
+.feed-table .row .st-ok{color:var(--ink)}
+.feed-table .row .st-warn{color:var(--red)}
+.feed-table .row .st-err{color:var(--red);font-weight:600}
+.feed-table .row .mdl{color:var(--ink)}
+.feed-table .row.new{animation:flash 1.2s ease-out}
+@keyframes flash{
+  0%{background:var(--red-soft)}
+  100%{background:transparent}
+}
+
+/* footer ------------------------------------------------------ */
+.colophon{
+  display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;
+  padding-top:14px;font-size:10.5px;color:var(--ink-3);
+  font-family:var(--mono);letter-spacing:.04em;
+}
+
+/* 响应式 ------------------------------------------------------ */
+@media (max-width:1180px){
+  .hero{grid-column:1/span 12;border-right:0;padding-right:0;border-bottom:1px solid var(--hairline)}
+  .kpi-rail{grid-column:1/span 12}
+  .trend{grid-column:1/span 12;border-right:0;padding-right:0}
+  .share{grid-column:1/span 12}
+  .hist{grid-column:1/span 12;border-right:0;padding-right:0}
+  .rank{grid-column:1/span 12}
+  .quality{grid-column:1/span 12;border-right:0;padding-right:0}
+  .budget{grid-column:1/span 12}
+}
+@media (max-width:760px){
+  .folio,.wrap{padding-left:18px;padding-right:18px}
+  .masthead h1{font-size:26px}
+  .hero-num{font-size:56px}
+  .hero-num .unit{font-size:22px}
+  .kpi-rail{grid-template-columns:1fr}
+  .kpi:nth-child(odd){padding-right:0;border-right:0}
+  .kpi:nth-child(even){padding-left:0}
+  .lat-row{grid-template-columns:1fr}
+  .feed-table .row{grid-template-columns:70px 1fr 1fr .8fr .8fr .7fr;font-size:10px}
+  .feed-table .row .hide-s{display:none}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+
+<header class="folio">
+  <div class="folio-rule">
+    <span class="brand"><i></i>TOKENPIVOT<span class="tag-g">G</span></span>
+    <span>用量分析 · 编辑数据版</span>
+    <span class="meta">第 <em>02</em> 辑 · 示例数据 · 视觉原型</span>
+  </div>
+  <div class="masthead">
+    <div>
+      <h1>今日的 token，<em>一版看清</em>。</h1>
+      <p class="lede">以编辑版面重排 dashboard：衬线大数做主角，红与蓝只标当前与对比，其余交给发丝线与留白。所有数字为示例公式生成，每次打开一致。</p>
+    </div>
+    <div class="controls">
+      <div class="window-switch" id="windowSwitch" role="tablist" aria-label="时间窗">
+        <button data-w="min" role="tab">分钟 · 60m</button>
+        <button data-w="hour" class="on" role="tab">小时 · 24h</button>
+        <button data-w="day" role="tab">天 · 30d</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="grid-12">
+
+    <!-- №1 hero -->
+    <section class="block hero">
+      <div class="block-head">
+        <span class="folio-no">№1</span>
+        <span class="block-title">Token 总量 · 当前时间窗</span>
+        <span class="block-aside" id="heroWindowLab">24 小时</span>
+      </div>
+      <div class="hero-kicker">Tokens consumed</div>
+      <div class="hero-num"><span id="heroNum">0</span><span class="unit" id="heroUnit">tokens</span></div>
+      <div class="hero-delta">
+        <span class="vs" id="heroDeltaVs">较昨日同时段</span>
+        <span id="heroDeltaVal" class="up">—</span>
+        <span class="vs" id="heroDeltaAbs">—</span>
+      </div>
+      <div class="hero-spark">
+        <div class="cap"><span>今日 vs 昨日 · 同时段</span><span id="sparkCap">24h</span></div>
+        <svg id="sparkSvg" viewBox="0 0 640 56" preserveAspectRatio="none" aria-hidden="true"></svg>
+      </div>
+    </section>
+
+    <!-- №2 KPI 边栏 -->
+    <section class="block kpi-rail" id="kpiRail">
+      <div class="kpi">
+        <div class="k">请求数</div>
+        <div class="v" id="kpiReq">—</div>
+        <div class="s" id="kpiReqSub">—</div>
+      </div>
+      <div class="kpi">
+        <div class="k">速率 · 当前</div>
+        <div class="v" id="kpiRpm">—<small>/min</small></div>
+        <div class="s" id="kpiRpmSub">—</div>
+      </div>
+      <div class="kpi">
+        <div class="k">时延 · p90</div>
+        <div class="v" id="kpiP90">—<small>ms</small></div>
+        <div class="s" id="kpiP90Sub">—</div>
+      </div>
+      <div class="kpi">
+        <div class="k">成本 · 今日</div>
+        <div class="v" id="kpiCost">—</div>
+        <div class="s" id="kpiCostSub">—</div>
+      </div>
+    </section>
+
+    <!-- №3 趋势 -->
+    <section class="block trend">
+      <div class="block-head">
+        <span class="folio-no">№3</span>
+        <span class="block-title">用量趋势 · 输入 / 输出 / 缓存</span>
+        <span class="block-aside" id="trendCap">按小时</span>
+      </div>
+      <div class="trend-canvas">
+        <svg id="trendSvg" viewBox="0 0 760 280" preserveAspectRatio="none"></svg>
+        <div class="trend-tip" id="trendTip"></div>
+      </div>
+      <div class="legend" id="trendLegend"></div>
+    </section>
+
+    <!-- №4 占比 -->
+    <section class="block share">
+      <div class="block-head">
+        <span class="folio-no">№4</span>
+        <span class="block-title">供应商占比</span>
+      </div>
+      <div id="shareList"></div>
+    </section>
+
+    <!-- №5 直方图 -->
+    <section class="block hist">
+      <div class="block-head">
+        <span class="folio-no">№5</span>
+        <span class="block-title">请求分布 · 每时间片</span>
+        <span class="block-aside" id="histCap">均值线 —</span>
+      </div>
+      <svg id="histSvg" viewBox="0 0 760 110" preserveAspectRatio="none"></svg>
+    </section>
+
+    <!-- №6 排名 -->
+    <section class="block rank">
+      <div class="block-head">
+        <span class="folio-no">№6</span>
+        <span class="block-title">维度排名</span>
+      </div>
+      <div class="rank-tabs" id="rankTabs">
+        <button data-t="project" class="on">项目</button>
+        <button data-t="model">模型</button>
+        <button data-t="provider">供应商</button>
+      </div>
+      <div class="rank-list" id="rankList"></div>
+    </section>
+
+    <!-- №7 质量 -->
+    <section class="block quality">
+      <div class="block-head">
+        <span class="folio-no">№7</span>
+        <span class="block-title">质量 · 时延与状态</span>
+        <span class="block-aside">近 24h</span>
+      </div>
+      <div class="lat-row">
+        <div class="lat-cell"><div class="k">p50</div><div class="v" id="latP50">—<small>ms</small></div></div>
+        <div class="lat-cell"><div class="k">p90</div><div class="v" id="latP90">—<small>ms</small></div></div>
+        <div class="lat-cell"><div class="k">p99</div><div class="v" id="latP99">—<small>ms</small></div></div>
+      </div>
+      <div class="lat-svg"><svg id="latSvg" viewBox="0 0 760 96" preserveAspectRatio="none"></svg></div>
+      <div class="codes" id="codeList"></div>
+    </section>
+
+    <!-- №8 预算 -->
+    <section class="block budget">
+      <div class="block-head">
+        <span class="folio-no">№8</span>
+        <span class="block-title">月度预算</span>
+      </div>
+      <div class="budget-num"><span id="budgetPct">—</span><small id="budgetPctSub">已用</small></div>
+      <div class="bullet">
+        <div class="fill" id="budgetFill" style="width:0%"></div>
+        <div class="target" id="budgetTarget" style="left:80%"></div>
+      </div>
+      <div class="budget-cap">
+        <span id="budgetUsed">$—</span>
+        <span id="budgetCap">cap $—</span>
+      </div>
+      <p class="budget-note" id="budgetNote">—</p>
+    </section>
+
+    <!-- №9 请求流 -->
+    <section class="block feed">
+      <div class="feed-head">
+        <span class="folio-no">№9</span>
+        <span class="cmd">$ tail -f <em>requests.log</em> · 每 3s 追加</span>
+        <div class="feed-filter" id="feedFilter"></div>
+      </div>
+      <div class="feed-table" id="feedTable">
+        <div class="row head">
+          <span>时间</span><span>项目</span><span>模型</span><span>供应商</span>
+          <span class="hide-s">in / out</span><span>时延</span><span>成本</span><span>状态</span>
+        </div>
+        <div id="feedRows"></div>
+      </div>
+    </section>
+
+  </div>
+
+  <footer class="colophon">
+    <span>TOKENPIVOT · 第二辑 G 版 · 2026-11-02</span>
+    <span>示例公式数据 · 非真实采集 · 口径：完成时刻计数</span>
+  </footer>
+</main>
+
+<script>
+/* ============================================================
+   数据层 · seed 固定伪随机
+   ============================================================ */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const rnd = mulberry32(20261102);
+
+const PROVIDERS = [
+  {id:'openai',    name:'OpenAI',    models:['gpt-5.2','gpt-5.2-mini'],  color:'#1d1b16'},
+  {id:'anthropic', name:'Anthropic', models:['claude-opus-4.5','claude-sonnet-4.5'], color:'#b7372a'},
+  {id:'gemini',    name:'Gemini',    models:['gemini-3-pro'],            color:'#2453a6'},
+  {id:'deepseek',  name:'DeepSeek',  models:['deepseek-v4'],             color:'#6f6a5f'},
+  {id:'moonshot',  name:'Moonshot',  models:['kimi-k3'],                  color:'#a39d8f'},
+];
+const PROJECTS = [
+  {id:'tokenpivot', name:'tokenpivot 主站'},
+  {id:'dsh',        name:'dsh-plugin'},
+  {id:'bridge',     name:'pi-bridge'},
+  {id:'website',    name:'website 前台'},
+  {id:'misc',       name:'未归属'},
+];
+
+const WINDOWS = {
+  min:  {n:60, label:'60 分钟',  cap:'按分钟', unit:'min',  spark:'60m', base:88000,  prevLabel:'较前一小时'},
+  hour: {n:24, label:'24 小时',  cap:'按小时', unit:'hour', spark:'24h', base:4200000, prevLabel:'较昨日同时段'},
+  day:  {n:30, label:'30 天',    cap:'按天',   unit:'day',  spark:'30d', base:96000000, prevLabel:'较前 30 天'},
+};
+
+/* 生成一条时间窗数据 */
+function genWindow(wKey){
+  const w = WINDOWS[wKey];
+  const series = {input:[],output:[],cache:[]};
+  const prev = [];
+  const reqs = [];
+  for(let i=0;i<w.n;i++){
+    const t = i/w.n;
+    const diurnal = 0.55 + 0.45*Math.sin(t*Math.PI*2 - Math.PI/2)*Math.sin(t*Math.PI*2 - Math.PI/2);
+    const spike = (i>w.n*0.62 && i<w.n*0.72) ? 1.9 : 1;
+    const base = w.base * diurnal * spike;
+    const inp = base * (0.42 + rnd()*0.06);
+    const out = base * (0.20 + rnd()*0.05);
+    const cch = base * (0.30 + rnd()*0.08);
+    series.input.push(inp);
+    series.output.push(out);
+    series.cache.push(cch);
+    prev.push(base * (0.85 + rnd()*0.25));
+    reqs.push(Math.round(base/900 + rnd()*400));
+  }
+  return {w, series, prev, reqs};
+}
+
+function sum(arr){return arr.reduce((a,b)=>a+b,0)}
+function fmt(n){
+  if(n>=1e9) return (n/1e9).toFixed(2)+'B';
+  if(n>=1e6) return (n/1e6).toFixed(2)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(1)+'K';
+  return Math.round(n).toString();
+}
+function fmtFull(n){return Math.round(n).toLocaleString('en-US')}
+function fmtMoney(n){return '$'+n.toLocaleString('en-US',{maximumFractionDigits:0})}
+
+/* ============================================================
+   状态
+   ============================================================ */
+const state = {
+  window:'hour',
+  data:genWindow('hour'),
+  hidden:{input:false,output:false,cache:false},
+  rankTab:'project',
+  feedFilter:null,
+  feedRows:[],
+  heroCur:0,
+  heroTarget:0,
+};
+const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ============================================================
+   hero + sparkline
+   ============================================================ */
+function renderHero(){
+  const d = state.data;
+  const total = sum(d.series.input)+sum(d.series.output)+sum(d.series.cache);
+  const prevTotal = sum(d.prev);
+  state.heroTarget = total;
+  if(reduced){ state.heroCur = total; }
+  document.getElementById('heroWindowLab').textContent = d.w.label;
+  document.getElementById('sparkCap').textContent = d.w.spark;
+
+  const delta = (total-prevTotal)/prevTotal;
+  const dv = document.getElementById('heroDeltaVal');
+  dv.textContent = (delta>=0?'+':'') + (delta*100).toFixed(1) + '%';
+  dv.className = delta>=0 ? 'up' : 'down';
+  document.getElementById('heroDeltaVs').textContent = d.w.prevLabel;
+  document.getElementById('heroDeltaAbs').textContent =
+    (delta>=0?'+':'−') + fmt(Math.abs(total-prevTotal)) + ' tokens';
+
+  // sparkline：今日实线(红) vs 昨日虚线(蓝)
+  const svg = document.getElementById('sparkSvg');
+  const W=640,H=56,P=4;
+  const cur = d.series.input.map((v,i)=>v+d.series.output[i]+d.series.cache[i]);
+  const maxV = Math.max(...cur,...d.prev)*1.08;
+  const x = i => P + i*(W-2*P)/(cur.length-1);
+  const y = v => H-P - (v/maxV)*(H-2*P);
+  const path = arr => arr.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)).join(' ');
+  svg.innerHTML = `
+    <path d="${path(d.prev)}" fill="none" stroke="#2453a6" stroke-width="1.2" stroke-dasharray="3 3" opacity=".7"/>
+    <path d="${path(cur)}" fill="none" stroke="#b7372a" stroke-width="1.6"/>
+    <circle cx="${x(cur.length-1)}" cy="${y(cur[cur.length-1])}" r="3" fill="#b7372a"/>
+  `;
+}
+
+function tickHero(){
+  if(state.heroCur < state.heroTarget){
+    const diff = state.heroTarget - state.heroCur;
+    state.heroCur += Math.max(diff*0.08, 1);
+    if(state.heroCur > state.heroTarget) state.heroCur = state.heroTarget;
+    document.getElementById('heroNum').textContent = fmt(state.heroCur);
+    document.getElementById('heroUnit').textContent = 'tokens';
+    requestAnimationFrame(tickHero);
+  }
+}
+
+/* ============================================================
+   KPI
+   ============================================================ */
+function renderKpi(){
+  const d = state.data;
+  const totalReq = sum(d.reqs);
+  const totalTok = sum(d.series.input)+sum(d.series.output)+sum(d.series.cache);
+  const rpm = totalReq / (d.w.unit==='min'?60 : d.w.unit==='hour'?24*60 : 30*24*60);
+  const cost = totalTok * 0.0000022;
+  document.getElementById('kpiReq').textContent = fmt(totalReq);
+  document.getElementById('kpiReqSub').textContent = d.w.label + ' · 完成时刻计数';
+  document.getElementById('kpiRpm').innerHTML = fmt(rpm)+'<small>/min</small>';
+  document.getElementById('kpiRpmSub').textContent = '峰值 ' + fmt(Math.max(...d.reqs)/(d.w.unit==='min'?1:d.w.unit==='hour'?60:1440)) + '/min';
+  document.getElementById('kpiP90').innerHTML = '1,840<small>ms</small>';
+  document.getElementById('kpiP90Sub').innerHTML = 'p50 640 · p99 <em>4,210</em>';
+  document.getElementById('kpiCost').textContent = fmtMoney(cost);
+  document.getElementById('kpiCostSub').textContent = '≈ $'+ (cost/ (d.w.unit==='day'?30:1) * 30).toFixed(0) +' / 月';
+}
+
+/* ============================================================
+   主趋势图
+   ============================================================ */
+const SERIES_META = [
+  {key:'input',  name:'输入',  color:'#1d1b16'},
+  {key:'output', name:'输出',  color:'#b7372a'},
+  {key:'cache',  name:'缓存',  color:'#2453a6'},
+];
+
+function renderTrend(){
+  const d = state.data;
+  const svg = document.getElementById('trendSvg');
+  const W=760,H=280,P={l:46,r:14,t:14,b:26};
+  const n = d.w.n;
+  const visible = SERIES_META.filter(s=>!state.hidden[s.key]);
+  const totals = d.series.input.map((_,i)=>
+    visible.reduce((a,s)=>a+d.series[s.key][i],0)
+  );
+  const maxV = Math.max(...totals)*1.12 || 1;
+  const x = i => P.l + i*(W-P.l-P.r)/(n-1);
+  const y = v => H-P.b - (v/maxV)*(H-P.t-P.b);
+
+  let gridLines = '';
+  for(let g=0;g<=4;g++){
+    const v = maxV*g/4;
+    const yy = y(v);
+    gridLines += `<line x1="${P.l}" y1="${yy}" x2="${W-P.r}" y2="${yy}" stroke="rgba(29,27,22,.08)" stroke-width="1"/>`;
+    gridLines += `<text x="${P.l-8}" y="${yy+3}" text-anchor="end" font-size="9" fill="#a39d8f" font-family="Georgia,serif" font-style="italic">${fmt(v)}</text>`;
+  }
+
+  // 堆叠面积（从 cache → output → input 顺序堆）
+  let areas = '';
+  let cumulative = new Array(n).fill(0);
+  const stackOrder = ['cache','output','input'];
+  for(const key of stackOrder){
+    if(state.hidden[key]) continue;
+    const meta = SERIES_META.find(s=>s.key===key);
+    const top = cumulative.map((c,i)=>c+d.series[key][i]);
+    const upPath = top.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)).join(' ');
+    const downPath = cumulative.slice().reverse().map((v,ri)=>{
+      const i = n-1-ri;
+      return 'L'+x(i).toFixed(1)+','+y(v).toFixed(1);
+    }).join(' ');
+    areas += `<path d="${upPath} ${downPath} Z" fill="${meta.color}" fill-opacity=".10" stroke="${meta.color}" stroke-width="1.4"/>`;
+    cumulative = top;
+  }
+
+  // x 轴刻度
+  let xTicks = '';
+  const tickEvery = Math.ceil(n/8);
+  for(let i=0;i<n;i+=tickEvery){
+    const lab = d.w.unit==='min' ? `-${n-i}m` : d.w.unit==='hour' ? `${String(i).padStart(2,'0')}:00` : `D-${n-i}`;
+    xTicks += `<text x="${x(i)}" y="${H-8}" text-anchor="middle" font-size="9" fill="#a39d8f" font-family="Georgia,serif">${lab}</text>`;
+    xTicks += `<line x1="${x(i)}" y1="${H-P.b}" x2="${x(i)}" y2="${H-P.b+3}" stroke="#1d1b16" stroke-width="1"/>`;
+  }
+
+  svg.innerHTML = gridLines + areas + xTicks + `<g id="trendHover"></g>`;
+
+  // hover 交互
+  const hoverLayer = svg.querySelector('#trendHover');
+  const tip = document.getElementById('trendTip');
+  const canvas = document.querySelector('.trend-canvas');
+  svg.onmousemove = (ev)=>{
+    const rect = svg.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) * (W/rect.width);
+    let i = Math.round((px-P.l)/((W-P.l-P.r)/(n-1)));
+    i = Math.max(0,Math.min(n-1,i));
+    const xx = x(i);
+    const yy = y(totals[i]);
+    hoverLayer.innerHTML = `
+      <line x1="${xx}" y1="${P.t}" x2="${xx}" y2="${H-P.b}" stroke="#b7372a" stroke-width="1" stroke-dasharray="2 2"/>
+      <circle cx="${xx}" cy="${yy}" r="3.5" fill="#b7372a"/>
+    `;
+    const lab = d.w.unit==='min' ? `-${n-i} 分钟` : d.w.unit==='hour' ? `${String(i).padStart(2,'0')}:00` : `第 ${i+1} 天`;
+    let rows = `<div class="t">${lab}</div>`;
+    for(const s of SERIES_META){
+      if(state.hidden[s.key]) continue;
+      rows += `<div class="r ${s.key==='output'?'cur':''}"><span>${s.name}</span><b>${fmt(d.series[s.key][i])}</b></div>`;
+    }
+    rows += `<div class="r" style="border-top:1px solid rgba(247,244,239,.2);padding-top:3px;margin-top:3px"><span>合计</span><b>${fmt(totals[i])}</b></div>`;
+    tip.innerHTML = rows;
+    tip.style.opacity = 1;
+    const cRect = canvas.getBoundingClientRect();
+    const tipX = (xx/W)*cRect.width;
+    tip.style.left = Math.min(Math.max(tipX-70,0),cRect.width-160)+'px';
+    tip.style.top = '10px';
+  };
+  svg.onmouseleave = ()=>{
+    tip.style.opacity = 0;
+    hoverLayer.innerHTML = '';
+  };
+
+  // legend
+  const legend = document.getElementById('trendLegend');
+  legend.innerHTML = SERIES_META.map(s=>
+    `<span data-k="${s.key}" class="${state.hidden[s.key]?'off':''}"><i style="background:${s.color}"></i>${s.name}</span>`
+  ).join('');
+  legend.querySelectorAll('span').forEach(el=>{
+    el.onclick = ()=>{
+      const k = el.dataset.k;
+      state.hidden[k] = !state.hidden[k];
+      renderTrend();
+    };
+  });
+
+  document.getElementById('trendCap').textContent = d.w.cap;
+}
+
+/* ============================================================
+   占比 100% 横棒
+   ============================================================ */
+function renderShare(){
+  // 按供应商拆分总量（公式占比，不随时间窗变化，模拟稳定结构）
+  const shares = [
+    {p:PROVIDERS[0], v:0.38},
+    {p:PROVIDERS[1], v:0.24},
+    {p:PROVIDERS[2], v:0.16},
+    {p:PROVIDERS[3], v:0.13},
+    {p:PROVIDERS[4], v:0.09},
+  ];
+  const totalTok = sum(state.data.series.input)+sum(state.data.series.output)+sum(state.data.series.cache);
+  const html = `
+    <div class="share-row">
+      <div class="lab"><b>按 token 量</b><span>${fmt(totalTok)} total</span></div>
+      <div class="stackbar">
+        ${shares.map(s=>`<i style="width:${(s.v*100).toFixed(1)}%;background:${s.p.color}"></i>`).join('')}
+      </div>
+    </div>
+    <div class="legend" style="margin-top:6px">
+      ${shares.map(s=>`<span style="cursor:default"><i style="background:${s.p.color}"></i>${s.p.name} · ${(s.v*100).toFixed(0)}%</span>`).join('')}
+    </div>
+  `;
+  document.getElementById('shareList').innerHTML = html;
+}
+
+/* ============================================================
+   直方图
+   ============================================================ */
+function renderHist(){
+  const d = state.data;
+  const svg = document.getElementById('histSvg');
+  const W=760,H=110,P={l:46,r:14,t:10,b:20};
+  const n = d.w.n;
+  const maxV = Math.max(...d.reqs)*1.1;
+  const avg = sum(d.reqs)/n;
+  const bw = (W-P.l-P.r)/n;
+  const x = i => P.l + i*bw;
+  const y = v => H-P.b - (v/maxV)*(H-P.t-P.b);
+
+  let bars = '';
+  for(let i=0;i<n;i++){
+    const isPeak = d.reqs[i] === Math.max(...d.reqs);
+    bars += `<rect x="${(x(i)+bw*0.15).toFixed(1)}" y="${y(d.reqs[i]).toFixed(1)}" width="${(bw*0.7).toFixed(1)}" height="${(H-P.b-y(d.reqs[i])).toFixed(1)}" fill="${isPeak?'#b7372a':'#1d1b16'}" fill-opacity="${isPeak?1:.78}"/>`;
+  }
+  const avgY = y(avg);
+  const avgLine = `<line x1="${P.l}" y1="${avgY}" x2="${W-P.r}" y2="${avgY}" stroke="#2453a6" stroke-width="1" stroke-dasharray="4 3"/>
+    <text x="${W-P.r}" y="${avgY-4}" text-anchor="end" font-size="9" fill="#2453a6" font-family="Georgia,serif" font-style="italic">avg ${fmt(avg)}</text>`;
+
+  svg.innerHTML = bars + avgLine +
+    `<line x1="${P.l}" y1="${H-P.b}" x2="${W-P.r}" y2="${H-P.b}" stroke="#1d1b16" stroke-width="1"/>`;
+  document.getElementById('histCap').textContent = '均值 ' + fmt(avg) + ' / ' + (d.w.unit==='min'?'min':d.w.unit==='hour'?'hour':'day');
+}
+
+/* ============================================================
+   排名
+   ============================================================ */
+function renderRank(){
+  const d = state.data;
+  const totalTok = sum(d.series.input)+sum(d.series.output)+sum(state.data.series.cache);
+  let items = [];
+  if(state.rankTab==='project'){
+    const ratios = [0.36,0.24,0.18,0.14,0.08];
+    items = PROJECTS.map((p,i)=>({name:p.name, sub:p.id, v:totalTok*ratios[i]}));
+  }else if(state.rankTab==='model'){
+    const all = PROVIDERS.flatMap(p=>p.models.map(m=>({name:m, sub:p.name})));
+    const ratios = [0.32,0.22,0.18,0.12,0.09,0.07];
+    items = all.slice(0,5).map((m,i)=>({...m, v:totalTok*ratios[i]}));
+  }else{
+    const ratios = [0.38,0.24,0.16,0.13,0.09];
+    items = PROVIDERS.map((p,i)=>({name:p.name, sub:p.models[0], v:totalTok*ratios[i]}));
+  }
+  const maxV = Math.max(...items.map(i=>i.v));
+  document.getElementById('rankList').innerHTML = items.map((it,i)=>`
+    <div class="rank-item">
+      <span class="no">${String(i+1).padStart(2,'0')}</span>
+      <span class="nm">${it.name}<small>${it.sub}</small></span>
+      <span class="val">${fmt(it.v)}</span>
+      <span class="bar"><i style="width:${(it.v/maxV*100).toFixed(1)}%"></i></span>
+    </div>
+  `).join('');
+}
+
+/* ============================================================
+   质量：时延分布 + 状态码
+   ============================================================ */
+function renderQuality(){
+  document.getElementById('latP50').innerHTML = '640<small>ms</small>';
+  document.getElementById('latP90').innerHTML = '1,840<small>ms</small>';
+  document.getElementById('latP99').innerHTML = '4,210<small>ms</small>';
+  // 24 桶时延分布（对数正态形）
+  const buckets = [];
+  for(let i=0;i<24;i++){
+    const t = i/24;
+    const v = Math.exp(-Math.pow((t-0.32)*4.2,2)) * (0.8+rnd()*0.3) + Math.exp(-Math.pow((t-0.78)*9,2))*0.25;
+    buckets.push(v);
+  }
+  const maxV = Math.max(...buckets);
+  const W=760,H=96,P={l:0,r:0,t:8,b:16};
+  const bw = W/24;
+  let bars = '';
+  for(let i=0;i<24;i++){
+    const h = (buckets[i]/maxV)*(H-P.t-P.b);
+    const isP99 = i>=21;
+    bars += `<rect x="${(i*bw+bw*0.18).toFixed(1)}" y="${(H-P.b-h).toFixed(1)}" width="${(bw*0.64).toFixed(1)}" height="${h.toFixed(1)}" fill="${isP99?'#b7372a':'#1d1b16'}" fill-opacity="${isP99?1:.75}"/>`;
+  }
+  document.getElementById('latSvg').innerHTML = bars +
+    `<text x="0" y="${H-4}" font-size="9" fill="#a39d8f" font-family="Georgia,serif" font-style="italic">0ms</text>
+     <text x="${W/2}" y="${H-4}" text-anchor="middle" font-size="9" fill="#a39d8f" font-family="Georgia,serif" font-style="italic">2s</text>
+     <text x="${W}" y="${H-4}" text-anchor="end" font-size="9" fill="#a39d8f" font-family="Georgia,serif" font-style="italic">4s+</text>`;
+
+  const codes = [
+    {k:'200 OK',   v:0.991, n:41872, cls:''},
+    {k:'429 限流', v:0.005, n:211,   cls:'c429'},
+    {k:'5xx 错误', v:0.003, n:127,   cls:'c5xx'},
+    {k:'timeout',  v:0.001, n:42,    cls:'c5xx'},
+  ];
+  document.getElementById('codeList').innerHTML = codes.map(c=>`
+    <div class="code-cell ${c.cls}">
+      <div class="k">${c.k}</div>
+      <div class="bar"><i style="width:${Math.max(c.v*100,2)}%"></i></div>
+      <div class="v">${c.n.toLocaleString()} · ${(c.v*100).toFixed(1)}%</div>
+    </div>
+  `).join('');
+}
+
+/* ============================================================
+   预算
+   ============================================================ */
+function renderBudget(){
+  const used = 1284, cap = 2000, target = 0.8;
+  const pct = used/cap;
+  document.getElementById('budgetPct').textContent = (pct*100).toFixed(0)+'%';
+  document.getElementById('budgetPctSub').textContent = '已用 · 本月';
+  document.getElementById('budgetFill').style.width = (pct*100)+'%';
+  document.getElementById('budgetTarget').style.left = (target*100)+'%';
+  document.getElementById('budgetUsed').textContent = fmtMoney(used)+' 已用';
+  document.getElementById('budgetCap').textContent = 'cap '+fmtMoney(cap);
+  const daysLeft = 30 - new Date().getDate();
+  const daily = used / new Date().getDate();
+  const proj = daily*30;
+  document.getElementById('budgetNote').innerHTML =
+    `红线为 80% 预警位。按当前日均 ${fmtMoney(daily)}，月底预计 <em>${fmtMoney(proj)}</em>，${proj>cap*target?'将触及预警':'在预警线内'}。剩 ${daysLeft} 天。`;
+}
+
+/* ============================================================
+   请求流
+   ============================================================ */
+function mkRow(){
+  const p = PROVIDERS[Math.floor(rnd()*PROVIDERS.length)];
+  const m = p.models[Math.floor(rnd()*p.models.length)];
+  const proj = PROJECTS[Math.floor(rnd()*PROJECTS.length)];
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2,'0');
+  const mm = String(now.getMinutes()).padStart(2,'0');
+  const ss = String(now.getSeconds()).padStart(2,'0');
+  const tin = Math.round(800+rnd()*4200);
+  const tout = Math.round(120+rnd()*1800);
+  const lat = Math.round(280+rnd()*3200);
+  const cost = ((tin*0.000008)+(tout*0.000024)).toFixed(3);
+  const r = rnd();
+  const st = r>0.985 ? {c:'500',cls:'st-err'} : r>0.965 ? {c:'429',cls:'st-warn'} : {c:'200',cls:'st-ok'};
+  return {time:`${hh}:${mm}:${ss}`, proj:proj.id, model:m, provider:p.id, tin, tout, lat, cost, st};
+}
+
+function rowHtml(r, isNew){
+  return `<div class="row ${isNew?'new':''}" data-p="${r.provider}">
+    <span>${r.time}</span>
+    <span class="mdl">${r.proj}</span>
+    <span class="mdl">${r.model}</span>
+    <span>${r.provider}</span>
+    <span class="hide-s">${fmt(r.tin)} / ${fmt(r.tout)}</span>
+    <span>${r.lat}ms</span>
+    <span>$${r.cost}</span>
+    <span class="${r.st.cls}">${r.st.c}</span>
+  </div>`;
+}
+
+function renderFeedFilter(){
+  const el = document.getElementById('feedFilter');
+  el.innerHTML = `<button data-p="" class="${!state.feedFilter?'on':''}">全部</button>` +
+    PROVIDERS.map(p=>`<button data-p="${p.id}" class="${state.feedFilter===p.id?'on':''}">${p.id}</button>`).join('');
+  el.querySelectorAll('button').forEach(b=>{
+    b.onclick = ()=>{
+      state.feedFilter = b.dataset.p || null;
+      renderFeedFilter();
+      renderFeedRows();
+    };
+  });
+}
+
+function renderFeedRows(){
+  const rows = state.feedRows.filter(r=>!state.feedFilter || r.provider===state.feedFilter);
+  document.getElementById('feedRows').innerHTML = rows.slice(0,10).map((r,i)=>rowHtml(r,i===0&&r._new)).join('');
+  state.feedRows.forEach(r=>r._new=false);
+}
+
+function feedTick(){
+  const r = mkRow();
+  r._new = true;
+  state.feedRows.unshift(r);
+  if(state.feedRows.length>40) state.feedRows.length = 40;
+  renderFeedRows();
+  // 计数器小幅前进
+  state.heroTarget += (state.data.series.input[0]+state.data.series.output[0])/state.data.w.n * 0.001;
+  state.heroCur = state.heroTarget;
+  document.getElementById('heroNum').textContent = fmt(state.heroTarget);
+}
+
+/* ============================================================
+   时间窗切换
+   ============================================================ */
+document.getElementById('windowSwitch').addEventListener('click',(e)=>{
+  const btn = e.target.closest('button');
+  if(!btn) return;
+  const w = btn.dataset.w;
+  if(w===state.window) return;
+  state.window = w;
+  state.data = genWindow(w);
+  document.querySelectorAll('#windowSwitch button').forEach(b=>b.classList.toggle('on',b===btn));
+  state.heroCur = 0;
+  renderAll();
+});
+
+document.getElementById('rankTabs').addEventListener('click',(e)=>{
+  const btn = e.target.closest('button');
+  if(!btn) return;
+  state.rankTab = btn.dataset.t;
+  document.querySelectorAll('#rankTabs button').forEach(b=>b.classList.toggle('on',b===btn));
+  renderRank();
+});
+
+/* ============================================================
+   启动
+   ============================================================ */
+function renderAll(){
+  renderHero();
+  renderKpi();
+  renderTrend();
+  renderShare();
+  renderHist();
+  renderRank();
+  renderQuality();
+  renderBudget();
+}
+
+// 初始化 feed
+for(let i=0;i<12;i++){ state.feedRows.push(mkRow()); }
+renderFeedFilter();
+renderFeedRows();
+renderAll();
+if(!reduced){
+  tickHero();
+  setInterval(feedTick, 3000);
+}else{
+  state.heroCur = state.heroTarget;
+  document.getElementById('heroNum').textContent = fmt(state.heroTarget);
+}
+</script>
+</body>
+</html>

@@ -37,7 +37,6 @@ export function GeekAuthWorkbench({
 
       <main className="main-stage">
         <div className="split-workbench">
-          <AuthDashboardSnapshot />
           <div className="login-spotlight-wrap">
             <AuthDualCabinCard
               mode={mode}
@@ -48,6 +47,7 @@ export function GeekAuthWorkbench({
               {children}
             </AuthDualCabinCard>
           </div>
+          <AuthDashboardSnapshot />
         </div>
       </main>
 

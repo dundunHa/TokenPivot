@@ -1,0 +1,1632 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenPivot · J 极客重奏版 · 方案 III 双栏登录页 (左 Dashboard 快照 + 右并排登录舱)</title>
+<style>
+/* ============================================================
+   TokenPivot · J 极客重奏（F++）登录页 v4
+   用户选定方向：
+   1. 右侧主焦点：采用【方案 III】「左飞书扫码+一键唤起 ‖ 右邮箱密码」并排双舱登录卡，
+      保留 3px 实心琥珀顶冠 + 聚光背光，一眼锁定登录操作区。
+   2. 左侧背景区：去掉宣传介绍文字，改为原汁原味的【J 风格 Dashboard 实时遥测快照】
+      （今日总 Token Hero 读数 + 4 维核心指标 + Braille 4x2 分钟速率曲线 + 模型/项目 Top 排行字符条），
+      采用无外框、低对比暗金质感呈现，既有真实仪表盘的气场，又不与右侧登录框抢视觉焦点。
+   ============================================================ */
+:root {
+  --bg: #0b0a08;
+  --panel: #120f0a;
+  --panel-focus: #16120c;
+  --panel-edge: rgba(224, 166, 75, 0.13);
+  --panel-edge-faint: rgba(224, 166, 75, 0.08);
+  --panel-edge-focus: rgba(224, 166, 75, 0.50);
+  --text: #f4f1ea;
+  --text-soft: #cfc9bc;
+  --amber: #e0a64b;
+  --amber-bright: #ecb55c;
+  --amber-dim: #7a6435;
+  --amber-faint: #463a20;
+  --amber-glow: rgba(224, 166, 75, 0.11);
+  --copper: #d1604f;
+  --copper-bg: rgba(209, 96, 79, 0.12);
+  --olive: #8a8672;
+  --olive-dim: #5c5849;
+  --green: #7fb069;
+  --green-bg: rgba(127, 176, 105, 0.12);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; min-height: 100vh; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  flex-direction: column;
+}
+::selection { background: rgba(224, 166, 75, 0.25); }
+button, input { font-family: inherit; }
+
+/* 顶部原型预览控制条 ----------------------------------------- */
+.proto-switcher {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: #080705;
+  border-bottom: 1px solid var(--panel-edge);
+  padding: 6px 24px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+.ps-badge {
+  color: var(--amber);
+  border: 1px solid var(--amber-dim);
+  padding: 1px 7px;
+  font-weight: 600;
+}
+.ps-group {
+  display: flex;
+  align-items: center;
+}
+.ps-label {
+  color: var(--olive-dim);
+  margin-right: 8px;
+}
+.ps-btn {
+  appearance: none;
+  background: transparent;
+  border: 1px solid rgba(224, 166, 75, 0.14);
+  color: var(--olive);
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  margin-right: -1px;
+  transition: all 0.12s;
+}
+.ps-btn:hover {
+  color: var(--text);
+  border-color: var(--amber);
+  z-index: 1;
+}
+.ps-btn.on {
+  background: rgba(224, 166, 75, 0.16);
+  color: var(--amber);
+  border-color: var(--amber);
+  font-weight: 600;
+  z-index: 2;
+}
+.ps-right {
+  margin-left: auto;
+  color: var(--olive-dim);
+  font-size: 11px;
+}
+.ps-right kbd {
+  color: var(--amber);
+  border: 1px solid var(--amber-faint);
+  padding: 0 4px;
+  font-size: 10px;
+}
+
+/* 顶栏 Shell Prompt（与 dashboard-j 同源，低调克制） ---------- */
+.shell-bar {
+  max-width: 1360px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 16px 32px 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+}
+.shell-prompt { color: var(--amber-dim); }
+.shell-prompt .user { color: var(--olive-dim); }
+.shell-prompt .path { color: var(--olive); }
+.shell-prompt .cmd { color: var(--text-soft); }
+.tag-j {
+  padding: 0 6px;
+  border: 1px solid var(--amber-dim);
+  color: var(--amber-dim);
+  font-size: 10.5px;
+}
+.shell-meta {
+  margin-left: auto;
+  color: var(--olive-dim);
+  font-size: 11px;
+  display: flex;
+  gap: 16px;
+}
+.shell-meta em { font-style: normal; color: var(--olive); }
+
+/* 主舞台：左 Dashboard 遥测快照 + 右并排登录主卡 -------------- */
+.main-stage {
+  flex: 1;
+  width: 100%;
+  max-width: 1360px;
+  margin: 0 auto;
+  padding: 20px 32px 40px;
+  display: flex;
+  align-items: center;
+}
+
+.split-workbench {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr 560px;
+  gap: 48px;
+  align-items: center;
+}
+@media (max-width: 1100px) {
+  .split-workbench {
+    grid-template-columns: 1fr;
+    max-width: 580px;
+    margin: 0 auto;
+    gap: 32px;
+  }
+}
+
+/* ============================================================
+   左栏：J 风格 Dashboard 实时遥测快照（无厚重外框，退后一步做数据背板）
+   ============================================================ */
+.dash-snapshot {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+  opacity: 0.82; /* 刻意控制在 0.82，保证右侧登录框永远是第一眼焦点 */
+  transition: opacity 0.18s;
+}
+.dash-snapshot:hover {
+  opacity: 0.98;
+}
+
+/* 顶部时间窗与工作空间状态条 */
+.ds-top-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--panel-edge-faint);
+  padding-bottom: 8px;
+  font-size: 11px;
+  color: var(--olive-dim);
+}
+.ds-top-meta .live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--amber-dim);
+}
+.ds-top-meta .live-dot {
+  width: 6px;
+  height: 6px;
+  background: var(--amber);
+  display: inline-block;
+  box-shadow: 0 0 6px rgba(224, 166, 75, 0.55);
+}
+.ds-win-pills {
+  display: inline-flex;
+  gap: 4px;
+}
+.ds-win-pills span {
+  padding: 1px 6px;
+  border: 1px solid var(--panel-edge-faint);
+  font-size: 10px;
+  color: var(--olive-dim);
+}
+.ds-win-pills span.on {
+  border-color: var(--amber-dim);
+  color: var(--amber);
+}
+
+/* Hero 大数 + 4 格核心指标条 */
+.ds-hero-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.ds-hero-num {
+  font-size: 52px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--amber);
+}
+.ds-hero-num small {
+  font-size: 15px;
+  color: var(--amber-dim);
+  margin-left: 8px;
+  letter-spacing: 0;
+}
+.ds-hero-delta {
+  font-size: 11.5px;
+  color: var(--olive);
+}
+.ds-hero-delta em {
+  font-style: normal;
+  color: var(--amber);
+}
+
+.ds-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border-top: 1px solid var(--panel-edge-faint);
+  border-bottom: 1px solid var(--panel-edge-faint);
+}
+.ds-m-cell {
+  padding: 8px 12px 8px 0;
+  border-right: 1px solid var(--panel-edge-faint);
+}
+.ds-m-cell:not(:first-child) {
+  padding-left: 12px;
+}
+.ds-m-cell:last-child {
+  border-right: 0;
+}
+.ds-m-cell .k {
+  font-size: 9.5px;
+  color: var(--olive-dim);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.ds-m-cell .v {
+  font-size: 16px;
+  color: var(--text-soft);
+  margin-top: 2px;
+}
+.ds-m-cell.hi .v { color: var(--amber); }
+.ds-m-cell .s {
+  font-size: 10px;
+  color: var(--amber-dim);
+  margin-top: 1px;
+}
+
+/* Braille 4x2 速率趋势图区 */
+.ds-chart-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ds-sec-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10.5px;
+  color: var(--olive-dim);
+}
+.ds-sec-head .no {
+  color: var(--amber-dim);
+  font-weight: 600;
+  margin-right: 6px;
+}
+.ds-sec-head .readout {
+  color: var(--amber);
+}
+.ds-braille-pre {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.12;
+  color: var(--amber-dim);
+  white-space: pre;
+  overflow: hidden;
+  cursor: crosshair;
+  user-select: none;
+  padding: 2px 0;
+}
+.ds-braille-pre .axis { color: var(--olive-dim); }
+.ds-braille-pre .cur {
+  color: var(--text);
+  background: rgba(224, 166, 75, 0.22);
+}
+
+/* 模型 / 项目 Top 消耗排行（J 风格右对齐标签 + 字符进度条） */
+.ds-rank-block {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  border-top: 1px solid var(--panel-edge-faint);
+  padding-top: 12px;
+}
+.ds-rank-tabs {
+  display: inline-flex;
+  gap: 10px;
+  font-size: 10.5px;
+}
+.ds-rank-tab {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--olive-dim);
+  padding: 0;
+  cursor: pointer;
+  font-size: 10.5px;
+}
+.ds-rank-tab.on {
+  color: var(--amber);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.ds-rank-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11.5px;
+}
+.ds-r-row {
+  display: grid;
+  grid-template-columns: 130px 1fr 64px 42px;
+  gap: 10px;
+  align-items: center;
+}
+.ds-r-row .name {
+  color: var(--olive);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ds-r-row .bar {
+  color: var(--amber-dim);
+  letter-spacing: 0.5px;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.ds-r-row .bar .f { color: var(--amber); }
+.ds-r-row .val {
+  color: var(--text-soft);
+  text-align: right;
+}
+.ds-r-row .pct {
+  color: var(--olive-dim);
+  text-align: right;
+  font-size: 10.5px;
+}
+
+/* 最近请求终端流（紧凑 3 行） */
+.ds-stream-mini {
+  border-top: 1px dashed var(--panel-edge-faint);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 10.5px;
+  color: var(--olive-dim);
+}
+.ds-stream-line {
+  display: grid;
+  grid-template-columns: 58px 54px 1fr auto;
+  gap: 8px;
+}
+.ds-stream-line .src { color: var(--amber-dim); }
+.ds-stream-line .mdl { color: var(--olive); }
+.ds-stream-line .tok { color: var(--text-soft); }
+
+/* ============================================================
+   右栏：唯一高对比视觉焦点 —— 方案 III 双舱并排登录卡
+   ============================================================ */
+.login-spotlight-wrap {
+  position: relative;
+}
+.login-spotlight-wrap::before {
+  content: "";
+  position: absolute;
+  inset: -32px;
+  background: radial-gradient(circle at 50% 48%, rgba(224, 166, 75, 0.13), transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.login-card {
+  position: relative;
+  z-index: 1;
+  background: var(--panel-focus);
+  border: 1px solid var(--panel-edge-focus);
+  border-top: 3px solid var(--amber); /* 3px 实心琥珀亮顶，一眼锁定登录面板 */
+  box-shadow: 0 28px 70px rgba(0, 0, 0, 0.82), 0 0 0 1px rgba(224, 166, 75, 0.10);
+  padding: 26px 28px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* 卡片头部 */
+.lc-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--panel-edge);
+  padding-bottom: 14px;
+}
+.lc-title-group .kicker {
+  font-size: 10.5px;
+  color: var(--amber);
+  letter-spacing: 0.1em;
+  margin-bottom: 3px;
+}
+.lc-title-group h1 {
+  font-family: var(--sans);
+  font-size: 21px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+.lc-title-group p {
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--olive);
+  margin: 4px 0 0;
+}
+
+/* 登录 / 注册 切换胶囊 */
+.lc-mode-pill {
+  display: inline-flex;
+  border: 1px solid var(--panel-edge);
+  background: var(--bg);
+  flex: 0 0 auto;
+}
+.lc-mode-pill button {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--olive);
+  padding: 5px 13px;
+  font-family: var(--sans);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.lc-mode-pill button.on {
+  background: var(--amber);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+/* 状态反馈横幅 */
+.lc-banner {
+  border: 1px solid var(--amber);
+  background: var(--amber-glow);
+  padding: 9px 12px;
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.lc-banner.err {
+  border-color: var(--copper);
+  background: var(--copper-bg);
+  color: #f3c3ba;
+}
+.lc-banner.ok {
+  border-color: var(--green);
+  background: var(--green-bg);
+  color: #cde8c1;
+}
+.lc-banner-top {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* 方案 III 核心：卡内「左飞书扫码/一键 ‖ 右邮箱密码」并排双舱 */
+.dual-cabin {
+  display: grid;
+  grid-template-columns: 206px 1fr;
+  gap: 24px;
+  align-items: stretch;
+}
+@media (max-width: 600px) {
+  .dual-cabin { grid-template-columns: 1fr; }
+}
+
+.cabin-feishu {
+  border-right: 1px solid var(--panel-edge);
+  padding-right: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  text-align: center;
+  gap: 10px;
+}
+@media (max-width: 600px) {
+  .cabin-feishu {
+    border-right: 0;
+    border-bottom: 1px solid var(--panel-edge);
+    padding-right: 0;
+    padding-bottom: 18px;
+  }
+}
+
+.cf-cabin-label {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10.5px;
+  color: var(--amber);
+}
+.cf-cabin-label span.badge {
+  padding: 0 5px;
+  border: 1px solid var(--amber-dim);
+  font-size: 9.5px;
+}
+
+/* 飞书扫码框（干净琥珀点阵风格，无扫描线动画） */
+.qr-square {
+  width: 132px;
+  height: 132px;
+  padding: 8px;
+  border: 1px solid var(--amber);
+  background: var(--bg);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.qr-dots {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: repeat(15, 1fr);
+  grid-template-rows: repeat(15, 1fr);
+  gap: 1px;
+}
+.qr-d { background: rgba(224, 166, 75, 0.06); }
+.qr-d.on { background: var(--amber); }
+.qr-center-badge {
+  position: absolute;
+  width: 26px;
+  height: 26px;
+  background: var(--bg);
+  border: 1px solid var(--amber);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.qr-mask {
+  position: absolute;
+  inset: 0;
+  background: rgba(11, 10, 8, 0.92);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px;
+  font-size: 11px;
+}
+
+.qr-caption {
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--text-soft);
+  line-height: 1.4;
+}
+.qr-caption small {
+  display: block;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--olive);
+  margin-top: 2px;
+}
+.qr-caption small em {
+  font-style: normal;
+  color: var(--amber);
+}
+
+/* 飞书实心琥珀一键唤起按钮 */
+.btn-feishu-hero {
+  appearance: none;
+  width: 100%;
+  height: 38px;
+  background: var(--amber);
+  color: var(--bg);
+  border: 1px solid var(--amber);
+  padding: 0 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  font-family: var(--sans);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  transition: all 0.12s;
+}
+.btn-feishu-hero:hover:not(:disabled) {
+  background: var(--amber-bright);
+  border-color: var(--amber-bright);
+}
+.btn-feishu-hero:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.qr-sim-bar {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+  justify-content: center;
+}
+.qr-mini-btn {
+  appearance: none;
+  background: transparent;
+  border: 1px dashed var(--panel-edge);
+  color: var(--olive);
+  padding: 2px 7px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.qr-mini-btn:hover {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+/* 右舱：邮箱与密码表单 */
+.cabin-password {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-width: 0;
+}
+.clean-form {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+.cf-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.cf-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.cf-label-row label {
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-soft);
+}
+.cf-input-box {
+  display: flex;
+  align-items: center;
+  background: var(--bg);
+  border: 1px solid rgba(224, 166, 75, 0.24);
+  padding: 0 11px;
+  height: 38px;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.cf-input-box:focus-within {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 2px rgba(224, 166, 75, 0.12);
+}
+.cf-input-box.err {
+  border-color: var(--copper);
+}
+.cf-prefix {
+  color: var(--amber-dim);
+  font-size: 12px;
+  margin-right: 8px;
+  user-select: none;
+}
+.cf-input-box input {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  caret-color: var(--amber);
+  min-width: 0;
+}
+.cf-input-box input::placeholder {
+  color: var(--olive-dim);
+}
+.cf-eye-btn {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--olive);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.cf-eye-btn:hover { color: var(--amber); }
+
+/* 渐进披露的密码码点标尺 */
+.pwd-progressive-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10.5px;
+  color: var(--olive);
+  padding-top: 1px;
+}
+.pwd-bar-track {
+  letter-spacing: 1px;
+  color: var(--amber-faint);
+}
+.pwd-bar-track .on { color: var(--amber); }
+.pwd-bar-track .ok { color: var(--green); }
+.cf-error {
+  font-family: var(--sans);
+  font-size: 11.5px;
+  color: var(--copper);
+}
+
+.btn-cred-submit {
+  appearance: none;
+  width: 100%;
+  height: 38px;
+  background: rgba(224, 166, 75, 0.09);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.12s;
+  margin-top: 4px;
+}
+.btn-cred-submit:hover:not(:disabled) {
+  background: var(--amber);
+  color: var(--bg);
+}
+.btn-cred-submit:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* 卡片底栏 */
+.lc-footer {
+  border-top: 1px solid var(--panel-edge);
+  padding-top: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--sans);
+  font-size: 11.5px;
+  color: var(--olive);
+}
+.btn-text-switch {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--amber);
+  font-family: var(--sans);
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.btn-text-switch:hover { color: var(--amber-bright); }
+
+/* 底部 tmux 状态条 */
+.tmux-bar {
+  margin-top: auto;
+  background: var(--amber);
+  color: var(--bg);
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  padding: 3px 16px;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.tmux-right {
+  margin-left: auto;
+  display: flex;
+  gap: 16px;
+}
+</style>
+</head>
+<body>
+
+<!-- 顶部原型预览控制条 -->
+<div class="proto-switcher" role="region" aria-label="左侧 Dashboard 密度与右侧登录状态切换">
+  <span class="ps-badge">T-067 · 方案 III 定稿预览 (v4)</span>
+
+  <div class="ps-group">
+    <span class="ps-label">左栏 Dashboard 模块:</span>
+    <button type="button" class="ps-btn on" data-dash="full">完整快照 (大数+曲线+排行)</button>
+    <button type="button" class="ps-btn" data-dash="compact">精简快照 (大数+Braille曲线)</button>
+    <button type="button" class="ps-btn" data-dash="stream">含实时请求流 (大数+曲线+日志流)</button>
+  </div>
+
+  <div class="ps-group">
+    <span class="ps-label">登录卡状态:</span>
+    <button type="button" class="ps-btn on" data-scene="normal">正常态</button>
+    <button type="button" class="ps-btn" data-scene="bind">同邮箱绑定确认</button>
+    <button type="button" class="ps-btn" data-scene="closed">403 注册关闭</button>
+    <button type="button" class="ps-btn" data-scene="ratelimit">429 限流倒计时</button>
+  </div>
+
+  <div class="ps-right">
+    快捷键: <kbd>F</kbd> 飞书一键登录 <kbd>/</kbd> 聚焦邮箱 <kbd>1/2</kbd> 登录/注册
+  </div>
+</div>
+
+<!-- 顶栏 Shell Prompt -->
+<header class="shell-bar">
+  <div class="shell-prompt">
+    <span class="user">tokenpivot</span>:<span class="path">~/overview</span>$ <span class="cmd">tp-watch --window=1h --granularity=1m</span>
+  </div>
+  <span class="tag-j">J · F++</span>
+  <div class="shell-meta">
+    <span>WORKSPACE: <em>ws_prod_core (UTC+08:00)</em></span>
+    <span>SOURCES: <em>dsh-cli, pi-agent</em></span>
+  </div>
+</header>
+
+<!-- 主舞台：左 Dashboard 遥测快照 + 右方案 III 双舱登录卡 -->
+<main class="main-stage">
+  <div class="split-workbench">
+
+    <!-- 左栏：Dashboard 实时数据快照（替代宣传文字，鼠标可交互查看分钟桶与切换排行） -->
+    <aside class="dash-snapshot" id="dash-snapshot" aria-label="Dashboard 实时遥测预览"></aside>
+
+    <!-- 右栏：唯一高亮视觉焦点 —— 方案 III「左飞书扫码/一键 ‖ 右邮箱密码」双舱卡 -->
+    <div class="login-spotlight-wrap">
+      <section class="login-card" id="login-card" aria-label="登录 TokenPivot"></section>
+    </div>
+
+  </div>
+</main>
+
+<!-- 底部 tmux 状态栏 -->
+<footer class="tmux-bar">
+  <span>[0:overview-preview]</span>
+  <span>[1:auth-gate*]</span>
+  <span id="tmux-info">DASH:FULL · SCENE:NORMAL</span>
+  <div class="tmux-right">
+    <span id="tmux-trace">READY: 左侧可移动鼠标查看 Braille 分钟桶读数，右侧可扫码或输入登录</span>
+    <span>TokenPivot v0.4</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  const state = {
+    dashMode: "full",     // 'full' | 'compact' | 'stream'
+    rankDim: "model",     // 'model' | 'provider' | 'project'
+    mode: "login",        // 'login' | 'register'
+    scene: "normal",      // 'normal' | 'bind' | 'closed' | 'ratelimit'
+    email: "",
+    password: "",
+    showPwd: false,
+    pwdFocused: false,
+    capsLock: false,
+    errors: {},
+    oauthStep: 0,
+    qrState: "waiting",   // 'waiting' | 'scanned' | 'expired'
+    qrSec: 180,
+    rlSec: 25
+  };
+
+  function setTrace(text) {
+    const el = document.getElementById("tmux-trace");
+    if (el) el.textContent = text;
+  }
+
+  // ==================== 1. 左栏 Dashboard 实时遥测快照渲染 ====================
+  const inSeries = [
+    44, 49, 46, 55, 68, 82, 94, 88, 76, 68, 72, 85, 106, 128, 134, 118, 96, 84,
+    80, 92, 115, 144, 166, 154, 132, 110, 94, 90, 108, 132, 156, 174, 186, 170
+  ];
+  const outSeries = [
+    14, 16, 15, 19, 24, 30, 36, 33, 28, 24, 26, 31, 39, 48, 51, 44, 35, 30,
+    28, 33, 42, 54, 64, 59, 49, 40, 34, 32, 39, 49, 58, 66, 72, 64
+  ];
+
+  function buildBraille(hoverCol) {
+    const cols = inSeries.length;
+    const rows = 5;
+    const maxV = 270;
+    const lBit = [0x01, 0x02, 0x04, 0x40];
+    const rBit = [0x08, 0x10, 0x20, 0x80];
+    const yAxis = ["260k", "195k", "130k", " 65k", "  0k"];
+    const lines = [];
+
+    for (let r = 0; r < rows; r++) {
+      let rowStr = `<span class="axis">${yAxis[r]} ┤</span>`;
+      for (let c = 0; c < cols; c++) {
+        let mask = 0;
+        const tot = inSeries[c] + outSeries[c];
+        const nextTot = inSeries[Math.min(cols - 1, c + 1)] + outSeries[Math.min(cols - 1, c + 1)];
+        for (let sub = 0; sub < 2; sub++) {
+          const v = sub === 0 ? tot : (tot + nextTot) / 2;
+          const dots = Math.round((v / maxV) * (rows * 4 - 1));
+          for (let d = 0; d < 4; d++) {
+            const pos = (rows - 1 - r) * 4 + (3 - d);
+            if (pos <= dots) mask |= sub === 0 ? lBit[d] : rBit[d];
+          }
+        }
+        const ch = String.fromCodePoint(0x2800 + mask);
+        rowStr += c === hoverCol ? `<span class="cur">${ch}</span>` : ch;
+      }
+      lines.push(rowStr);
+    }
+    lines.push(`<span class="axis">     └${"─".repeat(cols)}</span>`);
+    return lines.join("\n");
+  }
+
+  const rankData = {
+    model: [
+      { name: "claude-sonnet-4-5", val: "31.4M", pct: "46.7%", fill: 15 },
+      { name: "deepseek-v3.2", val: "19.8M", pct: "29.5%", fill: 10 },
+      { name: "gpt-5.4", val: "11.2M", pct: "16.7%", fill: 6 },
+      { name: "其他 (3 models)", val: "4.8M", pct: "7.1%", fill: 3 }
+    ],
+    provider: [
+      { name: "anthropic", val: "31.4M", pct: "46.7%", fill: 15 },
+      { name: "deepseek", val: "22.6M", pct: "33.6%", fill: 11 },
+      { name: "openai", val: "13.2M", pct: "19.7%", fill: 7 }
+    ],
+    project: [
+      { name: "tokenpivot-core", val: "28.9M", pct: "43.0%", fill: 14 },
+      { name: "dsh-harness", val: "24.1M", pct: "35.9%", fill: 12 },
+      { name: "pi-collector", val: "14.2M", pct: "21.1%", fill: 7 }
+    ]
+  };
+
+  function makeCharBar(filledCount) {
+    const total = 18;
+    return `<span class="f">${"█".repeat(filledCount)}</span>${"░".repeat(Math.max(0, total - filledCount))}`;
+  }
+
+  function renderDashboardSnapshot() {
+    const el = document.getElementById("dash-snapshot");
+    if (!el) return;
+
+    const rows = rankData[state.rankDim] || rankData.model;
+    const rankRowsHtml = rows
+      .map(
+        (r) => `
+        <div class="ds-r-row">
+          <span class="name">${r.name}</span>
+          <span class="bar">${makeCharBar(r.fill)}</span>
+          <span class="val">${r.val}</span>
+          <span class="pct">${r.pct}</span>
+        </div>`
+      )
+      .join("");
+
+    let bottomSectionHtml = "";
+    if (state.dashMode === "full") {
+      bottomSectionHtml = `
+        <div class="ds-rank-block">
+          <div class="ds-sec-head">
+            <span><span class="no">02</span>TOP CONSUMPTION RANKING · 来源消耗排行</span>
+            <div class="ds-rank-tabs">
+              <button type="button" class="ds-rank-tab ${state.rankDim === "model" ? "on" : ""}" data-rdim="model">按模型</button>
+              <button type="button" class="ds-rank-tab ${state.rankDim === "provider" ? "on" : ""}" data-rdim="provider">按供应商</button>
+              <button type="button" class="ds-rank-tab ${state.rankDim === "project" ? "on" : ""}" data-rdim="project">按项目</button>
+            </div>
+          </div>
+          <div class="ds-rank-rows">${rankRowsHtml}</div>
+        </div>
+      `;
+    } else if (state.dashMode === "stream") {
+      bottomSectionHtml = `
+        <div class="ds-stream-mini">
+          <div class="ds-sec-head" style="margin-bottom:2px">
+            <span><span class="no">02</span>RECENT INGESTED EVENTS · 最近上报明细</span>
+            <span>quality: ✓ known</span>
+          </div>
+          <div class="ds-stream-line">
+            <span>15:44:58</span>
+            <span class="src">[dsh]</span>
+            <span class="mdl">claude-sonnet-4-5 · tokenpivot-core</span>
+            <span class="tok">✓ 18,420 tok</span>
+          </div>
+          <div class="ds-stream-line">
+            <span>15:44:51</span>
+            <span class="src">[pi]</span>
+            <span class="mdl">deepseek-v3.2 · dsh-harness</span>
+            <span class="tok">✓ 9,150 tok</span>
+          </div>
+          <div class="ds-stream-line">
+            <span>15:44:44</span>
+            <span class="src">[dsh]</span>
+            <span class="mdl">gpt-5.4 · tokenpivot-core</span>
+            <span class="tok">✓ 6,840 tok</span>
+          </div>
+        </div>
+      `;
+    }
+
+    el.innerHTML = `
+      <div class="ds-top-meta">
+        <span class="live-pill">
+          <span class="live-dot"></span>
+          <span>LIVE SNAPSHOT · TODAY (00:00–15:45 UTC+8)</span>
+        </span>
+        <div class="ds-win-pills">
+          <span class="on">1m</span>
+          <span>1h</span>
+          <span>1d</span>
+        </div>
+      </div>
+
+      <div>
+        <div class="ds-sec-head">
+          <span><span class="no">00</span>TOTAL TOKENS · 今日累计消耗 (input + output)</span>
+          <span>freshness: 4s ago</span>
+        </div>
+        <div class="ds-hero-row">
+          <div class="ds-hero-num">67,248,910<small>tokens</small></div>
+          <div class="ds-hero-delta">ROLLING 60S: <em>148,920 tok/min</em></div>
+        </div>
+      </div>
+
+      <div class="ds-metrics-grid">
+        <div class="ds-m-cell">
+          <div class="k">INPUT TOKENS</div>
+          <div class="v">52.4M</div>
+          <div class="s">cache 68.2%</div>
+        </div>
+        <div class="ds-m-cell">
+          <div class="k">OUTPUT TOKENS</div>
+          <div class="v">14.8M</div>
+          <div class="s">22.0% share</div>
+        </div>
+        <div class="ds-m-cell">
+          <div class="k">REQUESTS</div>
+          <div class="v">4,812</div>
+          <div class="s">✓ 99.4% known</div>
+        </div>
+        <div class="ds-m-cell hi">
+          <div class="k">60S RATE</div>
+          <div class="v">2,482/s</div>
+          <div class="s">peak @ 14:20</div>
+        </div>
+      </div>
+
+      <div class="ds-chart-block">
+        <div class="ds-sec-head">
+          <span><span class="no">01</span>MINUTE TOKEN VELOCITY · Braille 4×2 速率曲线</span>
+          <span class="readout" id="ds-hover-readout">HOVER: 234,000 tok/min (in 170k · out 64k)</span>
+        </div>
+        <div class="ds-braille-pre" id="ds-braille-pre">${buildBraille(-1)}</div>
+      </div>
+
+      ${bottomSectionHtml}
+    `;
+
+    // 绑定 Braille 鼠标十字读数
+    const pre = document.getElementById("ds-braille-pre");
+    const readout = document.getElementById("ds-hover-readout");
+    if (pre && readout) {
+      pre.addEventListener("mousemove", (e) => {
+        const rect = pre.getBoundingClientRect();
+        const relX = Math.max(0, e.clientX - rect.left - 44);
+        const idx = Math.min(
+          inSeries.length - 1,
+          Math.max(0, Math.floor((relX / (rect.width - 48)) * inSeries.length))
+        );
+        pre.innerHTML = buildBraille(idx);
+        const inp = inSeries[idx];
+        const out = outSeries[idx];
+        const minsAgo = inSeries.length - 1 - idx;
+        readout.textContent = `T-${minsAgo}m: ${inp + out},000 tok/min (in ${inp}k · out ${out}k)`;
+      });
+      pre.addEventListener("mouseleave", () => {
+        pre.innerHTML = buildBraille(-1);
+        readout.textContent = "LATEST: 234,000 tok/min (in 170k · out 64k)";
+      });
+    }
+
+    // 绑定排行维度切换
+    document.querySelectorAll("[data-rdim]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.rankDim = btn.getAttribute("data-rdim");
+        renderDashboardSnapshot();
+      });
+    });
+  }
+
+  // ==================== 2. 右栏：方案 III 并排双舱登录卡渲染 ====================
+  function feishuIcon(fillColor) {
+    return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" style="flex:0 0 16px">
+      <path d="M3.5 5.2C3.5 4.54 4.21 4.12 4.78 4.46L13.6 9.65L9.85 13.4L3.5 9.6V5.2Z" fill="${fillColor}" fill-opacity="0.78"/>
+      <path d="M9.85 13.4L20.1 6.8C20.68 6.43 21.42 6.91 21.33 7.59L19.8 18.4C19.68 19.25 18.72 19.67 18.02 19.17L9.85 13.4Z" fill="${fillColor}"/>
+      <path d="M3.5 9.6L9.85 13.4L12.6 17.5C13.02 18.12 12.58 18.96 11.83 18.96H5.2C4.26 18.96 3.5 18.2 3.5 17.26V9.6Z" fill="${fillColor}" fill-opacity="0.58"/>
+    </svg>`;
+  }
+
+  function buildQrDots() {
+    const p = [
+      "111111101011111",
+      "100000100110001",
+      "101110101010101",
+      "101110100101101",
+      "101110101100101",
+      "100000100010001",
+      "111111101010101",
+      "000000001101000",
+      "111111100011011",
+      "100000101000101",
+      "101110101110110",
+      "101110100101011",
+      "101110101011001",
+      "100000100100110",
+      "111111101101011"
+    ];
+    let out = "";
+    for (let r = 0; r < 15; r++) {
+      for (let c = 0; c < 15; c++) {
+        out += `<div class="qr-d ${p[r][c] === "1" ? "on" : ""}"></div>`;
+      }
+    }
+    return out;
+  }
+
+  function checkPwd(pwd) {
+    const cp = Array.from(pwd).length;
+    const bytes = new TextEncoder().encode(pwd).length;
+    const ok = cp >= 8 && cp <= 64 && bytes <= 256;
+    const filled = Math.min(10, Math.round((cp / 12) * 10));
+    let bar = "";
+    for (let i = 0; i < 10; i++) {
+      bar += i < filled ? `<span class="${ok ? "ok" : "on"}">■</span>` : `<span>□</span>`;
+    }
+    return { cp, bytes, ok, bar };
+  }
+
+  let hsTimer = null;
+  function startFeishuHandshake(via) {
+    if (hsTimer) clearTimeout(hsTimer);
+    state.oauthStep = 1;
+    state.scene = "normal";
+    syncTopBar();
+    setTrace(`[FEISHU_AUTH] 正在通过 ${via} 发起 OAuth 2.0 授权…`);
+    renderLoginCard();
+
+    hsTimer = setTimeout(() => {
+      state.oauthStep = 2;
+      setTrace(`[FEISHU_CALLBACK] 已验证 state 防伪令牌，正在换取企业 open_id…`);
+      renderLoginCard();
+
+      hsTimer = setTimeout(() => {
+        state.oauthStep = 3;
+        setTrace(`[SESSION_READY] 已签发 tokenpivot_session Cookie (30d sliding)，即将进入总览`);
+        renderLoginCard();
+      }, 850);
+    }, 800);
+  }
+
+  function renderBanner() {
+    if (state.oauthStep > 0) {
+      const done = state.oauthStep === 3;
+      return `
+        <div class="lc-banner ${done ? "ok" : ""}" role="status">
+          <div class="lc-banner-top">
+            <span>${done ? "✓ 飞书登录成功" : "⋯ 正在连接飞书验证身份 (" + state.oauthStep + "/3)"}</span>
+            <span>${done ? "200 OK" : "OAUTH2"}</span>
+          </div>
+          <div>${
+            done
+              ? "已识别飞书账号 yg@tokenpivot.dev 并下发会话 Cookie，正在进入仪表盘…"
+              : "正在校验飞书授权码并创建同源安全会话…"
+          }</div>
+        </div>
+      `;
+    }
+    if (state.scene === "bind") {
+      return `
+        <div class="lc-banner" role="alert">
+          <div class="lc-banner-top">
+            <span>! 检测到同名邮箱账号，请确认绑定</span>
+            <span>LINK_ONCE</span>
+          </div>
+          <div>飞书账号 <strong>yg@tokenpivot.dev</strong> 与已有本地账号同名。请在右侧输入一次原密码完成绑定，后续即可飞书直登。</div>
+        </div>
+      `;
+    }
+    if (state.scene === "closed") {
+      return `
+        <div class="lc-banner err" role="alert">
+          <div class="lc-banner-top">
+            <span>✕ 当前部署未开放公开注册</span>
+            <span>403 REGISTRATION_CLOSED</span>
+          </div>
+          <div>管理员已关闭邮箱公开注册，请直接使用左侧<strong>飞书企业账号</strong>扫码或一键登录。</div>
+        </div>
+      `;
+    }
+    if (state.scene === "ratelimit") {
+      return `
+        <div class="lc-banner err" role="alert">
+          <div class="lc-banner-top">
+            <span>✕ 登录尝试过于频繁</span>
+            <span>429 · <span id="rl-timer">${state.rlSec}s</span> 后重试</span>
+          </div>
+          <div>已触发安全限流保护，请等待倒计时结束后再试。</div>
+        </div>
+      `;
+    }
+    return "";
+  }
+
+  function renderLoginCard() {
+    const card = document.getElementById("login-card");
+    if (!card) return;
+
+    const isLogin = state.mode === "login";
+    const isBind = state.scene === "bind";
+    const isLocked = state.scene === "ratelimit";
+    const emailVal = isBind && !state.email ? "yg@tokenpivot.dev" : state.email;
+    const pwdInfo = checkPwd(state.password);
+    const showMeter = !isLogin || state.pwdFocused || state.password.length > 0;
+
+    let maskHtml = "";
+    if (state.qrState === "scanned") {
+      maskHtml = `
+        <div class="qr-mask">
+          <span style="color:var(--green);font-weight:600">✓ 已扫码</span>
+          <button type="button" class="qr-mini-btn" id="btn-qr-ok" style="color:var(--amber);border-color:var(--amber)">点此模拟手机确认</button>
+        </div>
+      `;
+    } else if (state.qrState === "expired") {
+      maskHtml = `
+        <div class="qr-mask">
+          <span style="color:var(--copper);font-weight:600">二维码已过期</span>
+          <button type="button" class="qr-mini-btn" id="btn-qr-reload" style="color:var(--amber);border-color:var(--amber)">点击刷新 [R]</button>
+        </div>
+      `;
+    }
+
+    card.innerHTML = `
+      <div class="lc-header">
+        <div class="lc-title-group">
+          <div class="kicker">AUTH_GATE // SESSION_LOGIN</div>
+          <h1>${isLogin ? "登录 TokenPivot" : "注册 TokenPivot"}</h1>
+          <p>左侧飞书扫码或一键授权，右侧邮箱密码${isLogin ? "登录" : "直接注册"}</p>
+        </div>
+        <div class="lc-mode-pill" role="tablist">
+          <button type="button" class="${isLogin ? "on" : ""}" data-m="login">登录</button>
+          <button type="button" class="${!isLogin ? "on" : ""}" data-m="register">注册</button>
+        </div>
+      </div>
+
+      ${renderBanner()}
+
+      <div class="dual-cabin">
+        <!-- 左舱：飞书扫码 + 一键唤起客户端 -->
+        <div class="cabin-feishu">
+          <div class="cf-cabin-label">
+            <span>FEISHU SSO</span>
+            <span class="badge">推荐</span>
+          </div>
+
+          <div class="qr-square">
+            <div class="qr-dots">${buildQrDots()}</div>
+            <div class="qr-center-badge">${feishuIcon("#e0a64b")}</div>
+            ${maskHtml}
+          </div>
+
+          <div class="qr-caption">
+            使用 <strong>飞书 App</strong> 扫码登录
+            <small>有效期 <em id="qr-sec-text">${state.qrSec}s</em></small>
+          </div>
+
+          <button type="button" class="btn-feishu-hero" id="btn-feishu-go" ${isLocked ? "disabled" : ""}>
+            ${feishuIcon("#0b0a08")}
+            <span>一键唤起飞书授权 [F]</span>
+          </button>
+
+          <div class="qr-sim-bar">
+            <button type="button" class="qr-mini-btn" id="btn-sim-scan">模拟扫码</button>
+            <button type="button" class="qr-mini-btn" id="btn-sim-exp">模拟过期</button>
+          </div>
+        </div>
+
+        <!-- 右舱：邮箱与密码表单 -->
+        <div class="cabin-password">
+          <form class="clean-form" id="clean-auth-form" novalidate>
+            <div class="cf-field">
+              <div class="cf-label-row">
+                <label for="f-email">邮箱地址</label>
+                <span style="font-size:10.5px;color:var(--olive-dim)">按 / 聚焦</span>
+              </div>
+              <div class="cf-input-box ${state.errors.email ? "err" : ""}">
+                <span class="cf-prefix">&gt;</span>
+                <input
+                  id="f-email"
+                  type="email"
+                  placeholder="name@company.com"
+                  value="${emailVal.replace(/"/g, "&quot;")}"
+                  autocomplete="email"
+                  ${isLocked ? "disabled" : ""}
+                />
+              </div>
+              ${state.errors.email ? `<div class="cf-error">${state.errors.email}</div>` : ""}
+            </div>
+
+            <div class="cf-field">
+              <div class="cf-label-row">
+                <label for="f-pwd">${isBind ? "原账号密码（确认绑定）" : "密码"}</label>
+                ${
+                  state.capsLock
+                    ? `<span style="color:var(--amber);font-size:11px">⇪ 大写锁定</span>`
+                    : ""
+                }
+              </div>
+              <div class="cf-input-box ${state.errors.password ? "err" : ""}">
+                <span class="cf-prefix">&gt;</span>
+                <input
+                  id="f-pwd"
+                  type="${state.showPwd ? "text" : "password"}"
+                  placeholder="${isLogin ? "输入登录密码" : "设置 8–64 位密码"}"
+                  value="${state.password.replace(/"/g, "&quot;")}"
+                  autocomplete="${isLogin ? "current-password" : "new-password"}"
+                  ${isLocked ? "disabled" : ""}
+                />
+                <button type="button" class="cf-eye-btn" id="btn-eye">${
+                  state.showPwd ? "隐藏" : "显示"
+                }</button>
+              </div>
+
+              <div class="pwd-progressive-hint" id="pwd-hint-row" style="display:${
+                showMeter ? "flex" : "none"
+              }">
+                <span class="pwd-bar-track" id="pwd-bars">${pwdInfo.bar}</span>
+                <span id="pwd-nums">${pwdInfo.cp}/8–64 字符 · ${pwdInfo.bytes}/256B</span>
+              </div>
+              ${state.errors.password ? `<div class="cf-error">${state.errors.password}</div>` : ""}
+            </div>
+
+            <button type="submit" class="btn-cred-submit" ${isLocked ? "disabled" : ""}>
+              <span>${
+                isLocked
+                  ? `限流等待 ${state.rlSec}s…`
+                  : isBind
+                  ? "验证密码并绑定飞书"
+                  : isLogin
+                  ? "使用邮箱密码登录"
+                  : "创建账号并直接登录"
+              }</span>
+              <span>↵</span>
+            </button>
+          </form>
+
+          <div class="lc-footer">
+            <span>${isLogin ? "还没有账号？" : "已有账号？"} <button type="button" class="btn-text-switch" id="btn-foot-mode">${
+              isLogin ? "立即注册" : "去登录"
+            }</button></span>
+            <button type="button" class="btn-text-switch" id="btn-fill-demo">填入测试账号</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    bindCardEvents();
+  }
+
+  function bindCardEvents() {
+    document.querySelectorAll("[data-m]").forEach((b) => {
+      b.addEventListener("click", () => {
+        state.mode = b.getAttribute("data-m");
+        state.errors = {};
+        state.oauthStep = 0;
+        renderLoginCard();
+      });
+    });
+
+    document.getElementById("btn-foot-mode")?.addEventListener("click", () => {
+      state.mode = state.mode === "login" ? "register" : "login";
+      state.errors = {};
+      state.oauthStep = 0;
+      renderLoginCard();
+    });
+
+    document.getElementById("btn-feishu-go")?.addEventListener("click", () => {
+      startFeishuHandshake("飞书一键唤起");
+    });
+
+    document.getElementById("btn-sim-scan")?.addEventListener("click", () => {
+      state.qrState = "scanned";
+      setTrace("[QR_SCANNED] 手机飞书已扫码，等待手机端点击确认…");
+      renderLoginCard();
+    });
+
+    document.getElementById("btn-sim-exp")?.addEventListener("click", () => {
+      state.qrState = "expired";
+      state.qrSec = 0;
+      renderLoginCard();
+    });
+
+    document.getElementById("btn-qr-ok")?.addEventListener("click", () => {
+      state.qrState = "waiting";
+      startFeishuHandshake("飞书扫码确认");
+    });
+
+    document.getElementById("btn-qr-reload")?.addEventListener("click", () => {
+      state.qrState = "waiting";
+      state.qrSec = 180;
+      renderLoginCard();
+    });
+
+    const emailEl = document.getElementById("f-email");
+    if (emailEl) {
+      emailEl.addEventListener("input", (e) => {
+        state.email = e.target.value;
+      });
+    }
+
+    const pwdEl = document.getElementById("f-pwd");
+    if (pwdEl) {
+      pwdEl.addEventListener("focus", () => {
+        state.pwdFocused = true;
+        const row = document.getElementById("pwd-hint-row");
+        if (row) row.style.display = "flex";
+      });
+      pwdEl.addEventListener("input", (e) => {
+        state.password = e.target.value;
+        const info = checkPwd(state.password);
+        const bars = document.getElementById("pwd-bars");
+        const nums = document.getElementById("pwd-nums");
+        if (bars) bars.innerHTML = info.bar;
+        if (nums) nums.textContent = `${info.cp}/8–64 字符 · ${info.bytes}/256B`;
+      });
+      pwdEl.addEventListener("keydown", (e) => {
+        if (typeof e.getModifierState === "function") {
+          state.capsLock = e.getModifierState("CapsLock");
+        }
+      });
+    }
+
+    document.getElementById("btn-eye")?.addEventListener("click", () => {
+      state.showPwd = !state.showPwd;
+      renderLoginCard();
+    });
+
+    document.getElementById("btn-fill-demo")?.addEventListener("click", () => {
+      state.email = "yg@tokenpivot.dev";
+      state.password = "Tp#2026_Argon2id!";
+      state.errors = {};
+      setTrace("[DEMO_FILL] 已填入演示邮箱与密码");
+      renderLoginCard();
+    });
+
+    document.getElementById("clean-auth-form")?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const errs = {};
+      const curEmail = state.scene === "bind" && !state.email ? "yg@tokenpivot.dev" : state.email;
+      if (!curEmail) errs.email = "请输入邮箱地址";
+      const pInfo = checkPwd(state.password);
+      if (!state.password) {
+        errs.password = "请输入密码";
+      } else if (!pInfo.ok) {
+        errs.password = "密码需为 8–64 个字符，且不超过 256 字节";
+      }
+      state.errors = errs;
+      if (errs.email || errs.password) {
+        renderLoginCard();
+        document.getElementById(errs.email ? "f-email" : "f-pwd")?.focus();
+        return;
+      }
+      if (state.mode === "register" && state.scene === "closed") {
+        renderLoginCard();
+        return;
+      }
+      state.oauthStep = 3;
+      setTrace(`[AUTH_OK] ${curEmail} 登录成功，已下发 tokenpivot_session`);
+      renderLoginCard();
+    });
+  }
+
+  function syncTopBar() {
+    document.querySelectorAll("[data-dash]").forEach((b) => {
+      b.classList.toggle("on", b.getAttribute("data-dash") === state.dashMode);
+    });
+    document.querySelectorAll("[data-scene]").forEach((b) => {
+      b.classList.toggle("on", b.getAttribute("data-scene") === state.scene);
+    });
+    document.getElementById("tmux-info").textContent =
+      `DASH:${state.dashMode.toUpperCase()} · SCENE:${state.scene.toUpperCase()}`;
+  }
+
+  document.querySelectorAll("[data-dash]").forEach((b) => {
+    b.addEventListener("click", () => {
+      state.dashMode = b.getAttribute("data-dash");
+      syncTopBar();
+      renderDashboardSnapshot();
+    });
+  });
+
+  document.querySelectorAll("[data-scene]").forEach((b) => {
+    b.addEventListener("click", () => {
+      state.scene = b.getAttribute("data-scene");
+      state.oauthStep = 0;
+      state.errors = {};
+      if (state.scene === "ratelimit") state.rlSec = 25;
+      syncTopBar();
+      renderLoginCard();
+    });
+  });
+
+  setInterval(() => {
+    if (state.qrState === "waiting" && state.qrSec > 0) {
+      state.qrSec--;
+      const el = document.getElementById("qr-sec-text");
+      if (el) el.textContent = `${state.qrSec}s`;
+      if (state.qrSec === 0) {
+        state.qrState = "expired";
+        renderLoginCard();
+      }
+    }
+    if (state.scene === "ratelimit" && state.rlSec > 0) {
+      state.rlSec--;
+      const el = document.getElementById("rl-timer");
+      if (el) el.textContent = `${state.rlSec}s`;
+      if (state.rlSec === 0) {
+        state.scene = "normal";
+        syncTopBar();
+        renderLoginCard();
+      }
+    }
+  }, 1000);
+
+  window.addEventListener("keydown", (e) => {
+    const inInput = e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA");
+    if (e.key === "Escape" && inInput) {
+      e.target.blur();
+      return;
+    }
+    if (inInput) return;
+    if (e.key === "/") {
+      e.preventDefault();
+      document.getElementById("f-email")?.focus();
+    } else if (e.key === "f" || e.key === "F") {
+      e.preventDefault();
+      startFeishuHandshake("快捷键 [F]");
+    } else if (e.key === "r" || e.key === "R") {
+      e.preventDefault();
+      state.qrState = "waiting";
+      state.qrSec = 180;
+      renderLoginCard();
+    } else if (e.key === "1") {
+      state.mode = "login";
+      renderLoginCard();
+    } else if (e.key === "2") {
+      state.mode = "register";
+      renderLoginCard();
+    }
+  });
+
+  renderDashboardSnapshot();
+  renderLoginCard();
+})();
+</script>
+</body>
+</html>

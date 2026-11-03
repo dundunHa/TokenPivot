@@ -105,94 +105,98 @@ export function AuthDashboardSnapshot() {
         </div>
       </div>
 
-      <div className="ds-section">
-        <h2 className="ds-sec-title">
-          00 TOTAL TOKENS
-          <span className="ds-sec-note">· 今日累计消耗 (input + output)</span>
-        </h2>
-        <p className="ds-hero">
-          <span className="ds-hero-num">67,248,910</span>
-          <span className="ds-hero-unit">tokens</span>
-        </p>
-        <p className="ds-rolling">ROLLING 60S: 148,920 tok/min</p>
-        <div className="ds-metrics-grid">
-          {METRICS.map((metric) => (
-            <div className="ds-metric" key={metric.label}>
-              <p className="ds-metric-label">{metric.label}</p>
-              <p className="ds-metric-value">{metric.value}</p>
-              <p className="ds-metric-note">{metric.note}</p>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="ds-section">
-        <h2 className="ds-sec-title">
-          01 MINUTE TOKEN VELOCITY
-          <span className="ds-sec-note">· Braille 4×2 速率曲线</span>
-        </h2>
-        <div className="ds-chart" onMouseLeave={() => setHovered(null)}>
-          <div className="ds-chart-y" aria-hidden="true">
-            {Y_AXIS.map((label) => (
-              <span key={label}>{label}</span>
-            ))}
+      <div className="ds-sections-grid">
+        <div className="ds-section">
+          <h2 className="ds-sec-title">
+            00 TOTAL TOKENS
+            <span className="ds-sec-note">· 今日累计消耗 (input + output)</span>
+          </h2>
+          <div className="ds-hero-summary">
+            <p className="ds-hero">
+              <span className="ds-hero-num">67,248,910</span>
+              <span className="ds-hero-unit">tokens</span>
+            </p>
+            <p className="ds-rolling">ROLLING 60S: 148,920 tok/min</p>
           </div>
-          <div className="ds-chart-plot">
-            {CHART.lines.map((line, index) => (
-              <div className="ds-chart-line" key={index}>
-                {line}
+          <div className="ds-metrics-grid">
+            {METRICS.map((metric) => (
+              <div className="ds-metric" key={metric.label}>
+                <p className="ds-metric-label">{metric.label}</p>
+                <p className="ds-metric-value">{metric.value}</p>
+                <p className="ds-metric-note">{metric.note}</p>
               </div>
             ))}
-            <div className="ds-chart-cols" aria-hidden="true">
-              {IN_SERIES.map((_, index) => (
-                <span
-                  key={index}
-                  className={index === hovered ? "ds-col on" : "ds-col"}
-                  onMouseEnter={() => setHovered(index)}
-                />
-              ))}
-            </div>
           </div>
         </div>
-        <p className="ds-readout" data-testid="snapshot-readout">
-          {readout}
-        </p>
-        <p className="ds-legend">▪ input · ▫ output · 每列为一分钟</p>
-      </div>
 
-      <div className="ds-section">
-        <h2 className="ds-sec-title">
-          02 TOP CONSUMPTION RANKING
-          <span className="ds-sec-note">· 来源消耗排行</span>
-        </h2>
-        <div className="ds-rank-tabs" role="group" aria-label="排行维度">
-          {DIMENSIONS.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              className={
-                item.key === dimension ? "ds-rank-tab on" : "ds-rank-tab"
-              }
-              aria-pressed={item.key === dimension}
-              onClick={() => setDimension(item.key)}
-            >
-              {item.label}
-            </button>
-          ))}
+        <div className="ds-section">
+          <h2 className="ds-sec-title">
+            01 MINUTE TOKEN VELOCITY
+            <span className="ds-sec-note">· Braille 4×2 速率曲线</span>
+          </h2>
+          <div className="ds-chart" onMouseLeave={() => setHovered(null)}>
+            <div className="ds-chart-y" aria-hidden="true">
+              {Y_AXIS.map((label) => (
+                <span key={label}>{label}</span>
+              ))}
+            </div>
+            <div className="ds-chart-plot">
+              {CHART.lines.map((line, index) => (
+                <div className="ds-chart-line" key={index}>
+                  {line}
+                </div>
+              ))}
+              <div className="ds-chart-cols" aria-hidden="true">
+                {IN_SERIES.map((_, index) => (
+                  <span
+                    key={index}
+                    className={index === hovered ? "ds-col on" : "ds-col"}
+                    onMouseEnter={() => setHovered(index)}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+          <p className="ds-readout" data-testid="snapshot-readout">
+            {readout}
+          </p>
+          <p className="ds-legend">▪ input · ▫ output · 每列为一分钟</p>
         </div>
-        <ul className="ds-rank-list">
-          {rows.map((row) => (
-            <li className="ds-rank-row" key={row.name}>
-              <span className="ds-rank-name">{row.name}</span>
-              <span className="ds-rank-bar" aria-hidden="true">
-                {"█".repeat(row.fill)}
-                {"░".repeat(BAR_WIDTH - row.fill)}
-              </span>
-              <span className="ds-rank-value">{row.value}</span>
-              <span className="ds-rank-share">{row.share}</span>
-            </li>
-          ))}
-        </ul>
+
+        <div className="ds-section">
+          <h2 className="ds-sec-title">
+            02 TOP CONSUMPTION RANKING
+            <span className="ds-sec-note">· 来源消耗排行</span>
+          </h2>
+          <div className="ds-rank-tabs" role="group" aria-label="排行维度">
+            {DIMENSIONS.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                className={
+                  item.key === dimension ? "ds-rank-tab on" : "ds-rank-tab"
+                }
+                aria-pressed={item.key === dimension}
+                onClick={() => setDimension(item.key)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <ul className="ds-rank-list">
+            {rows.map((row) => (
+              <li className="ds-rank-row" key={row.name}>
+                <span className="ds-rank-name">{row.name}</span>
+                <span className="ds-rank-bar" aria-hidden="true">
+                  {"█".repeat(row.fill)}
+                  {"░".repeat(BAR_WIDTH - row.fill)}
+                </span>
+                <span className="ds-rank-value">{row.value}</span>
+                <span className="ds-rank-share">{row.share}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
       </div>
     </section>
   );
