@@ -27,7 +27,7 @@
 | RTT 序号 | 发送内容（`postgresTx` 内部操作） | 服务端执行顺序与快照语义 |
 |---|---|---|
 | **RTT 1** | `BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})` | 建立单条事件的独立 `READ COMMITTED` 事务 |
-| **RTT 2** | 首次 `Now(ctx)`：<br>• 无 `project_id`：单发 `SELECT clock_timestamp()`<br>• 有 `project_id`：通过 `pgconn.Batch`（`ExecBatch`）单次 `Sync` 同批发送 `SELECT clock_timestamp()` + `SELECT 1 FROM projects WHERE workspace_id = $1 AND id = $2` | 服务端按消息流顺序先解析并执行第 1 条 `SELECT clock_timestamp()`，再解析并执行第 2 条 `projectExistsQuery`（即便 `projects` 表解析或权限失败，第 1 条时间采样结果也已先返回）；若窗口为 `expired` 或 `FUTURE_EVENT` 直接返回并丢弃预取项目结果或错误；若窗口有效，紧随其后的 `ProjectExists` 直接读取已缓存结果或错误（**0 RTT**） |
+| **RTT 2** | 首次 `Now(ctx)`：<br>• 无 `project_id`：单发 `SELECT clock_timestamp()`（带 `pgx.QueryExecModeExec`，避免冷连接额外 `Prepare` 往返）<br>• 有 `project_id`：通过 `pgconn.Batch`（`ExecBatch`）单次 `Sync` 同批发送 `SELECT clock_timestamp()` + `SELECT 1 FROM projects WHERE workspace_id = $1 AND id = $2` | 服务端按消息流顺序先解析并执行第 1 条 `SELECT clock_timestamp()`，再解析并执行第 2 条 `projectExistsQuery`（即便 `projects` 表解析或权限失败，第 1 条时间采样结果也已先返回）；若窗口为 `expired` 或 `FUTURE_EVENT` 直接返回并丢弃预取项目结果或错误；若窗口有效，紧随其后的 `ProjectExists` 直接读取已缓存结果或错误（**0 RTT**） |
 | **RTT 3** | `InsertEvent(ctx, event)`：<br>通过 `pgconn.Batch`（`ExecBatch`）单次 `Sync` 同批发送 `insertEventQuery` + `SELECT clock_timestamp()` | 服务端先解析并执行 `INSERT INTO usage_events ... ON CONFLICT DO NOTHING RETURNING 1`（含唯一约束锁等待），待其完成后立即执行同批次的 `SELECT clock_timestamp()`；锁后时间缓存在 `postgresTx` 中，供紧随其后的 `windowExpired` (`Now`) **0 RTT** 消费 |
 | **RTT 4** | • **新增路径（`inserted == true`）**：`ApplyMinute(ctx, input)` 通过 `minuteBatchTx` 包装 `t.tx`，在 `aggregation.ApplyRequest` 调用 `tx.Exec` 时通过 `pgconn.Batch`（`ExecBatch`）单次 `Sync` 同批发送 `minuteUpsert` + `SELECT clock_timestamp()`<br>• **冲突路径（`inserted == false`）**：`ExistingEvent(ctx, ...)` 通过 `pgconn.Batch`（`ExecBatch`）单次 `Sync` 同批发送 `existingEventQuery` + `SELECT clock_timestamp()` | 两条路径均在新一轮网络往返中以新的 `READ COMMITTED` 语句快照执行；写桶或查旧行（含行锁等待）完成后立即采样 `clock_timestamp()` 并缓存，供提交前或比对前的 `windowExpired` (`Now`) **0 RTT** 消费 |
 | **RTT 5** | `Commit(ctx)` 或 `Rollback(ctx)` | 窗口复核通过后提交事务，否则回滚 |
@@ -57,8 +57,8 @@
    - 在 `hookTx` 上实现 `PrefetchProject`：仅当 `t.hooks.now == nil`（未注入脚本化时钟）时转发给 `t.inner`；当测试注入了 `t.hooks.now` 时跳过预取，`ProjectExists` 自动回退为单独执行 `projectExistsQuery`，保证既有锁等待与脚本时钟测试完全兼容。
    - 新增集成测试 `TestBatchPipelineSamplesClockAfterLockWait`：
      - 验证带 `project_id` 的新事件、重复事件、冲突事件通过 `postgresTx` 批处理管道完整成功；
-     - 通过包装底层 `net.Conn`（`ConnConfig.DialFunc`）统计客户端与 PostgreSQL 的请求-响应往返（RTT）次数，验证在**冷连接（首条事件）与热连接（后续事件）**上，新增、重复、冲突单条事件事务均严格为 **5 次网络往返**；
-     - 验证当 `projects` 表查询在解析阶段失败（例如临时重命名 `projects` 表）或执行阶段失败时，带 `project_id` 的过期事件仍返回 `expired`、未来事件仍返回 `FUTURE_EVENT`，而有效窗口事件返回 `retryable` 且日志阶段为 `"ingestion project"`（而非 `"ingestion server time"`）；
+     - 通过包装底层 `net.Conn`（`ConnConfig.DialFunc`）统计客户端与 PostgreSQL 的请求-响应往返（RTT）次数，验证在**冷连接（首条事件）与热连接（后续事件）**上，有/无 `project_id` 的新增、重复、冲突单条事件事务均严格为 **5 次网络往返**；
+     - 验证当 `projects` 表查询在解析阶段失败（临时重命名 `projects` 表）时，带 `project_id` 的过期事件仍返回 `expired`、未来事件仍返回 `FUTURE_EVENT`，而有效窗口事件返回 `retryable`（`UNAVAILABLE`），且 `bufferedProject.err` 归属为 `"ingestion project: database operation failed"`（而非 `"ingestion server time"`）；
      - 验证在真实数据库行锁阻塞下，`InsertEvent` 与 `ApplyMinute` 批处理返回的 `clock_timestamp()` 严格不早于持锁事务释放前采样的数据库服务端时间（证明管道内第 2 条 `SELECT clock_timestamp()` 确实在锁等待结束后求值）。
 
 ---
