@@ -85,20 +85,6 @@ func (p *Postgres) TouchSource(ctx context.Context, workspaceID, sourceID creden
 	return nil
 }
 
-// projectLookup is the ownership query one prefetch hint asks for.
-type projectLookup struct {
-	workspaceID credentials.ID
-	projectID   credentials.ID
-}
-
-// projectCheckResult is the ownership answer read from a prefetched round trip and
-// held until ProjectExists consumes it.
-type projectCheckResult struct {
-	lookup projectLookup
-	exists bool
-	err    error
-}
-
 // sampledTime is a server time read from the second statement of a pipelined write
 // and held until the following Now consumes it.
 type sampledTime struct {
@@ -197,74 +183,25 @@ func readBatchExec(mrr *pgconn.MultiResultReader) (pgconn.CommandTag, error) {
 }
 
 // postgresTx is the per-item transaction wrapper. Each method runs in the caller's
-// transaction, never commits on its own, and merges its own statement with the
-// adjacent independent statement into one pipelined round trip. The pending and
-// buffered fields hold the pipelined answers until their consumer asks for them.
+// transaction and never commits on its own. The three write methods merge their own
+// statement with the adjacent independent clock sample into one pipelined round
+// trip; sampledNow holds that sample until the following Now consumes it.
 type postgresTx struct {
-	tx              pgx.Tx
-	pendingProject  *projectLookup
-	bufferedProject *projectCheckResult
-	sampledNow      *sampledTime
-}
-
-// PrefetchProject announces that the next server time sample may be sent together
-// with this ownership query. It only records the hint: the query is queued by Now,
-// so a window that ends the item early never adds it to the batch.
-func (t *postgresTx) PrefetchProject(workspaceID, projectID credentials.ID) {
-	t.pendingProject = &projectLookup{workspaceID: workspaceID, projectID: projectID}
-	t.bufferedProject = nil
+	tx         pgx.Tx
+	sampledNow *sampledTime
 }
 
 // Now reads the server time from the database. It is a statement, not a
-// transaction-start constant, so a wait on a lock is visible to the next sample.
-// A pending project prefetch turns this sample and the ownership query into one
-// round trip; a time already sampled by the previous write is returned without any
-// round trip.
+// transaction-start constant, so a wait on a lock is visible to the next sample. A
+// time already sampled by the previous write is returned without any round trip.
+//
+// The first sample of an item is always its own statement: merging it with the
+// ownership query would make an expired or future event wait for that query, and
+// the window verdict must be decided before any other statement runs.
 func (t *postgresTx) Now(ctx context.Context) (time.Time, error) {
 	if sampled := t.sampledNow; sampled != nil {
 		t.sampledNow = nil
 		return sampled.at, sampled.err
-	}
-	if t.pendingProject != nil {
-		lookup := *t.pendingProject
-		t.pendingProject = nil
-		batch := newPipelinedBatch(t.tx)
-		// The sample is queued first, so the server has already produced its result
-		// before it even parses the ownership query.
-		if err := batch.add(nowQuery); err != nil {
-			return time.Time{}, database.SafeError("ingestion server time", err)
-		}
-		// The ownership answer is buffered, including its failure: an item that the
-		// window already ended must report expired or FUTURE_EVENT, never a project
-		// lookup error. A query that cannot be encoded at all is left out of the
-		// group rather than taking the time sample down with it.
-		buffered := &projectCheckResult{lookup: lookup}
-		projectErr := batch.add(projectExistsQuery, lookup.workspaceID, lookup.projectID)
-		if projectErr != nil {
-			buffered.err = database.SafeError("ingestion project", projectErr)
-		}
-		t.bufferedProject = buffered
-		mrr := batch.exec(ctx)
-		defer func() { _ = mrr.Close() }()
-
-		var now time.Time
-		if err := readBatchRow(mrr, batch.typeMap, &now); err != nil {
-			return time.Time{}, database.SafeError("ingestion server time", err)
-		}
-		if projectErr == nil {
-			var found int
-			switch err := readBatchRow(mrr, batch.typeMap, &found); {
-			case err == nil:
-				buffered.exists = true
-			case errors.Is(err, pgx.ErrNoRows):
-			default:
-				buffered.err = database.SafeError("ingestion project", err)
-			}
-		}
-		if closeErr := mrr.Close(); closeErr != nil && t.bufferedProject.err == nil {
-			return time.Time{}, database.SafeError("ingestion server time", closeErr)
-		}
-		return now, nil
 	}
 	var now time.Time
 	// A single statement runs in the same unnamed extended-query mode as a pipelined
@@ -278,19 +215,12 @@ func (t *postgresTx) Now(ctx context.Context) (time.Time, error) {
 
 // ProjectExists reports whether the project belongs to the workspace. Archived
 // projects still belong to it: archiving does not change the event's business
-// identity. A prefetched answer for exactly this pair is used as is; every other
-// call runs the query on its own.
+// identity. It runs as its own statement, so it never delays the window verdict
+// that the caller has already decided.
 func (t *postgresTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
-	t.pendingProject = nil
-	if buffered := t.bufferedProject; buffered != nil {
-		t.bufferedProject = nil
-		if buffered.lookup.workspaceID == workspaceID && buffered.lookup.projectID == projectID {
-			return buffered.exists, buffered.err
-		}
-	}
 	var found int
 	// Same unnamed mode as the pipelined group, so a cold connection does not pay a
-	// separate prepare round trip for this fallback.
+	// separate prepare round trip here.
 	if err := t.tx.QueryRow(ctx, projectExistsQuery, pgx.QueryExecModeExec, workspaceID, projectID).Scan(&found); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
@@ -458,7 +388,6 @@ func metricValue(metric aggregation.Metric) any {
 // Ensure the store and transaction wrappers satisfy the narrow interfaces the
 // service declares.
 var (
-	_ store             = (*Postgres)(nil)
-	_ itemTx            = (*postgresTx)(nil)
-	_ projectPrefetcher = (*postgresTx)(nil)
+	_ store  = (*Postgres)(nil)
+	_ itemTx = (*postgresTx)(nil)
 )

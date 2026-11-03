@@ -120,13 +120,6 @@ type itemTx interface {
 	Rollback(ctx context.Context) error
 }
 
-// projectPrefetcher is an optional extension implemented by the Postgres
-// transaction wrapper so the initial server-time sample and the project
-// ownership query can share one network round-trip when a project is set.
-type projectPrefetcher interface {
-	PrefetchProject(workspaceID, projectID credentials.ID)
-}
-
 // usage holds the six metrics in their frozen normalization order.
 type usage struct {
 	Input      aggregation.Metric
@@ -322,15 +315,6 @@ func (s *Service) processItem(ctx context.Context, credential credentials.Creden
 			s.logger.Warn("item rollback failed", "stage", "ingestion item", "err", database.SafeError("ingestion rollback", rollbackErr))
 		}
 	}()
-
-	// The ownership query is announced before the first sample: a transaction that
-	// can pipeline the two sends them in one round trip, and one that cannot simply
-	// ignores the hint.
-	if e.ProjectID.Valid {
-		if prefetcher, ok := tx.(projectPrefetcher); ok {
-			prefetcher.PrefetchProject(credential.WorkspaceID, e.ProjectID)
-		}
-	}
 
 	receivedAt, window, err := sampleWindow(ctx, tx, e)
 	if err != nil {
