@@ -3,6 +3,7 @@ package ingestion
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/dundunHa/TokenPivot/internal/aggregation"
@@ -10,6 +11,7 @@ import (
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -104,6 +106,96 @@ type sampledTime struct {
 	err error
 }
 
+// pipelinedBatch groups independent statements of one item transaction into a single
+// wire-protocol batch. Each statement is encoded and appended as Parse + Bind +
+// Describe + Execute, and exec appends the one Sync that ends the group, so the whole
+// group costs exactly one network round trip on a cold connection and on a warm one.
+//
+// It is deliberately not pgx.Batch: that path prepares a statement before binding it
+// and therefore pays a second round trip while the statement cache is cold, and it
+// aborts the whole group when a later statement fails to prepare. Here the server
+// resolves and runs the statements strictly in order, so a later statement's failure
+// can never suppress an earlier statement's already produced result.
+//
+// Every statement is unnamed. That skips the statement cache entirely, which is what
+// keeps the round-trip count independent of connection age.
+type pipelinedBatch struct {
+	conn    *pgx.Conn
+	typeMap *pgtype.Map
+	eqb     pgx.ExtendedQueryBuilder
+	batch   pgconn.Batch
+}
+
+// newPipelinedBatch prepares a batch on the connection the item transaction owns.
+func newPipelinedBatch(tx pgx.Tx) *pipelinedBatch {
+	conn := tx.Conn()
+	return &pipelinedBatch{conn: conn, typeMap: conn.TypeMap()}
+}
+
+// add encodes one statement with its arguments and appends it to the group. A
+// statement that cannot be encoded is left out, so the caller decides whether the
+// rest of the group is still worth sending.
+func (b *pipelinedBatch) add(sql string, args ...any) error {
+	if err := b.eqb.Build(b.typeMap, nil, args); err != nil {
+		return err
+	}
+	b.batch.ExecParams(sql, b.eqb.ParamValues, nil, b.eqb.ParamFormats, b.eqb.ResultFormats)
+	return nil
+}
+
+// exec writes the encoded group with its single Sync. The caller must close the
+// reader: closing drains every remaining message up to ReadyForQuery, so a failure
+// on one statement never leaves the connection busy for the transaction's rollback.
+func (b *pipelinedBatch) exec(ctx context.Context) *pgconn.MultiResultReader {
+	return b.conn.PgConn().ExecBatch(ctx, &b.batch)
+}
+
+// readBatchRow reads the single row of the next statement result of a pipelined
+// batch into dest. pgx.ErrNoRows reports a statement that produced no row; any other
+// error reports a statement that failed, including the statement that failed before
+// its own result began.
+func readBatchRow(mrr *pgconn.MultiResultReader, typeMap *pgtype.Map, dest ...any) error {
+	if !mrr.NextResult() {
+		if err := mrr.Close(); err != nil {
+			return err
+		}
+		return errors.New("no more results in batch")
+	}
+	rr := mrr.ResultReader()
+	if !rr.NextRow() {
+		if _, err := rr.Close(); err != nil {
+			return err
+		}
+		return pgx.ErrNoRows
+	}
+	fields := rr.FieldDescriptions()
+	values := rr.Values()
+	if len(fields) != len(dest) || len(values) != len(dest) {
+		_, _ = rr.Close()
+		return fmt.Errorf("result has %d columns, want %d", len(values), len(dest))
+	}
+	for i := range dest {
+		if err := typeMap.Scan(fields[i].DataTypeOID, fields[i].Format, values[i], dest[i]); err != nil {
+			_, _ = rr.Close()
+			return err
+		}
+	}
+	_, err := rr.Close()
+	return err
+}
+
+// readBatchExec reads the command tag of the next statement result of a pipelined
+// batch. A statement that failed reports its own error here.
+func readBatchExec(mrr *pgconn.MultiResultReader) (pgconn.CommandTag, error) {
+	if !mrr.NextResult() {
+		if err := mrr.Close(); err != nil {
+			return pgconn.CommandTag{}, err
+		}
+		return pgconn.CommandTag{}, errors.New("no more results in batch")
+	}
+	return mrr.ResultReader().Close()
+}
+
 // postgresTx is the per-item transaction wrapper. Each method runs in the caller's
 // transaction, never commits on its own, and merges its own statement with the
 // adjacent independent statement into one pipelined round trip. The pending and
@@ -136,35 +228,49 @@ func (t *postgresTx) Now(ctx context.Context) (time.Time, error) {
 	if t.pendingProject != nil {
 		lookup := *t.pendingProject
 		t.pendingProject = nil
-		var batch pgx.Batch
-		batch.Queue(nowQuery)
-		batch.Queue(projectExistsQuery, lookup.workspaceID, lookup.projectID)
-		br := t.tx.SendBatch(ctx, &batch)
-		defer func() { _ = br.Close() }()
-
-		var now time.Time
-		if err := br.QueryRow().Scan(&now); err != nil {
+		batch := newPipelinedBatch(t.tx)
+		// The sample is queued first, so the server has already produced its result
+		// before it even parses the ownership query.
+		if err := batch.add(nowQuery); err != nil {
 			return time.Time{}, database.SafeError("ingestion server time", err)
 		}
 		// The ownership answer is buffered, including its failure: an item that the
 		// window already ended must report expired or FUTURE_EVENT, never a project
-		// lookup error.
-		var found int
-		switch err := br.QueryRow().Scan(&found); {
-		case err == nil:
-			t.bufferedProject = &projectCheckResult{lookup: lookup, exists: true}
-		case errors.Is(err, pgx.ErrNoRows):
-			t.bufferedProject = &projectCheckResult{lookup: lookup}
-		default:
-			t.bufferedProject = &projectCheckResult{lookup: lookup, err: database.SafeError("ingestion project", err)}
+		// lookup error. A query that cannot be encoded at all is left out of the
+		// group rather than taking the time sample down with it.
+		buffered := &projectCheckResult{lookup: lookup}
+		projectErr := batch.add(projectExistsQuery, lookup.workspaceID, lookup.projectID)
+		if projectErr != nil {
+			buffered.err = database.SafeError("ingestion project", projectErr)
 		}
-		if closeErr := br.Close(); closeErr != nil && t.bufferedProject.err == nil {
+		t.bufferedProject = buffered
+		mrr := batch.exec(ctx)
+		defer func() { _ = mrr.Close() }()
+
+		var now time.Time
+		if err := readBatchRow(mrr, batch.typeMap, &now); err != nil {
+			return time.Time{}, database.SafeError("ingestion server time", err)
+		}
+		if projectErr == nil {
+			var found int
+			switch err := readBatchRow(mrr, batch.typeMap, &found); {
+			case err == nil:
+				buffered.exists = true
+			case errors.Is(err, pgx.ErrNoRows):
+			default:
+				buffered.err = database.SafeError("ingestion project", err)
+			}
+		}
+		if closeErr := mrr.Close(); closeErr != nil && t.bufferedProject.err == nil {
 			return time.Time{}, database.SafeError("ingestion server time", closeErr)
 		}
 		return now, nil
 	}
 	var now time.Time
-	if err := t.tx.QueryRow(ctx, nowQuery).Scan(&now); err != nil {
+	// A single statement runs in the same unnamed extended-query mode as a pipelined
+	// group: the default mode prepares a statement before binding it, which costs a
+	// second round trip while the connection's statement cache is still cold.
+	if err := t.tx.QueryRow(ctx, nowQuery, pgx.QueryExecModeExec).Scan(&now); err != nil {
 		return time.Time{}, database.SafeError("ingestion server time", err)
 	}
 	return now, nil
@@ -183,7 +289,9 @@ func (t *postgresTx) ProjectExists(ctx context.Context, workspaceID, projectID c
 		}
 	}
 	var found int
-	if err := t.tx.QueryRow(ctx, projectExistsQuery, workspaceID, projectID).Scan(&found); err != nil {
+	// Same unnamed mode as the pipelined group, so a cold connection does not pay a
+	// separate prepare round trip for this fallback.
+	if err := t.tx.QueryRow(ctx, projectExistsQuery, pgx.QueryExecModeExec, workspaceID, projectID).Scan(&found); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
@@ -198,22 +306,26 @@ func (t *postgresTx) ProjectExists(ctx context.Context, workspaceID, projectID c
 // insert's lock wait, not before it.
 func (t *postgresTx) InsertEvent(ctx context.Context, event storedEvent) (bool, error) {
 	t.sampledNow = nil
-	var batch pgx.Batch
-	batch.Queue(insertEventQuery, eventArgs(event)...)
-	batch.Queue(nowQuery)
-	br := t.tx.SendBatch(ctx, &batch)
-	defer func() { _ = br.Close() }()
+	batch := newPipelinedBatch(t.tx)
+	if err := batch.add(insertEventQuery, eventArgs(event)...); err != nil {
+		return false, database.SafeError("ingestion insert event", err)
+	}
+	if err := batch.add(nowQuery); err != nil {
+		return false, database.SafeError("ingestion server time", err)
+	}
+	mrr := batch.exec(ctx)
+	defer func() { _ = mrr.Close() }()
 
 	inserted := true
 	var found int
-	err := br.QueryRow().Scan(&found)
+	err := readBatchRow(mrr, batch.typeMap, &found)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// ON CONFLICT DO NOTHING RETURNING yields no row when the identity exists.
 		inserted = false
 	} else if err != nil {
 		return false, database.SafeError("ingestion insert event", err)
 	}
-	t.captureSampledNow(br)
+	t.captureSampledNow(mrr, batch.typeMap)
 	return inserted, nil
 }
 
@@ -222,22 +334,26 @@ func (t *postgresTx) InsertEvent(ctx context.Context, event storedEvent) (bool, 
 // read.
 func (t *postgresTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
 	t.sampledNow = nil
-	var batch pgx.Batch
-	batch.Queue(existingEventQuery, workspaceID, sourceID, sourceEventID)
-	batch.Queue(nowQuery)
-	br := t.tx.SendBatch(ctx, &batch)
-	defer func() { _ = br.Close() }()
+	batch := newPipelinedBatch(t.tx)
+	if err := batch.add(existingEventQuery, workspaceID, sourceID, sourceEventID); err != nil {
+		return storedEvent{}, false, database.SafeError("ingestion existing event", err)
+	}
+	if err := batch.add(nowQuery); err != nil {
+		return storedEvent{}, false, database.SafeError("ingestion server time", err)
+	}
+	mrr := batch.exec(ctx)
+	defer func() { _ = mrr.Close() }()
 
 	var existing storedEvent
 	found := true
-	err := br.QueryRow().Scan(&existing.NormalizationVersion, &existing.PayloadHash)
+	err := readBatchRow(mrr, batch.typeMap, &existing.NormalizationVersion, &existing.PayloadHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing = storedEvent{}
 		found = false
 	} else if err != nil {
 		return storedEvent{}, false, database.SafeError("ingestion existing event", err)
 	}
-	t.captureSampledNow(br)
+	t.captureSampledNow(mrr, batch.typeMap)
 	return existing, found, nil
 }
 
@@ -261,29 +377,33 @@ type minuteBatchTx struct {
 // of the statement is returned as is, so the aggregation package still owns its
 // stage name; the sample is only read once the statement itself succeeded.
 func (m *minuteBatchTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
-	var batch pgx.Batch
-	batch.Queue(sql, arguments...)
-	batch.Queue(nowQuery)
-	br := m.Tx.SendBatch(ctx, &batch)
-	defer func() { _ = br.Close() }()
-	tag, err := br.Exec()
+	batch := newPipelinedBatch(m.Tx)
+	if err := batch.add(sql, arguments...); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	if err := batch.add(nowQuery); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	mrr := batch.exec(ctx)
+	defer func() { _ = mrr.Close() }()
+	tag, err := readBatchExec(mrr)
 	if err != nil {
 		return pgconn.CommandTag{}, err
 	}
-	m.parent.captureSampledNow(br)
+	m.parent.captureSampledNow(mrr, batch.typeMap)
 	return tag, nil
 }
 
 // captureSampledNow reads the clock sample queued behind a pipelined statement and
 // holds its value or its sanitized error for the next Now.
-func (t *postgresTx) captureSampledNow(br pgx.BatchResults) {
+func (t *postgresTx) captureSampledNow(mrr *pgconn.MultiResultReader, typeMap *pgtype.Map) {
 	var now time.Time
-	if err := br.QueryRow().Scan(&now); err != nil {
+	if err := readBatchRow(mrr, typeMap, &now); err != nil {
 		t.sampledNow = &sampledTime{err: database.SafeError("ingestion server time", err)}
-		_ = br.Close()
+		_ = mrr.Close()
 		return
 	}
-	if err := br.Close(); err != nil {
+	if err := mrr.Close(); err != nil {
 		t.sampledNow = &sampledTime{err: database.SafeError("ingestion server time", err)}
 		return
 	}

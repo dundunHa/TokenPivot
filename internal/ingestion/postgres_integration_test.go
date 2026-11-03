@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -254,6 +255,42 @@ func (e *integrationEnv) pool(t *testing.T) *pgxpool.Pool {
 func (e *integrationEnv) service(t *testing.T, pool *pgxpool.Pool, logs *syncBuffer) *Service {
 	t.Helper()
 	return New(NewPostgres(pool), &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+}
+
+// countingPool opens one single-connection service pool whose dialer counts the
+// requests written on that socket, so a test can assert how many network round trips
+// one item transaction costs.
+func (e *integrationEnv) countingPool(t *testing.T, counter *roundTripCounter) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(e.appURL)
+	if err != nil {
+		t.Fatal(database.SafeError("parse app URL", err))
+	}
+	if config.ConnConfig.TLSConfig != nil {
+		t.Fatal("round trip counting needs a plaintext test connection")
+	}
+	// One connection keeps the counter attributable to one item transaction; a health
+	// check would add a request of its own, so it is pushed past the test's lifetime.
+	config.MaxConns = 1
+	config.MinConns = 0
+	config.MinIdleConns = 0
+	config.MaxConnLifetime = time.Hour
+	config.MaxConnIdleTime = time.Hour
+	config.HealthCheckPeriod = time.Hour
+	dialer := &net.Dialer{Timeout: database.ConnectTimeout}
+	config.ConnConfig.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &roundTripCountingConn{Conn: conn, counter: counter}, nil
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(database.SafeError("open counting pool", err))
+	}
+	t.Cleanup(pool.Close)
+	return pool
 }
 
 // syncBuffer is a goroutine-safe log sink.
@@ -1380,6 +1417,175 @@ func TestBatchPipelineSamplesClockAfterLockWait(t *testing.T) {
 			t.Fatalf("following sample now=%s err=%v want the cached %s", now, err, sampled.at)
 		}
 	})
+
+	// A failing ownership query must not outrank the window verdict: the time sample
+	// is produced before the server even parses the second statement, so an expired
+	// or future event keeps its own answer instead of becoming a storage failure.
+	t.Run("project query failure does not mask expired or future window", func(t *testing.T) {
+		// The table is renamed, so the ownership query fails while the server resolves
+		// it, which is the failure mode that used to abort the whole statement group
+		// before the time sample ran.
+		if _, err := e.owner.Exec(ctx, "ALTER TABLE projects RENAME TO projects_hidden"); err != nil {
+			t.Fatal(database.SafeError("hide projects table", err))
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := e.owner.Exec(cleanupCtx, "ALTER TABLE projects_hidden RENAME TO projects"); err != nil {
+				t.Error("restore projects table failed")
+			}
+		})
+
+		now := time.Now().UTC()
+		expiredAt := now.Add(-retainedWindow - 24*time.Hour).Truncate(time.Microsecond)
+		futureAt := now.Add(10 * time.Minute).Truncate(time.Microsecond)
+		validAt := now.Add(-time.Hour).Truncate(time.Microsecond)
+		logs := &syncBuffer{}
+		hidden := e.service(t, pool, logs)
+		results := runBatch(t, hidden, credential, encodedBatch(t,
+			acceptedEventJSON("evt-hidden-expired", expiredAt, projectID),
+			acceptedEventJSON("evt-hidden-future", futureAt, projectID),
+			acceptedEventJSON("evt-hidden-valid", validAt, projectID),
+		))
+		// The window verdicts are decided before the ownership answer is consumed, so
+		// only the valid event ever reads it, and only that event fails.
+		requireResultStatuses(t, results, statusExpired, statusRejected, statusRetryable)
+		requireResultCodes(t, results, "", codeFutureEvent, codeUnavailable)
+		for _, sourceEventID := range []string{"evt-hidden-expired", "evt-hidden-future", "evt-hidden-valid"} {
+			if count := e.countRows(t, ctx, workspaceID, sourceID, sourceEventID); count != 0 {
+				t.Fatalf("%s stored %d detail rows under a failing ownership query", sourceEventID, count)
+			}
+		}
+		// A per-item failure is reported without a log line, so the stage that owned it
+		// is asserted where it is still visible: on the sanitized answer buffered by the
+		// pipelined sample. The sample must succeed and only the ownership query may
+		// carry the project stage.
+		item := beginItem(t, ctx, store)
+		defer rollbackItem(t, ctx, item)
+		postgresItem, ok := item.(*postgresTx)
+		if !ok {
+			t.Fatal("NewPostgres did not return its own item transaction")
+		}
+		event := mustDecodeEvent(t, acceptedEventJSON("evt-hidden-sample", validAt, projectID))
+		postgresItem.PrefetchProject(credential.WorkspaceID, event.ProjectID)
+		if _, err := item.Now(ctx); err != nil {
+			t.Fatalf("initial sample failed under a failing ownership query: %v", err)
+		}
+		buffered := postgresItem.bufferedProject
+		if buffered == nil || buffered.err == nil {
+			t.Fatalf("buffered ownership answer=%+v want the project stage failure", buffered)
+		}
+		if got, want := buffered.err.Error(), "ingestion project: database operation failed"; got != want {
+			t.Fatalf("buffered ownership stage=%q want=%q", got, want)
+		}
+		if _, err := item.ProjectExists(ctx, credential.WorkspaceID, event.ProjectID); err == nil || err.Error() != buffered.err.Error() {
+			t.Fatalf("consumed ownership answer err=%v want the buffered project stage failure", err)
+		}
+		if strings.Contains(logs.String(), "ingestion server time") {
+			t.Fatalf("a failing ownership query was blamed on the server time stage: %s", logs.String())
+		}
+	})
+
+	// Every item transaction keeps the documented five round trips whether the
+	// connection has seen a statement before or not, because each statement is sent as
+	// an unnamed extended-protocol message with a single Sync instead of being prepared
+	// first.
+	t.Run("cold and warm connections both use five round trips per item", func(t *testing.T) {
+		// With a project: the sample and the ownership query share one round trip.
+		projectService, projectCounter := e.countedService(t)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, "cold accepted item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusAccepted)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, "warm accepted item",
+			acceptedEventJSON("evt-rtt-warm", occurredAt, projectID), statusAccepted)
+		// The duplicate and the conflict read the stored basis in their own statement,
+		// so they cost the same five round trips as the accepted item.
+		requireItemRoundTrips(t, projectService, projectCounter, credential, "duplicate item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusDuplicate)
+		conflict := fmt.Sprintf(`{"source_event_id":"evt-rtt-new","project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			uuidText(projectID), occurredAt.UTC().Format(microLayout))
+		requireItemRoundTrips(t, projectService, projectCounter, credential, "conflict item", conflict, statusConflict)
+
+		// Without a project: the first sample is a single statement of its own, and on a
+		// cold connection it must not pay a prepare round trip either.
+		bareService, bareCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, "cold accepted item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusAccepted)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, "warm accepted item without project",
+			acceptedEventJSON("evt-rtt-bare-warm", occurredAt, pgtype.UUID{}), statusAccepted)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, "duplicate item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusDuplicate)
+	})
+}
+
+// requireItemRoundTrips runs one item transaction on a counted service and asserts both
+// its status and its exact number of network round trips. One item transaction owns the
+// single pooled connection for its whole lifetime, so a counter reset belongs to
+// exactly one of them.
+func requireItemRoundTrips(t *testing.T, service *Service, counter *roundTripCounter, credential credentials.Credential, label, eventJSON, wantStatus string) {
+	t.Helper()
+	event := mustDecodeEvent(t, eventJSON)
+	counter.reset()
+	got := service.processItem(context.Background(), credential, event, time.Time{})
+	rounds := counter.value()
+	if got.status != wantStatus {
+		t.Fatalf("%s status=%s code=%s want=%s", label, got.status, got.code, wantStatus)
+	}
+	if rounds != 5 {
+		t.Fatalf("%s round trips=%d want=5", label, rounds)
+	}
+}
+
+// countedService returns a service on a single-connection pool whose requests are
+// counted, with the connection already established and idle. The startup exchange is
+// therefore never part of a measured item transaction, and the next item transaction
+// is the cold one.
+func (e *integrationEnv) countedService(t *testing.T) (*Service, *roundTripCounter) {
+	t.Helper()
+	counter := &roundTripCounter{}
+	countingPool := e.countingPool(t, counter)
+	conn, err := countingPool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(database.SafeError("acquire counting connection", err))
+	}
+	conn.Release()
+	return e.service(t, countingPool, &syncBuffer{}), counter
+}
+
+// roundTripCounter counts the client to server requests written on the sockets of one
+// pool. The pool under measurement holds a single connection, so the count is the
+// number of network round trips of one item transaction.
+type roundTripCounter struct {
+	requests atomic.Int64
+}
+
+// reset starts a new measurement. The socket state is left alone: the next write
+// still has to follow the previous response to be counted as a new request.
+func (c *roundTripCounter) reset() { c.requests.Store(0) }
+
+func (c *roundTripCounter) value() int64 { return c.requests.Load() }
+
+// roundTripCountingConn counts one request for every write that begins after the
+// previous response was read. pgx writes one buffer per request, so one counted write
+// is one network round trip.
+type roundTripCountingConn struct {
+	net.Conn
+	counter     *roundTripCounter
+	lastWasRead atomic.Bool
+}
+
+func (c *roundTripCountingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.lastWasRead.Store(true)
+	}
+	return n, err
+}
+
+func (c *roundTripCountingConn) Write(p []byte) (int, error) {
+	if c.lastWasRead.CompareAndSwap(true, false) {
+		c.counter.requests.Add(1)
+	}
+	return c.Conn.Write(p)
 }
 
 // beginItem opens one real item transaction on the test goroutine.
