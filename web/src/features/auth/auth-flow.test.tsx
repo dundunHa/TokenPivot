@@ -131,6 +131,8 @@ describe.each([
         sessionGets += 1;
         return errorResponse(401, "UNAUTHENTICATED");
       }),
+      // 注册/登录后都是零空间状态：由强制创建 modal 接住，不挂载业务页面。
+      http.get("/api/v1/workspaces", () => HttpResponse.json([])),
     );
     const user = userEvent.setup();
     renderApp(path);
@@ -138,7 +140,7 @@ describe.each([
     await user.click(screen.getByRole("button", { name: button }));
     await screen.findByText("normalised@example.com");
     expect(bodies).toEqual([{ email, password }]);
-    expect(screen.getByText("Personal")).toBeTruthy();
+    expect(await screen.findByRole("dialog")).toBeTruthy();
     expect(screen.getByRole("button", { name: "登出" })).toBeTruthy();
     expect(location()).toBe("/|REPLACE");
     expect(sessionGets).toBe(0);
@@ -156,6 +158,7 @@ describe("submit state", () => {
         await gate.promise;
         return HttpResponse.json(sessionBody("a@example.com", FUTURE));
       }),
+      http.get("/api/v1/workspaces", () => HttpResponse.json([])),
     );
     const user = userEvent.setup();
     renderApp("/login");
@@ -328,6 +331,7 @@ describe("logout", () => {
         HttpResponse.json(sessionBody("a@example.com", FUTURE)),
       ),
       http.post(LOGOUT, () => new HttpResponse(null, { status: 204 })),
+      http.get("/api/v1/workspaces", () => HttpResponse.json([])),
     );
     const user = userEvent.setup();
     renderApp("/");
@@ -344,8 +348,8 @@ describe("logout", () => {
         HttpResponse.json(sessionBody("a@example.com", FUTURE)),
       ),
       http.post(LOGOUT, () => errorResponse(500, "INTERNAL")),
-      // 总览的空间请求保持挂起，本用例只关注退出失败提示。
-      http.get("/api/v1/workspaces/current", () => new Promise(() => {})),
+      // 工作区列表保持挂起，本用例只关注退出失败提示。
+      http.get("/api/v1/workspaces", () => new Promise(() => {})),
     );
     const user = userEvent.setup();
     renderApp("/");

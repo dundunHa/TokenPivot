@@ -1,0 +1,556 @@
+import { describe, expect, it } from "vitest";
+import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter, useLocation } from "react-router";
+import { createAppQueryClient, sessionKey } from "@/features/auth/queries";
+import type { AuthSession } from "@/features/auth/model";
+import {
+  deferred,
+  errorResponse,
+  http,
+  HttpResponse,
+  server,
+} from "@/test/server";
+import { trimWorkspaceName, workspaceNameProblem, type Workspace } from "./api";
+import { WorkspaceHome } from "./WorkspaceHome";
+
+const WS_A = "0198f2b0-0000-7000-8000-0000000000aa";
+const WS_B = "0198f2b0-0000-7000-8000-0000000000bb";
+const WS_C = "0198f2b0-0000-7000-8000-0000000000cc";
+const USER = "user-a";
+const SESSION: AuthSession = {
+  user: { id: USER, email: "a@example.com" },
+  expires_at: "2999-01-01T00:00:00Z",
+};
+
+const workspace = (workspaceId: string, name: string): Workspace => ({
+  workspaceId,
+  name,
+});
+
+const body = (w: Workspace) => ({ workspace_id: w.workspaceId, name: w.name });
+
+const metric = (value: string) => ({
+  value,
+  known_count: "1",
+  estimated_count: "0",
+  missing_count: "0",
+});
+const stats = {
+  request_count: "1",
+  input_tokens: metric("1"),
+  output_tokens: metric("1"),
+  total_tokens: metric("2"),
+};
+
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <p data-testid="location">
+      {location.pathname}
+      {location.search}
+    </p>
+  );
+}
+
+function renderHome(client: QueryClient, path: string) {
+  client.setQueryData(sessionKey, SESSION);
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[path]}>
+        <LocationProbe />
+        <WorkspaceHome userId={USER} />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return client;
+}
+
+function search() {
+  const text = screen.getByTestId("location").textContent ?? "";
+  return new URLSearchParams(text.includes("?") ? text.split("?")[1] : "");
+}
+
+interface Backend {
+  state: { workspaces: Workspace[] };
+  calls: {
+    detail: string[];
+    options: string[];
+    aggregate: string[];
+    business: number;
+    posts: unknown[];
+  };
+}
+
+function useBackend(initial: Workspace[]): Backend {
+  const state = { workspaces: [...initial] };
+  const calls = {
+    detail: [] as string[],
+    options: [] as string[],
+    aggregate: [] as string[],
+    business: 0,
+    posts: [] as unknown[],
+  };
+  const base = "/api/v1/workspaces";
+  server.use(
+    http.get(base, () => HttpResponse.json(state.workspaces.map(body))),
+    http.get(`${base}/:id`, ({ params }) => {
+      const id = String(params.id);
+      calls.business += 1;
+      calls.detail.push(id);
+      const found = state.workspaces.find((w) => w.workspaceId === id);
+      return found
+        ? HttpResponse.json(body(found))
+        : errorResponse(403, "PERMISSION_DENIED");
+    }),
+    http.get(`${base}/:id/usage/options`, ({ params }) => {
+      calls.business += 1;
+      calls.options.push(String(params.id));
+      return HttpResponse.json({ providers: ["p1"], models: [] });
+    }),
+    http.get(`${base}/:id/projects`, () => {
+      calls.business += 1;
+      return HttpResponse.json([]);
+    }),
+    http.get(`${base}/:id/usage/aggregate`, ({ params }) => {
+      calls.business += 1;
+      calls.aggregate.push(String(params.id));
+      return HttpResponse.json({
+        range: {
+          start: "2026-10-28T00:00:00Z",
+          end: "2026-10-28T01:00:00Z",
+          as_of: "2026-10-28T01:00:00Z",
+          retention_cutoff: "2025-10-28T00:00:00Z",
+          timezone: "UTC",
+          granularity: "hour",
+        },
+        totals: stats,
+        points: [],
+      });
+    }),
+    http.get(`${base}/:id/usage/rankings`, ({ request }) =>
+      HttpResponse.json({
+        group_by: new URL(request.url).searchParams.get("group_by"),
+        overall: stats,
+        groups: [],
+        other: null,
+        next_cursor: null,
+      }),
+    ),
+    http.get(`${base}/:id/usage-events`, () =>
+      HttpResponse.json({
+        items: [],
+        next_cursor: null,
+        has_more: false,
+        start: "2026-10-28T01:00:00Z",
+        end: "2026-10-28T02:00:00Z",
+        as_of: "2026-10-28T02:00:00Z",
+        retention_cutoff: "2026-04-01T00:00:00Z",
+      }),
+    ),
+    http.get(`${base}/:id/usage-rate`, () =>
+      HttpResponse.json({
+        start: "2026-10-28T01:59:00Z",
+        end: "2026-10-28T02:00:00Z",
+        as_of: "2026-10-28T02:00:00Z",
+        window_seconds: 60,
+        unit: "tokens/min",
+        total_tokens: {
+          value: null,
+          event_count: 0,
+          known_count: 0,
+          estimated_count: 0,
+          missing_count: 0,
+        },
+        window_last_received_at: null,
+      }),
+    ),
+  );
+  return { state, calls };
+}
+
+describe("workspace name rules", () => {
+  it("trims the same Unicode whitespace as Go strings.TrimSpace", () => {
+    expect(trimWorkspaceName("  Alpha  ")).toBe("Alpha");
+    expect(trimWorkspaceName("\t\nAlpha\r\v\f")).toBe("Alpha");
+    expect(trimWorkspaceName("\u0085\u00A0Alpha\u1680\u3000")).toBe("Alpha");
+    expect(trimWorkspaceName("\u2000Alpha\u202F")).toBe("Alpha");
+    // U+180E 在 Go 的 IsSpace 中不是空白，不应被修剪。
+    expect(trimWorkspaceName("\u180EAlpha\u180E")).toBe("\u180EAlpha\u180E");
+  });
+
+  it("accepts 80 code points and 256 UTF-8 bytes, and rejects one more", () => {
+    expect(workspaceNameProblem("a".repeat(80))).toBeNull();
+    expect(workspaceNameProblem("a".repeat(81))).not.toBeNull();
+    expect(workspaceNameProblem("😀".repeat(64))).toBeNull();
+    expect(workspaceNameProblem("😀".repeat(65))).not.toBeNull();
+  });
+
+  it("rejects empty, control characters and a middle tab", () => {
+    expect(workspaceNameProblem("   ")).not.toBeNull();
+    expect(workspaceNameProblem("a\u0000b")).not.toBeNull();
+    expect(workspaceNameProblem("a\tb")).not.toBeNull();
+    expect(workspaceNameProblem("a b")).toBeNull();
+  });
+});
+
+describe("workspace home", () => {
+  it("waits for the list before mounting any business query", async () => {
+    const gate = deferred<Response>();
+    const client = createAppQueryClient();
+    server.use(http.get("/api/v1/workspaces", () => gate.promise));
+    renderHome(client, "/?tz=UTC");
+    expect(screen.getByRole("status").textContent).toContain("正在加载工作区");
+    expect(
+      client.getQueryCache().findAll({ queryKey: ["overview"] }),
+    ).toHaveLength(0);
+    await waitFor(() => expect(screen.getByRole("status")).toBeTruthy());
+    gate.resolve(HttpResponse.json([]));
+    await screen.findByRole("dialog");
+  });
+
+  it("shows a retryable list error instead of treating it as an empty workspace", async () => {
+    useBackend([workspace(WS_A, "Alpha")]);
+    let attempts = 0;
+    server.use(
+      http.get("/api/v1/workspaces", () => {
+        attempts += 1;
+        return attempts === 1
+          ? errorResponse(500, "INTERNAL")
+          : HttpResponse.json([body(workspace(WS_A, "Alpha"))]);
+      }),
+    );
+    const client = createAppQueryClient();
+    renderHome(client, "/?tz=UTC");
+    await screen.findByText("工作区列表加载失败，请稍后重试。");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(
+      client.getQueryCache().findAll({ queryKey: ["overview"] }),
+    ).toHaveLength(0);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await screen.findByTestId("metric-total");
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
+  });
+
+  it("falls back to the server's first workspace and preserves filters in the URL", async () => {
+    useBackend([workspace(WS_A, "Alpha"), workspace(WS_B, "Beta")]);
+    const client = createAppQueryClient();
+    renderHome(client, "/?tz=UTC&provider=anthropic");
+    await screen.findByTestId("metric-total");
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
+    expect(search().get("tz")).toBe("UTC");
+    expect(search().getAll("provider")).toEqual(["anthropic"]);
+    const aggregate = client
+      .getQueryCache()
+      .findAll({ queryKey: ["overview", "aggregate"] })
+      .at(0);
+    expect(aggregate?.queryKey.slice(0, 5)).toEqual([
+      "overview",
+      "aggregate",
+      USER,
+      WS_A,
+      "UTC",
+    ]);
+    expect(String(aggregate?.queryKey[5])).toContain("provider=anthropic");
+    expect(aggregate?.meta).toEqual({ userId: USER, workspaceId: WS_A });
+  });
+
+  it("canonicalizes a workspace id that is not a member workspace", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+    ]);
+    renderHome(createAppQueryClient(), `/?workspace=${WS_C}&tz=UTC`);
+    await screen.findByTestId("metric-total");
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
+    expect(backend.calls.detail).toEqual([]);
+    expect(search().get("tz")).toBe("UTC");
+  });
+
+  it("forces a non-dismissible create dialog when the list is empty and mounts no business page", async () => {
+    const backend = useBackend([]);
+    renderHome(createAppQueryClient(), "/");
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("创建工作区")).toBeTruthy();
+    expect(within(dialog).queryByRole("button", { name: "取消" })).toBeNull();
+    const input = within(dialog).getByLabelText("名称");
+    await userEvent.type(input, "Alpha");
+    await userEvent.keyboard("{Escape}");
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(backend.calls.business).toBe(0);
+    expect(backend.calls.posts).toHaveLength(0);
+  });
+
+  it("validates before submitting and keeps the entered name after a server error", async () => {
+    const backend = useBackend([]);
+    server.use(
+      http.post("/api/v1/workspaces", async ({ request }) => {
+        backend.calls.posts.push(await request.json());
+        return errorResponse(409, "WORKSPACE_NAME_CONFLICT");
+      }),
+    );
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), "/");
+    const dialog = await screen.findByRole("dialog");
+    const input = within(dialog).getByLabelText("名称");
+    const submit = within(dialog).getByRole("button", { name: "创建" });
+    await user.click(submit);
+    await within(dialog).findByText("请输入工作区名称");
+    expect(backend.calls.posts).toHaveLength(0);
+
+    await user.type(input, "  Alpha  ");
+    await user.click(submit);
+    await within(dialog).findByText("名称已存在，请换一个。");
+    expect((input as HTMLInputElement).value).toBe("  Alpha  ");
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(backend.calls.posts).toEqual([{ name: "Alpha" }]);
+  });
+
+  it.each([
+    [409, "WORKSPACE_LIMIT_REACHED", "已达到 2 个工作区上限。"],
+    [500, "INTERNAL", "服务暂不可用，请稍后重试。"],
+    [403, "PERMISSION_DENIED", "没有权限创建工作区。"],
+    [400, "INVALID_ARGUMENT", "名称不符合规则，请检查后重试。"],
+  ])("keeps the dialog and input after a %i %s", async (status, code, text) => {
+    useBackend([]);
+    server.use(
+      http.post("/api/v1/workspaces", () => errorResponse(status, code)),
+    );
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), "/");
+    const dialog = await screen.findByRole("dialog");
+    const input = within(dialog).getByLabelText("名称");
+    await user.type(input, "Alpha");
+    await user.click(within(dialog).getByRole("button", { name: "创建" }));
+    await within(dialog).findByText(text);
+    expect((input as HTMLInputElement).value).toBe("Alpha");
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+
+  it("creates the first workspace once, selects it and only then loads its business data", async () => {
+    const created = workspace(WS_B, "Beta");
+    const backend = useBackend([]);
+    const gate = deferred<Response>();
+    server.use(
+      http.post("/api/v1/workspaces", async ({ request }) => {
+        backend.calls.posts.push(await request.json());
+        return gate.promise;
+      }),
+    );
+    const user = userEvent.setup();
+    const client = renderHome(createAppQueryClient(), "/");
+    const dialog = await screen.findByRole("dialog");
+    const input = within(dialog).getByLabelText("名称");
+    await user.type(input, "  Beta  ");
+    const submit = within(dialog).getByRole("button", { name: "创建" });
+    await user.dblClick(submit);
+    await user.keyboard("{Enter}");
+    await within(dialog).findByRole("button", { name: "正在创建…" });
+    expect(backend.calls.posts).toHaveLength(1);
+
+    backend.state.workspaces = [created];
+    gate.resolve(HttpResponse.json(body(created), { status: 201 }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
+    await screen.findByTestId("metric-total");
+    expect(backend.calls.posts).toEqual([{ name: "Beta" }]);
+    expect(backend.calls.aggregate).toContain(WS_B);
+    expect(backend.calls.business).toBeGreaterThan(0);
+    expect(client.getQueryData(["workspace", "list", USER])).toEqual([
+      { workspaceId: WS_B, name: "Beta" },
+    ]);
+  });
+
+  it("opens a cancellable create dialog for an existing workspace and does not treat list length as quota", async () => {
+    useBackend([workspace(WS_A, "Alpha"), workspace(WS_B, "Beta")]);
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    await screen.findByTestId("metric-total");
+    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("switches only after the detail request succeeds and revalidates over HTTP", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+    ]);
+    const gate = deferred<Response>();
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_B}`, ({ request }) => {
+        backend.calls.detail.push(WS_B);
+        expect(request.signal).toBeInstanceOf(AbortSignal);
+        return gate.promise;
+      }),
+    );
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    await screen.findByTestId("metric-total");
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    expect(search().get("workspace")).toBe(WS_A);
+    expect(
+      screen.getByRole("button", { name: /Beta/ }).hasAttribute("disabled"),
+    ).toBe(true);
+    gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
+    await waitFor(() => expect(backend.calls.aggregate).toContain(WS_B));
+    expect(backend.calls.detail).toEqual([WS_B]);
+  });
+
+  it("keeps the old workspace, URL and list cache when the target detail returns 403", async () => {
+    useBackend([workspace(WS_A, "Alpha"), workspace(WS_B, "Beta")]);
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_B}`, () =>
+        errorResponse(403, "PERMISSION_DENIED"),
+      ),
+    );
+    const user = userEvent.setup();
+    const client = renderHome(
+      createAppQueryClient(),
+      `/?workspace=${WS_A}&tz=UTC`,
+    );
+    await screen.findByTestId("metric-total");
+    const listBefore = client.getQueryData(["workspace", "list", USER]);
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await screen.findByText(/无法切换到「Beta」/);
+    expect(search().get("workspace")).toBe(WS_A);
+    expect(screen.getByTestId("metric-total")).toBeTruthy();
+    expect(client.getQueryData(["workspace", "list", USER])).toEqual(
+      listBefore,
+    );
+    expect(
+      client.getQueryData(["workspace", "detail", USER, WS_B]),
+    ).toBeUndefined();
+  });
+
+  it("revalidates a cached target and still keeps the old data on 403", async () => {
+    useBackend([workspace(WS_A, "Alpha"), workspace(WS_B, "Beta")]);
+    const status = { conflict: false };
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_B}`, () =>
+        status.conflict
+          ? errorResponse(403, "PERMISSION_DENIED")
+          : HttpResponse.json(body(workspace(WS_B, "Beta"))),
+      ),
+    );
+    const user = userEvent.setup();
+    const client = renderHome(
+      createAppQueryClient(),
+      `/?workspace=${WS_A}&tz=UTC`,
+    );
+    await screen.findByTestId("metric-total");
+
+    // 第一次成功切换，让 B 的详情进入缓存。
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
+    expect(client.getQueryData(["workspace", "detail", USER, WS_B])).toEqual(
+      workspace(WS_B, "Beta"),
+    );
+    await user.click(screen.getByRole("button", { name: "Alpha" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
+    await screen.findByTestId("metric-total");
+
+    status.conflict = true;
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await screen.findByText(/无法切换到「Beta」/);
+    expect(search().get("workspace")).toBe(WS_A);
+    expect(screen.getByTestId("metric-total")).toBeTruthy();
+    expect(client.getQueryData(["workspace", "list", USER])).toBeDefined();
+  });
+
+  it("A→B→C cancels B's detail request and only the last target updates the URL", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+      workspace(WS_C, "Gamma"),
+    ]);
+    const gates = new Map<string, ReturnType<typeof deferred<Response>>>();
+    const signals = new Map<string, AbortSignal>();
+    for (const id of [WS_B, WS_C]) {
+      gates.set(id, deferred<Response>());
+    }
+    server.use(
+      http.get(`/api/v1/workspaces/:id`, ({ params, request }) => {
+        const id = String(params.id);
+        backend.calls.detail.push(id);
+        signals.set(id, request.signal);
+        return gates.get(id)?.promise ?? HttpResponse.json({});
+      }),
+    );
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    await screen.findByTestId("metric-total");
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
+    await user.click(screen.getByRole("button", { name: "Gamma" }));
+    await waitFor(() => expect(backend.calls.detail).toContain(WS_C));
+    expect(signals.get(WS_B)?.aborted).toBe(true);
+    gates.get(WS_C)?.resolve(HttpResponse.json(body(workspace(WS_C, "Gamma"))));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
+    gates.get(WS_B)?.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(search().get("workspace")).toBe(WS_C);
+  });
+
+  it("cancels the old workspace's business requests after a successful switch", async () => {
+    useBackend([workspace(WS_A, "Alpha"), workspace(WS_B, "Beta")]);
+    const optionGate = deferred<Response>();
+    let oldSignal: AbortSignal | undefined;
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_A}/usage/options`, ({ request }) => {
+        oldSignal = request.signal;
+        return optionGate.promise;
+      }),
+    );
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    await waitFor(() => expect(oldSignal).toBeInstanceOf(AbortSignal));
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
+    await waitFor(() => expect(oldSignal?.aborted).toBe(true));
+  });
+
+  it("does not use the old workspace data as a placeholder for the new one", async () => {
+    const backend = useBackend([
+      workspace(WS_A, "Alpha"),
+      workspace(WS_B, "Beta"),
+    ]);
+    const gate = deferred<Response>();
+    server.use(
+      http.get(`/api/v1/workspaces/${WS_B}/usage/aggregate`, ({ params }) => {
+        backend.calls.aggregate.push(String(params.id));
+        return gate.promise;
+      }),
+    );
+    const user = userEvent.setup();
+    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    await screen.findByTestId("metric-total");
+    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
+    // 旧空间的数据不能作为新空间占位；新聚合未返回前没有指标。
+    expect(screen.queryByTestId("metric-total")).toBeNull();
+    gate.resolve(
+      HttpResponse.json({
+        range: {
+          start: "2026-10-28T00:00:00Z",
+          end: "2026-10-28T01:00:00Z",
+          as_of: "2026-10-28T01:00:00Z",
+          retention_cutoff: "2025-10-28T00:00:00Z",
+          timezone: "UTC",
+          granularity: "hour",
+        },
+        totals: stats,
+        points: [],
+      }),
+    );
+    await screen.findByTestId("metric-total");
+  });
+});

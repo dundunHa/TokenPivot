@@ -9,6 +9,8 @@ interface GeekHeroMetricsProps {
   rate60: number | null;
   /** 时区 */
   timezone: string;
+  /** 当前工作区真实名称；由容器传入，不在组件内重复查询。 */
+  workspaceName: string;
 }
 
 /**
@@ -20,6 +22,7 @@ export function GeekHeroMetrics({
   totals,
   rate60,
   timezone,
+  workspaceName,
 }: GeekHeroMetricsProps) {
   const reduced = usePrefersReducedMotion();
   const totalStat = totals.total;
@@ -77,7 +80,10 @@ export function GeekHeroMetrics({
 
       {/* 数据状态 */}
       <div className="geek-data-status">
-        <StatusCell label="WORKSPACE / TZ" value={`Personal · ${timezone}`} />
+        <StatusCell
+          label="WORKSPACE / TZ"
+          value={`${workspaceName} · ${timezone}`}
+        />
         <StatusCell label="LAST RECEIVED" value="—" />
         <StatusCell label="COVERAGE" value="—" />
       </div>

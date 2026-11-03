@@ -91,8 +91,8 @@ function useBackend(opts?: {
     http.get("/api/v1/auth/session", () =>
       HttpResponse.json(sessionBody("a@example.com", "2999-01-01T00:00:00Z")),
     ),
-    http.get("/api/v1/workspaces/current", () =>
-      HttpResponse.json({ workspace_id: WS, name: "Personal" }),
+    http.get("/api/v1/workspaces", () =>
+      HttpResponse.json([{ workspace_id: WS, name: "Alpha" }]),
     ),
     http.get(`${BASE}/usage/options`, () =>
       HttpResponse.json({ providers: ["anthropic", "other"], models: ["m1"] }),
