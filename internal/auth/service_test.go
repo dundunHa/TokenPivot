@@ -29,6 +29,10 @@ type fakeStore struct {
 	registrations []string
 	// nextID is the identity assigned to the next created account.
 	nextID ID
+	// feishuIdentities maps a Feishu open_id to the account bound to it.
+	feishuIdentities map[string]User
+	// identities records the binding written for each account.
+	identities map[ID]FeishuIdentity
 
 	errCredential   error
 	errCreate       error
@@ -37,6 +41,8 @@ type fakeStore struct {
 	errCreateSess   error
 	errAuthenticate error
 	errRevoke       error
+	errFeishuLookup error
+	errFeishuUpsert error
 	createCalls     int
 	hasUsersCalls   int
 	lockCalls       int
@@ -51,8 +57,10 @@ type fakeSession struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		users:    make(map[string]Credential),
-		sessions: make(map[string]fakeSession),
+		users:            make(map[string]Credential),
+		sessions:         make(map[string]fakeSession),
+		feishuIdentities: make(map[string]User),
+		identities:       make(map[ID]FeishuIdentity),
 	}
 }
 
@@ -67,6 +75,79 @@ func (f *fakeStore) seedUser(email, password string) User {
 	user := User{ID: f.identifier(), Email: email}
 	f.users[email] = Credential{User: user, PasswordHash: hash}
 	return user
+}
+
+// seedFeishuUser inserts an account that has no local password, as the Feishu
+// callback creates it.
+func (f *fakeStore) seedFeishuUser(email string) User {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	user := User{ID: f.identifier(), Email: email}
+	f.users[email] = Credential{User: user}
+	return user
+}
+
+// seedFeishuBinding binds an open_id to an existing account.
+func (f *fakeStore) seedFeishuBinding(openID string, user User) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.feishuIdentities[openID] = user
+	f.identities[user.ID] = FeishuIdentity{OpenID: openID, Email: user.Email}
+}
+
+// UserByFeishuOpenID reports the account bound to an open_id.
+func (f *fakeStore) UserByFeishuOpenID(ctx context.Context, openID string) (User, bool, error) {
+	if f.errFeishuLookup != nil {
+		return User{}, false, f.errFeishuLookup
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	user, ok := f.feishuIdentities[openID]
+	return user, ok, nil
+}
+
+// CreateFeishuUser inserts an account without a local password.
+func (f *fakeStore) CreateFeishuUser(ctx context.Context, email string) (User, error) {
+	f.createCalls++
+	f.recordRegistration("feishu_user")
+	if f.errCreate != nil {
+		return User{}, f.errCreate
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.users[email]; exists {
+		return User{}, ErrEmailUnavailable
+	}
+	user := User{ID: f.identifier(), Email: email}
+	f.users[email] = Credential{User: user}
+	f.hashes = append(f.hashes, "")
+	return user, nil
+}
+
+// UpsertFeishuIdentity writes the binding once per (user, provider) and reports
+// an open_id already owned by another account.
+func (f *fakeStore) UpsertFeishuIdentity(ctx context.Context, userID ID, identity FeishuIdentity) error {
+	f.recordRegistration("identity")
+	if f.errFeishuUpsert != nil {
+		return f.errFeishuUpsert
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if owner, exists := f.feishuIdentities[identity.OpenID]; exists && owner.ID != userID {
+		return ErrFeishuIdentityConflict
+	}
+	var user User
+	for _, credential := range f.users {
+		if credential.User.ID == userID {
+			user = credential.User
+			break
+		}
+	}
+	if user.ID != (ID{}) {
+		f.feishuIdentities[identity.OpenID] = user
+	}
+	f.identities[userID] = identity
+	return nil
 }
 
 // identifier produces a deterministic distinct uuid for each fake account.
@@ -477,6 +558,21 @@ func TestLoginHidesWhetherAccountExists(t *testing.T) {
 	}
 	if _, err := service.Login(context.Background(), "synthetic@example.com", "synthetic-wrong-password", "127.0.0.1"); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("wrong password returned %v", err)
+	}
+}
+
+// TestLoginRefusesPasswordlessAccountAsWrongPassword proves an account created by
+// Feishu, which stores no local password, cannot be signed in with a password and
+// is indistinguishable from an account that simply has a different password.
+func TestLoginRefusesPasswordlessAccountAsWrongPassword(t *testing.T) {
+	service, store, _, _ := newTestService(t)
+	store.seedFeishuUser("feishu-only@example.com")
+	_, err := service.Login(context.Background(), "feishu-only@example.com", "synthetic-password", "127.0.0.1")
+	if !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("passwordless login error = %v, want ErrInvalidCredentials", err)
+	}
+	if len(store.sessions) != 0 {
+		t.Fatal("a passwordless account received a session")
 	}
 }
 
