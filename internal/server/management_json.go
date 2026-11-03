@@ -19,11 +19,30 @@ const maxManagementLabelBytes = 128
 
 // readManagementBody enforces the media type, the 16 KiB limit and the strict
 // JSON rules for the project and source request bodies, then returns the decoded
-// string fields. Only the names in allowed are known keys; the names in required
-// must be present, and when required is empty at least one field must be. Each
-// value must pass validManagementLabel. Messages are fixed and never repeat a
-// request value.
+// string fields. Each value must pass validManagementLabel, so the project and
+// source rules are unchanged. Messages are fixed and never repeat a request
+// value.
 func readManagementBody(w http.ResponseWriter, r *http.Request, allowed, required []string) (map[string]string, bool) {
+	fields, ok := readStrictManagementFields(w, r, allowed, required)
+	if !ok {
+		return nil, false
+	}
+	for _, value := range fields {
+		if !validManagementLabel(value) {
+			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "a field value is not acceptable")
+			return nil, false
+		}
+	}
+	return fields, true
+}
+
+// readStrictManagementFields enforces the media type, the 16 KiB limit and the
+// strict JSON rules shared by the management bodies, then returns the decoded
+// string fields. Only the names in allowed are known keys; the names in required
+// must be present, and when required is empty at least one field must be. It
+// applies no per-field value rule: callers validate the values with the rule
+// their resource documents.
+func readStrictManagementFields(w http.ResponseWriter, r *http.Request, allowed, required []string) (map[string]string, bool) {
 	if !isJSONContentType(r.Header.Get("Content-Type")) {
 		writeError(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "content type must be application/json")
 		return nil, false
@@ -60,12 +79,6 @@ func readManagementBody(w http.ResponseWriter, r *http.Request, allowed, require
 	if len(required) == 0 && len(fields) == 0 {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "at least one field is required")
 		return nil, false
-	}
-	for _, value := range fields {
-		if !validManagementLabel(value) {
-			writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "a field value is not acceptable")
-			return nil, false
-		}
 	}
 	return fields, true
 }

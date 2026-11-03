@@ -48,7 +48,7 @@ func newDetailsFixture(t *testing.T) (*usageFixture, *detailsFakeStore) {
 	handler := NewHandler(Options{
 		CheckReady:     func(context.Context) error { return nil },
 		Auth:           adapter,
-		RequestDetails: NewRequestDetails(requestdetails.New(store), workspaces.New(roles)),
+		RequestDetails: NewRequestDetails(requestdetails.New(store), workspaces.New(roles, nil)),
 	})
 	login := httptest.NewRequest(http.MethodPost, loginPath, strings.NewReader(`{"email":"reader@example.com","password":"synthetic-password"}`))
 	login.Header.Set("Content-Type", "application/json")
