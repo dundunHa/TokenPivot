@@ -203,10 +203,17 @@ func newPool(t *testing.T, value string) *pgxpool.Pool {
 	return pool
 }
 
+// insertWorkspace inserts one synthetic account and a workspace that account
+// created, so the required creator column holds a real users row.
 func insertWorkspace(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name string) ID {
 	t.Helper()
+	var createdBy ID
+	if err := pool.QueryRow(ctx, "INSERT INTO users (email, password_hash) VALUES ($1,$2) RETURNING id",
+		fmt.Sprintf("seed-%s@example.test", rand.Text()), "synthetic-encoding").Scan(&createdBy); err != nil {
+		t.Fatal(database.SafeError("insert workspace creator", err))
+	}
 	var id ID
-	if err := pool.QueryRow(ctx, "INSERT INTO workspaces (name) VALUES ($1) RETURNING id", name).Scan(&id); err != nil {
+	if err := pool.QueryRow(ctx, "INSERT INTO workspaces (created_by_user_id, name) VALUES ($1,$2) RETURNING id", createdBy, name).Scan(&id); err != nil {
 		t.Fatal(database.SafeError("insert workspace", err))
 	}
 	return id
