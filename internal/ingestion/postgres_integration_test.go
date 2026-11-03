@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -254,6 +255,42 @@ func (e *integrationEnv) pool(t *testing.T) *pgxpool.Pool {
 func (e *integrationEnv) service(t *testing.T, pool *pgxpool.Pool, logs *syncBuffer) *Service {
 	t.Helper()
 	return New(NewPostgres(pool), &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+}
+
+// countingPool opens one single-connection service pool whose dialer counts the
+// requests written on that socket, so a test can assert how many network round trips
+// one item transaction costs.
+func (e *integrationEnv) countingPool(t *testing.T, counter *roundTripCounter) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(e.appURL)
+	if err != nil {
+		t.Fatal(database.SafeError("parse app URL", err))
+	}
+	if config.ConnConfig.TLSConfig != nil {
+		t.Fatal("round trip counting needs a plaintext test connection")
+	}
+	// One connection keeps the counter attributable to one item transaction; a health
+	// check would add a request of its own, so it is pushed past the test's lifetime.
+	config.MaxConns = 1
+	config.MinConns = 0
+	config.MinIdleConns = 0
+	config.MaxConnLifetime = time.Hour
+	config.MaxConnIdleTime = time.Hour
+	config.HealthCheckPeriod = time.Hour
+	dialer := &net.Dialer{Timeout: database.ConnectTimeout}
+	config.ConnConfig.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &roundTripCountingConn{Conn: conn, counter: counter}, nil
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(database.SafeError("open counting pool", err))
+	}
+	t.Cleanup(pool.Close)
+	return pool
 }
 
 // syncBuffer is a goroutine-safe log sink.
@@ -1255,6 +1292,287 @@ func TestLockWaitCrossesLowerBoundInsideMinute(t *testing.T) {
 	if bucket.eventCount != 1 || bucket.sum[0] != 100 {
 		t.Fatalf("bucket=%+v want the unchanged seed event_count=1 input=100", bucket)
 	}
+}
+
+// TestBatchPipelineSamplesClockAfterLockWait drives the real pipelined statements
+// with no scripted clock: the second statement of each write must observe the
+// database server time after a lock wait released, and that value is cached for the
+// window re-check that follows. A sample taken while the write was still blocked is
+// therefore a lower bound the cached value may never undercut.
+func TestBatchPipelineSamplesClockAfterLockWait(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	store := NewPostgres(pool)
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	t.Run("pipelined statements keep their results", func(t *testing.T) {
+		service := e.service(t, pool, &syncBuffer{})
+		conflict := fmt.Sprintf(`{"source_event_id":"evt-batch-new","project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			uuidText(projectID), occurredAt.UTC().Format(microLayout))
+		results := runBatch(t, service, credential, encodedBatch(t,
+			acceptedEventJSON("evt-batch-new", occurredAt, projectID),
+			conflict,
+			acceptedEventJSON("evt-batch-new", occurredAt, projectID),
+		))
+		requireResultStatuses(t, results, statusAccepted, statusConflict, statusDuplicate)
+		if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-batch-new"); count != 1 {
+			t.Fatalf("rows=%d want=1", count)
+		}
+		bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		if bucket.eventCount != 1 || bucket.sum[0] != 100 {
+			t.Fatalf("bucket=%+v want one count of 100", bucket)
+		}
+	})
+
+	t.Run("insert samples the clock after the identity lock", func(t *testing.T) {
+		observer := e.probeConn(t)
+		item := beginItem(t, ctx, store)
+		defer rollbackItem(t, ctx, item)
+		postgresItem, ok := item.(*postgresTx)
+		if !ok {
+			t.Fatal("NewPostgres did not return its own item transaction")
+		}
+		event := mustDecodeEvent(t, acceptedEventJSON("evt-batch-insert", occurredAt, projectID))
+
+		receivedAt, window, err := sampleWindow(ctx, item, event)
+		if err != nil || window != verdictValid {
+			t.Fatalf("initial window err=%v verdict=%v want valid", err, window)
+		}
+		exists, err := item.ProjectExists(ctx, credential.WorkspaceID, event.ProjectID)
+		if err != nil || !exists {
+			t.Fatalf("project exists=%v err=%v want true", exists, err)
+		}
+
+		release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
+			holdIdentityLock(t, ctx, tx, workspaceID, sourceID, "evt-batch-insert", receivedAt)
+		})
+		done := make(chan error, 1)
+		go func() {
+			_, insertErr := item.InsertEvent(ctx, storedEventFor(credential, event, receivedAt))
+			done <- insertErr
+		}()
+		waitForWaitingBackend(t, ctx, observer)
+		blocked := e.serverTime(t, ctx, observer)
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("blocked insert failed: %v", err)
+		}
+		sampled := postgresItem.sampledNow
+		if sampled == nil || sampled.err != nil {
+			t.Fatalf("insert cached sample=%+v want the pipelined server time", sampled)
+		}
+		if sampled.at.Before(blocked) {
+			t.Fatalf("sampled %s is earlier than the server time %s read while the insert was blocked", sampled.at, blocked)
+		}
+		now, err := item.Now(ctx)
+		if err != nil || !now.Equal(sampled.at) {
+			t.Fatalf("following sample now=%s err=%v want the cached %s", now, err, sampled.at)
+		}
+	})
+
+	t.Run("minute increment samples the clock after the bucket lock", func(t *testing.T) {
+		observer := e.probeConn(t)
+		seed := e.service(t, pool, &syncBuffer{})
+		requireResultStatuses(t, runBatch(t, seed, credential, encodedBatch(t,
+			acceptedEventJSON("evt-batch-minute-seed", occurredAt, projectID),
+		)), statusAccepted)
+
+		item := beginItem(t, ctx, store)
+		defer rollbackItem(t, ctx, item)
+		postgresItem, ok := item.(*postgresTx)
+		if !ok {
+			t.Fatal("NewPostgres did not return its own item transaction")
+		}
+		event := mustDecodeEvent(t, acceptedEventJSON("evt-batch-minute", occurredAt, projectID))
+
+		release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
+			holdMinuteLock(t, ctx, tx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		})
+		done := make(chan error, 1)
+		go func() {
+			done <- item.ApplyMinute(ctx, minuteInputFor(credential, event))
+		}()
+		waitForWaitingBackend(t, ctx, observer)
+		blocked := e.serverTime(t, ctx, observer)
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("blocked minute increment failed: %v", err)
+		}
+		sampled := postgresItem.sampledNow
+		if sampled == nil || sampled.err != nil {
+			t.Fatalf("minute increment cached sample=%+v want the pipelined server time", sampled)
+		}
+		if sampled.at.Before(blocked) {
+			t.Fatalf("sampled %s is earlier than the server time %s read while the increment was blocked", sampled.at, blocked)
+		}
+		now, err := item.Now(ctx)
+		if err != nil || !now.Equal(sampled.at) {
+			t.Fatalf("following sample now=%s err=%v want the cached %s", now, err, sampled.at)
+		}
+	})
+
+	// The window verdict is decided by the first sample, which is a statement of its
+	// own, so an expired or future event never reaches the ownership query. That
+	// ordering is covered by TestExpiryPrecedesAnyIdentityLookup.
+
+	// The first sample and the ownership query are separate statements, so an item
+	// costs one round trip more when it carries a project. The counts are identical
+	// on a cold connection and on a warm one, because every statement is sent as an
+	// unnamed extended-protocol message with a single Sync instead of being prepared
+	// first.
+	t.Run("cold and warm connections use five round trips without project and six with project", func(t *testing.T) {
+		conflictWithProject := fmt.Sprintf(`{"source_event_id":"evt-rtt-new","project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			uuidText(projectID), occurredAt.UTC().Format(microLayout))
+
+		// With a project: begin, first sample, ownership query, insert with its clock
+		// sample, minute increment or comparison read with its clock sample, and the
+		// end of the transaction are six round trips.
+		projectService, projectCounter := e.countedService(t)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "cold accepted item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusAccepted)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm accepted item",
+			acceptedEventJSON("evt-rtt-warm", occurredAt, projectID), statusAccepted)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm duplicate item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusDuplicate)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm conflict item",
+			conflictWithProject, statusConflict)
+
+		// A cold duplicate and a cold conflict are measured on their own connections.
+		// The identity is already stored by the previous service, so the insert
+		// conflicts and the comparison read replaces the aggregation write, but the
+		// number of round trips stays the same.
+		coldDuplicateService, coldDuplicateCounter := e.countedService(t)
+		requireItemRoundTrips(t, coldDuplicateService, coldDuplicateCounter, credential, 6, "cold duplicate item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusDuplicate)
+		coldConflictService, coldConflictCounter := e.countedService(t)
+		requireItemRoundTrips(t, coldConflictService, coldConflictCounter, credential, 6, "cold conflict item",
+			conflictWithProject, statusConflict)
+
+		// Without a project: the ownership query is skipped, so every path costs one
+		// round trip less.
+		bareConflict := fmt.Sprintf(`{"source_event_id":"evt-rtt-bare","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			occurredAt.UTC().Format(microLayout))
+		bareService, bareCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "cold accepted item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusAccepted)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm accepted item without project",
+			acceptedEventJSON("evt-rtt-bare-warm", occurredAt, pgtype.UUID{}), statusAccepted)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm duplicate item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusDuplicate)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm conflict item without project",
+			bareConflict, statusConflict)
+
+		bareColdDuplicateService, bareColdDuplicateCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareColdDuplicateService, bareColdDuplicateCounter, credential, 5, "cold duplicate item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusDuplicate)
+		bareColdConflictService, bareColdConflictCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareColdConflictService, bareColdConflictCounter, credential, 5, "cold conflict item without project",
+			bareConflict, statusConflict)
+	})
+}
+
+// requireItemRoundTrips runs one item transaction on a counted service and asserts both
+// its status and its exact number of network round trips. One item transaction owns the
+// single pooled connection for its whole lifetime, so a counter reset belongs to
+// exactly one of them.
+func requireItemRoundTrips(t *testing.T, service *Service, counter *roundTripCounter, credential credentials.Credential, wantRounds int64, label, eventJSON, wantStatus string) {
+	t.Helper()
+	event := mustDecodeEvent(t, eventJSON)
+	counter.reset()
+	got := service.processItem(context.Background(), credential, event, time.Time{})
+	rounds := counter.value()
+	if got.status != wantStatus {
+		t.Fatalf("%s status=%s code=%s want=%s", label, got.status, got.code, wantStatus)
+	}
+	if rounds != wantRounds {
+		t.Fatalf("%s round trips=%d want=%d", label, rounds, wantRounds)
+	}
+}
+
+// countedService returns a service on a single-connection pool whose requests are
+// counted, with the connection already established and idle. The startup exchange is
+// therefore never part of a measured item transaction, and the next item transaction
+// is the cold one.
+func (e *integrationEnv) countedService(t *testing.T) (*Service, *roundTripCounter) {
+	t.Helper()
+	counter := &roundTripCounter{}
+	countingPool := e.countingPool(t, counter)
+	conn, err := countingPool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(database.SafeError("acquire counting connection", err))
+	}
+	conn.Release()
+	return e.service(t, countingPool, &syncBuffer{}), counter
+}
+
+// roundTripCounter counts the client to server requests written on the sockets of one
+// pool. The pool under measurement holds a single connection, so the count is the
+// number of network round trips of one item transaction.
+type roundTripCounter struct {
+	requests atomic.Int64
+}
+
+// reset starts a new measurement. The socket state is left alone: the next write
+// still has to follow the previous response to be counted as a new request.
+func (c *roundTripCounter) reset() { c.requests.Store(0) }
+
+func (c *roundTripCounter) value() int64 { return c.requests.Load() }
+
+// roundTripCountingConn counts one request for every write that begins after the
+// previous response was read. pgx writes one buffer per request, so one counted write
+// is one network round trip.
+type roundTripCountingConn struct {
+	net.Conn
+	counter     *roundTripCounter
+	lastWasRead atomic.Bool
+}
+
+func (c *roundTripCountingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.lastWasRead.Store(true)
+	}
+	return n, err
+}
+
+func (c *roundTripCountingConn) Write(p []byte) (int, error) {
+	if c.lastWasRead.CompareAndSwap(true, false) {
+		c.counter.requests.Add(1)
+	}
+	return c.Conn.Write(p)
+}
+
+// beginItem opens one real item transaction on the test goroutine.
+func beginItem(t *testing.T, ctx context.Context, store *Postgres) itemTx {
+	t.Helper()
+	item, err := store.BeginItem(ctx)
+	if err != nil {
+		t.Fatal(database.SafeError("begin item", err))
+	}
+	return item
+}
+
+// rollbackItem discards an item transaction that must never commit.
+func rollbackItem(t *testing.T, ctx context.Context, item itemTx) {
+	t.Helper()
+	if err := item.Rollback(ctx); err != nil {
+		t.Error(database.SafeError("rollback item", err))
+	}
+}
+
+// serverTime reads the server clock on the observation connection, so a test can
+// record a lower bound for a sample taken by another transaction.
+func (e *integrationEnv) serverTime(t *testing.T, ctx context.Context, observer *pgx.Conn) time.Time {
+	t.Helper()
+	var now time.Time
+	if err := observer.QueryRow(ctx, nowQuery).Scan(&now); err != nil {
+		t.Fatal(database.SafeError("sample server time", err))
+	}
+	return now
 }
 
 // hookStore wraps the real store and lets a test act at one exact point of the item
