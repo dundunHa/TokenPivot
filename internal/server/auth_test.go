@@ -138,11 +138,6 @@ func (f *authFakeStore) CreateUser(ctx context.Context, email, passwordHash stri
 	return user, nil
 }
 
-func (f *authFakeStore) CreatePersonal(ctx context.Context, userID auth.ID) error {
-	f.record("CreatePersonal")
-	return nil
-}
-
 func (f *authFakeStore) CreateSession(ctx context.Context, userID auth.ID, tokenHash []byte) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

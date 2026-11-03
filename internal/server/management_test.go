@@ -212,7 +212,7 @@ func newManagementFixture(t *testing.T) *managementFixture {
 		defer credStore.mu.Unlock()
 		credStore.archived[id.Bytes] = true
 	}}
-	memberships := workspaces.New(roles)
+	memberships := workspaces.New(roles, nil)
 	service := credentials.New(credStore)
 	handler := NewHandler(Options{
 		Auth:        adapter,
@@ -654,7 +654,7 @@ func TestSourceLifecycleAndArchiveBlocksCredentials(t *testing.T) {
 
 func TestManagementRoutesFailClosed(t *testing.T) {
 	adapter, _ := newTestAuth(t)
-	memberships := workspaces.New(newRoleFakeStore())
+	memberships := workspaces.New(newRoleFakeStore(), nil)
 	projectService := projects.New(&projectFakeStore{})
 	sourceService := sources.New(&sourceFakeStore{})
 	cases := map[string]Options{

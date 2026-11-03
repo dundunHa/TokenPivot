@@ -3,9 +3,11 @@
 -- +goose Up
 CREATE TABLE workspaces (
     id uuid PRIMARY KEY DEFAULT uuidv7(),
-    name text NOT NULL,
+    created_by_user_id uuid NOT NULL,
+    name text COLLATE "C" NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX uk_workspaces_created_by_user_id_name ON workspaces (created_by_user_id, name);
 CREATE TABLE projects (
     id uuid PRIMARY KEY DEFAULT uuidv7(),
     workspace_id uuid NOT NULL,
@@ -35,6 +37,8 @@ CREATE TABLE ingest_credentials (
 CREATE UNIQUE INDEX uk_ingest_credentials_secret_hash ON ingest_credentials (secret_hash);
 CREATE INDEX idx_ingest_credentials_workspace_id_source_id ON ingest_credentials (workspace_id, source_id);
 COMMENT ON TABLE workspaces IS 'Workspace tenancy root. Every other row is scoped to exactly one workspace.';
+COMMENT ON COLUMN workspaces.created_by_user_id IS 'Account that created the workspace. Counts toward that account''s creation quota and scopes the unique name; never grants a role.';
+COMMENT ON COLUMN workspaces.name IS 'Display name, trimmed by the application and compared bytewise under the C collation.';
 COMMENT ON TABLE projects IS 'Projects own usage attribution inside a workspace. Archiving keeps the project key reserved.';
 COMMENT ON TABLE sources IS 'Stable plugin instance identity per workspace. One row spans credential rotations and revocations.';
 COMMENT ON TABLE ingest_credentials IS 'Ingest credentials stored only as a SHA-256 digest. Revoked rows are kept for rotation history.';

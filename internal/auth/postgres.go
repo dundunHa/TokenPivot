@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/dundunHa/TokenPivot/internal/database"
-	"github.com/dundunHa/TokenPivot/internal/workspaces"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -70,12 +69,12 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 }
 
 // InTx runs fn inside one explicit READ COMMITTED transaction. The store passed
-// to fn is bound to that transaction, so the account, personal workspace, owner
-// membership and first session it writes commit or roll back as one unit. The
-// isolation level is spelled out because the closed-registration path relies on
-// READ COMMITTED: the statements after a lock wait take a fresh snapshot and see
-// the user that the previous lock holder committed. A nil function result
-// commits; any error rolls back and is returned as the caller supplied it.
+// to fn is bound to that transaction, so the account and its first session it
+// writes commit or roll back as one unit. The isolation level is spelled out
+// because the closed-registration path relies on READ COMMITTED: the statements
+// after a lock wait take a fresh snapshot and see the user that the previous lock
+// holder committed. A nil function result commits; any error rolls back and is
+// returned as the caller supplied it.
 func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, RegistrationStore) error) error {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
@@ -86,7 +85,7 @@ func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, Registrati
 		// is expected and deliberately ignored.
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
-	if err := fn(ctx, &registrationTxStore{sqlStore: &sqlStore{q: tx}, workspaces: workspaces.NewTx(tx)}); err != nil {
+	if err := fn(ctx, &registrationTxStore{sqlStore: &sqlStore{q: tx}}); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -96,12 +95,11 @@ func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, Registrati
 }
 
 // registrationTxStore is the transaction-bound registration store. It answers the
-// account and session statements through the shared sqlStore on this transaction
-// and reaches personal workspace creation through the workspaces transaction
-// adapter, so the order and the SQL of that step stay owned by internal/workspaces.
+// account and session statements through the shared sqlStore on this transaction;
+// it writes nothing else, so registration cannot create a workspace or a
+// membership.
 type registrationTxStore struct {
 	*sqlStore
-	workspaces *workspaces.Tx
 }
 
 // CreateUser inserts the account and returns the identity the database assigned.
@@ -113,16 +111,6 @@ func (s *registrationTxStore) CreateUser(ctx context.Context, email, passwordHas
 	}
 	user.ID = id
 	return user, nil
-}
-
-// CreatePersonal creates the user's initial personal workspace and owner
-// membership in this same transaction. The returned workspace is not part of the
-// registration response, so it is dropped here instead of being exposed.
-func (s *registrationTxStore) CreatePersonal(ctx context.Context, userID ID) error {
-	if _, err := s.workspaces.CreatePersonal(ctx, workspaces.ID{Bytes: userID, Valid: true}); err != nil {
-		return err
-	}
-	return nil
 }
 
 // LockRegistration takes the exclusive transactional registration lock and holds

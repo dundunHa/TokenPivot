@@ -39,8 +39,8 @@ function useBackend(opts?: { aggregate?: () => Response | Promise<Response> }) {
     http.get(SESSION, () =>
       HttpResponse.json(sessionBody("a@example.com", "2999-01-01T00:00:00Z")),
     ),
-    http.get("/api/v1/workspaces/current", () =>
-      HttpResponse.json({ workspace_id: WS, name: "Personal" }),
+    http.get("/api/v1/workspaces", () =>
+      HttpResponse.json([{ workspace_id: WS, name: "Alpha" }]),
     ),
     http.get(`${BASE}/usage/options`, () =>
       HttpResponse.json({ providers: ["anthropic"], models: ["m1"] }),

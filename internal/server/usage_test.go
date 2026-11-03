@@ -58,10 +58,9 @@ func newUsageFixture(t *testing.T) *usageFixture {
 	roles := newRoleFakeStore()
 	store := &usageFakeStore{}
 	handler := NewHandler(Options{
-		CheckReady:       func(context.Context) error { return nil },
-		Auth:             adapter,
-		Usage:            NewUsage(usage.New(store), workspaces.New(roles)),
-		CurrentWorkspace: NewCurrentWorkspace(workspaces.New(roles)),
+		CheckReady: func(context.Context) error { return nil },
+		Auth:       adapter,
+		Usage:      NewUsage(usage.New(store), workspaces.New(roles, nil)),
 	})
 	login := httptest.NewRequest(http.MethodPost, loginPath, strings.NewReader(`{"email":"reader@example.com","password":"synthetic-password"}`))
 	login.Header.Set("Content-Type", "application/json")
@@ -343,8 +342,8 @@ func TestUsageRoutesAbsentWithoutDependencies(t *testing.T) {
 	roles := newRoleFakeStore()
 	path := "/api/v1/workspaces/" + idWithByte(1).String() + "/usage/aggregate?" + validAggregateQuery
 	handlers := map[string]http.Handler{
-		"no auth":       NewHandler(Options{Usage: NewUsage(usage.New(&usageFakeStore{}), workspaces.New(roles))}),
-		"no service":    NewHandler(Options{Auth: adapter, Usage: NewUsage(nil, workspaces.New(roles))}),
+		"no auth":       NewHandler(Options{Usage: NewUsage(usage.New(&usageFakeStore{}), workspaces.New(roles, nil))}),
+		"no service":    NewHandler(Options{Auth: adapter, Usage: NewUsage(nil, workspaces.New(roles, nil))}),
 		"no membership": NewHandler(Options{Auth: adapter, Usage: NewUsage(usage.New(&usageFakeStore{}), nil)}),
 		"no usage":      NewHandler(Options{Auth: adapter}),
 	}

@@ -36,7 +36,7 @@ export function aggregateQuery(
       query,
     ] as const,
     queryFn: ({ signal }) => fetchAggregate(scope.workspaceId, query, signal),
-    meta: { userId: scope.userId },
+    meta: { userId: scope.userId, workspaceId: scope.workspaceId },
   });
 }
 
@@ -57,7 +57,7 @@ export function rankingsQuery(
       query,
     ] as const,
     queryFn: ({ signal }) => fetchRankings(scope.workspaceId, query, signal),
-    meta: { userId: scope.userId },
+    meta: { userId: scope.userId, workspaceId: scope.workspaceId },
   });
 }
 
@@ -70,7 +70,7 @@ export function projectsQuery(scope: QueryScope) {
       scope.workspaceId,
     ] as const,
     queryFn: ({ signal }) => fetchProjects(scope.workspaceId, signal),
-    meta: { userId: scope.userId },
+    meta: { userId: scope.userId, workspaceId: scope.workspaceId },
   });
 }
 

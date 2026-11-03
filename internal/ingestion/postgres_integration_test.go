@@ -274,12 +274,26 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
+// seedCreator inserts one synthetic account that owns a seeded workspace, so the
+// required creator column holds a real users row.
+func (e *integrationEnv) seedCreator(t *testing.T, ctx context.Context) pgtype.UUID {
+	t.Helper()
+	var id pgtype.UUID
+	if err := e.owner.QueryRow(ctx, "INSERT INTO users (email, password_hash) VALUES ($1,$2) RETURNING id",
+		"seed-"+hex.EncodeToString(randomBytes(t, 8))+"@example.test", "synthetic-encoding").Scan(&id); err != nil {
+		t.Fatal(database.SafeError("seed workspace creator", err))
+	}
+	return id
+}
+
 // seedSource creates one workspace and one source and returns their identities.
 func (e *integrationEnv) seedSource(t *testing.T, ctx context.Context) (pgtype.UUID, pgtype.UUID) {
 	t.Helper()
 	workspaceID := newIntegrationID(t)
 	sourceID := newIntegrationID(t)
-	if _, err := e.owner.Exec(ctx, "INSERT INTO workspaces (id, name) VALUES ($1,$2)", workspaceID, "synthetic workspace"); err != nil {
+	createdBy := e.seedCreator(t, ctx)
+	if _, err := e.owner.Exec(ctx, "INSERT INTO workspaces (id, created_by_user_id, name) VALUES ($1,$2,$3)",
+		workspaceID, createdBy, "synthetic workspace"); err != nil {
 		t.Fatal(database.SafeError("seed workspace", err))
 	}
 	if _, err := e.owner.Exec(ctx, "INSERT INTO sources (id, workspace_id, platform, instance_key) VALUES ($1,$2,$3,$4)",
@@ -548,7 +562,9 @@ func TestBatchMixedItemsIsolateFailures(t *testing.T) {
 func (e *integrationEnv) newWorkspace(t *testing.T, ctx context.Context) pgtype.UUID {
 	t.Helper()
 	workspaceID := newIntegrationID(t)
-	if _, err := e.owner.Exec(ctx, "INSERT INTO workspaces (id, name) VALUES ($1,$2)", workspaceID, "synthetic other workspace"); err != nil {
+	createdBy := e.seedCreator(t, ctx)
+	if _, err := e.owner.Exec(ctx, "INSERT INTO workspaces (id, created_by_user_id, name) VALUES ($1,$2,$3)",
+		workspaceID, createdBy, "synthetic other workspace"); err != nil {
 		t.Fatal(database.SafeError("seed other workspace", err))
 	}
 	return workspaceID

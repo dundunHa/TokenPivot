@@ -7,6 +7,7 @@
 ```mermaid
 erDiagram
   users ||--o{ workspace_memberships : joins
+  users ||--o{ workspaces : creates
   workspaces ||--o{ workspace_memberships : contains
   workspaces ||--o{ projects : owns
   workspaces ||--o{ sources : owns
@@ -20,15 +21,15 @@ erDiagram
 
 ## 2. 公共约定
 
-ID 用 UUID v7，由数据库默认值 `uuidv7()` 生成，写入后用 `RETURNING id` 取回，因此服务端最低版本为 **PostgreSQL 18**（该函数自 18 起内置）。机器标识列（`project_key`、`platform`、`instance_key`）使用 `COLLATE "C"`，按字节排序和判等，不随数据库 locale 与系统排序库版本变化；`name` 一类展示用列沿用数据库默认排序规则。时间为 timestamptz，存 UTC。Token 和计数用 bigint，禁止浮点存用量。业务字符串用 text；摘要值等二进制值用 bytea。必填默认 NOT NULL，可空字段逐项说明理由。数值范围、负数、溢出、引用与状态由应用层验证。索引命名规则：唯一索引 `uk_<表>_<列>`，普通索引 `idx_<表>_<列>`，主键索引用数据库默认名 `<表>_pkey`。字段名是设计建议，不是已发布接口。
+ID 用 UUID v7，由数据库默认值 `uuidv7()` 生成，写入后用 `RETURNING id` 取回，因此服务端最低版本为 **PostgreSQL 18**（该函数自 18 起内置）。机器标识列（`project_key`、`platform`、`instance_key`）与 `workspaces.name` 使用 `COLLATE "C"`，按字节排序和判等，不随数据库 locale 与系统排序库版本变化；其余展示用列（如 `projects.name`）沿用数据库默认排序规则。时间为 timestamptz，存 UTC。Token 和计数用 bigint，禁止浮点存用量。业务字符串用 text；摘要值等二进制值用 bytea。必填默认 NOT NULL，可空字段逐项说明理由。数值范围、负数、溢出、引用与状态由应用层验证。索引命名规则：唯一索引 `uk_<表>_<列>`，普通索引 `idx_<表>_<列>`，主键索引用数据库默认名 `<表>_pkey`。字段名是设计建议，不是已发布接口。
 
 ## 3. 核心实体与访问路径
 
 | 实体 | 核心字段/类型 | 唯一性与读写路径 |
 |---|---|---|
 | users | id uuid（默认 `uuidv7()`）；email text（`COLLATE "C"`，已规范化）；password_hash text（Argon2id 编码）；created_at timestamptz（默认 `now()`） | `uk_users_email` UNIQUE `(email)`；只存 TrimSpace + 小写后的规范化邮箱，按字节判等；不预建 `email_verified_at`：初期没有读写方，T-018 若恢复邮箱验证再以新迁移增加 |
-| workspaces | id uuid（默认 `uuidv7()`）；name text；created_at timestamptz（默认 `now()`） | 只有主键；name 不唯一，非空与长度由应用校验；成员列表按 workspace 关联查询 |
-| workspace_memberships | workspace_id/user_id uuid；role text；joined_at timestamptz（默认 `now()`） | `uk_workspace_memberships_workspace_id_user_id` UNIQUE `(workspace_id,user_id)`：同一用户对同一空间只能有一条成员关系，其 `workspace_id` 前缀同时支持按空间查成员；`idx_workspace_memberships_user_id` `(user_id)` 支持个人空间创建时查该用户已建立的 owner 空间；**不**对 `user_id` 单独建唯一索引，一个用户可属于多个空间。role 只用 text：owner/member，本期唯一写路径固定写 owner |
+| workspaces | id uuid（默认 `uuidv7()`）；created_by_user_id uuid；name text（`COLLATE "C"`）；created_at timestamptz（默认 `now()`） | `uk_workspaces_created_by_user_id_name` UNIQUE `(created_by_user_id,name)`：同账户名称精确唯一，索引前缀同时支持按创建者计数额度；`created_by_user_id` 不加外键，只用于额度与重名判定，不参与角色授权；name 非空、1–80 code point、≤256 字节 UTF-8、无控制字符由应用校验，大小写敏感且不做 Unicode 规范化；列表按成员关系 join 后以 `name COLLATE "C" ASC, id ASC` 排序 |
+| workspace_memberships | workspace_id/user_id uuid；role text；joined_at timestamptz（默认 `now()`） | `uk_workspace_memberships_workspace_id_user_id` UNIQUE `(workspace_id,user_id)`：同一用户对同一空间只能有一条成员关系，其 `workspace_id` 前缀同时支持按空间查成员；`idx_workspace_memberships_user_id` `(user_id)` 支持按用户列出其加入的工作空间；**不**对 `user_id` 单独建唯一索引，一个用户可属于多个空间。role 只用 text：owner/member，创建事务写 owner，member 只读且本期没有写入入口 |
 | projects | id/workspace_id uuid；project_key text（`COLLATE "C"`）；name text；archived_at timestamptz 可空；created_at timestamptz（默认 `now()`） | `uk_projects_workspace_id_project_key` UNIQUE `(workspace_id,project_key)`；唯一索引以 workspace_id 开头，兼作 workspace_id 引用索引并支持按空间列举。归档后 key 仍被占用（不用部分唯一索引）；归档不删除历史身份 |
 | sources | id/workspace_id uuid；platform、instance_key text（均 `COLLATE "C"`）；last_received_at timestamptz 可空；archived_at timestamptz 可空（迁移 00007）；created_at timestamptz（默认 `now()`） | `uk_sources_workspace_id_platform_instance_key` UNIQUE `(workspace_id,platform,instance_key)`；代表稳定插件实例，不代表一次凭证；实例标识生成待插件核验。归档后标识仍被占用 |
 | ingest_credentials | id/workspace_id/source_id uuid；secret_hash bytea；revoked_at timestamptz 可空；created_at timestamptz（默认 `now()`） | `uk_ingest_credentials_secret_hash` UNIQUE `(secret_hash)`：认证按完整令牌的 SHA-256 摘要等值查找，一个摘要只对应一条凭证；`idx_ingest_credentials_workspace_id_source_id` `(workspace_id,source_id)` 支持按空间或空间+source 列举；轮换创建新凭证但 source 不变，所以 source_id 不唯一 |
@@ -39,9 +40,31 @@ ID 用 UUID v7，由数据库默认值 `uuidv7()` 生成，写入后用 `RETURNI
 
 迁移 00005 的 `users`、`sessions` 沿用同一套约定：`tokenpivot_app` 只在这两张表上有 SELECT、INSERT、UPDATE，不授予 DELETE、TRUNCATE 等，过期与撤销都用 UPDATE 完成；除 `sessions.revoked_at` 可空外全部 NOT NULL；没有外键、CHECK、触发器与 RLS，`sessions.user_id` 的引用完整性、摘要固定 32 字节和 30 天滑动期限都只由应用保证，迁移不加约束；`users.email` 与 `sessions.token_hash` 的唯一索引同时是认证查询路径，因此不再另建普通索引。
 
-迁移 00006 的 `workspace_memberships` 沿用同一套约定：`tokenpivot_app` 在这一张表上只有 SELECT、INSERT，**没有** UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER，所以服务角色既改不了角色也删不掉成员，成员变更与邀请要等 T-020 有真实操作后另行授权；四列全部 NOT NULL，`joined_at` 默认 `now()`；不建代理主键（身份就是 `(workspace_id,user_id)`），不建外键、CHECK、触发器与 RLS，引用完整性、角色取值和 `owner` 唯一性都只由应用保证，迁移不加约束。本期唯一的写路径是注册事务内创建个人空间：`workspaces.name` 固定为 `Personal`，并写一条 `role=owner` 成员关系；`member` 只有查询语义，没有写入入口。成员列表、邀请、角色变更、最后 owner 保护尚未实现，`current workspace` 查询也未提供——`CreatePersonal` 的「按用户查 owner 空间」只在本期所有空间皆为个人的前提下成立。
+迁移 00006 的 `workspace_memberships` 沿用同一套约定：`tokenpivot_app` 在这一张表上只有 SELECT、INSERT，**没有** UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER，所以服务角色既改不了角色也删不掉成员，成员变更与邀请要等 T-020 有真实操作后另行授权；四列全部 NOT NULL，`joined_at` 默认 `now()`；不建代理主键（身份就是 `(workspace_id,user_id)`），不建外键、CHECK、触发器与 RLS，引用完整性、角色取值和 `owner` 唯一性都只由应用保证，迁移不加约束。本期唯一的写路径是工作空间创建事务：插入 `workspaces` 后在同一事务写一条 `role=owner` 成员关系，注册事务不再写这张表；`member` 只有查询语义，没有写入入口。成员列表、邀请、角色变更、最后 owner 保护尚未实现；服务端不保存“当前工作空间”，前端在 URL 中选择并经 `GET /workspaces/{id}` 校验成员资格。
 
 状态流转：凭证 active→revoked；会话 active→expired/revoked；一次性操作 pending→consumed/expired。消费采用条件更新，避免并发复用。成员变更需保护最后一个 owner。项目归档不回写旧事件，不做级联删除。凭证撤销或项目归档不清除防重记录。迁移 00007（T-054）为 `sources` 新增可空 `archived_at timestamptz`：无默认值、无回填、不加索引，旧行即 active；不改其他表，不加外键或级联。HTTP DELETE 对项目与来源都是归档（只写 `archived_at`，`COALESCE` 保留首次值），不物理删除，保留 `usage_events`、`usage_minute_stats`、来源与凭证行，不重新归属；归档行仍占用唯一键，删除后同键重建仍冲突；本期无恢复。来源归档在同一事务内锁来源行、写 `archived_at`，并把该来源下 `revoked_at IS NULL` 的凭证写 `revoked_at`（已撤销行、令牌摘要与 `source_id` 不变）；凭证签发/轮换与归档共用同一把来源行锁，已归档来源拒绝签发/轮换。来源 PATCH 只改 `platform`/`instance_key`。归档前已认证的采集请求可在归档后完成并更新 `last_received_at`。
+
+### 工作空间创建与列表（T-064）
+
+`workspaces` 自 T-064 起由用户手动创建，注册事务不再写入工作空间。修改既有迁移 00002 后，空库重建的 `workspaces` 结构为：
+
+```sql
+CREATE TABLE workspaces (
+    id uuid PRIMARY KEY DEFAULT uuidv7(),
+    created_by_user_id uuid NOT NULL,
+    name text COLLATE "C" NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX uk_workspaces_created_by_user_id_name ON workspaces (created_by_user_id, name);
+```
+
+`created_by_user_id` 不加 FK，只用于额度计数和同账户名称唯一，不参与运行时角色判定；索引前缀同时支持按创建者计数。创建在一个短事务内按固定顺序完成：`SELECT 1 FROM users WHERE id = $1 FOR UPDATE` 锁账户 → `SELECT count(*) FROM workspaces WHERE created_by_user_id = $1` → 插入 `workspaces` → 插入 `(workspace_id,user_id,'owner')` 成员关系。计数达到 2 返回额度错误，任一步失败整体回滚。事务使用默认 `READ COMMITTED`，同一账户的并发创建被 `users` 行锁串行化，不同账户互不阻塞；同账户重名由 `uk_workspaces_created_by_user_id_name` 兜底，只有该索引冲突映射为 `409 WORKSPACE_NAME_CONFLICT`，其他唯一冲突仍按内部错误处理，超额返回 `409 WORKSPACE_LIMIT_REACHED`。
+
+名称由应用在事务外校验：`TrimSpace` 后 1–80 个 Unicode code point、UTF-8 不超过 256 字节、不含控制字符；大小写敏感，不做 Unicode 规范化，`Alpha` 与 `alpha` 可共存。数据库保存修剪后的值，`COLLATE "C"` 使判等和排序都按字节进行。
+
+列表按 `workspace_memberships.user_id` join `workspaces`，只返回当前用户作为成员的空间，按 `name COLLATE "C" ASC, id ASC` 排序，不分页，空成员关系返回空数组。详情先经 `MembershipRole` 校验成员资格，再按已验证的 workspace ID 读取名称；非成员与不存在都返回 `403`，不泄露资源是否存在。服务端不保存“当前工作空间”，前端在 URL 中选择并由详情接口每次重新校验。
+
+本次修改既有迁移 00002，按最新结构从空库重建，不做旧库回填或兼容升级；真实部署库的重建步骤（DSN、停服与执行方式）为 TODO(待确认)，本文件不声称已在部署环境生效。
 
 ## 4. usage_events：不可变最终事件
 
