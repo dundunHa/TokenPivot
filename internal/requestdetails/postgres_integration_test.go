@@ -647,6 +647,8 @@ func TestSpeedWindowMeasuredEventsAndSeries(t *testing.T) {
 	f.add(t, at(-time.Minute, sp(7, 700, "known")))
 	f.add(t, at(-time.Minute-time.Microsecond, sp(1000, 1000, "known")))
 	f.add(t, at(0, sp(1000, 1000, "known")))
+	// The first series minute is whole: 11:00:10 is before as_of-60min (11:00:30) but in the 11:00 bucket.
+	f.add(t, at(-60*time.Minute-20*time.Second, sp(40, 400, "known")))
 	// Earlier in the hour, and outside the hour.
 	f.add(t, at(-10*time.Minute, sp(300, 3000, "known")))
 	f.add(t, at(-61*time.Minute, sp(9000, 9000, "known")))
@@ -688,6 +690,7 @@ func TestSpeedWindowMeasuredEventsAndSeries(t *testing.T) {
 		out, dur       string
 		measured, estd int64
 	}{
+		{m(11, 0), "40", "400", 1, 0},
 		{m(11, 50), "300", "3000", 1, 0},
 		{m(11, 59), "1007", "1700", 2, 0},
 		{m(12, 0), "150", "3000", 2, 1},
@@ -698,8 +701,8 @@ func TestSpeedWindowMeasuredEventsAndSeries(t *testing.T) {
 				want.at, val(p.OutputTokens), val(p.DurationMS), p.MeasuredCount, p.EstimatedCount, ok, want.out, want.dur, want.measured, want.estd)
 		}
 	}
-	if len(got) != 3 {
-		t.Fatalf("expected exactly the 11:50, 11:59 and 12:00 minutes, got %d: %+v", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("expected exactly the 11:00, 11:50, 11:59 and 12:00 minutes, got %d: %+v", len(got), got)
 	}
 	// Minutes with no measurable event are absent, never zero rows.
 	for _, p := range r.Points {

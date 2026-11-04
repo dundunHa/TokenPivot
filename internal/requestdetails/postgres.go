@@ -108,7 +108,7 @@ GROUP BY p.as_of`
 // speedQuery measures generation speed from the events that can be measured: a known
 // or estimated output_tokens and a positive duration_ms. As in rateQuery the database
 // statement start is sampled once as as_of. It returns one row per UTC minute of the last
-// 60 minutes (grouping(bucket)=0) and one overall row (grouping(bucket)=1) whose
+// 60 minutes, starting at the minute that contains as_of-60min so the first bucket is whole (grouping(bucket)=0) and one overall row (grouping(bucket)=1) whose
 // win_* columns cover only the rolling 60 seconds [as_of-60s, as_of); the per-minute rows'
 // all_* columns are the minute series. Empty minutes have no row. $1 workspace, $2 optional
 // fixed as_of, $3..$6 filter.
@@ -119,7 +119,7 @@ m AS (
   FROM p
   LEFT JOIN usage_events e
     ON e.workspace_id = $1
-   AND e.occurred_at >= p.as_of - interval '60 minutes'
+   AND e.occurred_at >= date_bin('1 minute', p.as_of - interval '60 minutes', TIMESTAMPTZ '2000-01-01 00:00:00+00')
    AND e.occurred_at < p.as_of
    ` + filterSQL("$3", "$4", "$5", "$6") + `
 )
