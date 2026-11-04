@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { useUsageOptions } from "@/features/workspace/queries";
-import { RequestLogPanel } from "@/features/requests/RequestLogPanel";
 import { OverviewFilterBar } from "./OverviewFilterBar";
 import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
@@ -66,7 +65,18 @@ export function OverviewPage({
   return <OverviewBody scope={{ userId, workspaceId }} />;
 }
 
-function OverviewBody({ scope }: { scope: QueryScope }) {
+/**
+ * 解析 URL 筛选：缺时区时写回、非法时给出重置入口；合法时把筛选和更新函数交给子树。
+ * 总览与请求明细页共用，保证两页的筛选语义一致。
+ */
+export function FiltersGate({
+  children,
+}: {
+  children: (
+    filters: OverviewFilters,
+    update: (next: OverviewFilters) => void,
+  ) => ReactNode;
+}) {
   const [params, setParams] = useSearchParams();
   const fallbackTz = useMemo(() => browserTimezone(), []);
   const parsed = useMemo(
@@ -110,7 +120,17 @@ function OverviewBody({ scope }: { scope: QueryScope }) {
       </div>
     );
   }
-  return <OverviewContent scope={scope} filters={filters} update={update} />;
+  return <>{children(filters, update)}</>;
+}
+
+function OverviewBody({ scope }: { scope: QueryScope }) {
+  return (
+    <FiltersGate>
+      {(filters, update) => (
+        <OverviewContent scope={scope} filters={filters} update={update} />
+      )}
+    </FiltersGate>
+  );
 }
 
 function defaults(timezone: string): OverviewFilters {
@@ -232,10 +252,6 @@ function OverviewContent({
             }
           }}
         />
-      </div>
-
-      <div className="geek-card">
-        <RequestLogPanel scope={scope} filters={filters} />
       </div>
     </div>
   );

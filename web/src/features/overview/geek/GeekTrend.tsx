@@ -1,10 +1,8 @@
-import { useId, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import {
-  Area,
-  AreaChart,
   CartesianGrid,
   Line,
-  ComposedChart,
+  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -57,7 +55,7 @@ interface TrendProps {
   timezone: string;
 }
 
-/** 趋势卡：总量（输入/输出）与按模型、按提供商的堆叠面积。 */
+/** 趋势卡：总量（输入/输出）与按模型、按提供商的折线。 */
 export function GeekTrend({
   scope,
   filters,
@@ -145,7 +143,11 @@ export function GeekTrend({
     return { rows, series };
   }, [grouped, trend.points, data.points, groupKeys, results]);
 
-  const stackNote = !grouped ? trend.stackNote : null;
+  // 输入/输出不完整或含估算时，总量虚线取自服务端，提示读者以它为准。
+  const showTotalLine = !grouped && !trend.stackable;
+  const note = showTotalLine
+    ? "部分时段的输入/输出缺失、含估算或与总量不一致，虚线为服务端总量。"
+    : null;
 
   return (
     <div className="geek-card geek-trend-card">
@@ -193,14 +195,11 @@ export function GeekTrend({
         <Chart
           rows={rows}
           series={series}
-          stacked={grouped || trend.stackable}
-          showTotalLine={!grouped && !trend.stackable}
+          showTotalLine={showTotalLine}
           timezone={timezone}
         />
       )}
-      {stackNote ? (
-        <p className="geek-trend-note geek-dim">{stackNote}</p>
-      ) : null}
+      {note ? <p className="geek-trend-note geek-dim">{note}</p> : null}
     </div>
   );
 }
@@ -208,40 +207,21 @@ export function GeekTrend({
 function Chart({
   rows,
   series,
-  stacked,
   showTotalLine,
   timezone,
 }: {
   rows: Row[];
   series: Series[];
-  stacked: boolean;
   showTotalLine: boolean;
   timezone: string;
 }) {
-  const id = useId().replace(/:/g, "");
-  const Wrapper = showTotalLine ? ComposedChart : AreaChart;
   const labels = useMemo(
     () => new Map(rows.map((r) => [r.at, r.label])),
     [rows],
   );
   return (
     <ResponsiveContainer width="100%" height={300}>
-      <Wrapper data={rows} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-        <defs>
-          {series.map((s) => (
-            <linearGradient
-              key={s.key}
-              id={`${id}-${s.key}`}
-              x1="0"
-              y1="0"
-              x2="0"
-              y2="1"
-            >
-              <stop offset="0%" stopColor={s.color} stopOpacity={0.55} />
-              <stop offset="100%" stopColor={s.color} stopOpacity={0.04} />
-            </linearGradient>
-          ))}
-        </defs>
+      <LineChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
         <CartesianGrid vertical={false} stroke="#26231e" />
         <XAxis
           dataKey="at"
@@ -263,17 +243,15 @@ function Chart({
           content={<TrendTooltip series={series} timezone={timezone} />}
         />
         {series.map((s) => (
-          <Area
+          <Line
             key={s.key}
             type="monotone"
             dataKey={s.key}
             name={s.name}
-            stackId={stacked ? "1" : undefined}
             stroke={s.color}
-            strokeWidth={1.75}
-            fill={`url(#${id}-${s.key})`}
+            strokeWidth={2}
             dot={false}
-            activeDot={{ r: 3.5, strokeWidth: 0, fill: s.color }}
+            activeDot={{ r: 4, strokeWidth: 0, fill: s.color }}
             connectNulls={false}
             isAnimationActive={false}
           />
@@ -290,7 +268,7 @@ function Chart({
             isAnimationActive={false}
           />
         ) : null}
-      </Wrapper>
+      </LineChart>
     </ResponsiveContainer>
   );
 }

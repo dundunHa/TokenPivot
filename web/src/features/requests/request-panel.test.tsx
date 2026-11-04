@@ -159,7 +159,7 @@ afterEach(() => {
 describe("request log panel", () => {
   it("renders rows with unavailable, zero and missing fields apart and rate text", async () => {
     useBackend();
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     const row = await screen.findByTestId("request-row");
     expect(row.textContent).toContain("100");
     expect(within(row).getByText("不可用")).toBeTruthy();
@@ -196,7 +196,7 @@ describe("request log panel", () => {
         ),
       events: () => HttpResponse.json(page([])),
     });
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     expect((await screen.findByTestId("rate-value")).textContent).toBe(
       "窗口内无事件",
     );
@@ -216,7 +216,7 @@ describe("request log panel", () => {
         ),
     });
     const user = userEvent.setup();
-    renderApp("/?tz=UTC&provider=anthropic&project=unassigned");
+    renderApp("/requests?tz=UTC&provider=anthropic&project=unassigned");
     await screen.findByTestId("request-row");
     const first = seen.events[0];
     expect(first?.searchParams.getAll("provider")).toEqual(["anthropic"]);
@@ -257,7 +257,7 @@ describe("request log panel", () => {
         ),
     });
     const user = userEvent.setup();
-    renderApp("/?tz=UTC&model=m1");
+    renderApp("/requests?tz=UTC&model=m1");
     await screen.findByTestId("request-row");
     await user.click(screen.getByRole("button", { name: "下一页" }));
     await screen.findByText(/更早页/);
@@ -280,7 +280,7 @@ describe("request log panel", () => {
         fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(rateBody()),
     });
     const user = userEvent.setup();
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     const list = await screen.findByRole("region", { name: "明细列表" });
     await within(list).findByText(/服务暂不可用/);
     await screen.findByText(/速率：服务暂不可用/);
@@ -302,7 +302,7 @@ describe("request log panel", () => {
       rate: () =>
         fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(rateBody()),
     });
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     await screen.findByTestId("rate-value");
     fail = true;
@@ -325,7 +325,7 @@ describe("request log panel", () => {
             : page([item("e1")], "c1"),
         ),
     });
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     await screen.findByTestId("rate-value");
     const e0 = seen.events.length;
@@ -351,7 +351,7 @@ describe("request log panel", () => {
   it("pauses polling while the page is hidden", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const seen = useBackend();
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     await screen.findByTestId("rate-value");
     act(() => setVisibility("hidden"));
@@ -374,7 +374,7 @@ describe("request log panel", () => {
       },
     });
     const user = userEvent.setup();
-    renderApp("/?tz=UTC&provider=anthropic");
+    renderApp("/requests?tz=UTC&provider=anthropic");
     await waitFor(() => expect(seen.events.length).toBe(1));
     await user.click(
       await screen.findByRole("button", { name: "移除 供应商 anthropic" }),
@@ -397,7 +397,7 @@ describe("request log panel", () => {
       ),
     );
     const user = userEvent.setup();
-    const client = renderApp("/?tz=UTC");
+    const client = renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     expect(
       client.getQueryCache().findAll({ queryKey: ["requests"] }).length,
@@ -420,7 +420,7 @@ describe("request log panel", () => {
         ),
     });
     const user = userEvent.setup();
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     expect(seen.events[0]?.searchParams.has("start")).toBe(false);
 
@@ -469,7 +469,7 @@ describe("request log panel", () => {
   it("rejects an invalid detail range without sending a request", async () => {
     const seen = useBackend();
     const user = userEvent.setup();
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     const n = seen.events.length;
     await user.type(screen.getByLabelText("明细起点"), "2026-09-02T00:00:00Z");
@@ -482,7 +482,7 @@ describe("request log panel", () => {
   it("keeps a fixed range stable across polling and keeps polling it on the first page", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const seen = useBackend();
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     const start = screen.getByLabelText("明细起点") as HTMLInputElement;
     const end = screen.getByLabelText("明细终点") as HTMLInputElement;
@@ -515,7 +515,7 @@ describe("request log panel", () => {
   it("resumes polling the latest page when the page becomes visible again", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const seen = useBackend();
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     act(() => setVisibility("hidden"));
     const before = seen.events.length;
@@ -537,7 +537,7 @@ describe("request log panel", () => {
             : page([item("e1")], "c1"),
         ),
     });
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     await act(async () => {
       screen.getByRole("button", { name: "下一页" }).click();
@@ -565,7 +565,7 @@ describe("request log panel", () => {
       events: () =>
         offline ? HttpResponse.error() : HttpResponse.json(page([item("e1")])),
     });
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     offline = true;
     await tick(5_000);
@@ -598,7 +598,7 @@ describe("request log panel", () => {
       ),
     );
     const user = userEvent.setup();
-    const client = renderApp("/?tz=UTC");
+    const client = renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     await user.click(screen.getByRole("button", { name: "下一页" }));
     await waitFor(() => expect(seen.events.length).toBe(2));
@@ -632,7 +632,7 @@ describe("request log panel", () => {
       rate: () =>
         offline ? HttpResponse.error() : HttpResponse.json(rateBody()),
     });
-    renderApp("/?tz=UTC");
+    renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
     await screen.findByTestId("rate-value");
     await act(async () => {

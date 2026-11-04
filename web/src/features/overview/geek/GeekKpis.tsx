@@ -1,10 +1,4 @@
-import {
-  useEffect,
-  useId,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { AggregateData, UsageStats } from "../overviewApi";
 import { formatCount, qualityNote } from "../overviewView";
 import { fmt } from "./geek-utils";
@@ -34,7 +28,6 @@ function Delta({ value }: { value: number | null }) {
 
 /** 极简趋势线：只表达走势，不带坐标轴。null 视为断点。 */
 function Sparkline({ values }: { values: (number | null)[] }) {
-  const id = useId();
   const nums = values.map((v) => v ?? 0);
   if (nums.length < 2) return <div className="geek-spark" />;
   const max = Math.max(...nums, 1);
@@ -52,13 +45,6 @@ function Sparkline({ values }: { values: (number | null)[] }) {
       preserveAspectRatio="none"
       aria-hidden
     >
-      <defs>
-        <linearGradient id={id} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="var(--geek-amber)" stopOpacity="0.35" />
-          <stop offset="100%" stopColor="var(--geek-amber)" stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <path d={`${line} L100,32 L0,32 Z`} fill={`url(#${id})`} />
       <path
         d={line}
         fill="none"
