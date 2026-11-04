@@ -57,7 +57,7 @@ export function GeekTrend({
   trend,
   timezone,
 }: TrendProps) {
-  const [mode, setMode] = useState<Mode>("total");
+  const [mode, setMode] = useState<Mode>("model");
   const grouped = mode !== "total";
   const rankings = useRankings(
     scope,

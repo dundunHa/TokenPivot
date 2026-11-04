@@ -11,6 +11,7 @@ import {
 
 const PRESETS: { id: RangePreset; label: string }[] = [
   { id: "1h", label: "最近一小时" },
+  { id: "24h", label: "近 24 小时" },
   { id: "today", label: "今天" },
   { id: "yesterday", label: "昨天" },
   { id: "7d", label: "最近七天" },

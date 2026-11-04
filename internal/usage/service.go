@@ -29,7 +29,9 @@ import (
 // Confirmed first-version limits (T-055 plan section 1).
 const (
 	// MaxPoints is the largest number of trend buckets one request may return.
-	MaxPoints = 1000
+	// 1500 keeps a 24-hour minute-level trend (up to 1441 buckets when the
+	// range end is not minute-aligned) within one request.
+	MaxPoints = 1500
 	// AutoPoints is the bucket count granularity=auto aims for: the finest
 	// granularity that stays within it is chosen, so a chart stays readable
 	// (about 200 bars) instead of merely legal (1000).
