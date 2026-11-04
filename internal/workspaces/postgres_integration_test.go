@@ -280,7 +280,8 @@ func createdBy(t *testing.T, ctx context.Context, pool *pgxpool.Pool, workspaceI
 
 // TestLatestSchemaShape proves a fresh schema built only from the released
 // migrations has the columns, collation and unique index the domain code relies
-// on, and no new foreign key, CHECK, trigger or row level security.
+// on, and no new foreign key, CHECK, trigger or row level security on its own
+// tables. Other domains may declare their own constraints in the same schema.
 func TestLatestSchemaShape(t *testing.T) {
 	_, pool, _ := newWorkspaces(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -314,12 +315,15 @@ WHERE schemaname = current_schema() AND indexname = 'uk_workspaces_created_by_us
 	if err := pool.QueryRow(ctx, `SELECT
  (SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
    JOIN pg_namespace n ON n.oid = r.relnamespace
-   WHERE n.nspname = current_schema() AND c.contype IN ('f', 'c')),
+   WHERE n.nspname = current_schema()
+   AND r.relname IN ('workspaces', 'workspace_memberships') AND c.contype IN ('f', 'c')),
  (SELECT count(*) FROM pg_trigger g JOIN pg_class r ON r.oid = g.tgrelid
    JOIN pg_namespace n ON n.oid = r.relnamespace
-   WHERE n.nspname = current_schema() AND NOT g.tgisinternal),
+   WHERE n.nspname = current_schema()
+   AND r.relname IN ('workspaces', 'workspace_memberships') AND NOT g.tgisinternal),
  (SELECT count(*) FROM pg_class r JOIN pg_namespace n ON n.oid = r.relnamespace
-   WHERE n.nspname = current_schema() AND r.relrowsecurity)`).Scan(&constraints, &triggers, &rls); err != nil {
+   WHERE n.nspname = current_schema()
+   AND r.relname IN ('workspaces', 'workspace_memberships') AND r.relrowsecurity)`).Scan(&constraints, &triggers, &rls); err != nil {
 		t.Fatal(database.SafeError("schema shape", err))
 	}
 	if constraints != 0 || triggers != 0 || rls != 0 {
