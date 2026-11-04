@@ -1,4 +1,4 @@
-import { queryOptions, useQuery } from "@tanstack/react-query";
+import { queryOptions, useQueries, useQuery } from "@tanstack/react-query";
 import type { OverviewFilters } from "@/features/overview/overviewFilters";
 import type { QueryScope } from "@/features/overview/overviewQueries";
 import {
@@ -64,5 +64,20 @@ export function useRate(scope: QueryScope, filters: OverviewFilters) {
     ...rateQuery(scope, filters),
     refetchInterval: POLL_MS,
     refetchOnWindowFocus: "always",
+  });
+}
+
+/** 按模型的实时速率：每个模型各取一条带单值模型筛选的速率，请求数等于模型数。 */
+export function useModelRates(
+  scope: QueryScope,
+  filters: OverviewFilters,
+  models: string[],
+) {
+  return useQueries({
+    queries: models.map((model) => ({
+      ...rateQuery(scope, { ...filters, models: [model] }),
+      refetchInterval: POLL_MS,
+      refetchOnWindowFocus: "always" as const,
+    })),
   });
 }

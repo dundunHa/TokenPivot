@@ -6,7 +6,11 @@ import {
   type RankingDimension,
 } from "./overviewApi";
 import { aggregateParams, rankingsParams } from "./overviewApi";
-import type { OverviewFilters, ResolvedRange } from "./overviewFilters";
+import {
+  resolveRange,
+  type OverviewFilters,
+  type ResolvedRange,
+} from "./overviewFilters";
 
 /** 页面可见时的刷新间隔；隐藏页不轮询（refetchIntervalInBackground 默认 false）。 */
 export const REFRESH_MS = 10_000;
@@ -148,5 +152,28 @@ export function useGroupSeries(
       ),
       refetchInterval: REFRESH_MS,
     })),
+  });
+}
+
+/**
+ * 活跃时段热力图：固定取最近 7 天、小时粒度，只带供应商/模型/项目筛选，
+ * 不随页面的时间范围与粒度变化（热力图的意义就是看一周的节律）。
+ */
+export function useWeekActivity(
+  scope: QueryScope,
+  filters: OverviewFilters,
+  nowMs: number,
+) {
+  const weekFilters: OverviewFilters = {
+    ...filters,
+    range: "7d",
+    granularity: "hour",
+    start: null,
+    end: null,
+  };
+  return useQuery({
+    ...aggregateQuery(scope, weekFilters, resolveRange(weekFilters, nowMs)),
+    refetchInterval: REFRESH_MS * 6,
+    retry: false,
   });
 }

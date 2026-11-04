@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { describeError } from "@/features/overview/overviewApi";
 import type { OverviewFilters } from "@/features/overview/overviewFilters";
@@ -11,9 +12,12 @@ import { useRate } from "./useRequestLogs";
 export function RateKpi({
   scope,
   filters,
+  children,
 }: {
   scope: QueryScope;
   filters: OverviewFilters;
+  /** 总速率下方的补充内容（总览页放各模型速率）。 */
+  children?: ReactNode;
 }) {
   const rate = useRate(scope, filters);
   const timezone = filters.timezone;
@@ -43,6 +47,7 @@ export function RateKpi({
       ) : (
         <RateView data={rate.data} stale={rate.isError} timezone={timezone} />
       )}
+      {children}
     </GeekKpiShell>
   );
 }

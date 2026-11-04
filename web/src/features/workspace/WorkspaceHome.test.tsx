@@ -775,8 +775,10 @@ describe("workspace home", () => {
         `/api/v1/workspaces/:id/usage/aggregate`,
         ({ params, request }) => {
           const id = String(params.id);
-          // 上一周期环比查询（day 粒度）不参与闸门，避免复用同一个 Response。
-          if (new URL(request.url).searchParams.get("granularity") === "day") {
+          // 上一周期环比（day）、活跃时段热力图（hour）与速率趋势（minute）是附带查询，不参与闸门，
+          // 避免多个请求复用同一个 Response。主趋势默认 auto 粒度。
+          const gran = new URL(request.url).searchParams.get("granularity");
+          if (gran === "day" || gran === "hour" || gran === "minute") {
             return HttpResponse.json(aggregateBody("0"));
           }
           backend.calls.aggregate.push(id);
@@ -821,10 +823,17 @@ describe("workspace home", () => {
     ]);
     const gate = deferred<Response>();
     server.use(
-      http.get(`/api/v1/workspaces/${WS_B}/usage/aggregate`, ({ params }) => {
-        backend.calls.aggregate.push(String(params.id));
-        return gate.promise;
-      }),
+      http.get(
+        `/api/v1/workspaces/${WS_B}/usage/aggregate`,
+        ({ params, request }) => {
+          const gran = new URL(request.url).searchParams.get("granularity");
+          if (gran === "day" || gran === "hour" || gran === "minute") {
+            return HttpResponse.json(aggregateBody("0"));
+          }
+          backend.calls.aggregate.push(String(params.id));
+          return gate.promise;
+        },
+      ),
     );
     const user = userEvent.setup();
     renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);

@@ -129,6 +129,13 @@ function useBackend(opts?: { aggregate?: () => Response | Promise<Response> }) {
   return calls;
 }
 
+/** 热力图（小时）与速率趋势（分钟）固定粒度另发聚合；这里只看主趋势的请求。 */
+const mainCalls = (calls: URL[]) =>
+  calls.filter(
+    (c) =>
+      !["hour", "minute"].includes(c.searchParams.get("granularity") ?? ""),
+  );
+
 describe("overview page", () => {
   it("shows the four metrics from the server and queries with the URL timezone", async () => {
     const calls = useBackend();
@@ -136,9 +143,9 @@ describe("overview page", () => {
     const total = await screen.findByTestId("metric-total");
     expect(total.textContent).toContain("120");
     expect(screen.getByTestId("metric-requests").textContent).toContain("7");
-    expect(calls[0]?.searchParams.get("timezone")).toBe("UTC");
-    expect(calls[0]?.searchParams.get("granularity")).toBe("auto");
-    expect(calls[0]?.searchParams.has("provider")).toBe(false);
+    expect(mainCalls(calls)[0]?.searchParams.get("timezone")).toBe("UTC");
+    expect(mainCalls(calls)[0]?.searchParams.get("granularity")).toBe("auto");
+    expect(mainCalls(calls)[0]?.searchParams.has("provider")).toBe(false);
   });
 
   it("does not send a query for an invalid link and offers a reset", async () => {
@@ -149,7 +156,7 @@ describe("overview page", () => {
     expect(calls).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "重置筛选" }));
     await screen.findByTestId("metric-total");
-    expect(calls).toHaveLength(1);
+    expect(mainCalls(calls)).toHaveLength(1);
   });
 
   it("writes the browser timezone back to the URL when missing", async () => {
@@ -297,18 +304,25 @@ describe("overview page", () => {
     });
     renderApp("/?tz=UTC&granularity=hour&range=today");
     await screen.findAllByText(/趋势点数超过上限 1000.*天/);
+    // 显式的“小时”在今天范围内放得下，主趋势不改粒度（其余是固定粒度的附带查询）。
+    const hourly = calls.filter(
+      (c) => c.searchParams.get("granularity") === "hour",
+    );
+    expect(hourly.length).toBeGreaterThan(0);
     expect(
-      calls.every((c) => c.searchParams.get("granularity") === "hour"),
-    ).toBe(true);
+      calls.some((c) => c.searchParams.get("granularity") === "auto"),
+    ).toBe(false);
   });
 
   it("lets the server choose when an explicit granularity is too fine for the range", async () => {
     const calls = useBackend();
     renderApp("/?tz=UTC&granularity=minute&range=7d");
     await screen.findByTestId("metric-total");
-    expect(calls.length).toBeGreaterThan(0);
+    expect(mainCalls(calls).length).toBeGreaterThan(0);
     expect(
-      calls.every((c) => c.searchParams.get("granularity") === "auto"),
+      mainCalls(calls).every(
+        (c) => c.searchParams.get("granularity") === "auto",
+      ),
     ).toBe(true);
     expect(screen.queryByText(/趋势点数超过上限/)).toBeNull();
   });

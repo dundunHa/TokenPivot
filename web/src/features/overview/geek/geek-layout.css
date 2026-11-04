@@ -586,3 +586,127 @@
   letter-spacing: 0;
   color: var(--geek-text-muted);
 }
+
+/* ===== 按模型速率（非交互行） ===== */
+.geek-rate-row {
+  cursor: default;
+}
+.geek-rate-row:hover {
+  background: transparent;
+}
+.geek-skeleton-md {
+  height: 120px;
+}
+.geek-rank-value em {
+  font-style: normal;
+  color: var(--geek-text-muted);
+}
+
+/* ===== 缓存与推理 ===== */
+.geek-comp-hero {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.geek-comp-label {
+  font-size: 12px;
+  color: var(--geek-text-dim);
+}
+.geek-comp-number {
+  font-size: 32px;
+  font-weight: 300;
+  color: var(--geek-amber);
+}
+.geek-comp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.geek-comp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.geek-comp-row em {
+  margin-left: 8px;
+  font-style: normal;
+  color: var(--geek-text-muted);
+}
+
+/* ===== 活跃时段热力图 ===== */
+.geek-heat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow-x: auto;
+}
+.geek-heat-axis,
+.geek-heat-row {
+  display: grid;
+  grid-template-columns: 88px repeat(24, minmax(14px, 1fr));
+  gap: 3px;
+  align-items: center;
+  min-width: 520px;
+}
+.geek-heat-axis span {
+  font-size: 10px;
+  text-align: left;
+  color: var(--geek-text-muted);
+}
+.geek-heat-day {
+  font-size: 11px;
+  color: var(--geek-text-dim);
+  white-space: nowrap;
+}
+.geek-heat-cell {
+  display: block;
+  height: 22px;
+  border-radius: 3px;
+  background: var(--geek-bg-raised);
+}
+.geek-heat-cell:hover {
+  outline: 1px solid var(--geek-text-dim);
+}
+
+/* ===== 实时速率卡内的分模型明细 ===== */
+.geek-model-rates {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.geek-model-rates li {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 6px;
+  font-size: 11px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.geek-model-rates li > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--w);
+  background: var(--c);
+  opacity: 0.16;
+  border-radius: 4px;
+}
+.geek-model-rates li > span {
+  position: relative;
+}
+.geek-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
