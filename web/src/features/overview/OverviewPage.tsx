@@ -7,14 +7,9 @@ import { RequestLogPanel } from "@/features/requests/RequestLogPanel";
 import { OverviewFilterBar } from "./OverviewFilterBar";
 import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
-import { GeekShell } from "./geek/GeekShell";
-import { GeekCommandBar } from "./geek/GeekCommandBar";
-import { GeekHeroMetrics } from "./geek/GeekHeroMetrics";
-import { GeekTrendChart } from "./geek/GeekTrendChart";
-import { GeekBrailleChart } from "./geek/GeekBrailleChart";
-
-import { GeekDataStatus } from "./geek/GeekDataStatus";
-import { GeekRequestLog } from "./geek/GeekRequestLog";
+import { GeekKpis } from "./geek/GeekKpis";
+import { GeekTrend } from "./geek/GeekTrend";
+import { RateKpi } from "@/features/requests/RateKpi";
 import {
   browserTimezone,
   DEFAULT_OVERVIEW_FILTERS,
@@ -25,7 +20,12 @@ import {
   toSearchParams,
   type OverviewFilters,
 } from "./overviewFilters";
-import { useAggregate, useProjects, type QueryScope } from "./overviewQueries";
+import {
+  useAggregate,
+  usePreviousTotals,
+  useProjects,
+  type QueryScope,
+} from "./overviewQueries";
 import { buildTrend } from "./overviewView";
 
 const TICK_MS = 10_000;
@@ -59,27 +59,14 @@ function toggle(list: string[], value: string): string[] {
 export function OverviewPage({
   userId,
   workspaceId,
-  workspaceName,
 }: {
   userId: string;
   workspaceId: string;
-  workspaceName: string;
 }) {
-  return (
-    <OverviewBody
-      scope={{ userId, workspaceId }}
-      workspaceName={workspaceName}
-    />
-  );
+  return <OverviewBody scope={{ userId, workspaceId }} />;
 }
 
-function OverviewBody({
-  scope,
-  workspaceName,
-}: {
-  scope: QueryScope;
-  workspaceName: string;
-}) {
+function OverviewBody({ scope }: { scope: QueryScope }) {
   const [params, setParams] = useSearchParams();
   const fallbackTz = useMemo(() => browserTimezone(), []);
   const parsed = useMemo(
@@ -123,14 +110,7 @@ function OverviewBody({
       </div>
     );
   }
-  return (
-    <OverviewContent
-      scope={scope}
-      workspaceName={workspaceName}
-      filters={filters}
-      update={update}
-    />
-  );
+  return <OverviewContent scope={scope} filters={filters} update={update} />;
 }
 
 function defaults(timezone: string): OverviewFilters {
@@ -155,12 +135,10 @@ function stripOwn(base: URLSearchParams): URLSearchParams {
 
 function OverviewContent({
   scope,
-  workspaceName,
   filters,
   update,
 }: {
   scope: QueryScope;
-  workspaceName: string;
   filters: OverviewFilters;
   update: (next: OverviewFilters) => void;
 }) {
@@ -191,136 +169,74 @@ function OverviewContent({
   const identity = filterIdentity(filters);
 
   const data = aggregate.data;
-  const [showBraille, setShowBraille] = useState(false);
+  const previous = usePreviousTotals(scope, filters, range, now);
 
   return (
-    <GeekShell workspaceName={workspaceName} filterSummary={identity}>
-      {/* 命令输入条 */}
-      <GeekCommandBar
+    <div className="geek-main">
+      <OverviewFilterBar
         filters={filters}
-        onApply={(updates) => update({ ...filters, ...updates })}
+        providerOptions={(options.data?.providers ?? []).map(asOption)}
+        modelOptions={(options.data?.models ?? []).map(asOption)}
+        projectOptions={projectOptions}
+        optionsError={
+          options.isError ? "筛选选项加载失败，暂时无法编辑供应商/模型。" : null
+        }
+        projectsError={
+          projects.isError ? "项目列表加载失败，暂时无法编辑项目。" : null
+        }
+        onChange={update}
       />
 
-      {/* 可视化筛选栏（保留为可折叠入口） */}
-      <details className="geek-filter-details">
-        <summary
-          className="geek-dim"
-          style={{ cursor: "pointer", fontSize: 12 }}
-        >
-          ▾ 可视化筛选
-        </summary>
-        <OverviewFilterBar
-          filters={filters}
-          providerOptions={(options.data?.providers ?? []).map(asOption)}
-          modelOptions={(options.data?.models ?? []).map(asOption)}
-          projectOptions={projectOptions}
-          optionsError={
-            options.isError
-              ? "筛选选项加载失败，暂时无法编辑供应商/模型。"
-              : null
-          }
-          projectsError={
-            projects.isError ? "项目列表加载失败，暂时无法编辑项目。" : null
-          }
-          onChange={update}
+      {data ? (
+        <GeekKpis
+          data={data}
+          previous={previous.data?.totals}
+          rate={<RateKpi scope={scope} filters={filters} />}
         />
-      </details>
+      ) : null}
 
-      {/* 60/40 双栏 */}
-      <div className="geek-workbench">
-        {/* 左栏 */}
-        <div className="flex flex-col gap-4">
-          {/* Hero 指标 */}
-          {data ? (
-            <GeekHeroMetrics
-              totals={data.totals}
-              rate60={null}
-              timezone={tz}
-              workspaceName={workspaceName}
-            />
-          ) : null}
-
-          {/* 趋势图 */}
-          <Section title="趋势" query={aggregate} timezone={tz}>
-            <div className="geek-trend-toggle">
-              <button
-                className={`geek-ranking-tab ${!showBraille ? "geek-tab-active" : ""}`}
-                onClick={() => setShowBraille(false)}
-              >
-                面积图
-              </button>
-              <button
-                className={`geek-ranking-tab ${showBraille ? "geek-tab-active" : ""}`}
-                onClick={() => setShowBraille(true)}
-              >
-                braille
-              </button>
-            </div>
-            {data && trend ? (
-              trend.points.length === 0 ? (
-                <p className="geek-empty geek-dim">
-                  {data.totals.requestCount === "0"
-                    ? "所选范围与筛选下没有用量。"
-                    : "没有可展示的趋势点。"}
-                </p>
-              ) : showBraille ? (
-                <GeekBrailleChart trend={trend} />
-              ) : (
-                <GeekTrendChart trend={trend} timezone={tz} />
-              )
-            ) : null}
-          </Section>
-
-          {/* 排名 — 复用现有 OverviewRanking 保持查询/交互逻辑 */}
-          <div className="geek-ranking-wrapper">
-            <OverviewRanking
-              identity={identity}
+      <div className="geek-split">
+        <Section title="趋势" query={aggregate} timezone={tz}>
+          {data && trend ? (
+            <GeekTrend
               scope={scope}
               filters={filters}
               range={range}
-              projectNames={projectNames}
-              onToggle={(dim, val) => {
-                if (dim === "provider") {
-                  update({
-                    ...filters,
-                    providers: toggle(filters.providers, val),
-                  });
-                } else if (dim === "model") {
-                  update({ ...filters, models: toggle(filters.models, val) });
-                } else if (dim === "project") {
-                  update({
-                    ...filters,
-                    projects: toggle(filters.projects, val),
-                  });
-                }
-              }}
-            />
-          </div>
-        </div>
-
-        {/* 右栏 */}
-        <div className="flex flex-col gap-4">
-          {/* 数据状态 */}
-          {data ? (
-            <GeekDataStatus
-              workspaceName={workspaceName}
+              data={data}
+              trend={trend}
               timezone={tz}
-              lastReceivedAt={null}
-              sourceCount={0}
-              rangeStart={data.range.start}
-              rangeEnd={data.range.end}
-              asOf={data.range.asOf}
-              retentionCutoff={data.range.retentionCutoff}
-              pageUpdatedAt={new Date(aggregate.dataUpdatedAt).toISOString()}
             />
           ) : null}
+        </Section>
 
-          {/* 请求日志 */}
-          <GeekRequestLog>
-            <RequestLogPanel scope={scope} filters={filters} />
-          </GeekRequestLog>
-        </div>
+        {/* 排名 — 复用现有 OverviewRanking 保持查询/交互逻辑 */}
+        <OverviewRanking
+          identity={identity}
+          scope={scope}
+          filters={filters}
+          range={range}
+          projectNames={projectNames}
+          onToggle={(dim, val) => {
+            if (dim === "provider") {
+              update({
+                ...filters,
+                providers: toggle(filters.providers, val),
+              });
+            } else if (dim === "model") {
+              update({ ...filters, models: toggle(filters.models, val) });
+            } else if (dim === "project") {
+              update({
+                ...filters,
+                projects: toggle(filters.projects, val),
+              });
+            }
+          }}
+        />
       </div>
-    </GeekShell>
+
+      <div className="geek-card">
+        <RequestLogPanel scope={scope} filters={filters} />
+      </div>
+    </div>
   );
 }

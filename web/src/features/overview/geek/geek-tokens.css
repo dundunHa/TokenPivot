@@ -11,9 +11,9 @@
 
   /* 文字 */
   --geek-text: #f4f1ea;
-  --geek-text-dim: #8a8578;
-  --geek-text-muted: #5c574a;
-  --geek-text-faint: #3a362e;
+  --geek-text-dim: #a09a8c;
+  --geek-text-muted: #857f70;
+  --geek-text-faint: #6a655a;
 
   /* 琥珀 */
   --geek-amber: #e0a64b;
@@ -28,30 +28,17 @@
   --geek-info: #7aa2ff;
 
   /* 边线 */
-  --geek-border: #1e1c18;
-  --geek-border-light: #2a2722;
+  --geek-border: #26231e;
+  --geek-border-light: #34302a;
 
   /* 字体 */
   --geek-mono:
     ui-monospace, "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
 
   /* 间距 */
-  --geek-gap: 18px;
+  --geek-gap: 16px;
   --geek-pad: 16px;
-  --geek-radius: 4px;
-}
-
-/* 全局 geek 容器 */
-.geek-shell {
-  background: var(--geek-bg);
-  color: var(--geek-text);
-  font-family: var(--geek-mono);
-  font-variant-numeric: tabular-nums;
-  min-height: 100vh;
-}
-
-.geek-shell * {
-  font-family: inherit;
+  --geek-radius: 6px;
 }
 
 /* 等宽数字 */
@@ -85,57 +72,9 @@
   color: var(--geek-error);
 }
 
-/* 面板 */
-.geek-panel {
-  background: var(--geek-bg-panel);
-  border: 1px solid var(--geek-border);
-  border-radius: var(--geek-radius);
-  padding: var(--geek-pad);
-}
-
-/* 细分隔线 */
-.geek-divider {
-  border: none;
-  border-top: 1px solid var(--geek-border);
-  margin: 0;
-}
-
-/* 闪烁光标 */
-@keyframes geek-blink {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0;
-  }
-}
-.geek-cursor {
-  display: inline-block;
-  width: 8px;
-  height: 16px;
-  background: var(--geek-amber);
-  animation: geek-blink 1s step-end infinite;
-  vertical-align: text-bottom;
-}
-
-/* 字符图通用 */
-.geek-char-chart {
-  font-family: var(--geek-mono);
-  white-space: pre;
-  line-height: 1.2;
-  font-size: 13px;
-}
-
 /* 减少动效 */
 @media (prefers-reduced-motion: reduce) {
-  .geek-cursor {
+  .geek-skeleton {
     animation: none;
-  }
-  .geek-shell *,
-  .geek-shell *::before,
-  .geek-shell *::after {
-    animation-duration: 0.01ms !important;
-    transition-duration: 0.01ms !important;
   }
 }

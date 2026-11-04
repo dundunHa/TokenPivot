@@ -1,4 +1,4 @@
-import { queryOptions, useQuery } from "@tanstack/react-query";
+import { queryOptions, useQueries, useQuery } from "@tanstack/react-query";
 import {
   fetchAggregate,
   fetchProjects,
@@ -105,4 +105,48 @@ export function useRankings(
 
 export function useProjects(scope: QueryScope) {
   return useQuery(projectsQuery(scope));
+}
+
+/** 上一周期（同长度、紧邻当前起点之前）的总量，用于环比；失败时调用方不展示环比。 */
+export function usePreviousTotals(
+  scope: QueryScope,
+  filters: OverviewFilters,
+  range: ResolvedRange,
+  nowMs: number,
+) {
+  const length = (range.endMs ?? nowMs) - range.startMs;
+  const previous: ResolvedRange = {
+    startMs: range.startMs - length,
+    endMs: range.startMs,
+  };
+  return useQuery({
+    ...aggregateQuery(scope, { ...filters, granularity: "day" }, previous),
+    enabled: length > 0,
+    retry: false,
+    refetchInterval: REFRESH_MS,
+  });
+}
+
+/** 按模型 / 供应商拆分趋势：每个分组各取一条带单值筛选的聚合，请求数等于分组数。 */
+export function useGroupSeries(
+  scope: QueryScope,
+  filters: OverviewFilters,
+  range: ResolvedRange,
+  dimension: "model" | "provider",
+  keys: string[],
+) {
+  return useQueries({
+    queries: keys.map((key) => ({
+      ...aggregateQuery(
+        scope,
+        {
+          ...filters,
+          models: dimension === "model" ? [key] : filters.models,
+          providers: dimension === "provider" ? [key] : filters.providers,
+        },
+        range,
+      ),
+      refetchInterval: REFRESH_MS,
+    })),
+  });
 }

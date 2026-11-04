@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { Button } from "@/components/ui/button";
 import { Section } from "./OverviewSection";
 import type { RankingDimension } from "./overviewApi";
 import type { OverviewFilters, ResolvedRange } from "./overviewFilters";
@@ -7,7 +6,6 @@ import { useRankings, type QueryScope } from "./overviewQueries";
 import {
   formatCount,
   formatShare,
-  glyphBar,
   MISSING,
   rankingRow,
   type RankingRow,
@@ -37,7 +35,7 @@ function Rows({
   onToggle: (value: string) => void;
 }) {
   return (
-    <ul className="flex flex-col gap-1">
+    <ul className="geek-rank-list">
       {rows.map((row) => {
         const on = selected.includes(row.filterValue);
         return (
@@ -47,23 +45,27 @@ function Rows({
               aria-pressed={on}
               aria-label={`${row.label}${row.sublabel ? `（${row.sublabel}）` : ""}`}
               onClick={() => onToggle(row.filterValue)}
-              className="hover:bg-accent grid w-full grid-cols-[1fr_auto] gap-x-3 rounded-md px-2 py-1 text-left text-sm aria-pressed:border aria-pressed:border-primary"
+              className="geek-rank-row"
             >
-              <span className="truncate">
+              <span className="geek-rank-name">
                 {row.label}
                 {row.sublabel ? (
-                  <span className="text-subtle"> · {row.sublabel}</span>
+                  <span className="geek-dim"> · {row.sublabel}</span>
                 ) : null}
-                {on ? <span className="text-primary"> [已筛选]</span> : null}
+                {on ? <span className="geek-amber"> [已筛选]</span> : null}
               </span>
-              <span>
+              <span className="geek-rank-value geek-num">
                 {row.total === null ? MISSING : formatCount(row.total)} ·{" "}
                 {formatShare(row.share)}
               </span>
-              <span aria-hidden className="text-primary text-xs">
-                {glyphBar(row.share) ?? ""}
+              <span aria-hidden className="geek-rank-track">
+                <span
+                  style={{ width: `${Math.round((row.share ?? 0) * 100)}%` }}
+                />
               </span>
-              <span className="text-muted-foreground text-xs">{row.note}</span>
+              {row.note ? (
+                <span className="geek-rank-note">{row.note}</span>
+              ) : null}
             </button>
           </li>
         );
@@ -97,9 +99,13 @@ function Tail({ cursor, ...c }: Common & { cursor: string }) {
             onToggle={c.onToggle}
           />
           {query.data.nextCursor && !more ? (
-            <Button variant="link" size="inline" onClick={() => setMore(true)}>
+            <button
+              type="button"
+              className="geek-link"
+              onClick={() => setMore(true)}
+            >
               继续展开
-            </Button>
+            </button>
           ) : null}
           {query.data.nextCursor && more ? (
             <Tail {...c} cursor={query.data.nextCursor} />
@@ -133,29 +139,30 @@ export function OverviewRanking({
   const data = query.data;
   const toggle = (value: string) => onToggle(dimension, value);
   return (
-    <div className="flex flex-col gap-3">
-      <div role="tablist" aria-label="排名维度" className="flex gap-2">
-        {TABS.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            role="tab"
-            aria-selected={dimension === tab.id}
-            onClick={() => {
-              setDimension(tab.id);
-              setExpanded(false);
-            }}
-            className="aria-selected:text-primary aria-selected:border-primary border-b border-transparent px-2 py-1 text-sm"
-          >
-            {tab.label}
-          </button>
-        ))}
+    <div className="geek-card">
+      <div className="geek-card-head">
+        <h2 className="geek-card-title">排名</h2>
+        <div role="tablist" aria-label="排名维度" className="geek-segmented">
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={dimension === tab.id}
+              onClick={() => {
+                setDimension(tab.id);
+                setExpanded(false);
+              }}
+              className="geek-ranking-tab"
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
       </div>
       <Section title="排名" query={query} timezone={filters.timezone}>
         {data && data.groups.length === 0 && !data.other ? (
-          <p className="text-muted-foreground text-sm">
-            当前筛选下没有排名数据。
-          </p>
+          <p className="geek-dim geek-empty">当前筛选下没有排名数据。</p>
         ) : null}
         {data ? (
           <>
@@ -167,16 +174,16 @@ export function OverviewRanking({
               onToggle={toggle}
             />
             {data.other && data.nextCursor ? (
-              <Button
-                variant="link"
-                size="inline"
+              <button
+                type="button"
+                className="geek-link"
                 aria-expanded={expanded}
                 onClick={() => setExpanded((v) => !v)}
               >
                 {expanded
                   ? "收起其他"
                   : `其他 ${formatShare(data.other.share)}`}
-              </Button>
+              </button>
             ) : null}
             {expanded && data.nextCursor ? (
               <Tail
