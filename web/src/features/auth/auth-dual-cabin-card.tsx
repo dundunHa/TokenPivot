@@ -24,7 +24,7 @@ export function AuthDualCabinCard({
   return (
     <section className="login-card" aria-labelledby="auth-card-title">
       <div className="lc-head">
-        <p className="lc-eyebrow">// TOKENPIVOT · AUTH GATE</p>
+        <p className="lc-eyebrow">TOKENPIVOT</p>
         <h1 className="lc-title" id="auth-card-title">
           {title}
         </h1>
@@ -59,21 +59,10 @@ export function AuthDualCabinCard({
             <h3 className="lc-cabin-title" id="cred-cabin-title">
               EMAIL &amp; PASSWORD
             </h3>
-            <span className="lc-badge lc-badge-subtle">快捷键 /</span>
           </div>
-          <p className="lc-cabin-note">
-            {isLogin
-              ? "输入本地账号邮箱与密码进入工作空间。"
-              : "填写企业或个人邮箱与密码创建新账号。"}
-          </p>
           {children}
         </div>
       </div>
-      <p className="lc-foot">
-        {isLogin
-          ? "邮箱密码与飞书企业账号指向同一个工作空间。"
-          : "注册后立即登录；企业邮箱可由管理员关闭公开注册。"}
-      </p>
     </section>
   );
 }
