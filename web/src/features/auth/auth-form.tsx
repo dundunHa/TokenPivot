@@ -92,30 +92,6 @@ export function AuthForm({
   // 当前错误对应的倒计时还没走完时禁止提交；新错误会带来新的秒数。
   const rateLimited = retryLimit !== undefined && retiredLimit !== retryLimit;
 
-  // 全局快捷键：/ 聚焦邮箱，Esc 让输入框失焦。
-  useEffect(() => {
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.defaultPrevented) return;
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      const target = event.target;
-      const inField =
-        target instanceof HTMLElement &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.isContentEditable);
-      if (event.key === "Escape") {
-        if (inField && target instanceof HTMLElement) target.blur();
-        return;
-      }
-      if (event.key === "/" && !inField) {
-        event.preventDefault();
-        emailRef.current?.focus();
-      }
-    }
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, []);
-
   function trackCapsLock(event: ReactKeyboardEvent<HTMLInputElement>) {
     if (typeof event.getModifierState === "function") {
       setCapsLock(event.getModifierState("CapsLock"));
@@ -308,9 +284,6 @@ export function AuthForm({
           >
             {submitLabel}
           </button>
-          <span className="cf-kbd" aria-hidden="true">
-            [↵]
-          </span>
         </div>
       </form>
     </div>

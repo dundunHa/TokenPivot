@@ -18,8 +18,6 @@ const LOGIN = "/api/v1/auth/login";
 const REGISTER = "/api/v1/auth/register";
 const FUTURE = "2999-01-01T00:00:00Z";
 
-const BRAILLE = /^[\u2800-\u28FF]+$/;
-
 function authorizeEnabled(state = "abc123") {
   server.use(
     http.get(AUTHORIZE, () =>
@@ -45,43 +43,27 @@ async function fill(
 
 const location = () => screen.getByTestId("location").textContent;
 
-/** 按 F：返回 false 说明快捷键处理因不可唤起而没有拦截，也就不会跳转。 */
-function pressLaunchKey(): boolean {
-  const event = new KeyboardEvent("keydown", {
-    key: "f",
-    bubbles: true,
-    cancelable: true,
-  });
-  document.dispatchEvent(event);
-  return event.defaultPrevented;
-}
-
 describe("dashboard snapshot", () => {
   it("renders the hard-coded telemetry without creating a session query", async () => {
     authorizeEnabled();
     const client = renderApp("/login");
 
-    expect(screen.getByText("67,248,910")).toBeTruthy();
-    expect(screen.getByText("ROLLING 60S: 148,920 tok/min")).toBeTruthy();
-    for (const label of [
-      "INPUT TOKENS",
-      "OUTPUT TOKENS",
-      "REQUESTS",
-      "60S RATE",
-    ]) {
+    expect(screen.getByText("67.25")).toBeTruthy();
+    for (const label of ["输入 Token", "输出 Token", "请求数", "当前速率"]) {
       expect(screen.getByText(label)).toBeTruthy();
     }
     expect(screen.getByText("52.4M")).toBeTruthy();
+    expect(screen.getByText("14.8M")).toBeTruthy();
     expect(screen.getByText("4,812")).toBeTruthy();
-
-    const lines = Array.from(document.querySelectorAll(".ds-chart-line"));
-    expect(lines).toHaveLength(5);
-    for (const line of lines) {
-      expect(line.textContent ?? "").toMatch(BRAILLE);
-    }
+    expect(
+      screen.getByRole("img", { name: "按模型 Token 速率趋势" }),
+    ).toBeTruthy();
     expect(screen.getByTestId("snapshot-readout").textContent).toBe(
-      "LATEST: 234,000 tok/min (in 170k · out 64k)",
+      "最新 · Top 3 217K tok/min",
     );
+    expect(document.querySelector(".shell-bar, .tmux-bar")).toBeNull();
+    expect(screen.queryByText(/快捷键/)).toBeNull();
+    expect(screen.queryByText("[↵]")).toBeNull();
 
     // 公开页不创建会话查询，也不写任何 ["auth", ...] 缓存。
     expect(
@@ -102,23 +84,52 @@ describe("dashboard snapshot", () => {
     ).toBe(true);
   });
 
-  it("switches the ranking between model, provider and project", async () => {
+  it("switches trend lines and legends between models and providers", async () => {
     authorizeEnabled();
     renderApp("/login");
     const user = userEvent.setup();
 
-    expect(screen.getByText("claude-sonnet-4-5")).toBeTruthy();
-    expect(document.querySelector(".ds-rank-bar")?.textContent).toHaveLength(
-      18,
+    expect(screen.getByText("Claude Sonnet 4.5")).toBeTruthy();
+    expect(screen.getByText("DeepSeek v3.2")).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "按提供商" }));
+    expect(screen.getByText("Anthropic")).toBeTruthy();
+    expect(screen.getByText("OpenAI")).toBeTruthy();
+    expect(screen.queryByText("Claude Sonnet 4.5")).toBeNull();
+    expect(
+      screen.getByRole("img", { name: "按提供商 Token 速率趋势" }),
+    ).toBeTruthy();
+    expect(
+      screen
+        .getByRole("button", { name: "按提供商" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("reads historical trend values with keyboard navigation", async () => {
+    authorizeEnabled();
+    renderApp("/login");
+    const user = userEvent.setup();
+    const chart = screen.getByRole("group", {
+      name: "历史趋势读数，使用左右方向键",
+    });
+
+    chart.focus();
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.getByTestId("snapshot-readout").textContent).toContain(
+      "T-1m · Top 3",
     );
-
-    await user.click(screen.getByRole("button", { name: "按供应商" }));
-    expect(screen.getByText("anthropic")).toBeTruthy();
-    expect(screen.queryByText("claude-sonnet-4-5")).toBeNull();
-
-    await user.click(screen.getByRole("button", { name: "按项目" }));
-    expect(screen.getByText("tokenpivot-core")).toBeTruthy();
-    expect(screen.queryByText("anthropic")).toBeNull();
+    await user.keyboard("{Home}");
+    expect(screen.getByTestId("snapshot-readout").textContent).toContain(
+      "T-33m · Top 3",
+    );
+    await user.keyboard("{End}");
+    expect(screen.getByTestId("snapshot-readout").textContent).toContain(
+      "T-0m · Top 3",
+    );
+    expect(
+      document.getElementById("usage-readout")?.getAttribute("aria-live"),
+    ).toBe("polite");
   });
 });
 
@@ -141,11 +152,43 @@ describe("feishu cabin", () => {
         /有效期 (180|179)s/,
       );
     });
-    expect(
-      screen
-        .getByRole("button", { name: "一键唤起飞书授权 [F]" })
-        .hasAttribute("disabled"),
-    ).toBe(false);
+    await waitFor(() => {
+      expect(
+        screen
+          .getByRole("button", { name: "使用飞书账号继续" })
+          .hasAttribute("disabled"),
+      ).toBe(false);
+    });
+  });
+
+  it("ignores global launch and refresh shortcuts", async () => {
+    let calls = 0;
+    server.use(
+      http.get(AUTHORIZE, () => {
+        calls += 1;
+        return HttpResponse.json({
+          enabled: true,
+          authorize_url:
+            "https://open.feishu.cn/open-apis/authen/v1/authorize?state=abc",
+          expires_in_seconds: 180,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/login");
+
+    await waitFor(() => {
+      expect(
+        screen
+          .getByRole("button", { name: "使用飞书账号继续" })
+          .hasAttribute("disabled"),
+      ).toBe(false);
+    });
+    await user.keyboard("f");
+    await user.keyboard("r");
+
+    expect(calls).toBe(1);
+    expect(location()).toBe("/login|POP");
   });
 
   it("disables the feishu entry when the deployment has no credentials", async () => {
@@ -163,7 +206,7 @@ describe("feishu cabin", () => {
     await screen.findByText("当前实例未配置飞书应用凭证");
     expect(
       screen
-        .getByRole("button", { name: "一键唤起飞书授权 [F]" })
+        .getByRole("button", { name: "使用飞书账号继续" })
         .hasAttribute("disabled"),
     ).toBe(true);
     expect(screen.getByText("未启用")).toBeTruthy();
@@ -186,11 +229,11 @@ describe("feishu cabin", () => {
 
     await screen.findByText("二维码已过期");
     const launch = screen.getByRole("button", {
-      name: "一键唤起飞书授权 [F]",
+      name: "使用飞书账号继续",
     });
     expect(launch.hasAttribute("disabled")).toBe(true);
 
-    await user.click(screen.getByRole("button", { name: "点击刷新 [R]" }));
+    await user.click(screen.getByRole("button", { name: "刷新二维码" }));
     await waitFor(() => expect(screen.queryByText("二维码已过期")).toBeNull());
     await waitFor(() => expect(calls).toBe(2));
     await waitFor(() => expect(launch.hasAttribute("disabled")).toBe(false));
@@ -215,16 +258,15 @@ describe("feishu cabin", () => {
 
     await screen.findByText("二维码已过期");
     const launch = screen.getByRole("button", {
-      name: "一键唤起飞书授权 [F]",
+      name: "使用飞书账号继续",
     });
     expect(launch.hasAttribute("disabled")).toBe(true);
 
-    await user.click(screen.getByRole("button", { name: "点击刷新 [R]" }));
+    await user.click(screen.getByRole("button", { name: "刷新二维码" }));
     await waitFor(() => expect(calls).toBe(2));
 
-    // 新授权响应还没回来：旧地址已清空，按钮与 F 都不得再跳转。
+    // 新授权响应还没回来：旧地址已清空，按钮不得再跳转。
     expect(launch.hasAttribute("disabled")).toBe(true);
-    expect(pressLaunchKey()).toBe(false);
     expect(location()).toBe("/login|POP");
 
     pending.resolve();
@@ -239,7 +281,7 @@ describe("feishu cabin", () => {
     await screen.findByText("二维码已过期");
     expect(
       screen
-        .getByRole("button", { name: "一键唤起飞书授权 [F]" })
+        .getByRole("button", { name: "使用飞书账号继续" })
         .hasAttribute("disabled"),
     ).toBe(true);
     // 不暴露任何无效跳转入口：点阵仍在，但没有授权地址可去。

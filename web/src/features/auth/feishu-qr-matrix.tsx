@@ -3,7 +3,7 @@ import { fetchFeishuAuthorize } from "./api";
 import type { FeishuAuthorizeInfo } from "./model";
 
 /**
- * 左舱：飞书扫码点阵 + 一键唤起。
+ * 左舱：飞书扫码点阵 + 账号授权。
  *
  * 二维码是纯 CSS Grid 点阵（无 canvas、无外部图片），由授权地址确定性派生：
  * 同一个 `authorize_url` 永远画出同一张点阵，测试无需比对像素。
@@ -165,7 +165,7 @@ export function FeishuQrMatrix({
         <div className="qr-mask">
           <p className="qr-mask-title">二维码已过期</p>
           <button type="button" className="qr-refresh" onClick={onRefresh}>
-            点击刷新 [R]
+            刷新二维码
           </button>
         </div>
       ) : null}
@@ -174,7 +174,7 @@ export function FeishuQrMatrix({
 }
 
 /**
- * 飞书 SSO 舱：持有授权地址、180 秒有效期与全局快捷键（R 刷新 / F 唤起）。
+ * 飞书 SSO 舱：持有授权地址与 180 秒有效期。
  * 授权地址用组件内的原始 fetch 获取，不进 TanStack QueryCache ——
  * 公开登录页不创建任何 `["auth", ...]` 会话查询。
  */
@@ -226,7 +226,7 @@ export function FeishuCabin() {
       info.expiresInSeconds > 0 ? info.expiresInSeconds : DEFAULT_TTL_SECONDS;
     const now = Date.now();
     // 刷新请求在途期间没有有效地址：旧地址的 `state` Cookie 已被前一次回调消费，
-    // 留着它会让按钮和 `F` 继续跳向一个必然被拒的地址。只有新响应带回地址后
+    // 留着它会让按钮继续跳向一个必然被拒的地址。只有新响应带回地址后
     // `canLaunch` 才重新为真。
     setInfo((current) => ({ ...current, authorizeUrl: null }));
     setClock(now);
@@ -239,37 +239,6 @@ export function FeishuCabin() {
     window.location.assign(authorizeUrl);
   }, [authorizeUrl, canLaunch]);
 
-  useEffect(() => {
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.defaultPrevented) return;
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      const target = event.target;
-      if (target instanceof HTMLElement) {
-        const tag = target.tagName;
-        if (
-          tag === "INPUT" ||
-          tag === "TEXTAREA" ||
-          tag === "SELECT" ||
-          target.isContentEditable
-        ) {
-          return;
-        }
-      }
-      if (event.key === "r" || event.key === "R") {
-        event.preventDefault();
-        refresh();
-      }
-      if (event.key === "f" || event.key === "F") {
-        // 过期或没有授权地址时 F 与按钮同样不生效，避免跳到无效地址。
-        if (!canLaunch) return;
-        event.preventDefault();
-        launch();
-      }
-    }
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [canLaunch, launch, refresh]);
-
   return (
     <section
       className="lc-cabin lc-cabin-feishu"
@@ -281,7 +250,7 @@ export function FeishuCabin() {
         </h3>
         <span className="lc-badge">推荐</span>
       </div>
-      <p className="lc-cabin-note">手机飞书扫码，或在桌面飞书确认授权。</p>
+      <p className="lc-cabin-note">扫码或确认授权</p>
       <FeishuQrMatrix
         authorizeUrl={info.authorizeUrl}
         enabled={info.enabled}
@@ -297,9 +266,8 @@ export function FeishuCabin() {
         disabled={!canLaunch}
         onClick={launch}
       >
-        一键唤起飞书授权 [F]
+        使用飞书账号继续
       </button>
-      <p className="lc-cabin-foot">按企业邮箱匹配或创建账号</p>
     </section>
   );
 }
