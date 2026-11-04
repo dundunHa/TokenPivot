@@ -89,6 +89,19 @@ describe("dashboard snapshot", () => {
     ).toBeUndefined();
   });
 
+  it("places telemetry before the login card in desktop reading order", () => {
+    authorizeEnabled();
+    renderApp("/login");
+
+    const workbench = document.querySelector(".split-workbench");
+    expect(
+      workbench?.firstElementChild?.classList.contains("dash-snapshot"),
+    ).toBe(true);
+    expect(
+      workbench?.lastElementChild?.classList.contains("login-spotlight-wrap"),
+    ).toBe(true);
+  });
+
   it("switches the ranking between model, provider and project", async () => {
     authorizeEnabled();
     renderApp("/login");
