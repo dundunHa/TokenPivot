@@ -92,8 +92,11 @@ export function OverviewFilterBar({
   projectOptions,
   optionsError,
   projectsError,
+  dimensionsOnly = false,
   onChange,
 }: {
+  /** 只显示供应商/模型/项目（请求明细页不使用时间范围与粒度）。 */
+  dimensionsOnly?: boolean;
   filters: OverviewFilters;
   providerOptions: Option[];
   modelOptions: Option[];
@@ -155,37 +158,43 @@ export function OverviewFilterBar({
   return (
     <div className="geek-filters">
       <div className="geek-toolbar">
-        <div role="group" aria-label="时间范围" className="geek-segmented">
-          {PRESETS.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              className="geek-ranking-tab"
-              aria-pressed={
-                p.id === "custom"
-                  ? customOpen
-                  : !customOpen && filters.range === p.id
-              }
-              onClick={() => pickPreset(p.id)}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
-        <div role="group" aria-label="粒度" className="geek-segmented">
-          {GRANULARITIES.map((g) => (
-            <button
-              key={g}
-              type="button"
-              className="geek-ranking-tab"
-              aria-pressed={filters.granularity === g}
-              onClick={() => onChange({ ...filters, granularity: g })}
-            >
-              {GRAN_LABEL[g]}
-            </button>
-          ))}
-        </div>
-        <div className="geek-toolbar-end">
+        {dimensionsOnly ? null : (
+          <>
+            <div role="group" aria-label="时间范围" className="geek-segmented">
+              {PRESETS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className="geek-ranking-tab"
+                  aria-pressed={
+                    p.id === "custom"
+                      ? customOpen
+                      : !customOpen && filters.range === p.id
+                  }
+                  onClick={() => pickPreset(p.id)}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <div role="group" aria-label="粒度" className="geek-segmented">
+              {GRANULARITIES.map((g) => (
+                <button
+                  key={g}
+                  type="button"
+                  className="geek-ranking-tab"
+                  aria-pressed={filters.granularity === g}
+                  onClick={() => onChange({ ...filters, granularity: g })}
+                >
+                  {GRAN_LABEL[g]}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+        <div
+          className={`geek-toolbar-end ${dimensionsOnly ? "geek-toolbar-start" : ""}`}
+        >
           <MultiSelect
             label="供应商"
             options={providerOptions}
@@ -224,7 +233,7 @@ export function OverviewFilterBar({
           ))}
         </ul>
       ) : null}
-      {customOpen ? (
+      {customOpen && !dimensionsOnly ? (
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-end gap-2">
             <label className="text-muted-foreground flex flex-col gap-1 text-xs">

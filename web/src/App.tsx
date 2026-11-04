@@ -9,6 +9,7 @@ export function App() {
       <Route path="/login" element={<LoginPage />} />
       <Route path="/register" element={<RegisterPage />} />
       <Route path="/" element={<HomePage />} />
+      <Route path="/requests" element={<HomePage view="requests" />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

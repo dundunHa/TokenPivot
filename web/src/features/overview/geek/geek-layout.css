@@ -484,7 +484,7 @@
 
 /* ===== 请求明细 ===== */
 .geek-table-wrap {
-  max-height: 440px;
+  max-height: min(70vh, 720px);
   overflow: auto;
   border: 1px solid var(--geek-border);
   border-radius: var(--geek-radius);
@@ -550,4 +550,32 @@
 }
 .geek-ms-inline > summary:hover {
   color: var(--geek-text);
+}
+.geek-toolbar-start {
+  margin-left: 0;
+}
+
+/* ===== 顶部导航 ===== */
+.geek-nav {
+  display: flex;
+  gap: 4px;
+  margin-left: 12px;
+}
+.geek-nav a {
+  padding: 4px 12px;
+  font-size: 13px;
+  color: var(--geek-text-dim);
+  border-bottom: 2px solid transparent;
+  transition: color 0.12s;
+}
+.geek-nav a:hover {
+  color: var(--geek-text);
+}
+.geek-nav a[aria-current="page"] {
+  color: var(--geek-amber);
+  border-bottom-color: var(--geek-amber);
+}
+.geek-kpis-single {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 320px;
 }

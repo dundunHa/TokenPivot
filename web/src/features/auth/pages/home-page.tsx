@@ -1,11 +1,16 @@
-import { Navigate } from "react-router";
+import { NavLink, Navigate, useLocation } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { WorkspaceHome } from "@/features/workspace/WorkspaceHome";
 import { authErrorMessage } from "../model";
 import { useAuthSession, useLogoutMutation } from "../queries";
 
-export function HomePage() {
+export function HomePage({
+  view = "overview",
+}: {
+  view?: "overview" | "requests";
+}) {
+  const { search } = useLocation();
   const auth = useAuthSession();
   const logout = useLogoutMutation();
 
@@ -23,6 +28,14 @@ export function HomePage() {
           </span>
           TokenPivot
         </h1>
+        {auth.status === "ready" ? (
+          <nav aria-label="主导航" className="geek-nav">
+            <NavLink to={{ pathname: "/", search }} end>
+              总览
+            </NavLink>
+            <NavLink to={{ pathname: "/requests", search }}>请求明细</NavLink>
+          </nav>
+        ) : null}
         {auth.status === "ready" ? (
           <div className="ml-auto flex items-center gap-3">
             <span className="text-muted-foreground flex items-center gap-2 text-xs">
@@ -74,7 +87,7 @@ export function HomePage() {
               </AlertDescription>
             </Alert>
           ) : null}
-          <WorkspaceHome userId={auth.session.user.id} />
+          <WorkspaceHome userId={auth.session.user.id} view={view} />
         </>
       ) : null}
     </main>

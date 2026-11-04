@@ -4,6 +4,7 @@ import { useLocation, useSearchParams } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { OverviewPage } from "@/features/overview/OverviewPage";
+import { RequestsPage } from "@/features/requests/RequestsPage";
 import { ApiError } from "@/lib/api";
 import type { Workspace } from "./api";
 import {
@@ -36,7 +37,13 @@ function readWriteToken(state: unknown): number | null {
  * 工作区容器：列表就绪前或为空时不挂载任何业务页面。
  * 当前空间只来自 URL 的 `workspace` 参数；参数缺失或不属于当前用户时回落到服务端首项。
  */
-export function WorkspaceHome({ userId }: { userId: string }) {
+export function WorkspaceHome({
+  userId,
+  view = "overview",
+}: {
+  userId: string;
+  view?: "overview" | "requests";
+}) {
   const client = useQueryClient();
   const list = useWorkspaceList(userId);
   const [params, setParams] = useSearchParams();
@@ -290,11 +297,19 @@ export function WorkspaceHome({ userId }: { userId: string }) {
         onCreate={() => setCreateOpen(true)}
         onSelect={(workspace) => void selectWorkspace(workspace)}
       />
-      <OverviewPage
-        key={current.workspaceId}
-        userId={userId}
-        workspaceId={current.workspaceId}
-      />
+      {view === "requests" ? (
+        <RequestsPage
+          key={current.workspaceId}
+          userId={userId}
+          workspaceId={current.workspaceId}
+        />
+      ) : (
+        <OverviewPage
+          key={current.workspaceId}
+          userId={userId}
+          workspaceId={current.workspaceId}
+        />
+      )}
       {createOpen ? (
         <WorkspaceCreateDialog
           userId={userId}
