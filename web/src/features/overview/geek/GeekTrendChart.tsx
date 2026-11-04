@@ -48,7 +48,7 @@ export function GeekTrendChart({ trend, timezone }: GeekTrendChartProps) {
   const stackId = trend.stackable ? "1" : undefined;
 
   return (
-    <div className="geek-trend">
+    <div>
       <ResponsiveContainer width="100%" height={280}>
         <ComposedChart
           data={data}

@@ -11,9 +11,9 @@
 
   /* 文字 */
   --geek-text: #f4f1ea;
-  --geek-text-dim: #8a8578;
-  --geek-text-muted: #5c574a;
-  --geek-text-faint: #3a362e;
+  --geek-text-dim: #a09a8c;
+  --geek-text-muted: #857f70;
+  --geek-text-faint: #6a655a;
 
   /* 琥珀 */
   --geek-amber: #e0a64b;
@@ -28,17 +28,17 @@
   --geek-info: #7aa2ff;
 
   /* 边线 */
-  --geek-border: #1e1c18;
-  --geek-border-light: #2a2722;
+  --geek-border: #26231e;
+  --geek-border-light: #34302a;
 
   /* 字体 */
   --geek-mono:
     ui-monospace, "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
 
   /* 间距 */
-  --geek-gap: 18px;
+  --geek-gap: 16px;
   --geek-pad: 16px;
-  --geek-radius: 4px;
+  --geek-radius: 6px;
 }
 
 /* 全局 geek 容器 */
@@ -47,7 +47,9 @@
   color: var(--geek-text);
   font-family: var(--geek-mono);
   font-variant-numeric: tabular-nums;
-  min-height: 100vh;
+  border: 1px solid var(--geek-border-light);
+  border-radius: 8px;
+  overflow: hidden;
 }
 
 .geek-shell * {

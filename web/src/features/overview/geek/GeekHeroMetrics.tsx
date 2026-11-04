@@ -7,10 +7,6 @@ interface GeekHeroMetricsProps {
   totals: UsageStats;
   /** 最近 60 秒速率（tokens/min），null = 不可用 */
   rate60: number | null;
-  /** 时区 */
-  timezone: string;
-  /** 当前工作区真实名称；由容器传入，不在组件内重复查询。 */
-  workspaceName: string;
 }
 
 /**
@@ -18,18 +14,14 @@ interface GeekHeroMetricsProps {
  * PRD §5.2：输入 Token / 输出 Token / 请求数 / 最近 60 秒速率。
  * PRD §7：total 取自服务端，cache 不额外加到 total。
  */
-export function GeekHeroMetrics({
-  totals,
-  rate60,
-  timezone,
-  workspaceName,
-}: GeekHeroMetricsProps) {
+export function GeekHeroMetrics({ totals, rate60 }: GeekHeroMetricsProps) {
   const reduced = usePrefersReducedMotion();
   const totalStat = totals.total;
   const totalVal = totalStat.value !== null ? Number(totalStat.value) : null;
 
   return (
     <div className="geek-hero">
+      <div className="geek-hero-label">TOTAL · 所选时段总用量</div>
       {/* 大数 hero — 总量取自服务端 */}
       <div className="geek-hero-number" data-testid="metric-total">
         {totalVal !== null ? (
@@ -77,16 +69,6 @@ export function GeekHeroMetrics({
         <BreakdownRow label="input" stat={totals.input} total={totalVal} />
         <BreakdownRow label="output" stat={totals.output} total={totalVal} />
       </div>
-
-      {/* 数据状态 */}
-      <div className="geek-data-status">
-        <StatusCell
-          label="WORKSPACE / TZ"
-          value={`${workspaceName} · ${timezone}`}
-        />
-        <StatusCell label="LAST RECEIVED" value="—" />
-        <StatusCell label="COVERAGE" value="—" />
-      </div>
     </div>
   );
 }
@@ -127,17 +109,16 @@ function BreakdownRow({
   stat: MetricStat;
   total: number | null;
 }) {
-  const BAR_W = 32;
   const val = stat.value !== null ? Number(stat.value) : null;
   const pct = total !== null && total > 0 && val !== null ? val / total : 0;
-  const filled = Math.round(pct * BAR_W);
-  const bar = "█".repeat(filled) + "░".repeat(BAR_W - filled);
   const q = metricQuality(stat);
 
   return (
     <div className="geek-bd-row">
-      <span className="geek-bd-label geek-dim">{label}</span>
-      <span className="geek-bd-bar geek-amber">{bar}</span>
+      <span className="geek-dim">{label}</span>
+      <span className="geek-bd-bar" aria-hidden>
+        <span style={{ width: `${Math.round(pct * 1000) / 10}%` }} />
+      </span>
       <span className="geek-bd-value geek-num">{formatCount(stat.value)}</span>
       <span className="geek-bd-pct geek-dim">
         {q !== "known"
@@ -146,15 +127,6 @@ function BreakdownRow({
             ? `${(pct * 100).toFixed(1)}%`
             : "—"}
       </span>
-    </div>
-  );
-}
-
-function StatusCell({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="geek-ds-cell">
-      <div className="geek-ds-label geek-dim">{label}</div>
-      <div className="geek-ds-value">{value}</div>
     </div>
   );
 }

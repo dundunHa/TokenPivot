@@ -12,12 +12,38 @@ export function HomePage() {
   if (auth.status === "anonymous") return <Navigate to="/login" replace />;
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-6xl flex-col gap-6 px-6 py-10">
-      <header className="flex flex-col gap-2">
-        <p className="text-primary text-sm">TokenPivot</p>
-        <h1 className="text-xl font-semibold">当前会话</h1>
+    <main className="mx-auto flex min-h-screen w-full max-w-[1400px] flex-col gap-5 px-6 py-6">
+      <header className="border-divider flex flex-wrap items-center gap-x-4 gap-y-2 border-b pb-4">
+        <h1 className="text-primary flex items-center gap-2 text-base font-semibold tracking-wide">
+          <span
+            aria-hidden
+            className="border-primary inline-flex size-5 items-center justify-center rounded-sm border text-[11px]"
+          >
+            T
+          </span>
+          TokenPivot
+        </h1>
+        {auth.status === "ready" ? (
+          <div className="ml-auto flex items-center gap-3">
+            <span className="text-muted-foreground flex items-center gap-2 text-xs">
+              <span
+                aria-hidden
+                className="bg-success inline-block size-1.5 rounded-full"
+              />
+              <span className="sr-only">已登录，用户</span>
+              <span className="break-all">{auth.session.user.email}</span>
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={logout.isPending}
+              onClick={() => logout.mutate()}
+            >
+              {logout.isPending ? "正在退出…" : "登出"}
+            </Button>
+          </div>
+        ) : null}
       </header>
-      <div className="border-divider border-t" />
       {auth.status === "loading" || auth.status === "checking" ? (
         <p role="status" className="text-muted-foreground text-sm">
           正在确认登录状态…
@@ -30,13 +56,17 @@ export function HomePage() {
               无法确认登录状态：{authErrorMessage(auth.error)}
             </AlertDescription>
           </Alert>
-          <Button variant="outline" onClick={() => void auth.retry()}>
+          <Button
+            variant="outline"
+            className="self-start"
+            onClick={() => void auth.retry()}
+          >
             重试
           </Button>
         </div>
       ) : null}
       {auth.status === "ready" ? (
-        <div className="flex flex-col gap-4">
+        <>
           {logout.isError ? (
             <Alert variant="destructive">
               <AlertDescription>
@@ -44,22 +74,8 @@ export function HomePage() {
               </AlertDescription>
             </Alert>
           ) : null}
-          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
-            <dt className="text-subtle">状态</dt>
-            <dd className="text-success">已登录</dd>
-            <dt className="text-subtle">用户</dt>
-            <dd className="break-all">{auth.session.user.email}</dd>
-          </dl>
-          <Button
-            variant="outline"
-            disabled={logout.isPending}
-            onClick={() => logout.mutate()}
-          >
-            {logout.isPending ? "正在退出…" : "登出"}
-          </Button>
-          <div className="border-divider border-t" />
           <WorkspaceHome userId={auth.session.user.id} />
-        </div>
+        </>
       ) : null}
     </main>
   );

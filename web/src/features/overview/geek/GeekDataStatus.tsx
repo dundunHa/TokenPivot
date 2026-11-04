@@ -1,12 +1,13 @@
 import { fmtAgo } from "./geek-utils";
 import { formatInstant } from "../overviewView";
-import { useSyncExternalStore } from "react";
+import { Fragment, useSyncExternalStore, type ReactNode } from "react";
 
 interface GeekDataStatusProps {
   workspaceName: string;
   timezone: string;
   lastReceivedAt: string | null;
-  sourceCount: number;
+  /** 覆盖来源数；服务端尚未提供时为 null。 */
+  sourceCount: number | null;
   rangeStart: string;
   rangeEnd: string;
   asOf: string;
@@ -42,56 +43,42 @@ export function GeekDataStatus({
     lastReceivedAt && now > 0
       ? fmtAgo(now - new Date(lastReceivedAt).getTime())
       : null;
+  const rows: [string, ReactNode][] = [
+    ["workspace", workspaceName],
+    ["timezone", timezone],
+    [
+      "last received",
+      agoText ? (
+        <>
+          <span className="geek-dot geek-ok" />
+          {agoText}
+        </>
+      ) : (
+        "—"
+      ),
+    ],
+    ["coverage", sourceCount === null ? "—" : `${sourceCount} sources`],
+    [
+      "range",
+      `${formatInstant(rangeStart, timezone)} → ${formatInstant(rangeEnd, timezone)}`,
+    ],
+    ["as_of", formatInstant(asOf, timezone)],
+    ["retention", formatInstant(retentionCutoff, timezone)],
+    ["updated", formatInstant(pageUpdatedAt, timezone)],
+  ];
   return (
-    <div className="geek-data-status-panel">
-      <div className="geek-ds-row">
-        <span className="geek-ds-key geek-dim">workspace / tz</span>
-        <span className="geek-ds-val">
-          {workspaceName} · {timezone}
-        </span>
+    <section className="geek-card" aria-label="数据状态">
+      <div className="geek-card-head">
+        <h2 className="geek-card-title">数据状态</h2>
       </div>
-      <div className="geek-ds-row">
-        <span className="geek-ds-key geek-dim">last received</span>
-        <span className="geek-ds-val">
-          {agoText ? (
-            <>
-              <span className="geek-dot geek-ok" />
-              {agoText}
-            </>
-          ) : (
-            "—"
-          )}
-        </span>
-      </div>
-      <div className="geek-ds-row">
-        <span className="geek-ds-key geek-dim">coverage</span>
-        <span className="geek-ds-val">{sourceCount} sources</span>
-      </div>
-      <div className="geek-ds-row">
-        <span className="geek-ds-key geek-dim">range</span>
-        <span className="geek-ds-val geek-num">
-          {formatInstant(rangeStart, timezone)} →{" "}
-          {formatInstant(rangeEnd, timezone)}
-        </span>
-      </div>
-      <div className="geek-ds-row">
-        <span className="geek-ds-key geek-dim">as_of</span>
-        <span className="geek-ds-val geek-num">
-          {formatInstant(asOf, timezone)}
-        </span>
-      </div>
-      <div className="geek-ds-row">
-        <span className="geek-ds-key geek-dim">retention</span>
-        <span className="geek-ds-val geek-num">
-          {formatInstant(retentionCutoff, timezone)}
-        </span>
-      </div>
-      <div className="geek-ds-row">
-        <span className="geek-ds-key geek-dim">updated</span>
-        <span className="geek-ds-val geek-num">
-          {formatInstant(pageUpdatedAt, timezone)}
-        </span>
-      </div>
-    </div>
+      <dl className="geek-ds-list">
+        {rows.map(([key, value]) => (
+          <Fragment key={key}>
+            <dt>{key}</dt>
+            <dd className="geek-num">{value}</dd>
+          </Fragment>
+        ))}
+      </dl>
+    </section>
   );
 }
