@@ -41,21 +41,6 @@
   --geek-radius: 6px;
 }
 
-/* 全局 geek 容器 */
-.geek-shell {
-  background: var(--geek-bg);
-  color: var(--geek-text);
-  font-family: var(--geek-mono);
-  font-variant-numeric: tabular-nums;
-  border: 1px solid var(--geek-border-light);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.geek-shell * {
-  font-family: inherit;
-}
-
 /* 等宽数字 */
 .geek-num {
   font-variant-numeric: tabular-nums;
@@ -87,57 +72,9 @@
   color: var(--geek-error);
 }
 
-/* 面板 */
-.geek-panel {
-  background: var(--geek-bg-panel);
-  border: 1px solid var(--geek-border);
-  border-radius: var(--geek-radius);
-  padding: var(--geek-pad);
-}
-
-/* 细分隔线 */
-.geek-divider {
-  border: none;
-  border-top: 1px solid var(--geek-border);
-  margin: 0;
-}
-
-/* 闪烁光标 */
-@keyframes geek-blink {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0;
-  }
-}
-.geek-cursor {
-  display: inline-block;
-  width: 8px;
-  height: 16px;
-  background: var(--geek-amber);
-  animation: geek-blink 1s step-end infinite;
-  vertical-align: text-bottom;
-}
-
-/* 字符图通用 */
-.geek-char-chart {
-  font-family: var(--geek-mono);
-  white-space: pre;
-  line-height: 1.2;
-  font-size: 13px;
-}
-
 /* 减少动效 */
 @media (prefers-reduced-motion: reduce) {
-  .geek-cursor {
+  .geek-skeleton {
     animation: none;
-  }
-  .geek-shell *,
-  .geek-shell *::before,
-  .geek-shell *::after {
-    animation-duration: 0.01ms !important;
-    transition-duration: 0.01ms !important;
   }
 }

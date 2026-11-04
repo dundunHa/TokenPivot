@@ -775,6 +775,10 @@ describe("workspace home", () => {
         `/api/v1/workspaces/:id/usage/aggregate`,
         ({ params, request }) => {
           const id = String(params.id);
+          // 上一周期环比查询（day 粒度）不参与闸门，避免复用同一个 Response。
+          if (new URL(request.url).searchParams.get("granularity") === "day") {
+            return HttpResponse.json(aggregateBody("0"));
+          }
           backend.calls.aggregate.push(id);
           signals.set(id, request.signal);
           return (

@@ -51,7 +51,9 @@ function useBackend(opts?: { aggregate?: () => Response | Promise<Response> }) {
       ]),
     ),
     http.get(`${BASE}/usage/aggregate`, ({ request }) => {
-      calls.push(new URL(request.url));
+      // “上一周期”环比查询固定用 day 粒度；这里只记录当前周期的聚合请求。
+      const url = new URL(request.url);
+      if (url.searchParams.get("granularity") !== "day") calls.push(url);
       return (
         opts?.aggregate?.() ??
         HttpResponse.json({

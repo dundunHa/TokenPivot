@@ -294,7 +294,6 @@ export function WorkspaceHome({ userId }: { userId: string }) {
         key={current.workspaceId}
         userId={userId}
         workspaceId={current.workspaceId}
-        workspaceName={current.name}
       />
       {createOpen ? (
         <WorkspaceCreateDialog
