@@ -18,7 +18,7 @@ export function RateKpi({
   const rate = useRate(scope, filters);
   const timezone = filters.timezone;
   return (
-    <GeekKpiShell label="实时速率 · 每分钟">
+    <GeekKpiShell label="实时速率">
       {rate.isPending ? (
         <div
           role="status"
@@ -59,18 +59,18 @@ function RateView({
   const view = describeRate(data);
   const fresh = data.windowLastReceivedAt
     ? `窗口内最后接收 ${formatInstant(data.windowLastReceivedAt, timezone, true)}`
-    : "窗口内无事件，接收新鲜度未知";
+    : "暂无数据";
   return (
     <div
       data-testid="rate"
       title={`窗口截至 ${formatInstant(data.end, timezone, true)} · ${fresh}`}
     >
       <div className="geek-kpi-row">
-        <div
-          className="geek-kpi-number geek-num geek-live"
-          data-testid="rate-value"
-        >
-          {view.headline}
+        <div className="geek-kpi-number geek-num geek-live">
+          <span data-testid="rate-value">{view.headline}</span>
+          {view.headline === "—" ? null : (
+            <span className="geek-kpi-unit">tokens/s</span>
+          )}
         </div>
       </div>
       {view.notes.length > 0 ? (

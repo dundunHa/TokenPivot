@@ -40,10 +40,13 @@ describe("request model", () => {
   });
 
   it("describes no events, unavailable, zero, estimated and partial coverage apart", () => {
-    expect(describeRate(rate({})).headline).toBe("窗口内无事件");
+    expect(describeRate(rate({}))).toEqual({
+      headline: "—",
+      notes: ["暂无数据"],
+    });
     expect(
       describeRate(rate({ eventCount: 2, missingCount: 2 })).headline,
-    ).toBe("用量不可用");
+    ).toBe("—");
     expect(
       describeRate(rate({ value: "0", eventCount: 1, knownCount: 1 })),
     ).toEqual({ headline: "0", notes: [] });
@@ -56,7 +59,7 @@ describe("request model", () => {
         missingCount: 1,
       }),
     );
-    expect(mixed.headline).toBe("12,000");
+    expect(mixed.headline).toBe("200");
     expect(mixed.notes).toEqual(["含估算 1 条", "部分覆盖：缺失 1 条"]);
   });
 
