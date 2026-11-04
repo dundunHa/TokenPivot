@@ -221,6 +221,30 @@ describe("overview page", () => {
     ).toBe("false");
   });
 
+  it("keeps the request log off the overview and opens it from the nav with filters kept", async () => {
+    useBackend();
+    const user = userEvent.setup();
+    renderApp("/?tz=UTC&provider=anthropic");
+    await screen.findByTestId("metric-total");
+    expect(screen.queryByRole("region", { name: "请求明细" })).toBeNull();
+    await user.click(screen.getByRole("link", { name: "请求明细" }));
+    await screen.findByRole("region", { name: "请求明细" });
+    expect(screen.getByTestId("location").textContent).toContain("/requests");
+    expect(screen.queryByTestId("metric-total")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "移除 供应商 anthropic" }),
+    ).toBeTruthy();
+    await user.click(screen.getByRole("link", { name: "总览" }));
+    await screen.findByTestId("metric-total");
+  });
+
+  it("shows a reset for an invalid link on the requests page too", async () => {
+    useBackend();
+    renderApp("/requests?range=bogus&tz=UTC");
+    await screen.findByText(/链接筛选无效/);
+    expect(screen.getByRole("button", { name: "重置筛选" })).toBeTruthy();
+  });
+
   it("refetches immediately when the page becomes visible again (fixed range, infinite staleTime)", async () => {
     const calls = useBackend();
     renderApp(
