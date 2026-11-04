@@ -433,7 +433,7 @@
 .login-spotlight-wrap::before {
   content: "";
   position: absolute;
-  inset: -44px -40px -56px;
+  inset: -44px 0 -56px;
   background: radial-gradient(
     closest-side,
     rgba(224, 166, 75, 0.16),
