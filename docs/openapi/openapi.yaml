@@ -410,7 +410,7 @@ info:
 
     - 历史统计最多查 **13 个日历月**，且不得早于实际保留截点。
     - 统一左闭右开区间 `[start, end)`。带秒的历史范围**明确拒绝**，不静默对齐到整分钟。
-    - 每次趋势查询最多 **1000 个时间桶**。超过时返回稳定错误码 `TOO_MANY_POINTS`，并附允许上限与比请求粒度更粗、满足上限的**最细建议粒度**（hour → day）；没有可用粒度时提示缩短范围。**不得服务端静默改粒度。**
+    - 每次趋势查询最多 **1000 个时间桶**。显式指定粒度超过时返回稳定错误码 `TOO_MANY_POINTS`，并附允许上限与比请求粒度更粗、满足上限的**最细建议粒度**（hour → day）；没有可用粒度时提示缩短范围。**不得服务端静默改粒度**；调用方传 `granularity=auto` 即显式授权服务端选择，响应的 `range.granularity` 回显实际粒度。
     - 请求明细分页默认 **50**、最大 **200**；明细仍受 180 天实际数据保留限制，不能因为分钟统计可查 13 个月就承诺明细可查 13 个月。
     - 查询侧不定每秒请求数（RPS）与并发数：PRD 的并发查询量与性能环境尚未确认，未量测前写数字只会形成虚假保证。
 
@@ -1912,6 +1912,8 @@ paths:
 
         **点数上限**：相交桶数超过 **1000** 返回 `400 TOO_MANY_POINTS`，`error.details` 为 `{max_points: 1000, suggested_granularity: hour|day|null}`（比请求粒度更粗、满足上限的最细粒度；`null` 表示只能缩短范围）。服务端不截断 points，也不静默改变粒度。
 
+        **自动粒度**：`granularity=auto` 由服务端在 `minute`、`hour`、`day` 中选**桶数不超过 200 的最细粒度**（都超过则取 `day`），选择只取决于请求范围与时区，并通过响应的 `range.granularity` 回显实际值；`day` 仍超过 1000 时与显式请求一样返回 `TOO_MANY_POINTS`。只有 `auto` 才由服务端选粒度，显式粒度的行为不变。
+
         **数值**：所有聚合值与计数都是十进制字符串（`DecimalString`），超过 JavaScript 安全整数或 int64 也逐位准确；仅缺失的 `MetricStats.value` 为 `null`。单事件采集的 JSON integer 格式不受影响。
 
         **授权**：先会话，再 workspace 成员角色（owner 与 member 可读），然后才校验参数与保留截点、执行查询。
@@ -2601,7 +2603,7 @@ components:
       required: true
       schema:
         type: string
-        enum: [minute, hour, day]
+        enum: [auto, minute, hour, day]
     UsageProvider:
       name: provider
       in: query
@@ -4073,7 +4075,7 @@ components:
         granularity:
           type: string
           enum: [minute, hour, day]
-      description: '字段含义同 UsageRangeBase，另回传请求的 timezone 与 granularity。'
+      description: '字段含义同 UsageRangeBase，另回传请求的 timezone 与实际使用的 granularity（请求 `granularity=auto` 时为服务端选定的值）。'
     UsageAggregatePoint:
       type: object
       additionalProperties: false

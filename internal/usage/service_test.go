@@ -1035,3 +1035,62 @@ func TestOptionsStoreErrorPassesThrough(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestAutoGranularityPicksFinestWithinTarget(t *testing.T) {
+	cases := []struct {
+		name       string
+		start, end string
+		want       Granularity
+	}{
+		{"1 hour -> minute", "2026-10-27T00:00:00Z", "2026-10-27T01:00:00Z", Minute},
+		{"exactly 200 minutes -> minute", "2026-10-27T00:00:00Z", "2026-10-27T03:20:00Z", Minute},
+		{"201 minutes -> hour", "2026-10-27T00:00:00Z", "2026-10-27T03:21:00Z", Hour},
+		{"one day -> hour", "2026-10-27T00:00:00Z", "2026-10-28T00:00:00Z", Hour},
+		{"7 days -> hour", "2026-10-21T00:00:00Z", "2026-10-28T00:00:00Z", Hour},
+		{"30 days -> day", "2026-09-28T00:00:00Z", "2026-10-28T00:00:00Z", Day},
+		{"1 year -> day", "2025-10-28T00:00:00Z", "2026-10-28T00:00:00Z", Day},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store := &fakeStore{}
+			s, _, _ := newTestService(store)
+			values := set(set(set(aggValues(), "granularity", "auto"), "start", c.start), "end", c.end)
+			resp, err := s.Aggregate(context.Background(), testWorkspace, values)
+			if err != nil {
+				t.Fatalf("auto: %v", err)
+			}
+			if resp.Range.Granularity != c.want {
+				t.Fatalf("granularity = %s, want %s", resp.Range.Granularity, c.want)
+			}
+		})
+	}
+}
+
+func TestAutoGranularityRespectsMaxPointsAndKeepsExplicitStrict(t *testing.T) {
+	store := &fakeStore{}
+	s, _, _ := newTestService(store)
+	// Explicit minute over 1001 minutes is still rejected: no silent change.
+	values := set(set(set(aggValues(), "granularity", "minute"), "start", "2026-10-27T00:00:00Z"), "end", "2026-10-27T16:41:00Z")
+	_, err := s.Aggregate(context.Background(), testWorkspace, values)
+	assertSuggestion(t, err, MaxPoints, Hour)
+	// The same range with auto succeeds.
+	resp, err := s.Aggregate(context.Background(), testWorkspace, set(values, "granularity", "auto"))
+	if err != nil || resp.Range.Granularity != Hour {
+		t.Fatalf("auto resp=%v err=%v, want hour", resp, err)
+	}
+	// When even day exceeds the hard limit, auto fails like an explicit day request.
+	s.maxPoints = 5
+	s.autoPoints = 3
+	values = set(set(set(aggValues(), "granularity", "auto"), "start", "2026-10-01T00:00:00Z"), "end", "2026-10-28T00:00:00Z")
+	_, err = s.Aggregate(context.Background(), testWorkspace, values)
+	assertSuggestion(t, err, 5, "")
+}
+
+func TestAutoGranularityIsCaseSensitive(t *testing.T) {
+	s, _, _ := newTestService(&fakeStore{})
+	for _, v := range []string{"AUTO", "Auto", ""} {
+		if _, err := s.Aggregate(context.Background(), testWorkspace, set(aggValues(), "granularity", v)); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("granularity=%q err=%v, want ErrInvalidArgument", v, err)
+		}
+	}
+}

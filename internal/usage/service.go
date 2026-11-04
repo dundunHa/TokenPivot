@@ -30,6 +30,10 @@ import (
 const (
 	// MaxPoints is the largest number of trend buckets one request may return.
 	MaxPoints = 1000
+	// AutoPoints is the bucket count granularity=auto aims for: the finest
+	// granularity that stays within it is chosen, so a chart stays readable
+	// (about 200 bars) instead of merely legal (1000).
+	AutoPoints = 200
 	// DefaultLimit and MaxLimit bound one ranking page.
 	DefaultLimit = 10
 	MaxLimit     = 50
@@ -245,11 +249,13 @@ type Service struct {
 	store     Store
 	now       func() time.Time
 	maxPoints int
+	// autoPoints is the target for granularity=auto; effective limit is min(autoPoints, maxPoints).
+	autoPoints int
 }
 
 // New returns a Service on the given store.
 func New(store Store) *Service {
-	return &Service{store: store, now: time.Now, maxPoints: MaxPoints}
+	return &Service{store: store, now: time.Now, maxPoints: MaxPoints, autoPoints: AutoPoints}
 }
 
 var (
@@ -284,7 +290,7 @@ func (s *Service) Aggregate(ctx context.Context, workspaceID pgtype.UUID, values
 	if err != nil {
 		return nil, err
 	}
-	granularity, err := parseGranularity(values)
+	granularity, auto, err := parseGranularity(values)
 	if err != nil {
 		return nil, err
 	}
@@ -295,6 +301,13 @@ func (s *Service) Aggregate(ctx context.Context, workspaceID pgtype.UUID, values
 	cutoff, err := checkRange(q, end, now)
 	if err != nil {
 		return nil, err
+	}
+	if auto {
+		// Explicit opt-in: the caller asked the server to choose; the chosen
+		// granularity is echoed in range.granularity.
+		if granularity, err = s.autoGranularity(q.start, end, loc); err != nil {
+			return nil, fmt.Errorf("usage auto granularity: %w", err)
+		}
 	}
 	buckets, tooMany, err := enumerateBuckets(q.start, end, granularity, loc, s.maxPoints, nil)
 	if err != nil {
@@ -563,16 +576,21 @@ func strictRFC3339(value string) (zeroFraction, ok bool) {
 	return false, false
 }
 
-func parseGranularity(values url.Values) (Granularity, error) {
+// parseGranularity returns the requested granularity; auto reports that the
+// caller asked the server to choose one (the returned granularity is then unset).
+func parseGranularity(values url.Values) (g Granularity, auto bool, err error) {
 	text, err := single(values, "granularity")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	switch g := Granularity(text); g {
+	switch Granularity(text) {
 	case Minute, Hour, Day:
-		return g, nil
+		return Granularity(text), false, nil
 	}
-	return "", ErrInvalidArgument
+	if text == "auto" {
+		return "", true, nil
+	}
+	return "", false, ErrInvalidArgument
 }
 
 func parseGroupBy(values url.Values) (GroupBy, error) {
@@ -773,6 +791,24 @@ func enumerateBuckets(start, end time.Time, g Granularity, loc *time.Location, m
 		cur = next
 	}
 	return out, false, nil
+}
+
+// autoGranularity picks the finest granularity (minute, hour, day) whose bucket
+// count stays within the auto target. When even day exceeds the target it still
+// returns day: the regular MaxPoints check then decides whether the range is
+// legal, so auto never fails where an explicit day request would succeed.
+func (s *Service) autoGranularity(start, end time.Time, loc *time.Location) (Granularity, error) {
+	target := min(s.autoPoints, s.maxPoints)
+	for _, candidate := range []Granularity{Minute, Hour} {
+		_, tooMany, err := enumerateBuckets(start, end, candidate, loc, target, nil)
+		if err != nil {
+			return "", err
+		}
+		if !tooMany {
+			return candidate, nil
+		}
+	}
+	return Day, nil
 }
 
 // suggest returns the finest granularity coarser than g (hour, then day) whose
