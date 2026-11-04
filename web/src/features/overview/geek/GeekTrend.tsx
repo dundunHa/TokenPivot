@@ -1,13 +1,4 @@
 import { useMemo, useState } from "react";
-import {
-  CartesianGrid,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
 import type { AggregateData } from "../overviewApi";
 import type { OverviewFilters, ResolvedRange } from "../overviewFilters";
 import {
@@ -15,8 +6,14 @@ import {
   useRankings,
   type QueryScope,
 } from "../overviewQueries";
-import { formatInstant, type TrendModel } from "../overviewView";
+import type { TrendModel } from "../overviewView";
+import { SERIES_PALETTE } from "./chartScale";
 import { fmt } from "./geek-utils";
+import {
+  GeekLineChart,
+  type ChartRow,
+  type ChartSeries,
+} from "./GeekLineChart";
 
 type Mode = "total" | "model" | "provider";
 
@@ -30,21 +27,11 @@ const INPUT_COLOR = "#e0a64b";
 const OUTPUT_COLOR = "#7aa2ff";
 const OTHER_COLOR = "#6a655a";
 /** 分组调色：与琥珀主色相邻但可区分，深色背景下对比度足够。 */
-const PALETTE = ["#e0a64b", "#7aa2ff", "#7fd1a8", "#c792ea", "#f07f6f"];
+const PALETTE = SERIES_PALETTE;
 const GROUP_LIMIT = 5;
-const AXIS = { fill: "#857f70", fontSize: 11 };
 
-interface Row {
-  at: string;
-  label: string;
-  [key: string]: number | string | null;
-}
-
-interface Series {
-  key: string;
-  name: string;
-  color: string;
-}
+type Row = ChartRow;
+type Series = ChartSeries;
 
 interface TrendProps {
   scope: QueryScope;
@@ -160,6 +147,12 @@ export function GeekTrend({
 
   // 输入/输出不完整或含估算时，总量虚线取自服务端，提示读者以它为准。
   const showTotalLine = !grouped && !trend.stackable;
+  const chartSeries: Series[] = showTotalLine
+    ? [
+        ...series,
+        { key: "total", name: "总量", color: "#f4f1ea", dashed: true },
+      ]
+    : series;
   const note =
     total && showTotalLine
       ? "部分时段的输入/输出缺失、含估算或与总量不一致，虚线为服务端总量。"
@@ -213,128 +206,15 @@ export function GeekTrend({
       ) : series.length === 0 || rows.length === 0 ? (
         <p className="geek-empty geek-dim">暂无数据</p>
       ) : (
-        <Chart
+        <GeekLineChart
           rows={rows}
-          series={series}
-          showTotalLine={showTotalLine}
+          series={chartSeries}
           timezone={timezone}
+          format={fmt}
+          showSum
         />
       )}
       {note ? <p className="geek-trend-note geek-dim">{note}</p> : null}
-    </div>
-  );
-}
-
-function Chart({
-  rows,
-  series,
-  showTotalLine,
-  timezone,
-}: {
-  rows: Row[];
-  series: Series[];
-  showTotalLine: boolean;
-  timezone: string;
-}) {
-  const labels = useMemo(
-    () => new Map(rows.map((r) => [r.at, r.label])),
-    [rows],
-  );
-  return (
-    <ResponsiveContainer width="100%" height={300}>
-      <LineChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-        <CartesianGrid vertical={false} stroke="#26231e" />
-        <XAxis
-          dataKey="at"
-          tick={AXIS}
-          tickFormatter={(v: string) => labels.get(v) ?? v}
-          axisLine={{ stroke: "#26231e" }}
-          tickLine={false}
-          minTickGap={48}
-        />
-        <YAxis
-          tick={AXIS}
-          tickFormatter={(v: number) => fmt(v)}
-          axisLine={false}
-          tickLine={false}
-          width={48}
-        />
-        <Tooltip
-          cursor={{ stroke: "#857f70", strokeDasharray: "3 3" }}
-          content={<TrendTooltip series={series} timezone={timezone} />}
-        />
-        {series.map((s) => (
-          <Line
-            key={s.key}
-            type="monotone"
-            dataKey={s.key}
-            name={s.name}
-            stroke={s.color}
-            strokeWidth={2}
-            dot={false}
-            activeDot={{ r: 4, strokeWidth: 0, fill: s.color }}
-            connectNulls={false}
-            isAnimationActive={false}
-          />
-        ))}
-        {showTotalLine ? (
-          <Line
-            type="monotone"
-            dataKey="total"
-            name="总量"
-            stroke="#f4f1ea"
-            strokeWidth={1}
-            strokeDasharray="4 3"
-            dot={false}
-            isAnimationActive={false}
-          />
-        ) : null}
-      </LineChart>
-    </ResponsiveContainer>
-  );
-}
-
-interface TooltipPayload {
-  dataKey?: string | number;
-  value?: number | string | null;
-  payload?: Row;
-}
-
-function TrendTooltip({
-  active,
-  payload,
-  series,
-  timezone,
-}: {
-  active?: boolean;
-  payload?: TooltipPayload[];
-  series: Series[];
-  timezone: string;
-}) {
-  const row = payload?.[0]?.payload;
-  if (!active || !row) return null;
-  const items = series
-    .map((s) => ({ ...s, value: row[s.key] }))
-    .filter(
-      (s): s is typeof s & { value: number } => typeof s.value === "number",
-    );
-  const sum = items.reduce((a, s) => a + s.value, 0);
-  return (
-    <div className="geek-tooltip">
-      <div className="geek-tooltip-time">{formatInstant(row.at, timezone)}</div>
-      {items.map((s) => (
-        <div key={s.key} className="geek-tooltip-row">
-          <i style={{ background: s.color }} />
-          <span>{s.name}</span>
-          <b className="geek-num">{fmt(s.value)}</b>
-        </div>
-      ))}
-      <div className="geek-tooltip-row geek-tooltip-sum">
-        <span>合计</span>
-        <b className="geek-num">
-          {typeof row.total === "number" ? fmt(row.total) : fmt(sum)}
-        </b>
-      </div>
     </div>
   );
 }

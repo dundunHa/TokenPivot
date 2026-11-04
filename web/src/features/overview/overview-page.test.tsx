@@ -129,9 +129,12 @@ function useBackend(opts?: { aggregate?: () => Response | Promise<Response> }) {
   return calls;
 }
 
-/** 热力图固定用小时粒度另发一条聚合；这里只看主趋势的请求。 */
+/** 热力图（小时）与速率趋势（分钟）固定粒度另发聚合；这里只看主趋势的请求。 */
 const mainCalls = (calls: URL[]) =>
-  calls.filter((c) => c.searchParams.get("granularity") !== "hour");
+  calls.filter(
+    (c) =>
+      !["hour", "minute"].includes(c.searchParams.get("granularity") ?? ""),
+  );
 
 describe("overview page", () => {
   it("shows the four metrics from the server and queries with the URL timezone", async () => {
@@ -301,9 +304,14 @@ describe("overview page", () => {
     });
     renderApp("/?tz=UTC&granularity=hour&range=today");
     await screen.findAllByText(/趋势点数超过上限 1000.*天/);
+    // 显式的“小时”在今天范围内放得下，主趋势不改粒度（其余是固定粒度的附带查询）。
+    const hourly = calls.filter(
+      (c) => c.searchParams.get("granularity") === "hour",
+    );
+    expect(hourly.length).toBeGreaterThan(0);
     expect(
-      calls.every((c) => c.searchParams.get("granularity") === "hour"),
-    ).toBe(true);
+      calls.some((c) => c.searchParams.get("granularity") === "auto"),
+    ).toBe(false);
   });
 
   it("lets the server choose when an explicit granularity is too fine for the range", async () => {

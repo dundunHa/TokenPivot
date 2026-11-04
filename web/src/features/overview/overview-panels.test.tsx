@@ -147,20 +147,42 @@ describe("overview panels", () => {
     expect(screen.queryByTestId("cache-hit")).toBeNull();
   });
 
-  it("lists the top models by live rate in tokens/s, highest first", async () => {
+  it("lists the top models by live rate in the rate card, in tokens/s, highest first", async () => {
     const seen = useBackend();
     renderApp("/?tz=UTC");
-    const rows = await screen.findAllByTestId("model-rate");
     await waitFor(() =>
       expect(
         screen.getAllByTestId("model-rate").map((r) => r.textContent),
-      ).toEqual([expect.stringContaining("m1"), expect.stringContaining("m2")]),
+      ).toEqual([
+        expect.stringMatching(/m1.*100/),
+        expect.stringMatching(/m2.*50/),
+      ]),
     );
-    expect(rows).toHaveLength(2);
     const texts = screen.getAllByTestId("model-rate").map((r) => r.textContent);
     expect(texts[0]).toContain("100");
     expect(texts[1]).toContain("50");
     expect(seen.rateModels).toEqual(expect.arrayContaining(["m1", "m2"]));
+    // 分模型明细在顶部“实时速率”指标卡内，总速率仍在。
+    const rate = screen.getByTestId("rate");
+    expect(
+      rate
+        .closest(".geek-kpi")
+        ?.contains(screen.getAllByTestId("model-rate")[0] ?? null),
+    ).toBe(true);
+  });
+
+  it("draws the per-minute rate trend for the total and each model", async () => {
+    const seen = useBackend();
+    renderApp("/?tz=UTC");
+    const card = await screen.findByRole("region", { name: "实时速率趋势" });
+    await waitFor(() => expect(seen.aggregateGran).toContain("minute"));
+    expect(within(card).getByText(/近 60 分钟/)).toBeTruthy();
+    // 总量 + 两个模型各一条分钟聚合。
+    await waitFor(() =>
+      expect(
+        seen.aggregateGran.filter((g) => g === "minute").length,
+      ).toBeGreaterThanOrEqual(3),
+    );
   });
 
   it("draws the weekly activity heatmap with its peak", async () => {

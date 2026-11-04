@@ -10,7 +10,8 @@ import { GeekComposition } from "./geek/GeekComposition";
 import { GeekHeatmap } from "./geek/GeekHeatmap";
 import { GeekKpis } from "./geek/GeekKpis";
 import { GeekTrend } from "./geek/GeekTrend";
-import { ModelRates } from "@/features/requests/ModelRates";
+import { ModelRateList } from "@/features/requests/ModelRateList";
+import { RateTrend } from "@/features/requests/RateTrend";
 import { RateKpi } from "@/features/requests/RateKpi";
 import {
   browserTimezone,
@@ -216,7 +217,11 @@ function OverviewContent({
         <GeekKpis
           data={data}
           previous={previous.data?.totals}
-          rate={<RateKpi scope={scope} filters={filters} />}
+          rate={
+            <RateKpi scope={scope} filters={filters}>
+              <ModelRateList scope={scope} filters={filters} range={range} />
+            </RateKpi>
+          }
         />
       ) : null}
 
@@ -260,7 +265,7 @@ function OverviewContent({
       </div>
 
       <div className="geek-split">
-        <ModelRates scope={scope} filters={filters} range={range} />
+        <RateTrend scope={scope} filters={filters} range={range} nowMs={now} />
         {data ? <GeekComposition data={data} /> : null}
       </div>
 
