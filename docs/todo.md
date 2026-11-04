@@ -1,6 +1,6 @@
 # TODO
 
-<!-- todo-meta: next-id=61 -->
+<!-- todo-meta: next-id=69 -->
 
 ## 里程碑一：采集打通
 
@@ -29,3 +29,20 @@
   - 决策: docs/decisions/0003-minute-aggregation-and-retention.md
 - [ ] T-042 {P2} **响应式与动效可访问性** 桌面优先重排，小屏保留核心指标/筛选/趋势/明细；跟随系统 prefers-reduced-motion，不做设置项；状态不只靠颜色。
   - prd: docs/prd.md §8
+
+## 前端原型
+
+
+## 前端
+
+- [ ] T-062 {running} {P1} **dashboard 正式前端：J 极客重奏方案落地 web/** 用户返修确认：按 J 原型复刻全部区块；无真实接口的数据标记不可用，不用演示数据；修正默认 braille、直角面板、窗口切换、字符直方图、排名、日志与响应式。
+  - plan: docs/plans/2026-11-02-overview-j-geek-redesign.md
+
+## 部署
+
+- [ ] T-065 {P1} **BF 部署 J 完整复刻版** J 原型全部区块返修通过终审后，固定 main 提交并发布到 BF；沿用备份、迁移和版本健康验收。
+
+## 后端与存储优化
+
+
+## 前端与认证

@@ -44,6 +44,11 @@ const FUTURE = "2999-01-01T00:00:00Z";
 const DAY = 86_400_000;
 const realSetTimeout = setTimeout;
 
+// 本文件只验证会话竞态；登录成功后落到零空间，避免挂载业务查询干扰请求计数。
+beforeEach(() => {
+  server.use(http.get("/api/v1/workspaces", () => HttpResponse.json([])));
+});
+
 /** 假时间下不能用 RTL waitFor（它依赖被替换的 setTimeout）；用真实定时器轮询。 */
 async function until(check: () => unknown) {
   for (let i = 0; i < 200; i += 1) {

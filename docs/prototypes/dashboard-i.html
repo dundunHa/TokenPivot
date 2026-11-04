@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TokenPivot · I 克制暗夜版</title>
+<style>
+/* ============================================================
+   I 克制暗夜版 — 设计假设
+   · Raycast/Cron 式安静深灰：暗但不黑、柔焦、细线、单一点缀
+   · 细体超大数字 + 玻璃读数卡 + 噪点去眩光
+   · 反 slop：零紫渐变、零 emoji、零亮色大面积填充
+   ============================================================ */
+:root{
+  --bg:#101114;
+  --panel:#16181d;
+  --panel-edge:rgba(255,255,255,.06);
+  --panel-hi:rgba(255,255,255,.04);
+  --text:#e8eaee;
+  --text-2:#9aa0ab;
+  --text-3:#5d636d;
+  --accent:#7aa2ff;
+  --accent-dim:rgba(122,162,255,.15);
+  --ok:#4ecb7d;
+  --warn:#e0b36b;
+  --err:#e0685f;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Helvetica Neue","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--sans);
+  font-size:13px;
+  line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+  font-variant-numeric:tabular-nums;
+  position:relative;
+}
+/* 顶部氛围光：只此一处 */
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(900px 400px at 50% -10%,rgba(122,162,255,.05),transparent 70%);
+}
+/* 噪点纹理：去眩光 */
+body::after{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:1;
+  opacity:.028;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+button{font-family:inherit}
+
+/* 顶部 ------------------------------------------------------- */
+.topbar{
+  position:relative;z-index:2;
+  max-width:1440px;margin:0 auto;padding:20px 36px 0;
+  display:flex;align-items:center;gap:16px;
+}
+.brand{
+  display:flex;align-items:center;gap:10px;
+  font-size:12px;font-weight:500;letter-spacing:.04em;
+}
+.brand i{
+  width:8px;height:8px;border-radius:2px;
+  background:linear-gradient(135deg,#e8eaee,#7aa2ff);
+  display:inline-block;
+}
+.tag-i{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:20px;height:20px;border-radius:5px;
+  background:var(--panel);border:1px solid var(--panel-edge);
+  font-size:11px;font-weight:500;color:var(--text-2);
+}
+.brand-ver{font-size:11px;color:var(--text-3);font-weight:400}
+.top-meta{
+  margin-left:auto;display:flex;align-items:center;gap:12px;
+  font-size:11px;color:var(--text-3);
+}
+.top-meta .dot{width:5px;height:5px;border-radius:50%;background:var(--ok);display:inline-block;margin-right:6px;box-shadow:0 0 6px rgba(78,203,125,.5)}
+.top-meta em{font-style:normal;color:var(--text-2)}
+
+/* 页眉 ------------------------------------------------------- */
+.pagehead{
+  position:relative;z-index:2;
+  max-width:1440px;margin:0 auto;padding:32px 36px 24px;
+  display:flex;align-items:flex-end;gap:24px;flex-wrap:wrap;
+}
+.ph-left h1{
+  font-size:28px;font-weight:600;letter-spacing:-.025em;margin:0;
+}
+.ph-left .lede{
+  margin:8px 0 0;font-size:12.5px;color:var(--text-2);max-width:480px;line-height:1.65;
+}
+.ph-right{margin-left:auto}
+.seg{
+  display:flex;background:var(--panel);border:1px solid var(--panel-edge);
+  border-radius:9px;padding:3px;gap:2px;
+}
+.seg button{
+  appearance:none;background:transparent;border:0;cursor:pointer;
+  padding:6px 14px;font-size:11.5px;font-weight:500;
+  color:var(--text-2);border-radius:6px;
+  transition:background .12s,color .12s;
+}
+.seg button:hover{color:var(--text)}
+.seg button.on{
+  background:var(--accent-dim);color:var(--accent);
+  box-shadow:inset 0 0 0 1px rgba(122,162,255,.2);
+}
+
+/* 主体 ------------------------------------------------------- */
+.wrap{
+  position:relative;z-index:2;
+  max-width:1440px;margin:0 auto;padding:0 36px 48px;
+}
+.panel{
+  background:var(--panel);
+  border:1px solid var(--panel-edge);
+  border-radius:13px;
+  position:relative;
+  overflow:hidden;
+}
+.panel::before{
+  content:"";position:absolute;top:0;left:0;right:0;height:1px;
+  background:var(--panel-hi);pointer-events:none;
+}
+.panel-pad{padding:20px 22px}
+.panel-head{
+  display:flex;align-items:baseline;gap:10px;
+  margin-bottom:16px;
+}
+.panel-title{
+  font-size:11px;font-weight:500;letter-spacing:.08em;
+  color:var(--text-2);text-transform:uppercase;
+}
+.panel-aside{
+  margin-left:auto;font-size:11px;color:var(--text-3);
+  font-family:var(--mono);
+}
+
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px}
+
+/* hero ------------------------------------------------------- */
+.hero{grid-column:1/span 5;display:flex;flex-direction:column}
+.hero-num{
+  font-size:72px;font-weight:300;letter-spacing:-.03em;line-height:1;
+  margin:8px 0 0;
+}
+.hero-num .unit{font-size:20px;font-weight:400;color:var(--text-3);margin-left:8px}
+.hero-delta{
+  margin-top:14px;display:flex;align-items:center;gap:12px;
+  font-size:12px;color:var(--text-2);
+}
+.hero-delta .pill{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:2px 8px;border-radius:5px;font-size:11px;font-weight:500;
+  background:rgba(78,203,125,.1);color:var(--ok);
+}
+.hero-delta .pill.down{background:rgba(224,104,95,.1);color:var(--err)}
+.hero-spark{margin-top:auto;padding-top:20px}
+.hero-spark .cap{
+  display:flex;justify-content:space-between;
+  font-size:10.5px;color:var(--text-3);margin-bottom:8px;
+}
+.hero-spark svg{display:block;width:100%;height:44px}
+
+/* kpi -------------------------------------------------------- */
+.kpi-rail{grid-column:6/span 7;display:grid;grid-template-columns:repeat(4,1fr);gap:18px}
+.kpi{
+  background:var(--panel);border:1px solid var(--panel-edge);
+  border-radius:13px;padding:18px 18px 16px;
+  position:relative;overflow:hidden;
+}
+.kpi::before{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:var(--panel-hi)}
+.kpi .k{font-size:10.5px;font-weight:500;letter-spacing:.06em;color:var(--text-3);text-transform:uppercase}
+.kpi .v{font-size:26px;font-weight:400;letter-spacing:-.02em;margin-top:10px;line-height:1.1}
+.kpi .v small{font-size:13px;color:var(--text-3);margin-left:3px}
+.kpi .s{font-size:11px;color:var(--text-3);margin-top:8px}
+.kpi .s em{font-style:normal;color:var(--text-2)}
+.kpi .spark{margin-top:10px}
+.kpi .spark svg{display:block;width:100%;height:24px}
+
+/* 趋势 ------------------------------------------------------- */
+.trend{grid-column:1/span 8}
+.trend-canvas{position:relative}
+.trend-canvas svg{display:block;width:100%;height:340px}
+.trend-tip{
+  position:absolute;pointer-events:none;
+  background:rgba(22,24,29,.85);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--panel-edge);
+  border-radius:10px;
+  padding:12px 14px;
+  font-size:12px;
+  opacity:0;transition:opacity .15s;
+  min-width:170px;z-index:5;
+  box-shadow:0 8px 24px rgba(0,0,0,.3);
+}
+.trend-tip .t{font-size:11px;color:var(--text-3);margin-bottom:8px;letter-spacing:.04em}
+.trend-tip .r{display:flex;justify-content:space-between;gap:18px;padding:3px 0;color:var(--text-2)}
+.trend-tip .r b{font-weight:500;color:var(--text)}
+.trend-tip .r.cur b{color:var(--accent)}
+.trend-legend{display:flex;gap:6px;margin-top:14px;flex-wrap:wrap}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:4px 10px;border-radius:6px;
+  background:transparent;border:1px solid transparent;
+  font-size:11.5px;color:var(--text-2);cursor:pointer;
+  transition:all .12s;
+}
+.chip:hover{background:rgba(255,255,255,.03);color:var(--text)}
+.chip i{width:7px;height:7px;border-radius:2px;display:inline-block}
+.chip.off{color:var(--text-3)}
+.chip.off i{opacity:.3}
+
+/* 占比 -------------------------------------------------------- */
+.share{grid-column:9/span 4}
+.donut-wrap{display:flex;align-items:center;gap:20px;margin:8px 0 16px}
+.donut{position:relative;flex:0 0 120px}
+.donut svg{display:block;width:120px;height:120px;transform:rotate(-90deg)}
+.donut-center{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+}
+.donut-center .v{font-size:22px;font-weight:400;letter-spacing:-.02em}
+.donut-center .k{font-size:10px;color:var(--text-3);margin-top:2px}
+.share-list{flex:1;display:flex;flex-direction:column;gap:8px}
+.share-item{
+  display:flex;align-items:center;gap:8px;font-size:11.5px;
+  cursor:pointer;padding:3px 0;
+}
+.share-item:hover .nm{color:var(--text)}
+.share-item.off{opacity:.35}
+.share-item i{width:7px;height:7px;border-radius:2px;flex:0 0 7px}
+.share-item .nm{color:var(--text-2);flex:1}
+.share-item .pct{font-family:var(--mono);font-size:11px;color:var(--text)}
+
+/* 直方图 ------------------------------------------------------ */
+.hist{grid-column:1/span 8}
+.hist svg{display:block;width:100%;height:160px}
+
+/* 排名 -------------------------------------------------------- */
+.rank{grid-column:9/span 4}
+.rank-tabs{display:flex;gap:2px;background:rgba(0,0,0,.2);border-radius:7px;padding:3px;margin-bottom:14px;width:fit-content}
+.rank-tabs button{
+  appearance:none;background:transparent;border:0;cursor:pointer;
+  padding:4px 12px;font-size:11px;font-weight:500;color:var(--text-3);
+  border-radius:5px;transition:all .12s;
+}
+.rank-tabs button:hover{color:var(--text)}
+.rank-tabs button.on{background:rgba(255,255,255,.06);color:var(--text)}
+.rank-list{display:flex;flex-direction:column;gap:2px}
+.rank-item{
+  display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:center;
+  padding:9px 0;border-bottom:1px solid rgba(255,255,255,.04);
+}
+.rank-item:last-child{border-bottom:0}
+.rank-item .nm{font-size:12px;color:var(--text)}
+.rank-item .nm small{display:block;font-size:10.5px;color:var(--text-3);margin-top:2px}
+.rank-item .val{font-size:14px;font-weight:500;font-family:var(--mono)}
+.rank-item .bar{grid-column:1/span 2;height:3px;background:rgba(255,255,255,.05);border-radius:2px;overflow:hidden;margin-top:4px}
+.rank-item .bar i{display:block;height:100%;background:var(--text-3);border-radius:2px}
+.rank-item:first-child .bar i{background:var(--accent)}
+.rank-item:first-child .val{color:var(--accent)}
+
+/* 质量 -------------------------------------------------------- */
+.quality{grid-column:1/span 8}
+.lat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:18px}
+.lat-cell .k{font-size:10.5px;font-weight:500;letter-spacing:.06em;color:var(--text-3);text-transform:uppercase}
+.lat-cell .v{font-size:24px;font-weight:300;letter-spacing:-.02em;margin-top:6px}
+.lat-cell .v small{font-size:12px;color:var(--text-3);margin-left:3px}
+.lat-svg svg{display:block;width:100%;height:80px}
+.codes{display:flex;gap:20px;margin-top:18px;flex-wrap:wrap}
+.code-cell{flex:1;min-width:100px}
+.code-cell .k{font-family:var(--mono);font-size:11px;color:var(--text-2);display:flex;align-items:center;gap:6px}
+.code-cell .k i{width:6px;height:6px;border-radius:50%;background:var(--ok)}
+.code-cell.c429 .k i{background:var(--warn)}
+.code-cell.c5xx .k i{background:var(--err)}
+.code-cell .bar{height:4px;margin:8px 0 6px;background:rgba(255,255,255,.05);border-radius:2px;overflow:hidden}
+.code-cell .bar i{display:block;height:100%;background:var(--ok);border-radius:2px}
+.code-cell.c429 .bar i{background:var(--warn)}
+.code-cell.c5xx .bar i{background:var(--err)}
+.code-cell .v{font-size:11px;color:var(--text-3);font-family:var(--mono)}
+
+/* 预算 -------------------------------------------------------- */
+.budget{grid-column:9/span 4}
+.budget-num{font-size:44px;font-weight:300;letter-spacing:-.02em;line-height:1}
+.budget-num small{font-size:14px;color:var(--text-3);margin-left:8px;font-weight:400}
+.budget-bar{
+  position:relative;height:6px;margin:18px 0 10px;
+  background:rgba(255,255,255,.05);border-radius:3px;overflow:visible;
+}
+.budget-bar .fill{
+  position:absolute;left:0;top:0;bottom:0;
+  background:var(--accent);border-radius:3px;
+}
+.budget-bar .target{
+  position:absolute;top:-4px;bottom:-4px;width:2px;
+  background:var(--warn);border-radius:1px;
+}
+.budget-cap{display:flex;justify-content:space-between;font-size:11px;color:var(--text-3);font-family:var(--mono)}
+.budget-note{margin-top:14px;font-size:12px;color:var(--text-2);line-height:1.7}
+.budget-note em{font-style:normal;color:var(--warn)}
+
+/* 请求流 ------------------------------------------------------ */
+.feed{grid-column:1/span 12}
+.feed-head{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.feed-head .cmd{font-family:var(--mono);font-size:12px;color:var(--text-2)}
+.feed-head .cmd em{font-style:normal;color:var(--accent)}
+.feed-filter{margin-left:auto;display:flex;gap:4px}
+.feed-filter button{
+  appearance:none;background:transparent;border:1px solid transparent;cursor:pointer;
+  padding:4px 10px;font-family:var(--mono);font-size:10.5px;color:var(--text-3);
+  border-radius:6px;transition:all .12s;
+}
+.feed-filter button:hover{color:var(--text);background:rgba(255,255,255,.03)}
+.feed-filter button.on{color:var(--accent);background:var(--accent-dim);border-color:rgba(122,162,255,.2)}
+.feed-table{
+  font-family:var(--mono);font-size:11.5px;
+  height:320px;overflow:hidden;
+}
+.feed-table .row{
+  display:grid;grid-template-columns:80px 1fr 1.6fr 1fr 1fr .8fr .8fr .6fr;gap:14px;
+  padding:8px 4px;border-bottom:1px solid rgba(255,255,255,.03);
+  color:var(--text-3);align-items:center;
+}
+.feed-table .row.head{
+  color:var(--text-3);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+  border-bottom:1px solid var(--panel-edge);padding-bottom:10px;margin-bottom:4px;
+}
+.feed-table .row .st-ok{color:var(--ok)}
+.feed-table .row .st-warn{color:var(--warn)}
+.feed-table .row .st-err{color:var(--err)}
+.feed-table .row .mdl{color:var(--text-2)}
+.feed-table .row.new{animation:flash 1.4s ease-out}
+@keyframes flash{
+  0%{background:rgba(122,162,255,.06)}
+  100%{background:transparent}
+}
+
+/* footer ------------------------------------------------------ */
+.colophon{
+  display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;
+  margin-top:28px;padding-top:16px;
+  border-top:1px solid var(--panel-edge);
+  font-size:11px;color:var(--text-3);
+}
+
+/* 响应式 ------------------------------------------------------ */
+@media (max-width:1180px){
+  .hero{grid-column:1/span 12}
+  .kpi-rail{grid-column:1/span 12}
+  .trend{grid-column:1/span 12}
+  .share{grid-column:1/span 12}
+  .hist{grid-column:1/span 12}
+  .rank{grid-column:1/span 12}
+  .quality{grid-column:1/span 12}
+  .budget{grid-column:1/span 12}
+}
+@media (max-width:760px){
+  .topbar,.pagehead,.wrap{padding-left:20px;padding-right:20px}
+  .ph-left h1{font-size:22px}
+  .hero-num{font-size:48px}
+  .hero-num .unit{font-size:16px}
+  .kpi-rail{grid-template-columns:1fr 1fr}
+  .lat-row{grid-template-columns:1fr}
+  .donut-wrap{flex-direction:column;align-items:flex-start}
+  .feed-table .row{grid-template-columns:64px 1fr 1fr .8fr .8fr .6fr;font-size:10px}
+  .feed-table .row .hide-s{display:none}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand"><i></i>TokenPivot<span class="tag-i">I</span><span class="brand-ver">克制暗夜</span></span>
+  <div class="top-meta">
+    <span><span class="dot"></span>实时</span>
+    <span>·</span>
+    <span><em>示例数据</em> · 视觉原型</span>
+  </div>
+</header>
+
+<div class="pagehead">
+  <div class="ph-left">
+    <h1>安静一点，看清用量。</h1>
+    <p class="lede">深灰底、细体数字、单一尘蓝点缀。把终端的喧闹关在门外，留一张能久看的面板。</p>
+  </div>
+  <div class="ph-right">
+    <div class="seg" id="windowSwitch" role="tablist" aria-label="时间窗">
+      <button data-w="min" role="tab">60 分钟</button>
+      <button data-w="hour" class="on" role="tab">24 小时</button>
+      <button data-w="day" role="tab">30 天</button>
+    </div>
+  </div>
+</div>
+
+<main class="wrap">
+  <div class="grid">
+
+    <!-- hero -->
+    <section class="panel panel-pad hero">
+      <div class="panel-head">
+        <span class="panel-title">Token 总量</span>
+        <span class="panel-aside" id="heroWindowLab">24h</span>
+      </div>
+      <div class="hero-num"><span id="heroNum">0</span><span class="unit">tokens</span></div>
+      <div class="hero-delta">
+        <span class="pill" id="heroDeltaPill">—</span>
+        <span id="heroDeltaVs">较昨日同时段</span>
+      </div>
+      <div class="hero-spark">
+        <div class="cap"><span>今日 vs 昨日</span><span id="sparkCap">24h</span></div>
+        <svg id="sparkSvg" viewBox="0 0 400 44" preserveAspectRatio="none"></svg>
+      </div>
+    </section>
+
+    <!-- KPI -->
+    <div class="kpi-rail">
+      <div class="kpi">
+        <div class="k">请求数</div>
+        <div class="v" id="kpiReq">—</div>
+        <div class="s" id="kpiReqSub">—</div>
+        <div class="spark"><svg id="kpiSpark1" viewBox="0 0 100 24" preserveAspectRatio="none"></svg></div>
+      </div>
+      <div class="kpi">
+        <div class="k">速率</div>
+        <div class="v" id="kpiRpm">—<small>/min</small></div>
+        <div class="s" id="kpiRpmSub">—</div>
+        <div class="spark"><svg id="kpiSpark2" viewBox="0 0 100 24" preserveAspectRatio="none"></svg></div>
+      </div>
+      <div class="kpi">
+        <div class="k">时延 p90</div>
+        <div class="v" id="kpiP90">—<small>ms</small></div>
+        <div class="s" id="kpiP90Sub">—</div>
+        <div class="spark"><svg id="kpiSpark3" viewBox="0 0 100 24" preserveAspectRatio="none"></svg></div>
+      </div>
+      <div class="kpi">
+        <div class="k">成本 · 今日</div>
+        <div class="v" id="kpiCost">—</div>
+        <div class="s" id="kpiCostSub">—</div>
+        <div class="spark"><svg id="kpiSpark4" viewBox="0 0 100 24" preserveAspectRatio="none"></svg></div>
+      </div>
+    </div>
+
+    <!-- 趋势 -->
+    <section class="panel panel-pad trend">
+      <div class="panel-head">
+        <span class="panel-title">用量趋势</span>
+        <span class="panel-aside" id="trendCap">按小时</span>
+      </div>
+      <div class="trend-canvas">
+        <svg id="trendSvg" viewBox="0 0 760 340" preserveAspectRatio="none"></svg>
+        <div class="trend-tip" id="trendTip"></div>
+      </div>
+      <div class="trend-legend" id="trendLegend"></div>
+    </section>
+
+    <!-- 占比 -->
+    <section class="panel panel-pad share">
+      <div class="panel-head">
+        <span class="panel-title">供应商</span>
+        <span class="panel-aside">tokens</span>
+      </div>
+      <div class="donut-wrap">
+        <div class="donut">
+          <svg id="donutSvg" viewBox="0 0 120 120"></svg>
+          <div class="donut-center">
+            <div class="v" id="donutTotal">—</div>
+            <div class="k">total</div>
+          </div>
+        </div>
+        <div class="share-list" id="shareList"></div>
+      </div>
+    </section>
+
+    <!-- 直方图 -->
+    <section class="panel panel-pad hist">
+      <div class="panel-head">
+        <span class="panel-title">请求分布</span>
+        <span class="panel-aside" id="histCap">均值 —</span>
+      </div>
+      <svg id="histSvg" viewBox="0 0 760 160" preserveAspectRatio="none"></svg>
+    </section>
+
+    <!-- 排名 -->
+    <section class="panel panel-pad rank">
+      <div class="panel-head">
+        <span class="panel-title">维度排名</span>
+        <span class="panel-aside">top 5</span>
+      </div>
+      <div class="rank-tabs" id="rankTabs">
+        <button data-t="project" class="on">项目</button>
+        <button data-t="model">模型</button>
+        <button data-t="provider">供应商</button>
+      </div>
+      <div class="rank-list" id="rankList"></div>
+    </section>
+
+    <!-- 质量 -->
+    <section class="panel panel-pad quality">
+      <div class="panel-head">
+        <span class="panel-title">质量</span>
+        <span class="panel-aside">近 24h</span>
+      </div>
+      <div class="lat-row">
+        <div class="lat-cell"><div class="k">p50</div><div class="v" id="latP50">—<small>ms</small></div></div>
+        <div class="lat-cell"><div class="k">p90</div><div class="v" id="latP90">—<small>ms</small></div></div>
+        <div class="lat-cell"><div class="k">p99</div><div class="v" id="latP99">—<small>ms</small></div></div>
+      </div>
+      <div class="lat-svg"><svg id="latSvg" viewBox="0 0 760 80" preserveAspectRatio="none"></svg></div>
+      <div class="codes" id="codeList"></div>
+    </section>
+
+    <!-- 预算 -->
+    <section class="panel panel-pad budget">
+      <div class="panel-head">
+        <span class="panel-title">月度预算</span>
+        <span class="panel-aside">nov</span>
+      </div>
+      <div class="budget-num"><span id="budgetPct">—</span><small>已用</small></div>
+      <div class="budget-bar">
+        <div class="fill" id="budgetFill" style="width:0%"></div>
+        <div class="target" id="budgetTarget" style="left:80%"></div>
+      </div>
+      <div class="budget-cap">
+        <span id="budgetUsed">$—</span>
+        <span id="budgetCap">$—</span>
+      </div>
+      <p class="budget-note" id="budgetNote">—</p>
+    </section>
+
+    <!-- 请求流 -->
+    <section class="panel panel-pad feed">
+      <div class="feed-head">
+        <span class="cmd">$ tail -f <em>requests.log</em></span>
+        <div class="feed-filter" id="feedFilter"></div>
+      </div>
+      <div class="feed-table" id="feedTable">
+        <div class="row head">
+          <span>时间</span><span>项目</span><span>模型</span><span>供应商</span>
+          <span class="hide-s">in / out</span><span>时延</span><span>成本</span><span>状态</span>
+        </div>
+        <div id="feedRows"></div>
+      </div>
+    </section>
+
+  </div>
+
+  <footer class="colophon">
+    <span>TokenPivot · 第二辑 I 版 · 2026-11-02</span>
+    <span>示例公式数据 · 非真实采集 · 口径：完成时刻计数</span>
+  </footer>
+</main>
+
+<script>
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const rnd = mulberry32(20261102);
+
+const PROVIDERS = [
+  {id:'openai',    name:'OpenAI',    models:['gpt-5.2','gpt-5.2-mini'],  color:'#7aa2ff'},
+  {id:'anthropic', name:'Anthropic', models:['claude-opus-4.5','claude-sonnet-4.5'], color:'#e0b36b'},
+  {id:'gemini',    name:'Gemini',    models:['gemini-3-pro'],            color:'#4ecb7d'},
+  {id:'deepseek',  name:'DeepSeek',  models:['deepseek-v4'],             color:'#9aa0ab'},
+  {id:'moonshot',  name:'Moonshot',  models:['kimi-k3'],                  color:'#5d636d'},
+];
+const PROJECTS = [
+  {id:'tokenpivot', name:'tokenpivot 主站'},
+  {id:'dsh',        name:'dsh-plugin'},
+  {id:'bridge',     name:'pi-bridge'},
+  {id:'website',    name:'website 前台'},
+  {id:'misc',       name:'未归属'},
+];
+const WINDOWS = {
+  min:  {n:60, label:'60 分钟', cap:'按分钟', unit:'min',  spark:'60m', base:88000,   prevLabel:'较前一小时'},
+  hour: {n:24, label:'24 小时', cap:'按小时', unit:'hour', spark:'24h', base:4200000, prevLabel:'较昨日同时段'},
+  day:  {n:30, label:'30 天',   cap:'按天',   unit:'day',  spark:'30d', base:96000000, prevLabel:'较前 30 天'},
+};
+function genWindow(wKey){
+  const w = WINDOWS[wKey];
+  const series = {input:[],output:[],cache:[]};
+  const prev = [], reqs = [];
+  for(let i=0;i<w.n;i++){
+    const t = i/w.n;
+    const diurnal = 0.55 + 0.45*Math.sin(t*Math.PI*2 - Math.PI/2)*Math.sin(t*Math.PI*2 - Math.PI/2);
+    const spike = (i>w.n*0.62 && i<w.n*0.72) ? 1.9 : 1;
+    const base = w.base * diurnal * spike;
+    series.input.push(base * (0.42 + rnd()*0.06));
+    series.output.push(base * (0.20 + rnd()*0.05));
+    series.cache.push(base * (0.30 + rnd()*0.08));
+    prev.push(base * (0.85 + rnd()*0.25));
+    reqs.push(Math.round(base/900 + rnd()*400));
+  }
+  return {w, series, prev, reqs};
+}
+function sum(a){return a.reduce((x,y)=>x+y,0)}
+function fmt(n){
+  if(n>=1e9) return (n/1e9).toFixed(2)+'B';
+  if(n>=1e6) return (n/1e6).toFixed(2)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(1)+'K';
+  return Math.round(n).toString();
+}
+function fmtMoney(n){return '$'+n.toLocaleString('en-US',{maximumFractionDigits:0})}
+
+const state = {
+  window:'hour',
+  data:genWindow('hour'),
+  hidden:{input:false,output:false,cache:false},
+  shareOff:{},
+  rankTab:'project',
+  feedFilter:null,
+  feedRows:[],
+  heroCur:0, heroTarget:0,
+};
+const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* hero */
+function renderHero(){
+  const d = state.data;
+  const total = sum(d.series.input)+sum(d.series.output)+sum(d.series.cache);
+  const prevTotal = sum(d.prev);
+  state.heroTarget = total;
+  if(reduced) state.heroCur = total;
+  document.getElementById('heroWindowLab').textContent = d.w.spark;
+  document.getElementById('sparkCap').textContent = d.w.spark;
+  const delta = (total-prevTotal)/prevTotal;
+  const pill = document.getElementById('heroDeltaPill');
+  pill.textContent = (delta>=0?'↑ +':'↓ ') + (delta*100).toFixed(1) + '%';
+  pill.className = 'pill' + (delta>=0?'':' down');
+  document.getElementById('heroDeltaVs').textContent = d.w.prevLabel;
+
+  const svg = document.getElementById('sparkSvg');
+  const W=400,H=44,P=4;
+  const cur = d.series.input.map((v,i)=>v+d.series.output[i]+d.series.cache[i]);
+  const maxV = Math.max(...cur,...d.prev)*1.08;
+  const x = i => P + i*(W-2*P)/(cur.length-1);
+  const y = v => H-P - (v/maxV)*(H-2*P);
+  const path = arr => arr.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)).join(' ');
+  const areaPath = cur.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)).join(' ') +
+    ` L${x(cur.length-1)},${H-P} L${x(0)},${H-P} Z`;
+  svg.innerHTML = `
+    <defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7aa2ff" stop-opacity=".18"/>
+      <stop offset="100%" stop-color="#7aa2ff" stop-opacity="0"/>
+    </linearGradient></defs>
+    <path d="${areaPath}" fill="url(#sg)"/>
+    <path d="${path(d.prev)}" fill="none" stroke="#5d636d" stroke-width="1" stroke-dasharray="2 3"/>
+    <path d="${path(cur)}" fill="none" stroke="#7aa2ff" stroke-width="1.5"/>
+    <circle cx="${x(cur.length-1)}" cy="${y(cur[cur.length-1])}" r="3" fill="#7aa2ff"/>
+    <circle cx="${x(cur.length-1)}" cy="${y(cur[cur.length-1])}" r="6" fill="#7aa2ff" opacity=".2"/>
+  `;
+}
+function tickHero(){
+  if(state.heroCur < state.heroTarget){
+    const diff = state.heroTarget - state.heroCur;
+    state.heroCur += Math.max(diff*0.08,1);
+    if(state.heroCur > state.heroTarget) state.heroCur = state.heroTarget;
+    document.getElementById('heroNum').textContent = fmt(state.heroCur);
+    requestAnimationFrame(tickHero);
+  }
+}
+
+/* KPI */
+function renderKpi(){
+  const d = state.data;
+  const totalReq = sum(d.reqs);
+  const totalTok = sum(d.series.input)+sum(d.series.output)+sum(d.series.cache);
+  const rpm = totalReq / (d.w.unit==='min'?60 : d.w.unit==='hour'?24*60 : 30*24*60);
+  const cost = totalTok * 0.0000022;
+  document.getElementById('kpiReq').textContent = fmt(totalReq);
+  document.getElementById('kpiReqSub').textContent = d.w.label;
+  document.getElementById('kpiRpm').innerHTML = fmt(rpm)+'<small>/min</small>';
+  document.getElementById('kpiRpmSub').textContent = '峰值 ' + fmt(Math.max(...d.reqs)/(d.w.unit==='min'?1:d.w.unit==='hour'?60:1440));
+  document.getElementById('kpiP90').innerHTML = '1,840<small>ms</small>';
+  document.getElementById('kpiP90Sub').innerHTML = 'p50 <em>640</em> · p99 <em>4,210</em>';
+  document.getElementById('kpiCost').textContent = fmtMoney(cost);
+  document.getElementById('kpiCostSub').textContent = '≈ $'+ (cost/(d.w.unit==='day'?30:1)*30).toFixed(0) +'/月';
+
+  // KPI sparklines
+  const sparkData = [
+    {id:'kpiSpark1', arr:d.reqs, color:'#7aa2ff'},
+    {id:'kpiSpark2', arr:d.reqs.map((v,i)=>v/(d.w.unit==='min'?1:60)), color:'#7aa2ff'},
+    {id:'kpiSpark3', arr:d.series.output.map((v,i)=>600+Math.sin(i/3)*400+rnd()*200), color:'#9aa0ab'},
+    {id:'kpiSpark4', arr:d.series.input.map((v,i)=>(v+d.series.output[i])*0.0000022), color:'#4ecb7d'},
+  ];
+  for(const s of sparkData){
+    const svg = document.getElementById(s.id);
+    const maxV = Math.max(...s.arr)*1.1 || 1;
+    const minV = Math.min(...s.arr)*0.9;
+    const range = maxV-minV || 1;
+    const x = i => i*(100/(s.arr.length-1));
+    const y = v => 22 - ((v-minV)/range)*20;
+    const path = s.arr.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)).join(' ');
+    svg.innerHTML = `<path d="${path}" fill="none" stroke="${s.color}" stroke-width="1.2" opacity=".6"/>`;
+  }
+}
+
+/* 趋势 */
+const SERIES_META = [
+  {key:'input',  name:'输入',  color:'#9aa0ab'},
+  {key:'output', name:'输出',  color:'#7aa2ff'},
+  {key:'cache',  name:'缓存',  color:'#4ecb7d'},
+];
+function renderTrend(){
+  const d = state.data;
+  const svg = document.getElementById('trendSvg');
+  const W=760,H=340,P={l:48,r:16,t:16,b:28};
+  const n = d.w.n;
+  const visible = SERIES_META.filter(s=>!state.hidden[s.key]);
+  const totals = d.series.input.map((_,i)=>visible.reduce((a,s)=>a+d.series[s.key][i],0));
+  const maxV = Math.max(...totals)*1.12 || 1;
+  const x = i => P.l + i*(W-P.l-P.r)/(n-1);
+  const y = v => H-P.b - (v/maxV)*(H-P.t-P.b);
+
+  let grid = '';
+  for(let g=0;g<=4;g++){
+    const v = maxV*g/4, yy = y(v);
+    grid += `<line x1="${P.l}" y1="${yy}" x2="${W-P.r}" y2="${yy}" stroke="rgba(255,255,255,.04)" stroke-width="1"/>`;
+    grid += `<text x="${P.l-10}" y="${yy+3}" text-anchor="end" font-size="10" fill="#5d636d" font-family="ui-monospace,Menlo,monospace">${fmt(v)}</text>`;
+  }
+
+  let areas = '';
+  let cumulative = new Array(n).fill(0);
+  for(const key of ['cache','output','input']){
+    if(state.hidden[key]) continue;
+    const meta = SERIES_META.find(s=>s.key===key);
+    const top = cumulative.map((c,i)=>c+d.series[key][i]);
+    const upPath = top.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)).join(' ');
+    const downPath = cumulative.slice().reverse().map((v,ri)=>{
+      const i = n-1-ri;
+      return 'L'+x(i).toFixed(1)+','+y(v).toFixed(1);
+    }).join(' ');
+    const isAccent = key==='output';
+    const glow = isAccent ? `filter="drop-shadow(0 0 12px rgba(122,162,255,.25))"` : '';
+    areas += `<path d="${upPath} ${downPath} Z" fill="${meta.color}" fill-opacity="${isAccent?.12:.05}" stroke="${meta.color}" stroke-width="${isAccent?1.8:1.2}" ${glow}/>`;
+    cumulative = top;
+  }
+
+  let xTicks = '';
+  const tickEvery = Math.ceil(n/7);
+  for(let i=0;i<n;i+=tickEvery){
+    const lab = d.w.unit==='min' ? `-${n-i}m` : d.w.unit==='hour' ? `${String(i).padStart(2,'0')}:00` : `D-${n-i}`;
+    xTicks += `<text x="${x(i)}" y="${H-8}" text-anchor="middle" font-size="10" fill="#5d636d" font-family="ui-monospace,Menlo,monospace">${lab}</text>`;
+  }
+
+  svg.innerHTML = grid + areas + xTicks + `<g id="trendHover"></g>`;
+
+  const hoverLayer = svg.querySelector('#trendHover');
+  const tip = document.getElementById('trendTip');
+  const canvas = document.querySelector('.trend-canvas');
+  svg.onmousemove = (ev)=>{
+    const rect = svg.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) * (W/rect.width);
+    let i = Math.round((px-P.l)/((W-P.l-P.r)/(n-1)));
+    i = Math.max(0,Math.min(n-1,i));
+    const xx = x(i), yy = y(totals[i]);
+    hoverLayer.innerHTML = `
+      <line x1="${xx}" y1="${P.t}" x2="${xx}" y2="${H-P.b}" stroke="rgba(122,162,255,.4)" stroke-width="1"/>
+      <circle cx="${xx}" cy="${yy}" r="4" fill="#7aa2ff"/>
+      <circle cx="${xx}" cy="${yy}" r="8" fill="#7aa2ff" opacity=".2"/>
+    `;
+    const lab = d.w.unit==='min' ? `-${n-i} 分钟` : d.w.unit==='hour' ? `${String(i).padStart(2,'0')}:00` : `第 ${i+1} 天`;
+    let rows = `<div class="t">${lab}</div>`;
+    for(const s of SERIES_META){
+      if(state.hidden[s.key]) continue;
+      rows += `<div class="r ${s.key==='output'?'cur':''}"><span>${s.name}</span><b>${fmt(d.series[s.key][i])}</b></div>`;
+    }
+    rows += `<div class="r" style="border-top:1px solid rgba(255,255,255,.08);padding-top:5px;margin-top:5px"><span>合计</span><b>${fmt(totals[i])}</b></div>`;
+    tip.innerHTML = rows;
+    tip.style.opacity = 1;
+    const cRect = canvas.getBoundingClientRect();
+    const tipX = (xx/W)*cRect.width;
+    tip.style.left = Math.min(Math.max(tipX-85,0),cRect.width-190)+'px';
+    tip.style.top = '14px';
+  };
+  svg.onmouseleave = ()=>{ tip.style.opacity=0; hoverLayer.innerHTML=''; };
+
+  const legend = document.getElementById('trendLegend');
+  legend.innerHTML = SERIES_META.map(s=>
+    `<span class="chip ${state.hidden[s.key]?'off':''}" data-k="${s.key}"><i style="background:${s.color}"></i>${s.name}</span>`
+  ).join('');
+  legend.querySelectorAll('.chip').forEach(el=>{
+    el.onclick = ()=>{
+      state.hidden[el.dataset.k] = !state.hidden[el.dataset.k];
+      renderTrend();
+    };
+  });
+  document.getElementById('trendCap').textContent = d.w.cap;
+}
+
+/* 占比 donut */
+function renderShare(){
+  const shares = [
+    {p:PROVIDERS[0], v:0.38},
+    {p:PROVIDERS[1], v:0.24},
+    {p:PROVIDERS[2], v:0.16},
+    {p:PROVIDERS[3], v:0.13},
+    {p:PROVIDERS[4], v:0.09},
+  ];
+  const totalTok = sum(state.data.series.input)+sum(state.data.series.output)+sum(state.data.series.cache);
+  document.getElementById('donutTotal').textContent = fmt(totalTok);
+
+  const R=48, CX=60, CY=60, CIRC=2*Math.PI*R;
+  let offset = 0;
+  let arcs = '';
+  for(const s of shares){
+    const off = state.shareOff[s.p.id];
+    const len = off ? 0 : s.v * CIRC;
+    arcs += `<circle cx="${CX}" cy="${CY}" r="${R}" fill="none" stroke="${s.p.color}" stroke-width="14"
+      stroke-dasharray="${len} ${CIRC-len}" stroke-dashoffset="${-offset}"
+      opacity="${off?.15:1}" style="transition:stroke-dasharray .3s,opacity .2s"/>`;
+    offset += s.v * CIRC;
+  }
+  document.getElementById('donutSvg').innerHTML = arcs;
+
+  document.getElementById('shareList').innerHTML = shares.map(s=>`
+    <div class="share-item ${state.shareOff[s.p.id]?'off':''}" data-p="${s.p.id}">
+      <i style="background:${s.p.color}"></i>
+      <span class="nm">${s.p.name}</span>
+      <span class="pct">${(s.v*100).toFixed(0)}%</span>
+    </div>
+  `).join('');
+  document.querySelectorAll('.share-item').forEach(el=>{
+    el.onclick = ()=>{
+      const id = el.dataset.p;
+      state.shareOff[id] = !state.shareOff[id];
+      renderShare();
+    };
+  });
+}
+
+/* 直方图 */
+function renderHist(){
+  const d = state.data;
+  const svg = document.getElementById('histSvg');
+  const W=760,H=160,P={l:48,r:16,t:14,b:22};
+  const n = d.w.n;
+  const maxV = Math.max(...d.reqs)*1.1;
+  const avg = sum(d.reqs)/n;
+  const bw = (W-P.l-P.r)/n;
+  const x = i => P.l + i*bw;
+  const y = v => H-P.b - (v/maxV)*(H-P.t-P.b);
+
+  let bars = '';
+  const peakV = Math.max(...d.reqs);
+  for(let i=0;i<n;i++){
+    const isPeak = d.reqs[i]===peakV;
+    bars += `<rect x="${(x(i)+bw*0.15).toFixed(1)}" y="${y(d.reqs[i]).toFixed(1)}" width="${(bw*0.7).toFixed(1)}" height="${(H-P.b-y(d.reqs[i])).toFixed(1)}" rx="2" fill="${isPeak?'#7aa2ff':'#9aa0ab'}" fill-opacity="${isPeak?1:.4}"/>`;
+  }
+  const avgY = y(avg);
+  svg.innerHTML = bars +
+    `<line x1="${P.l}" y1="${avgY}" x2="${W-P.r}" y2="${avgY}" stroke="#7aa2ff" stroke-width="1" stroke-dasharray="3 4" opacity=".5"/>
+     <text x="${W-P.r}" y="${avgY-4}" text-anchor="end" font-size="10" fill="#7aa2ff" font-family="ui-monospace,Menlo,monospace">avg ${fmt(avg)}</text>`;
+  document.getElementById('histCap').textContent = '均值 ' + fmt(avg);
+}
+
+/* 排名 */
+function renderRank(){
+  const totalTok = sum(state.data.series.input)+sum(state.data.series.output)+sum(state.data.series.cache);
+  let items = [];
+  if(state.rankTab==='project'){
+    const ratios = [0.36,0.24,0.18,0.14,0.08];
+    items = PROJECTS.map((p,i)=>({name:p.name, sub:p.id, v:totalTok*ratios[i]}));
+  }else if(state.rankTab==='model'){
+    const all = PROVIDERS.flatMap(p=>p.models.map(m=>({name:m, sub:p.name})));
+    const ratios = [0.32,0.22,0.18,0.12,0.09];
+    items = all.slice(0,5).map((m,i)=>({...m, v:totalTok*ratios[i]}));
+  }else{
+    const ratios = [0.38,0.24,0.16,0.13,0.09];
+    items = PROVIDERS.map((p,i)=>({name:p.name, sub:p.models[0], v:totalTok*ratios[i]}));
+  }
+  const maxV = Math.max(...items.map(i=>i.v));
+  document.getElementById('rankList').innerHTML = items.map((it,i)=>`
+    <div class="rank-item">
+      <span class="nm">${it.name}<small>${it.sub}</small></span>
+      <span class="val">${fmt(it.v)}</span>
+      <span class="bar"><i style="width:${(it.v/maxV*100).toFixed(1)}%"></i></span>
+    </div>
+  `).join('');
+}
+
+/* 质量 */
+function renderQuality(){
+  document.getElementById('latP50').innerHTML = '640<small>ms</small>';
+  document.getElementById('latP90').innerHTML = '1,840<small>ms</small>';
+  document.getElementById('latP99').innerHTML = '4,210<small>ms</small>';
+  const buckets = [];
+  for(let i=0;i<24;i++){
+    const t = i/24;
+    buckets.push(Math.exp(-Math.pow((t-0.32)*4.2,2))*(0.8+rnd()*0.3) + Math.exp(-Math.pow((t-0.78)*9,2))*0.25);
+  }
+  const maxV = Math.max(...buckets);
+  const W=760,H=80,P={l:0,r:0,t:6,b:14};
+  const bw = W/24;
+  let bars = '';
+  for(let i=0;i<24;i++){
+    const h = (buckets[i]/maxV)*(H-P.t-P.b);
+    const isP99 = i>=21;
+    bars += `<rect x="${(i*bw+bw*0.2).toFixed(1)}" y="${(H-P.b-h).toFixed(1)}" width="${(bw*0.6).toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${isP99?'#e0b36b':'#9aa0ab'}" fill-opacity="${isP99?.9:.35}"/>`;
+  }
+  document.getElementById('latSvg').innerHTML = bars +
+    `<text x="0" y="${H-2}" font-size="9" fill="#5d636d" font-family="ui-monospace,Menlo,monospace">0ms</text>
+     <text x="${W/2}" y="${H-2}" text-anchor="middle" font-size="9" fill="#5d636d" font-family="ui-monospace,Menlo,monospace">2s</text>
+     <text x="${W}" y="${H-2}" text-anchor="end" font-size="9" fill="#5d636d" font-family="ui-monospace,Menlo,monospace">4s+</text>`;
+
+  const codes = [
+    {k:'200',  v:0.991, n:41872, cls:''},
+    {k:'429',  v:0.005, n:211,   cls:'c429'},
+    {k:'5xx',  v:0.003, n:127,   cls:'c5xx'},
+    {k:'t/o',  v:0.001, n:42,    cls:'c5xx'},
+  ];
+  document.getElementById('codeList').innerHTML = codes.map(c=>`
+    <div class="code-cell ${c.cls}">
+      <div class="k"><i></i>${c.k}</div>
+      <div class="bar"><i style="width:${Math.max(c.v*100,3)}%"></i></div>
+      <div class="v">${c.n.toLocaleString()} · ${(c.v*100).toFixed(1)}%</div>
+    </div>
+  `).join('');
+}
+
+/* 预算 */
+function renderBudget(){
+  const used = 1284, cap = 2000, target = 0.8;
+  const pct = used/cap;
+  document.getElementById('budgetPct').textContent = (pct*100).toFixed(0)+'%';
+  document.getElementById('budgetFill').style.width = (pct*100)+'%';
+  document.getElementById('budgetTarget').style.left = (target*100)+'%';
+  document.getElementById('budgetUsed').textContent = fmtMoney(used)+' 已用';
+  document.getElementById('budgetCap').textContent = 'cap '+fmtMoney(cap);
+  const daily = used / new Date().getDate();
+  const proj = daily*30;
+  document.getElementById('budgetNote').innerHTML =
+    `按当前日均 ${fmtMoney(daily)}，月底预计 <em>${fmtMoney(proj)}</em>，${proj>cap*target?'将触及 80% 预警':'在预警线内'}。`;
+}
+
+/* 请求流 */
+function mkRow(){
+  const p = PROVIDERS[Math.floor(rnd()*PROVIDERS.length)];
+  const m = p.models[Math.floor(rnd()*p.models.length)];
+  const proj = PROJECTS[Math.floor(rnd()*PROJECTS.length)];
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2,'0');
+  const mm = String(now.getMinutes()).padStart(2,'0');
+  const ss = String(now.getSeconds()).padStart(2,'0');
+  const tin = Math.round(800+rnd()*4200);
+  const tout = Math.round(120+rnd()*1800);
+  const lat = Math.round(280+rnd()*3200);
+  const cost = ((tin*0.000008)+(tout*0.000024)).toFixed(3);
+  const r = rnd();
+  const st = r>0.985 ? {c:'500',cls:'st-err'} : r>0.965 ? {c:'429',cls:'st-warn'} : {c:'200',cls:'st-ok'};
+  return {time:`${hh}:${mm}:${ss}`, proj:proj.id, model:m, provider:p.id, tin, tout, lat, cost, st};
+}
+function rowHtml(r,isNew){
+  return `<div class="row ${isNew?'new':''}" data-p="${r.provider}">
+    <span>${r.time}</span>
+    <span class="mdl">${r.proj}</span>
+    <span class="mdl">${r.model}</span>
+    <span>${r.provider}</span>
+    <span class="hide-s">${fmt(r.tin)}/${fmt(r.tout)}</span>
+    <span>${r.lat}ms</span>
+    <span>$${r.cost}</span>
+    <span class="${r.st.cls}">${r.st.c}</span>
+  </div>`;
+}
+function renderFeedFilter(){
+  const el = document.getElementById('feedFilter');
+  el.innerHTML = `<button data-p="" class="${!state.feedFilter?'on':''}">全部</button>` +
+    PROVIDERS.map(p=>`<button data-p="${p.id}" class="${state.feedFilter===p.id?'on':''}">${p.id}</button>`).join('');
+  el.querySelectorAll('button').forEach(b=>{
+    b.onclick = ()=>{
+      state.feedFilter = b.dataset.p || null;
+      renderFeedFilter(); renderFeedRows();
+    };
+  });
+}
+function renderFeedRows(){
+  const rows = state.feedRows.filter(r=>!state.feedFilter || r.provider===state.feedFilter);
+  document.getElementById('feedRows').innerHTML = rows.slice(0,11).map((r,i)=>rowHtml(r,i===0&&r._new)).join('');
+  state.feedRows.forEach(r=>r._new=false);
+}
+function feedTick(){
+  const r = mkRow(); r._new = true;
+  state.feedRows.unshift(r);
+  if(state.feedRows.length>40) state.feedRows.length = 40;
+  renderFeedRows();
+  state.heroTarget += 500;
+  state.heroCur = state.heroTarget;
+  document.getElementById('heroNum').textContent = fmt(state.heroTarget);
+}
+
+/* 事件 */
+document.getElementById('windowSwitch').addEventListener('click',(e)=>{
+  const btn = e.target.closest('button');
+  if(!btn) return;
+  const w = btn.dataset.w;
+  if(w===state.window) return;
+  state.window = w;
+  state.data = genWindow(w);
+  document.querySelectorAll('#windowSwitch button').forEach(b=>b.classList.toggle('on',b===btn));
+  state.heroCur = 0;
+  renderAll();
+});
+document.getElementById('rankTabs').addEventListener('click',(e)=>{
+  const btn = e.target.closest('button');
+  if(!btn) return;
+  state.rankTab = btn.dataset.t;
+  document.querySelectorAll('#rankTabs button').forEach(b=>b.classList.toggle('on',b===btn));
+  renderRank();
+});
+
+function renderAll(){
+  renderHero(); renderKpi(); renderTrend(); renderShare();
+  renderHist(); renderRank(); renderQuality(); renderBudget();
+}
+
+for(let i=0;i<12;i++) state.feedRows.push(mkRow());
+renderFeedFilter(); renderFeedRows(); renderAll();
+if(!reduced){
+  tickHero();
+  setInterval(feedTick, 3000);
+}else{
+  state.heroCur = state.heroTarget;
+  document.getElementById('heroNum').textContent = fmt(state.heroTarget);
+}
+</script>
+</body>
+</html>

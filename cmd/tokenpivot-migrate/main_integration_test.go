@@ -172,7 +172,7 @@ func TestSingleConnectionMatrix(t *testing.T) {
 			}
 			latest := sources[len(sources)-1].Version
 			previous := sources[len(sources)-2].Version
-			if latest != 7 || previous != 6 {
+			if latest != 8 || previous != 7 {
 				t.Fatalf("latest=%d previous=%d: update the per-migration assertions below for the new latest migration", latest, previous)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -202,28 +202,31 @@ func TestSingleConnectionMatrix(t *testing.T) {
 				if version != want {
 					t.Fatalf("version=%d want=%d", version, want)
 				}
-				// The latest migration (00007) only adds sources.archived_at, so down-one
-				// must drop that column and leave every table, including
-				// workspace_memberships (00006), in place.
-				var memberships, authTables, usageMinuteStats, usageEvents, foundation, archivedAt bool
-				if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.workspace_memberships') IS NOT NULL, to_regclass(current_schema()||'.users') IS NOT NULL, to_regclass(current_schema()||'.usage_minute_stats') IS NOT NULL, to_regclass(current_schema()||'.usage_events') IS NOT NULL, to_regclass(current_schema()||'.workspaces') IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'archived_at')").Scan(&memberships, &authTables, &usageMinuteStats, &usageEvents, &foundation, &archivedAt); err != nil {
+				// The latest migration (00008) adds user_identities and makes
+				// users.password_hash nullable. down-one must drop that table and restore
+				// NOT NULL, while sources.archived_at (00007) stays applied.
+				var memberships, authTables, usageMinuteStats, usageEvents, foundation, archivedAt, identityTable, nullablePassword bool
+				if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.workspace_memberships') IS NOT NULL, to_regclass(current_schema()||'.users') IS NOT NULL, to_regclass(current_schema()||'.usage_minute_stats') IS NOT NULL, to_regclass(current_schema()||'.usage_events') IS NOT NULL, to_regclass(current_schema()||'.workspaces') IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'archived_at'), to_regclass(current_schema()||'.user_identities') IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'users' AND column_name = 'password_hash' AND is_nullable = 'YES')").Scan(&memberships, &authTables, &usageMinuteStats, &usageEvents, &foundation, &archivedAt, &identityTable, &nullablePassword); err != nil {
 					t.Fatal(database.SafeError("table set", err))
 				}
 				switch command {
 				case "status":
-					if memberships || authTables || usageMinuteStats || usageEvents || foundation || archivedAt {
+					if memberships || authTables || usageMinuteStats || usageEvents || foundation || archivedAt || identityTable || nullablePassword {
 						t.Fatal("business tables exist before up")
 					}
 				case "down-one":
-					if archivedAt {
-						t.Fatal("down-one did not drop sources.archived_at of the latest migration")
+					if identityTable || nullablePassword {
+						t.Fatal("down-one did not revert user_identities or users.password_hash NOT NULL of the latest migration")
+					}
+					if !archivedAt {
+						t.Fatal("down-one removed sources.archived_at of an earlier migration")
 					}
 					if !memberships || !authTables || !usageMinuteStats || !usageEvents || !foundation {
 						t.Fatal("down-one removed a table of an earlier migration")
 					}
 				default:
-					if !memberships || !authTables || !usageMinuteStats || !usageEvents || !foundation || !archivedAt {
-						t.Fatal("up did not create the membership, auth, minute stats, usage event, foundation tables and sources.archived_at")
+					if !memberships || !authTables || !usageMinuteStats || !usageEvents || !foundation || !archivedAt || !identityTable || !nullablePassword {
+						t.Fatal("up did not create the membership, auth, identity, minute stats, usage event and foundation tables, sources.archived_at and a nullable users.password_hash")
 					}
 				}
 				t.Logf("command=%s exit=0 duration=%s version=%d", command, time.Since(start), version)

@@ -11,7 +11,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { ApiError } from "@/lib/api";
-import { fetchSession, login, logout, register } from "./api";
+import { bindFeishu, fetchSession, login, logout, register } from "./api";
 import { expiresAtMs, type AuthCredentials, type AuthSession } from "./model";
 
 export const sessionKey = ["auth", "session"] as const;
@@ -71,9 +71,26 @@ async function handleBusinessError(
     await clearToAnonymous(client);
     return;
   }
+  // 工作区切换验证的 403 是局部结果：由切换器就地提示，不清理其他业务缓存。
+  if (query.meta?.local403 === true) return;
   await dropBusiness(client, query);
   // 失败查询自身保留错误态供界面显示无权限，但旧 data 不得继续可见。
   query.setState({ data: undefined, dataUpdatedAt: 0 });
+}
+
+/**
+ * mutation 不经过 QueryCache，401 须由调用方显式走同一清理。
+ * 只有发起写入时的身份仍是当前会话身份才处理，旧身份的迟到 401 不影响新登录。
+ */
+export async function handleMutationUnauthenticated(
+  client: QueryClient,
+  error: unknown,
+  issuer: string,
+): Promise<boolean> {
+  if (!(error instanceof ApiError) || error.status !== 401) return false;
+  if (sessionUserId(client) !== issuer) return false;
+  await clearToAnonymous(client);
+  return true;
 }
 
 export function createAppQueryClient(): QueryClient {
@@ -127,6 +144,23 @@ export function useCredentialsMutation(kind: "login" | "register") {
     onMutate: () => cancelSession(client),
     onSuccess: async (session) => {
       // 先清旧身份的业务缓存，再写入新会话，防止跨账号残留。
+      await Promise.all([cancelSession(client), dropBusiness(client)]);
+      client.setQueryData<AuthSession | null>(sessionKey, session);
+    },
+  });
+}
+
+/**
+ * 同邮箱飞书绑定：提交一次原账号密码。
+ * 成功路径与邮箱登录一致：先清旧身份业务缓存，再写入新会话。
+ */
+export function useFeishuBindMutation() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationKey: writeKey,
+    mutationFn: (password: string) => bindFeishu(password),
+    onMutate: () => cancelSession(client),
+    onSuccess: async (session) => {
       await Promise.all([cancelSession(client), dropBusiness(client)]);
       client.setQueryData<AuthSession | null>(sessionKey, session);
     },

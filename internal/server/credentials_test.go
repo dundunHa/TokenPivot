@@ -209,31 +209,85 @@ func (f *credentialFakeStore) Revoke(ctx context.Context, workspaceID, credentia
 	return true, nil
 }
 
-// roleFakeStore is the membership lookup used by the owner gate.
+// roleFakeStore is the membership lookup and workspace read model shared by the
+// workspace gate and the workspace endpoints.
 type roleFakeStore struct {
 	mu    sync.Mutex
 	roles map[[16]byte]map[[16]byte]workspaces.Role
 	err   error
 	calls int
-	// current holds each user's earliest owned workspace for CurrentWorkspace.
-	current map[[16]byte]workspaces.Workspace
+	// list is returned by List in the order it was set: the database decides the
+	// C-collation order, so the handler must pass it through unchanged.
+	list []workspaces.Workspace
+	// spaces is the workspace row store read by Workspace.
+	spaces map[[16]byte]workspaces.Workspace
+	// listErr and lookupErr force one read to fail without touching the
+	// membership lookup the gates use.
+	listErr   error
+	lookupErr error
+	// listCalls and lookupCalls count the read methods, so a rejected request
+	// can be proven to have stopped before the store.
+	listCalls   int
+	lookupCalls int
 }
 
 func newRoleFakeStore() *roleFakeStore {
 	return &roleFakeStore{
-		roles:   make(map[[16]byte]map[[16]byte]workspaces.Role),
-		current: make(map[[16]byte]workspaces.Workspace),
+		roles:  make(map[[16]byte]map[[16]byte]workspaces.Role),
+		spaces: make(map[[16]byte]workspaces.Workspace),
 	}
 }
 
-func (f *roleFakeStore) CurrentWorkspace(ctx context.Context, userID workspaces.ID) (workspaces.Workspace, bool, error) {
+// setList replaces the workspace list List answers.
+func (f *roleFakeStore) setList(list ...workspaces.Workspace) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.err != nil {
-		return workspaces.Workspace{}, false, f.err
+	f.list = list
+}
+
+// addWorkspace stores one workspace row for the detail read.
+func (f *roleFakeStore) addWorkspace(workspace workspaces.Workspace) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.spaces[workspace.ID.Bytes] = workspace
+}
+
+// setListError makes List fail.
+func (f *roleFakeStore) setListError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listErr = err
+}
+
+// setWorkspaceError makes the detail read fail.
+func (f *roleFakeStore) setWorkspaceError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lookupErr = err
+}
+
+// List returns the canned workspaces. No membership is an empty non-nil slice,
+// which the handler must render as [].
+func (f *roleFakeStore) List(ctx context.Context, userID workspaces.ID) ([]workspaces.Workspace, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listCalls++
+	if f.listErr != nil {
+		return nil, f.listErr
 	}
-	w, ok := f.current[userID.Bytes]
-	return w, ok, nil
+	return append([]workspaces.Workspace{}, f.list...), nil
+}
+
+// Workspace returns one stored workspace row.
+func (f *roleFakeStore) Workspace(ctx context.Context, workspaceID workspaces.ID) (workspaces.Workspace, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lookupCalls++
+	if f.lookupErr != nil {
+		return workspaces.Workspace{}, false, f.lookupErr
+	}
+	workspace, ok := f.spaces[workspaceID.Bytes]
+	return workspace, ok, nil
 }
 
 func (f *roleFakeStore) setRole(userID, workspaceID workspaces.ID, role workspaces.Role) {
@@ -314,7 +368,7 @@ func newCredentialFixture(t *testing.T) *credentialFixture {
 	handler := NewHandler(Options{
 		CheckReady:  func(context.Context) error { return nil },
 		Auth:        adapter,
-		Credentials: NewCredentials(service, workspaces.New(roles)),
+		Credentials: NewCredentials(service, workspaces.New(roles, nil)),
 	})
 
 	login := httptest.NewRequest(http.MethodPost, loginPath, strings.NewReader(`{"email":"owner@example.com","password":"synthetic-password"}`))
@@ -1100,7 +1154,7 @@ func TestCredentialRoutesAbsentWithoutAdapter(t *testing.T) {
 	service := credentials.New(newCredentialFakeStore())
 	cases := map[string]http.Handler{
 		"no credentials": NewHandler(Options{Auth: adapter}),
-		"no auth":        NewHandler(Options{Credentials: NewCredentials(service, workspaces.New(newRoleFakeStore()))}),
+		"no auth":        NewHandler(Options{Credentials: NewCredentials(service, workspaces.New(newRoleFakeStore(), nil))}),
 	}
 	for name, handler := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -6,9 +6,9 @@ info:
   description: |
     # 1. 范围与文档边界
 
-    本文冻结 TokenPivot 首版三组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）、**浏览器账号会话**（注册、登录、当前会话、登出，以及可信 Origin、会话 Cookie 与错误码）与 **owner 凭证管理**（列表、签发、轮换、撤销，以及会话、`Origin`、owner 准入与错误码）。
+    本文冻结 TokenPivot 首版三组接口的格式：**同步批量采集**（方法、路径、外部格式主版本、请求与逐项响应、字段与校验、缺失/零值/估算语义、规范化与摘要、时间窗口与采样点、批量限额）、**浏览器账号会话**（注册、登录、当前会话、登出，以及飞书 OAuth 授权、回调与同邮箱首次密码绑定，连同可信 Origin、会话 Cookie 与错误码）与 **owner 凭证管理**（列表、签发、轮换、撤销，以及会话、`Origin`、owner 准入与错误码）。
 
-    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证只有 `/api/v1/auth/*` 四个端点，凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`workspaces/current`、`usage/options`，T-057）与请求明细/60 秒速率接口（`usage-events`、`usage-rate`，T-058）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作空间与成员管理属 T-019/T-054，不在本文。
+    - 采集只有 `/api/v1/ingestion/events` 一个端点，浏览器认证有 `/api/v1/auth/*` 下的七个端点（注册、登录、当前会话、登出四个邮箱密码端点，加飞书 authorize、callback、bind 三个端点），凭证管理只有 `/api/v1/workspaces/*` 下的四个 owner 端点。聚合查询接口（`usage/aggregate`、`usage/rankings`，T-055）与总览只读接口（`usage/options`，T-057）与请求明细/60 秒速率接口（`usage-events`、`usage-rate`，T-058）见 `usage` 标签，其响应中的聚合整数一律是十进制字符串；单事件采集的 JSON integer 格式不变。工作区列表、创建与详情接口见 `workspaces` 标签（T-064），注册不再创建工作区，零空间是正常状态；成员邀请、成员列表与角色管理属 T-020，不在本文。
     - 本文是格式依据，不是实现说明：不描述 handler 结构、SQL、聚合算法与清理任务。
     - 本文不核实任何采集来源（插件所对接的平台）能否提供某个字段。来源没有能力时按缺失上报，不得伪造值，也不得由服务端补造。
     - 本文所有限额都是首版安全上限，**未经压测**，不构成吞吐承诺。
@@ -49,11 +49,17 @@ info:
     ## 4.2 浏览器端点（会话 Cookie）
 
     - 只认 `cookieAuth`（`tokenpivot_session`）。明文为 `tps_` + `crypto/rand.Text()`，数据库只存完整令牌的 SHA-256 原始 32 字节摘要；`tpk_` 插件令牌在这里不被接受，Bearer 头也不建立浏览器身份。
-    - 会话 30 天精确滑动：每次有效认证都用一条 `UPDATE ... FROM ... RETURNING` 续期并返回到期时间，无刷新阈值、无绝对截止；数据库返回 0 行即 `401 UNAUTHENTICATED`。四个端点的所有响应都带 `Cache-Control: no-store`。
-    - 写请求（注册、登录、登出）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。`GET /api/v1/auth/session` 是读请求，不要求 `Origin`。例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true`（BF 经用户明确批准）时完全不做 Origin 校验，缺失或不等不再 403，会话认证与权限不变。
-    - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。owner 与工作空间成员判断属 T-019，本文不定义；注册时会为每个新用户创建展示名固定为 `Personal` 的个人空间并写入其 `owner` 成员关系，但响应不返回工作空间字段，也没有工作空间 HTTP 接口。
+    - 会话 30 天精确滑动：每次有效认证都用一条 `UPDATE ... FROM ... RETURNING` 续期并返回到期时间，无刷新阈值、无绝对截止；数据库返回 0 行即 `401 UNAUTHENTICATED`。浏览器认证端点的所有响应都带 `Cache-Control: no-store`。
+    - 写请求（注册、登录、登出、飞书同邮箱绑定）必须携带恰好一个 `Origin`，与部署配置的可信 Web origin 在 scheme、host、port 上完全相等；缺失、`null`、多值或不等一律 `403 PERMISSION_DENIED` 且不写库。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。读请求与浏览器顶层导航不要求 `Origin`：`GET /api/v1/auth/session`、`GET /api/v1/auth/feishu/authorize`、`GET /api/v1/auth/feishu/callback`。例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true`（BF 经用户明确批准）时完全不做 Origin 校验，缺失或不等不再 403，会话认证与权限不变。
+    - 服务端身份只从 Cookie 取得；handler 不读取请求体或路径中的用户 ID。工作区成员判断（owner/member）只来自 `workspace_memberships`，由 `workspaces` 标签下各工作区端点统一校验。注册只创建 `users` 行与首个 `sessions` 行，**不创建工作区或成员关系**，因此注册后是零工作区状态：前端调用工作区列表拿到 `[]` 后再引导用户创建第一个工作区。成员邀请、成员列表与角色管理属 T-020，本文不定义。
     - 注册与登录限流为单进程内存固定窗口（每规范化邮箱 10 分钟 5 次、每远端 IP 10 分钟 20 次），所有合法尝试都占额度、成功不返还；达到上限的请求不执行密码哈希或写库。
     - 注册开关由部署环境变量 `TOKENPIVOT_REGISTRATION_OPEN` 决定，启动时读取一次，未设置等同 `false`，只接受精确的 `true`/`false`。关闭时仅空库的首个用户可注册，其余一律 `403 REGISTRATION_CLOSED`；空库判定与首个用户写入在同一 `READ COMMITTED` 事务内，并在事务级排他 advisory lock 之后进行。没有查询注册状态的端点。
+    - 飞书登录由部署环境变量 `TOKENPIVOT_FEISHU_APP_ID` / `TOKENPIVOT_FEISHU_APP_SECRET` 决定是否可用，启动时读取一次；任一为空即未配置。未配置时 `GET /api/v1/auth/feishu/authorize` 仍返回 `200`，但 `enabled: false`、`authorize_url: null`，且不种 `tokenpivot_feishu_state`；callback 在未配置时重定向到 `/login?error=FEISHU_AUTH_FAILED`，bind 返回 `503 UNAVAILABLE`，两者都不发起任何外部请求。`TOKENPIVOT_FEISHU_REDIRECT_URI` 可选，用于覆盖回调地址；未设置时由可信 Web origin 拼 `/api/v1/auth/feishu/callback`。App Secret 只出现在服务端对飞书开放平台的请求里，不进响应、日志或错误消息。
+    - 飞书端点使用两个独立的短期 Cookie，都不含明文业务凭据：`tokenpivot_feishu_state`（`Path=/api/v1/auth/feishu`、`Max-Age=180`、`HttpOnly`、`SameSite=Lax`，值只存 `state` 的 SHA-256 摘要）与 `tokenpivot_feishu_bind`（同 Path 与属性，`Max-Age=600`，值是待绑定凭证的摘要）。两者都不带 `Domain`，`Secure` 与 `tokenpivot_session` 的规则一致（由可信 Web origin 的 scheme 决定）。正式会话仍只有 `tokenpivot_session` 一个。
+    - `GET /api/v1/auth/feishu/callback` 是浏览器顶层导航，不是 XHR：成功与失败都以 `302` 加 `Location` 表达，不使用 JSON 错误体，也不返回 `4xx`/`5xx` 状态码给浏览器。失败一律重定向回 `/login?error=<CODE>`，取值见该端点描述；这些 `CODE` 是重定向查询参数，不是 `AuthError.code`。
+    - 飞书回调的账号判定顺序固定：先按 `(provider='feishu', provider_user_id=open_id)` 命中 `user_identities`，再按规范化 `email` 命中 `users`，最后才考虑自动建号。同邮箱命中本地账号时不直接登录，而是下发 `tokenpivot_feishu_bind` 并要求用原密码确认一次（`POST /api/v1/auth/feishu/bind`），因此飞书邮箱无法单方面接管已有本地账号。
+    - 自动建号受 `TOKENPIVOT_FEISHU_AUTO_PROVISION` 控制（启动时读取一次，只接受精确的 `true`/`false`，未设置等同 `true`）。它与 `TOKENPIVOT_REGISTRATION_OPEN` 是两个独立开关：注册关闭只拦邮箱密码注册，不自动关闭飞书建号。飞书自动建号与直接注册一样只写 `users`、`user_identities`、`sessions`，**不创建工作区或成员关系**。
+    - 纯飞书账号的 `users.password_hash` 为 `NULL`。用邮箱密码登录这类账号时，服务端仍执行一次固定成本的 Argon2id 校验并返回 `401 INVALID_CREDENTIALS`，与「邮箱不存在」「密码错误」不可区分，不暴露该邮箱是否只能通过飞书登录。
 
     # 5. 时间精度、180 天窗口与采样点
 
@@ -454,7 +460,9 @@ tags:
   - name: ingestion
     description: '插件凭证认证的同步批量采集端点。只接受 `Authorization: Bearer`，不回退 Cookie。'
   - name: browser-auth
-    description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出这些写操作必须携带与可信 Web origin 完全一致的 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。'
+    description: '浏览器账号与会话端点。使用主机范围会话 Cookie；注册、登录、登出、飞书同邮箱绑定这些写操作必须携带与可信 Web origin 完全一致的 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。飞书 `authorize` 与 `callback` 是读请求、不要求 `Origin`，回调以 `302` 顶层导航表达结果。'
+  - name: workspaces
+    description: '工作区列表、创建与详情端点。只认浏览器会话 Cookie：列表与详情是读请求、不要求 `Origin`；创建是写请求，必须携带可信 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验；默认 `false` 时按本文所述执行）。任何已登录用户都可创建并成为新工作区的 owner，单账户最多 2 个。'
   - name: credentials
     description: 'owner 管理接入凭证的端点。只认浏览器会话 Cookie 且要求 workspace owner；列表是读请求、不要求 `Origin`，签发、轮换、撤销三个写操作必须携带可信 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。插件令牌 `tpk_` 不能用于这些路径。'
   - name: usage
@@ -644,7 +652,7 @@ paths:
       operationId: registerBrowserAccount
       summary: 直接注册账号并创建首个会话
       description: |
-        用邮箱和密码直接创建账号，不需要邮箱验证。注册成功在**同一事务**内写入四部分数据：`users` 行、该用户展示名固定为 `Personal` 的个人空间、这条空间的 `owner` 成员关系，以及首个 `sessions` 行；然后返回 `201`、`{user, expires_at}` 和新的会话 Cookie，因此刚注册的用户无需再次输入密码。任一步失败整体回滚，不会出现只有用户没有个人空间或没有会话的半套数据。
+        用邮箱和密码直接创建账号，不需要邮箱验证。注册成功在**同一事务**内写入两部分数据：`users` 行与首个 `sessions` 行；然后返回 `201`、`{user, expires_at}` 和新的会话 Cookie，因此刚注册的用户无需再次输入密码。任一步失败整体回滚，不会出现只有用户没有会话的半套数据。**注册不创建工作区或成员关系**：新账号处于零工作区状态，需先调用 `POST /api/v1/workspaces` 创建第一个工作区。
 
         **写请求默认必须携带 `Origin`**（`TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 的 BF 例外下不校验）：恰好一个值，且与部署配置的可信 Web origin 在 scheme、host、port 上完全相等。缺失、空白、`null`、多值或不等一律 `403 PERMISSION_DENIED`，且不产生任何数据库写入。不从 `Host`、`Forwarded`、`X-Forwarded-Host` 建立信任。（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验，不再因它返回 `403`，请求直接进入会话等后续检查；默认 `false` 时按本文所述执行）。
 
@@ -670,7 +678,7 @@ paths:
               $ref: '#/components/schemas/AuthRequest'
       responses:
         '201':
-          description: '账号、个人空间、owner 成员关系与首个会话已创建并提交；`Set-Cookie` 下发 `tokenpivot_session`。'
+          description: '账号与首个会话已创建并提交；不创建工作区。`Set-Cookie` 下发 `tokenpivot_session`。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -858,34 +866,315 @@ paths:
           $ref: '#/components/responses/AuthInternal'
         '503':
           $ref: '#/components/responses/AuthUnavailable'
-  /api/v1/workspaces/current:
+  /api/v1/auth/feishu/authorize:
     get:
       tags:
-        - usage
-      operationId: getCurrentWorkspace
-      summary: 读取当前用户的个人空间
+        - browser-auth
+      operationId: getFeishuAuthorize
+      summary: 获取飞书授权地址并种下 state Cookie
       description: |
-        返回会话用户创建最早的 owner 空间（`joined_at, id` 升序第一个）的 `workspace_id` 与 `name`。身份只来自会话，不接受任何查询参数或 body 指定用户或空间。读请求，不要求 `Origin`。
+        登录页初始化或点击刷新二维码时调用。每次调用都生成新的 `state`：服务端取 128 位随机值，响应里给出完整授权地址，Cookie 里只存它的 SHA-256 摘要，因此页面脚本读不到可复用的 `state`。新的 `state` 会覆盖上一枚 Cookie，旧二维码随即失效。
 
-        **仅限当前阶段**：每个用户只有一个注册时创建的 Personal 空间。它不是空间列表，也不是切换接口；多空间上线时必须重新设计。
-        找不到空间属于数据完整性故障，返回 `500 INTERNAL`，**不创建空间、不返回占位值**。所有响应 `Cache-Control: no-store`。
-      security:
-        - cookieAuth: []
+        **未配置飞书时仍返回 `200`**：`enabled: false`、`authorize_url: null`、`expires_in_seconds: 0`，不下发 `tokenpivot_feishu_state`。前端据此显示「当前实例未配置飞书应用凭证」并禁用一键授权入口；这不是错误，不用 `5xx` 表达。
+
+        **配置启用时**返回 `200`、`enabled: true`，`authorize_url` 指向 `https://open.feishu.cn/open-apis/authen/v1/authorize?app_id=…&redirect_uri=…&state=…`（主域名可用 `TOKENPIVOT_FEISHU_BASE_URL` 覆盖，便于对着本地桩服务联调），`expires_in_seconds` 固定 `180`，同响应下发 `tokenpivot_feishu_state`（`Max-Age=180`）。前端用同一个地址驱动二维码与一键唤起，两条入口都是浏览器顶层导航到该地址。
+
+        这是读请求，**不要求 `Origin`**；响应带 `Cache-Control: no-store`，避免缓存把已过期的二维码地址重新发出去。
+      security: []
       responses:
         '200':
-          description: '当前个人空间。'
+          description: '配置启用与未启用都返回 200，用 `enabled` 区分；启用时 `Set-Cookie` 下发 `tokenpivot_feishu_state`。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Set-Cookie:
+              description: '仅启用时出现：`tokenpivot_feishu_state=<state 的 SHA-256 摘要>`、`Max-Age=180`、`HttpOnly`、`SameSite=Lax`、`Path=/api/v1/auth/feishu`，`Secure` 与 `tokenpivot_session` 一致。'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeishuAuthorizeResponse'
+              examples:
+                enabled:
+                  summary: 已配置飞书应用凭证
+                  value:
+                    enabled: true
+                    authorize_url: 'https://open.feishu.cn/open-apis/authen/v1/authorize?app_id=cli_a1b2c3d4e5f6&redirect_uri=https%3A%2F%2Ftokenpivot.example.com%2Fapi%2Fv1%2Fauth%2Ffeishu%2Fcallback&state=2f8c1d7e4a5b4c3d9e0f1a2b3c4d5e6f'
+                    expires_in_seconds: 180
+                disabled:
+                  summary: 未配置飞书应用凭证
+                  value:
+                    enabled: false
+                    authorize_url: null
+                    expires_in_seconds: 0
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+  /api/v1/auth/feishu/callback:
+    get:
+      tags:
+        - browser-auth
+      operationId: handleFeishuCallback
+      summary: 处理飞书 OAuth 回调并签发会话或待绑定凭证
+      description: |
+        浏览器顶层导航的目标，由飞书在用户确认授权后跳转过来。结果一律用 `302` 加 `Location` 表达，响应体为空；不使用 JSON 错误体。所有响应都带 `Cache-Control: no-store`。
+
+        **校验顺序**：`tokenpivot_feishu_state` Cookie 存在且与 `SHA-256(state)` 恒定时间相等 → 按远端 IP 限流 → 用 `code` 换 `user_access_token` 并读取用户信息（`open_id`、`union_id`、`tenant_key`、`email`、`name`）。`tokenpivot_feishu_state` 无论成功失败都立即清除。
+
+        **失败重定向**一律是 `Location: /login?error=<CODE>`：
+
+        | CODE | 触发条件 |
+        |---|---|
+        | `FEISHU_STATE_INVALID` | `state` Cookie 缺失、为空或与 `SHA-256(state)` 不等；`code` 缺失也按此处理 |
+        | `RATE_LIMITED` | 远端 IP 的认证限流窗口已用尽（与登录同一计数口径） |
+        | `FEISHU_EMAIL_REQUIRED` | 飞书返回的用户信息没有可用邮箱，无法建立或匹配账号 |
+        | `FEISHU_AUTH_FAILED` | 换票失败、飞书返回非成功状态、用户信息不完整，或当前实例未配置飞书凭证 |
+        | `REGISTRATION_CLOSED` | 分支 C 本应建号，但 `TOKENPIVOT_FEISHU_AUTO_PROVISION=false`、`TOKENPIVOT_REGISTRATION_OPEN=false` 且数据库非空 |
+
+        这些 CODE 只出现在重定向查询参数里，不属于 `AuthError.code` 枚举。
+
+        **成功分支**：
+
+        - **A 已绑定**：`(provider='feishu', provider_user_id=open_id)` 命中 `user_identities` → 为该 `user_id` 新建 `sessions` 行，下发 `tokenpivot_session`，`Location: /`。
+        - **B 同邮箱本地账号仍未绑定**：按规范化 `email` 命中 `users` → 不直接登录；生成 10 分钟有效的待绑定凭证，下发 `tokenpivot_feishu_bind`（`Max-Age=600`、`HttpOnly`、`SameSite=Lax`、`Path=/api/v1/auth/feishu`），`Location: /login?feishu_bind=1&email=<urlencoded_email>`。登录页据此显示「同邮箱绑定确认」，用户输入一次原密码后调用 `POST /api/v1/auth/feishu/bind`。
+        - **C 新用户自动建号**：`users` 无该邮箱，且 `TOKENPIVOT_FEISHU_AUTO_PROVISION=true`（默认）、`TOKENPIVOT_REGISTRATION_OPEN=true` 或空库首用户三者任一成立 → 在同一事务内写 `users`（`password_hash` 为 `NULL`）、`user_identities`、`sessions`，`Location: /`。不创建工作区或成员关系。
+
+        分支 B 与分支 A、C 互斥：同一枚 `open_id` 已有绑定行时永远走 A，不会再走 B 或 C。回调不是幂等操作：重复提交同一 `code` 会被 state 校验拦下（Cookie 已清除）。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/FeishuAuthorizationCode'
+        - $ref: '#/components/parameters/FeishuState'
+      responses:
+        '302':
+          description: |
+            回调结果。分支 A、C 下发 `tokenpivot_session` 并去 `/`；分支 B 下发 `tokenpivot_feishu_bind` 并去 `/login?feishu_bind=1&email=…`；失败去 `/login?error=<CODE>`。所有分支同时清除 `tokenpivot_feishu_state`。
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Location:
+              description: '分支 A、C：`/`；分支 B：`/login?feishu_bind=1&email=<urlencoded_email>`；失败：`/login?error=<CODE>`，CODE 见端点描述。'
+              schema:
+                type: string
+            Set-Cookie:
+              description: |
+                可能同时出现两枚：清除 `tokenpivot_feishu_state`（`Max-Age=-1`、`Expires=Thu, 01 Jan 1970 00:00:00 GMT`、同 `Path`），以及按分支下发 `tokenpivot_session`（30 天，属性同 `cookieAuth`）或 `tokenpivot_feishu_bind`（`Max-Age=600`）。失败分支不带会话或绑定 Cookie。
+              schema:
+                type: string
+  /api/v1/auth/feishu/bind:
+    post:
+      tags:
+        - browser-auth
+      operationId: bindFeishuAccount
+      summary: 用原密码确认并绑定飞书身份
+      description: |
+        分支 B 的第二步：回调已下发 `tokenpivot_feishu_bind` 待绑定凭证，用户在这里提交**原账号密码**确认一次，服务端校验通过后写入 `user_identities` 并签发正式会话。飞书侧掌握的企业邮箱因此不能单方面接管一个已有密码的本地账号。
+
+        **前置顺序**：严格 `Origin` 校验 → 待绑定 Cookie 存在且未过期 → 请求体解析 → 按规范化邮箱与远端 IP 限流 → Argon2id 校验。任一前置失败都不写库。
+
+        `tokenpivot_feishu_bind` 缺失、已过期或无法验证时返回 `401 UNAUTHENTICATED`，调用方需重新走一次飞书授权（先 `authorize`，再 `callback`）；这与「原密码错误」的 `401 INVALID_CREDENTIALS` 靠 `code` 区分。密码错误时待绑定 Cookie 保留到过期或限流耗尽，允许重试。
+
+        **成功**：同一事务内写入 `user_identities`（`(user_id, provider)` 已存在时保留已有行，不覆盖）并新建一条 `sessions` 行；随后清除 `tokenpivot_feishu_bind`、下发新的 `tokenpivot_session`，返回 `200` 与 `{user, expires_at}`。同一用户重复完成绑定时结果仍是 `200`，不报冲突。
+
+        绑定不改变账号密码，也不撤销该用户的其他会话。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeishuBindRequest'
+      responses:
+        '200':
+          description: '绑定完成并已签发新会话；`Set-Cookie` 下发 `tokenpivot_session` 并清除 `tokenpivot_feishu_bind`。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Set-Cookie:
+              description: '两枚：`tokenpivot_session`（30 天，属性同 `cookieAuth`）与清除 `tokenpivot_feishu_bind`（`Max-Age=-1`、`Expires=Thu, 01 Jan 1970 00:00:00 GMT`、`Path=/api/v1/auth/feishu`）。'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        '400':
+          $ref: '#/components/responses/AuthInvalidArgument'
+        '401':
+          description: |
+            两种原因共用此状态码，靠 `code` 区分：
+
+            - `UNAUTHENTICATED`：`tokenpivot_feishu_bind` 缺失、已过期或无法验证，需重新走飞书授权。
+            - `INVALID_CREDENTIALS`：原账号密码错误。待绑定凭证保留，可在过期或限流耗尽前重试。
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CurrentWorkspace'
+                $ref: '#/components/schemas/AuthError'
+              examples:
+                unauthenticated:
+                  summary: 待绑定凭证缺失或已过期
+                  value:
+                    error:
+                      code: UNAUTHENTICATED
+                      message: authentication required
+                invalidCredentials:
+                  summary: 原账号密码错误
+                  value:
+                    error:
+                      code: INVALID_CREDENTIALS
+                      message: email or password is incorrect
+        '403':
+          $ref: '#/components/responses/AuthPermissionDenied'
+        '413':
+          $ref: '#/components/responses/AuthBodyTooLarge'
+        '415':
+          $ref: '#/components/responses/AuthUnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/AuthRateLimited'
+        '500':
+          $ref: '#/components/responses/AuthInternal'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+  /api/v1/workspaces:
+    get:
+      tags:
+        - workspaces
+      operationId: listWorkspaces
+      summary: 列出当前用户可访问的工作区
+      description: |
+        返回会话用户作为成员可访问的全部工作区，按 `name` 的 C 排序（逐字节）升序、相同名称再按 `workspace_id` 升序。排序完全由服务端决定，客户端不再重排。身份只来自会话，不接受查询参数指定用户或工作区。读请求，不要求 `Origin`。
+
+        没有成员关系是正常状态：返回空数组 `[]`，不是错误，也不创建任何占位工作区。列表不分页，因为单账户本期最多手动创建 2 个工作区。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '工作区数组（顶层即数组）；没有成员关系时为 `[]`。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceList'
               example:
-                workspace_id: 0199a0b0-0000-7000-8000-00000000000a
-                name: Personal
+                - workspace_id: 018f2f2a-0000-7000-8000-000000000000
+                  name: Alpha
         '401':
           $ref: '#/components/responses/ManagementUnauthenticated'
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+    post:
+      tags:
+        - workspaces
+      operationId: createWorkspace
+      summary: 手动创建一个工作区
+      description: |
+        当前会话用户创建一个工作区，并在同一事务内成为它的 owner。身份只来自会话：`workspace_id`、`created_by_user_id`、`role` 都不被接受，出现即按未知字段 `400 INVALID_ARGUMENT` 拒绝且不写库。
+
+        写操作默认必须携带与可信 Web origin 完全一致的 `Origin`（例外：部署设置 `TOKENPIVOT_DISABLE_ORIGIN_CHECK=true` 时完全跳过 Origin 校验；默认 `false` 时按本文所述执行）。准入顺序固定为 **`Origin` → 会话 → 请求体 → 数据库**。
+
+        **名称规则**：首尾 Unicode 空白先被修剪，数据库只保存修剪后的名称；修剪后为空、超过 80 个 Unicode code point、UTF-8 编码超过 256 字节，或包含 Unicode control character，均为 `400 INVALID_ARGUMENT`。名称中间的普通空白允许。不做大小写折叠，也不做 Unicode 规范化，因此 `Alpha` 与 `alpha` 是两个可共存的名称，只有修剪后字节完全相同才算重名。
+
+        **额度**：每个账户最多成功创建 2 个工作区，第一个同样计入。创建事务先锁定该账户的 `users` 行，再统计它已创建的工作区数，最后插入工作区与 owner 成员关系；同一账户的并发创建因此串行，最多两个成功。同账户重名由唯一索引 `(created_by_user_id, name)` 裁决。
+
+        创建**不是幂等操作**：`POST` 没有幂等键，响应丢失后重试会再次计数；同名重试得到 `409 WORKSPACE_NAME_CONFLICT`，超额得到 `409 WORKSPACE_LIMIT_REACHED`。成员表等其他唯一冲突与查询失败都是 `500 INTERNAL`，不会伪装成重名。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TrustedOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspaceCreateRequest'
+            example:
+              name: Alpha
+      responses:
+        '201':
+          description: '已创建的工作区；返回修剪后的名称与数据库生成的 UUID。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+              example:
+                workspace_id: 018f2f2a-0000-7000-8000-000000000000
+                name: Alpha
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
+        '409':
+          description: '`WORKSPACE_NAME_CONFLICT`：该账户已有同名工作区；`WORKSPACE_LIMIT_REACHED`：该账户已创建 2 个工作区。两种情况都不写入任何行。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagementError'
+              examples:
+                nameConflict:
+                  value:
+                    error:
+                      code: WORKSPACE_NAME_CONFLICT
+                      message: workspace name already exists
+                limitReached:
+                  value:
+                    error:
+                      code: WORKSPACE_LIMIT_REACHED
+                      message: workspace limit reached
+        '500':
+          $ref: '#/components/responses/ManagementInternal'
+        '503':
+          $ref: '#/components/responses/ManagementUnavailable'
+  /api/v1/workspaces/{workspaceID}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - workspaces
+      operationId: getWorkspace
+      summary: 读取工作区详情并验证成员资格
+      description: |
+        返回路径工作区的 `workspace_id` 与 `name`，用于切换前验证目标可访问。身份只来自会话；读请求不要求 `Origin`。
+
+        授权与工作区资源一致：会话有效且当前用户是该工作区成员（owner 或 member）时 `200`。不是成员与工作区不存在都返回 `403 PERMISSION_DENIED`，不区分二者，也不返回任何资源内容。切换没有服务端会话写入：成功只表示目标可访问，前端随后修改 URL 中的 `workspace` 参数。
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: '目标工作区身份与名称。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+              example:
+                workspace_id: 018f2f2a-0000-7000-8000-000000000000
+                name: Alpha
+        '400':
+          $ref: '#/components/responses/ManagementInvalidArgument'
+        '401':
+          $ref: '#/components/responses/ManagementUnauthenticated'
+        '403':
+          $ref: '#/components/responses/ManagementPermissionDenied'
         '500':
           $ref: '#/components/responses/ManagementInternal'
         '503':
@@ -2265,6 +2554,23 @@ components:
         type: string
         format: uuid
 
+    FeishuAuthorizationCode:
+      name: code
+      in: query
+      required: true
+      description: '飞书 OAuth 2.0 授权码，由飞书在用户确认授权后附加到回调地址。只在服务端用于换 `user_access_token`，不回显、不写日志；缺失时按 `FEISHU_STATE_INVALID` 重定向。'
+      schema:
+        type: string
+        minLength: 1
+    FeishuState:
+      name: state
+      in: query
+      required: true
+      description: '授权时由服务端生成的随机 `state`。回调必须带回它，并且与 `tokenpivot_feishu_state` Cookie 里存着的 `SHA-256(state)` 摘要恒定时间相等，否则按 `FEISHU_STATE_INVALID` 重定向。'
+      schema:
+        type: string
+        minLength: 1
+
     UsageStart:
       name: start
       in: query
@@ -3162,6 +3468,27 @@ components:
           description: 安全的短原因标记，例如 `unknown_field`、`body_not_json`、`too_many_events`、`empty_events`；不包含 SQL 或堆栈。
       description: 单条字段/原因说明。仅供定位与展示，程序分支请用整批 `error.code`。
 
+    FeishuAuthorizeResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - enabled
+        - authorize_url
+        - expires_in_seconds
+      properties:
+        enabled:
+          type: boolean
+          description: '当前实例是否已配置飞书应用凭证（`TOKENPIVOT_FEISHU_APP_ID` 与 `TOKENPIVOT_FEISHU_APP_SECRET` 都非空）。为 `false` 时另外两个字段固定是 `null` 与 `0`，前端应禁用飞书入口，而不是重试。'
+        authorize_url:
+          type: [string, 'null']
+          format: uri
+          description: '完整的飞书 OAuth 2.0 授权地址（`https://open.feishu.cn/open-apis/authen/v1/authorize?app_id=…&redirect_uri=…&state=…`）。前端直接把它当作二维码内容与一键授权的跳转目标。`enabled` 为 `false` 时是 `null`。'
+        expires_in_seconds:
+          type: integer
+          minimum: 0
+          description: '授权地址的有效期，秒。启用时固定 `180`，与 `tokenpivot_feishu_state` Cookie 的 `Max-Age` 一致；未启用时 `0`。归零后前端应遮住二维码并要求刷新，不要继续使用过期地址。'
+      description: '飞书授权地址查询结果。未配置飞书不是错误：仍返回 `200` 与 `enabled: false`，前端据此把「实例没有飞书」和「服务故障」分开处理。'
+
     AuthRequest:
       type: object
       additionalProperties: false
@@ -3185,6 +3512,22 @@ components:
           writeOnly: true
       description: |
         注册与登录共用同一请求格式。必须是单个 JSON 对象：未知字段、任何层级的重复键、非法 UTF-8 和尾随内容一律 `400 INVALID_ARGUMENT`；`user_id`、`role`、`workspace`、`email_verified_at`、会话参数等字段都不被接受。请求体上限 16 KiB（`413 BODY_TOO_LARGE`），媒体类型必须是 `application/json`（`415 UNSUPPORTED_MEDIA_TYPE`）。
+
+    FeishuBindRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - password
+      properties:
+        password:
+          type: string
+          minLength: 8
+          maxLength: 256
+          description: |
+            原账号密码。合法 UTF-8，8–64 个 Unicode 码点且不超过 256 字节；不 trim、不做 Unicode 规范化，哈希的是用户原始字节。与 `AuthRequest.password` 同一格式。
+          writeOnly: true
+      description: |
+        飞书同邮箱绑定的请求体：只有 `password` 一个字段。邮箱取自 `tokenpivot_feishu_bind` 待绑定凭证，**不接受**请求体里的 `email`——出现即按未知字段 `400 INVALID_ARGUMENT` 拒绝，客户端不能借请求体指定别的账号。请求体上限 16 KiB（`413 BODY_TOO_LARGE`），媒体类型必须是 `application/json`（`415 UNSUPPORTED_MEDIA_TYPE`）。
 
     AuthUser:
       type: object
@@ -3287,6 +3630,8 @@ components:
                 - PERMISSION_DENIED
                 - NOT_FOUND
                 - CONFLICT
+                - WORKSPACE_NAME_CONFLICT
+                - WORKSPACE_LIMIT_REACHED
                 - BODY_TOO_LARGE
                 - UNSUPPORTED_MEDIA_TYPE
                 - INTERNAL
@@ -3296,7 +3641,7 @@ components:
               type: string
               description: 面向人的短说明，固定文案，不含 SQL、约束细节、令牌或请求值。
       description: |
-        项目与来源管理端点的错误体：
+        工作区、项目与来源管理端点的错误体：
 
         | code | 状态码 |
         |---|---|
@@ -3305,9 +3650,11 @@ components:
         | `PERMISSION_DENIED` | 403 |
         | `NOT_FOUND` | 404 |
         | `CONFLICT` | 409 |
+        | `WORKSPACE_NAME_CONFLICT` | 409（固定 message `workspace name already exists`） |
+        | `WORKSPACE_LIMIT_REACHED` | 409（固定 message `workspace limit reached`） |
         | `BODY_TOO_LARGE` | 413 |
         | `UNSUPPORTED_MEDIA_TYPE` | 415 |
-        | `INTERNAL` | 500（成员角色或资源数据库故障） |
+        | `INTERNAL` | 500（成员角色、工作区或资源数据库故障） |
         | `UNAVAILABLE` | 503（仅会话存储/续期故障） |
 
         所有响应带 `Cache-Control: no-store`。
@@ -3330,7 +3677,7 @@ components:
           description: '`null` 表示 active；否则为首次归档时间（RFC 3339），重复归档不改变它。'
       description: 一个项目。
 
-    CurrentWorkspace:
+    Workspace:
       type: object
       additionalProperties: false
       required: [workspace_id, name]
@@ -3340,7 +3687,26 @@ components:
           format: uuid
         name:
           type: string
-      description: 当前用户的个人空间身份。
+          minLength: 1
+          maxLength: 80
+          description: '已修剪的展示名称；大小写敏感，不做 Unicode 规范化。'
+      description: 一个工作区的身份与展示名称。
+
+    WorkspaceList:
+      type: array
+      items:
+        $ref: '#/components/schemas/Workspace'
+      description: '工作区数组（顶层即数组），按 `name` 的 C 排序升序、相同名称再按 `workspace_id` 升序；没有成员关系时为空数组。'
+
+    WorkspaceCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: '1–80 个 Unicode code point 且不超过 256 个 UTF-8 字节；首尾空白先被修剪，不能包含 control character。'
+      description: 创建工作区的请求体；只接受 `name`，归属与角色全部来自会话和数据库。
 
     UsageOptions:
       type: object

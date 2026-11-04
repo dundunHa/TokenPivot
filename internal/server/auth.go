@@ -113,25 +113,11 @@ func (a *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// readAuthRequest enforces the media type, the body size limit and the strict
-// JSON rules, then returns the two decoded fields.
+// readAuthRequest enforces the authentication body rules, then returns the two
+// decoded fields.
 func readAuthRequest(w http.ResponseWriter, r *http.Request) (authRequest, bool) {
-	if !isJSONContentType(r.Header.Get("Content-Type")) {
-		writeError(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "content type must be application/json")
-		return authRequest{}, false
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAuthBodyBytes))
-	if err != nil {
-		var maxBytes *http.MaxBytesError
-		if errors.As(err, &maxBytes) {
-			writeError(w, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "request body is too large")
-			return authRequest{}, false
-		}
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body could not be read")
-		return authRequest{}, false
-	}
-	if !utf8.Valid(body) {
-		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body must be valid UTF-8")
+	body, ok := readJSONBody(w, r)
+	if !ok {
 		return authRequest{}, false
 	}
 	request, err := decodeAuthRequest(body)
@@ -144,6 +130,31 @@ func readAuthRequest(w http.ResponseWriter, r *http.Request) (authRequest, bool)
 		return authRequest{}, false
 	}
 	return request, true
+}
+
+// readJSONBody enforces the media type, the body size limit and valid UTF-8,
+// then returns the raw body. Every browser write endpoint shares these three
+// rules; only the accepted fields differ.
+func readJSONBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		writeError(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "content type must be application/json")
+		return nil, false
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAuthBodyBytes))
+	if err != nil {
+		var maxBytes *http.MaxBytesError
+		if errors.As(err, &maxBytes) {
+			writeError(w, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "request body is too large")
+			return nil, false
+		}
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body could not be read")
+		return nil, false
+	}
+	if !utf8.Valid(body) {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "request body must be valid UTF-8")
+		return nil, false
+	}
+	return body, true
 }
 
 // Strict body errors. They stay distinct so the response can name the documented

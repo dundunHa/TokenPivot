@@ -40,7 +40,8 @@ func expectedFoundationColumns() map[string]foundationColumn {
 	workspaceID := foundationColumn{dataType: "uuid", nullable: "NO"}
 	return map[string]foundationColumn{
 		"workspaces.id":                   id,
-		"workspaces.name":                 {dataType: "text", nullable: "NO"},
+		"workspaces.created_by_user_id":   {dataType: "uuid", nullable: "NO"},
+		"workspaces.name":                 {dataType: "text", nullable: "NO", collation: "C"},
 		"workspaces.created_at":           createdAt,
 		"projects.id":                     id,
 		"projects.workspace_id":           workspaceID,
@@ -72,6 +73,7 @@ type foundationIndex struct {
 func expectedFoundationIndexes() map[string]foundationIndex {
 	return map[string]foundationIndex{
 		"workspaces_pkey":                               {unique: true, columns: "id"},
+		"uk_workspaces_created_by_user_id_name":         {unique: true, columns: "created_by_user_id,name"},
 		"projects_pkey":                                 {unique: true, columns: "id"},
 		"uk_projects_workspace_id_project_key":          {unique: true, columns: "workspace_id,project_key"},
 		"sources_pkey":                                  {unique: true, columns: "id"},
@@ -82,8 +84,10 @@ func expectedFoundationIndexes() map[string]foundationIndex {
 	}
 }
 
-// TestFoundationTables pins itself to migration 00002 with UpTo/DownTo so later
-// migrations cannot change these assertions.
+// TestFoundationTables pins the structural assertions to migration 00002 with
+// UpTo/DownTo so later migrations cannot change them. Only the subtests that
+// write rows advance to migration 00005, because a real account is required as
+// workspaces.created_by_user_id.
 func TestFoundationTables(t *testing.T) {
 	migrationURL, appURL := integrationSchema(t)
 	p, db := testProvider(t, migrationURL, migrations.Files)
@@ -246,13 +250,25 @@ func TestFoundationTables(t *testing.T) {
 		t.Logf("grants=INSERT,SELECT,UPDATE on %d tables", len(actual))
 	})
 
+	// users only exist from migration 00005, while the assertions above stay
+	// pinned to 00002. Advance before the write subtests so every fixture
+	// workspace references a real account instead of a fabricated UUID.
+	if _, err := p.UpTo(ctx, authTablesVersionForT019); err != nil {
+		t.Fatal(database.SafeError("users up", err))
+	}
+	creator := seedUser(t, ctx, app, "foundation-creator@example.com")
+
 	t.Run("defaults", func(t *testing.T) {
 		var id string
 		var createdAt time.Time
 		var version int
-		err := app.QueryRow(ctx, "INSERT INTO workspaces (name) VALUES ($1) RETURNING id, created_at, uuid_extract_version(id)", "synthetic-defaults").Scan(&id, &createdAt, &version)
+		var createdBy string
+		err := app.QueryRow(ctx, "INSERT INTO workspaces (created_by_user_id, name) VALUES ($1, $2) RETURNING id, created_at, uuid_extract_version(id), created_by_user_id", creator, "synthetic-defaults").Scan(&id, &createdAt, &version, &createdBy)
 		if err != nil {
 			t.Fatal(database.SafeError("insert workspace", err))
+		}
+		if createdBy != creator {
+			t.Fatalf("created_by_user_id=%s want=%s", createdBy, creator)
 		}
 		if version != 7 {
 			t.Fatalf("uuid version=%d want=7", version)
@@ -260,12 +276,12 @@ func TestFoundationTables(t *testing.T) {
 		if createdAt.IsZero() {
 			t.Fatal("created_at was not defaulted")
 		}
-		t.Logf("workspace id version=%d created_at defaulted", version)
+		t.Logf("workspace id version=%d created_at defaulted creator=%s", version, createdBy)
 	})
 
 	t.Run("project uniqueness", func(t *testing.T) {
-		ws1 := insertWorkspace(t, ctx, app, "synthetic-projects-a")
-		ws2 := insertWorkspace(t, ctx, app, "synthetic-projects-b")
+		ws1 := insertWorkspace(t, ctx, app, creator, "synthetic-projects-a")
+		ws2 := insertWorkspace(t, ctx, app, creator, "synthetic-projects-b")
 		insertProject(t, ctx, app, ws1, "k")
 		var err error
 		_, err = app.Exec(ctx, "INSERT INTO projects (workspace_id, project_key, name) VALUES ($1, $2, $3)", ws1, "k", "synthetic-duplicate")
@@ -280,8 +296,8 @@ func TestFoundationTables(t *testing.T) {
 	})
 
 	t.Run("source uniqueness", func(t *testing.T) {
-		ws1 := insertWorkspace(t, ctx, app, "synthetic-sources-a")
-		ws2 := insertWorkspace(t, ctx, app, "synthetic-sources-b")
+		ws1 := insertWorkspace(t, ctx, app, creator, "synthetic-sources-a")
+		ws2 := insertWorkspace(t, ctx, app, creator, "synthetic-sources-b")
 		insertSource(t, ctx, app, ws1, "synthetic-platform", "instance-1")
 		var err error
 		_, err = app.Exec(ctx, "INSERT INTO sources (workspace_id, platform, instance_key) VALUES ($1, $2, $3)", ws1, "synthetic-platform", "instance-1")
@@ -291,7 +307,7 @@ func TestFoundationTables(t *testing.T) {
 	})
 
 	t.Run("rotation and revocation", func(t *testing.T) {
-		ws := insertWorkspace(t, ctx, app, "synthetic-rotation")
+		ws := insertWorkspace(t, ctx, app, creator, "synthetic-rotation")
 		sourceID := insertSource(t, ctx, app, ws, "synthetic-platform", "instance-rotate")
 		hashA := bytes.Repeat([]byte{0xa1}, 32)
 		hashB := bytes.Repeat([]byte{0xb2}, 32)
@@ -373,10 +389,10 @@ func TestFoundationTables(t *testing.T) {
 	})
 }
 
-func insertWorkspace(t *testing.T, ctx context.Context, app *pgx.Conn, name string) string {
+func insertWorkspace(t *testing.T, ctx context.Context, app *pgx.Conn, creatorID, name string) string {
 	t.Helper()
 	var id string
-	if err := app.QueryRow(ctx, "INSERT INTO workspaces (name) VALUES ($1) RETURNING id", name).Scan(&id); err != nil {
+	if err := app.QueryRow(ctx, "INSERT INTO workspaces (created_by_user_id, name) VALUES ($1, $2) RETURNING id", creatorID, name).Scan(&id); err != nil {
 		t.Fatal(database.SafeError("insert workspace", err))
 	}
 	return id

@@ -10,9 +10,9 @@ CREATE UNIQUE INDEX uk_workspace_memberships_workspace_id_user_id
 CREATE INDEX idx_workspace_memberships_user_id
     ON workspace_memberships (user_id);
 COMMENT ON TABLE workspace_memberships IS
-    'User membership and role within a workspace. The current release only writes owner rows for personal workspaces.';
+    'User membership and role within a workspace. Creating a workspace writes its owner membership in the same transaction.';
 COMMENT ON COLUMN workspace_memberships.role IS
-    'Application-validated role: owner or member. Only the personal-workspace creation path writes owner in this release.';
+    'Application-validated role: owner or member. Creation writes owner; member is read-only.';
 GRANT SELECT, INSERT ON workspace_memberships TO tokenpivot_app;
 
 -- +goose Down
