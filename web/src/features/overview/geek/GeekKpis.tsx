@@ -110,7 +110,8 @@ export function GeekKpis({ data, previous, rate }: GeekKpisProps) {
 
   const inputShare = total && input !== null ? input / total : null;
   const outputShare = total && output !== null ? output / total : null;
-  const totalNote = qualityNote(totals.total);
+  const empty = totals.requestCount === "0" && total === null;
+  const totalNote = empty ? "暂无数据" : qualityNote(totals.total);
 
   return (
     <div className="geek-kpis">
@@ -122,7 +123,9 @@ export function GeekKpis({ data, previous, rate }: GeekKpisProps) {
             ) : (
               "—"
             )}
-            <span className="geek-kpi-unit">tokens</span>
+            {total === null ? null : (
+              <span className="geek-kpi-unit">tokens</span>
+            )}
           </div>
           <Delta value={change(total, prevTotal)} />
         </div>
@@ -168,7 +171,9 @@ export function GeekKpis({ data, previous, rate }: GeekKpisProps) {
         <div className="geek-kpi-row">
           <div className="geek-kpi-number geek-num">
             {average === null ? "—" : fmt(average)}
-            <span className="geek-kpi-unit">tokens</span>
+            {average === null ? null : (
+              <span className="geek-kpi-unit">tokens</span>
+            )}
           </div>
           <Delta value={change(average, prevAverage)} />
         </div>
@@ -207,20 +212,33 @@ function usePrefersReducedMotion(): boolean {
   );
 }
 
+/**
+ * 数字变化时从“当前正在显示的值”过渡到新值（增量），而不是每次从 0 重新计数；
+ * 只有首次出现时从 0 起。
+ */
 function CountUp({ target, reduced }: { target: number; reduced: boolean }) {
   // 测试环境直接显示目标值，避免异步动画导致断言不稳定
   const isTest =
     typeof process !== "undefined" && process.env.NODE_ENV === "test";
   const skip = reduced || isTest;
   const [current, setCurrent] = useState(skip ? target : 0);
+  /** 最近一次渲染出的值：下一段动画的起点。 */
+  const shown = useRef(skip ? target : 0);
   const raf = useRef(0);
 
   useEffect(() => {
     if (skip) return;
+    const from = shown.current;
+    if (from === target) return;
     const start = performance.now();
+    const duration = 600;
     const animate = (now: number) => {
-      const progress = Math.min((now - start) / 900, 1);
-      setCurrent(Math.round(target * (1 - Math.pow(1 - progress, 3))));
+      const progress = Math.min((now - start) / duration, 1);
+      const value = Math.round(
+        from + (target - from) * (1 - Math.pow(1 - progress, 3)),
+      );
+      shown.current = value;
+      setCurrent(value);
       if (progress < 1) raf.current = requestAnimationFrame(animate);
     };
     raf.current = requestAnimationFrame(animate);

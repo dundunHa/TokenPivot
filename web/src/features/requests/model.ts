@@ -33,17 +33,25 @@ export interface RateView {
   notes: string[];
 }
 
-/** 速率文案：无事件、用量不可用、真实 0 互相区分；含估算 / 部分覆盖必须标出。 */
+/** 窗口为 60 秒、值为窗口内总量（tokens/min），换算成 tokens/s 展示。 */
+function perSecond(value: string): string {
+  const rate = Number(value) / 60;
+  if (rate === 0) return "0";
+  if (rate >= 100) return formatExact(String(Math.round(rate)));
+  return rate.toFixed(1).replace(/\.0$/, "");
+}
+
+/** 速率文案（tokens/s）：无数据显示“—”；真实 0 与缺失分开；含估算 / 部分覆盖必须标出。 */
 export function describeRate(rate: RateData): RateView {
   const notes: string[] = [];
   if (rate.eventCount === 0) {
-    return { headline: "窗口内无事件", notes };
+    return { headline: "—", notes: ["暂无数据"] };
   }
   if (rate.value === null) {
     notes.push(`缺失 ${rate.missingCount} 条`);
-    return { headline: "用量不可用", notes };
+    return { headline: "—", notes };
   }
-  const headline = formatExact(rate.value);
+  const headline = perSecond(rate.value);
   if (rate.estimatedCount > 0) notes.push(`含估算 ${rate.estimatedCount} 条`);
   if (rate.missingCount > 0) {
     notes.push(`部分覆盖：缺失 ${rate.missingCount} 条`);

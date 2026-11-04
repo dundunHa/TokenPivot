@@ -167,9 +167,7 @@ describe("request log panel", () => {
     expect(within(row).getByText("状态不可用")).toBeTruthy();
     expect(within(row).getByText("耗时不详")).toBeTruthy();
     expect(within(row).getByText("未归属")).toBeTruthy();
-    expect((await screen.findByTestId("rate-value")).textContent).toBe(
-      "12,000",
-    );
+    expect((await screen.findByTestId("rate-value")).textContent).toBe("200");
     expect(screen.getByTestId("rate-notes").textContent).toContain(
       "含估算 1 条",
     );
@@ -197,12 +195,9 @@ describe("request log panel", () => {
       events: () => HttpResponse.json(page([])),
     });
     renderApp("/requests?tz=UTC");
-    expect((await screen.findByTestId("rate-value")).textContent).toBe(
-      "窗口内无事件",
-    );
-    expect(screen.getByTestId("rate-fresh").textContent).toContain(
-      "接收新鲜度未知",
-    );
+    expect((await screen.findByTestId("rate-value")).textContent).toBe("—");
+    expect(screen.getByTestId("rate-notes").textContent).toContain("暂无数据");
+    expect(screen.getByTestId("rate-fresh").textContent).toContain("暂无数据");
     await screen.findByText("当前保留明细中没有匹配的请求。");
   });
 
@@ -312,7 +307,7 @@ describe("request log panel", () => {
     await screen.findByText(/^更新失败，展示截至/);
     await screen.findByText(/速率更新失败，展示截至/);
     expect(screen.getByTestId("request-row")).toBeTruthy();
-    expect(screen.getByTestId("rate-value").textContent).toBe("12,000");
+    expect(screen.getByTestId("rate-value").textContent).toBe("200");
   });
 
   it("polls both every 5 seconds on the latest page and only the rate on an older page", async () => {
@@ -649,7 +644,7 @@ describe("request log panel", () => {
     });
     await tick(5_000);
     await waitFor(() => expect(screen.queryByText(/速率更新失败/)).toBeNull());
-    expect(screen.getByTestId("rate-value").textContent).toBe("12,000");
+    expect(screen.getByTestId("rate-value").textContent).toBe("200");
     expect(screen.getAllByTestId("request-row")).toHaveLength(1);
     expect(seen.events.length).toBe(e);
   });

@@ -145,9 +145,10 @@ export function GeekTrend({
 
   // 输入/输出不完整或含估算时，总量虚线取自服务端，提示读者以它为准。
   const showTotalLine = !grouped && !trend.stackable;
-  const note = showTotalLine
-    ? "部分时段的输入/输出缺失、含估算或与总量不一致，虚线为服务端总量。"
-    : null;
+  const note =
+    total && showTotalLine
+      ? "部分时段的输入/输出缺失、含估算或与总量不一致，虚线为服务端总量。"
+      : null;
 
   return (
     <div className="geek-card geek-trend-card">
@@ -168,7 +169,7 @@ export function GeekTrend({
         </div>
       </div>
 
-      <ul className="geek-legend" aria-label="图例">
+      <ul className="geek-legend" aria-label="图例" hidden={!total}>
         {series.map((s) => (
           <li key={s.key}>
             <i style={{ background: s.color }} />
@@ -179,9 +180,7 @@ export function GeekTrend({
 
       {!total ? (
         <p className="geek-empty geek-dim">
-          {data.totals.requestCount === "0"
-            ? "所选范围与筛选下没有用量。"
-            : "没有可展示的趋势点。"}
+          {data.totals.requestCount === "0" ? "暂无数据" : "暂无数据"}
         </p>
       ) : loading ? (
         <div role="status" aria-label="趋势加载中" className="geek-skeleton" />
@@ -190,7 +189,7 @@ export function GeekTrend({
           分组趋势加载失败，请稍后重试。
         </p>
       ) : series.length === 0 || rows.length === 0 ? (
-        <p className="geek-empty geek-dim">当前筛选下没有分组数据。</p>
+        <p className="geek-empty geek-dim">暂无数据</p>
       ) : (
         <Chart
           rows={rows}

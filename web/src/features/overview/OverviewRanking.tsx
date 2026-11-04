@@ -162,7 +162,7 @@ export function OverviewRanking({
       </div>
       <Section title="排名" query={query} timezone={filters.timezone}>
         {data && data.groups.length === 0 && !data.other ? (
-          <p className="geek-dim geek-empty">当前筛选下没有排名数据。</p>
+          <p className="geek-dim geek-empty">暂无数据</p>
         ) : null}
         {data ? (
           <>
