@@ -1031,6 +1031,17 @@
   }
 }
 
+@media (min-width: 1101px) and (max-width: 1279px) {
+  .lc-cabins {
+    grid-template-columns: 220px minmax(0, 1fr);
+    gap: 24px;
+  }
+
+  .lc-cabin-feishu {
+    padding-right: 24px;
+  }
+}
+
 @media (max-width: 720px) {
   .split-workbench {
     grid-template-columns: minmax(0, 1fr);
