@@ -107,11 +107,13 @@ GROUP BY p.as_of`
 
 // speedQuery measures generation speed from the events that can be measured: a known
 // or estimated output_tokens and a positive duration_ms. As in rateQuery the database
-// statement start is sampled once as as_of. It returns one row per UTC minute of the last
-// 60 minutes, starting at the minute that contains as_of-60min so the first bucket is whole (grouping(bucket)=0) and one overall row (grouping(bucket)=1) whose
-// win_* columns cover only the rolling 60 seconds [as_of-60s, as_of); the per-minute rows'
-// all_* columns are the minute series. Empty minutes have no row. $1 workspace, $2 optional
-// fixed as_of, $3..$6 filter.
+// statement start is sampled once as as_of.
+//
+// It returns one row per UTC minute (grouping(bucket)=0) from the minute that contains
+// as_of-60min up to as_of, so the first bucket is whole, and one overall row
+// (grouping(bucket)=1). The overall row's win_* columns cover only the rolling 60 seconds
+// [as_of-60s, as_of); the per-minute rows' sums are the minute series. Empty minutes have
+// no row. $1 workspace, $2 optional fixed as_of, $3..$6 filter.
 var speedQuery = `WITH p AS (SELECT COALESCE($2::timestamptz, statement_timestamp()) AS as_of),
 m AS (
   SELECT p.as_of, e.occurred_at, e.output_tokens_quality, e.output_tokens, e.duration_ms,

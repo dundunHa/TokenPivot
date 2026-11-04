@@ -106,6 +106,7 @@ func TestRequestDetailsInvalidArguments(t *testing.T) {
 	bad := map[string][]string{
 		"events": {"limit=0", "limit=101", "limit=1&limit=2", "start=2026-01-01T00:00:00Z", "cursor=x", "bad=1", "provider=", "model=%ff", "project=nope", "%zz"},
 		"rate":   {"limit=5", "start=2026-01-01T00:00:00Z", "project=nope"},
+		"speed":  {"limit=5", "start=2026-01-01T00:00:00Z", "project=nope"},
 	}
 	for kind, queries := range bad {
 		for _, q := range queries {
@@ -139,6 +140,14 @@ func TestRequestDetailsMalformedWorkspaceAndRateBody(t *testing.T) {
 			t.Fatalf("missing %s in %s", want, body)
 		}
 	}
+	w = f.get(t, detailsPath(f, "speed", ""), true)
+	body = w.Body.String()
+	for _, want := range []string{`"window_seconds":60`, `"unit":"tokens/s"`, `"output_tokens":null`, `"duration_ms":null`, `"event_count":0`, `"points":[]`} {
+		if w.Code != http.StatusOK || !strings.Contains(body, want) {
+			t.Fatalf("speed: status %d, missing %s in %s", w.Code, want, body)
+		}
+	}
+	assertNoStore(t, w)
 	w = f.get(t, detailsPath(f, "events", ""), true)
 	if !strings.Contains(w.Body.String(), `"items":[]`) {
 		t.Fatalf("events body %s", w.Body.String())
