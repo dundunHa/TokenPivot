@@ -39,6 +39,12 @@ func (f *detailsFakeStore) Rate(_ context.Context, p requestdetails.RateParams) 
 	return requestdetails.RateRow{AsOf: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)}, f.err
 }
 
+func (f *detailsFakeStore) Speed(_ context.Context, p requestdetails.SpeedParams) (requestdetails.SpeedRow, error) {
+	f.calls++
+	f.workspace = p.WorkspaceID.String()
+	return requestdetails.SpeedRow{AsOf: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)}, f.err
+}
+
 func newDetailsFixture(t *testing.T) (*usageFixture, *detailsFakeStore) {
 	t.Helper()
 	adapter, authStore := newTestAuth(t)

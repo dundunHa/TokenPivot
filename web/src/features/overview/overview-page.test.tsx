@@ -89,21 +89,20 @@ function useBackend(opts?: { aggregate?: () => Response | Promise<Response> }) {
         retention_cutoff: "2026-04-01T00:00:00Z",
       }),
     ),
-    http.get(`${BASE}/usage-rate`, () =>
+    http.get(`${BASE}/usage-speed`, () =>
       HttpResponse.json({
-        start: "2026-10-28T01:59:00Z",
-        end: "2026-10-28T02:00:00Z",
         as_of: "2026-10-28T02:00:00Z",
+        series_start: "2026-10-28T01:00:00Z",
         window_seconds: 60,
-        unit: "tokens/min",
-        total_tokens: {
-          value: null,
+        unit: "tokens/s",
+        current: {
+          output_tokens: null,
+          duration_ms: null,
           event_count: 0,
-          known_count: 0,
+          measured_count: 0,
           estimated_count: 0,
-          missing_count: 0,
         },
-        window_last_received_at: null,
+        points: [],
       }),
     ),
     http.get(`${BASE}/usage/rankings`, ({ request }) => {
@@ -129,14 +128,14 @@ function useBackend(opts?: { aggregate?: () => Response | Promise<Response> }) {
   return calls;
 }
 
-/** 热力图（小时）与速率趋势（分钟）固定粒度另发聚合；这里只看主趋势的请求。 */
+/** 热力图（小时）与默认趋势之外的固定粒度另发聚合；这里只看主趋势的请求。 */
 const mainCalls = (calls: URL[]) =>
   calls.filter(
     (c) =>
       !["hour", "minute"].includes(c.searchParams.get("granularity") ?? ""),
   );
 
-/** 默认趋势请求：分钟粒度、约 24 小时、不带模型筛选（区别于速率趋势与按模型的分组序列）。 */
+/** 默认趋势请求：分钟粒度、约 24 小时、不带模型筛选（区别于按模型的分组序列）。 */
 const defaultTrendCalls = (calls: URL[]) =>
   calls.filter(
     (c) =>
@@ -153,7 +152,7 @@ describe("overview page", () => {
     const total = await screen.findByTestId("metric-total");
     expect(total.textContent).toContain("120");
     expect(screen.getByTestId("metric-requests").textContent).toContain("7");
-    // 默认：近 24 小时、按分钟（1h 的速率趋势同为分钟粒度，靠起点区分）。
+    // 默认：近 24 小时、按分钟。
     const trend = defaultTrendCalls(calls);
     expect(trend.length).toBeGreaterThan(0);
     expect(trend[0]?.searchParams.get("timezone")).toBe("UTC");

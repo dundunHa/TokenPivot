@@ -48,20 +48,20 @@ const page = (
   ...RANGE,
   ...over,
 });
-const rateBody = (over: Record<string, unknown> = {}) => ({
-  start: "2026-10-28T11:59:00Z",
-  end: "2026-10-28T12:00:00Z",
+const speedBody = (over: Record<string, unknown> = {}) => ({
   as_of: "2026-10-28T12:00:00Z",
+  series_start: "2026-10-28T11:00:00Z",
   window_seconds: 60,
-  unit: "tokens/min",
-  total_tokens: {
-    value: "12000",
+  unit: "tokens/s",
+  // 20,000 输出 token ÷ 100 s 请求耗时 = 200 tokens/s；5 条里 3 条可测量。
+  current: {
+    output_tokens: "20000",
+    duration_ms: "100000",
     event_count: 5,
-    known_count: 3,
+    measured_count: 3,
     estimated_count: 1,
-    missing_count: 1,
   },
-  window_last_received_at: "2026-10-28T11:59:59Z",
+  points: [],
   ...over,
 });
 
@@ -128,10 +128,10 @@ function useBackend(opts?: {
       seen.events.push(url);
       return opts?.events?.(url) ?? HttpResponse.json(page([item("e1")]));
     }),
-    http.get(`${BASE}/usage-rate`, ({ request }) => {
+    http.get(`${BASE}/usage-speed`, ({ request }) => {
       const url = new URL(request.url);
       seen.rates.push(url);
-      return opts?.rate?.(url) ?? HttpResponse.json(rateBody());
+      return opts?.rate?.(url) ?? HttpResponse.json(speedBody());
     }),
   );
   return seen;
@@ -171,9 +171,11 @@ describe("request log panel", () => {
     expect(screen.getByTestId("rate-notes").textContent).toContain(
       "含估算 1 条",
     );
-    expect(screen.getByTestId("rate-notes").textContent).toContain("部分覆盖");
+    expect(screen.getByTestId("rate-notes").textContent).toContain(
+      "部分覆盖：2 条无耗时",
+    );
     expect(screen.getByTestId("rate-fresh").textContent).toContain(
-      "窗口内最后接收",
+      "近 60 秒，截至",
     );
   });
 
@@ -181,15 +183,14 @@ describe("request log panel", () => {
     useBackend({
       rate: () =>
         HttpResponse.json(
-          rateBody({
-            total_tokens: {
-              value: null,
+          speedBody({
+            current: {
+              output_tokens: null,
+              duration_ms: null,
               event_count: 0,
-              known_count: 0,
+              measured_count: 0,
               estimated_count: 0,
-              missing_count: 0,
             },
-            window_last_received_at: null,
           }),
         ),
       events: () => HttpResponse.json(page([])),
@@ -197,7 +198,6 @@ describe("request log panel", () => {
     renderApp("/requests?tz=UTC");
     expect((await screen.findByTestId("rate-value")).textContent).toBe("—");
     expect(screen.getByTestId("rate-notes").textContent).toContain("暂无数据");
-    expect(screen.getByTestId("rate-fresh").textContent).toContain("暂无数据");
     await screen.findByText("当前保留明细中没有匹配的请求。");
   });
 
@@ -272,17 +272,17 @@ describe("request log panel", () => {
           ? errorResponse(500, "INTERNAL")
           : HttpResponse.json(page([item("e1")])),
       rate: () =>
-        fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(rateBody()),
+        fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(speedBody()),
     });
     const user = userEvent.setup();
     renderApp("/requests?tz=UTC");
     const list = await screen.findByRole("region", { name: "明细列表" });
     await within(list).findByText(/服务暂不可用/);
-    await screen.findByText(/速率：服务暂不可用/);
+    await screen.findByText(/速度：服务暂不可用/);
     fail = false;
     await user.click(within(list).getByRole("button", { name: "重试" }));
     await screen.findByTestId("request-row");
-    await user.click(screen.getByRole("button", { name: "重试速率" }));
+    await user.click(screen.getByRole("button", { name: "重试速度" }));
     await screen.findByTestId("rate-value");
   });
 
@@ -295,7 +295,7 @@ describe("request log panel", () => {
           ? errorResponse(500, "INTERNAL")
           : HttpResponse.json(page([item("e1")])),
       rate: () =>
-        fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(rateBody()),
+        fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(speedBody()),
     });
     renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
@@ -305,7 +305,7 @@ describe("request log panel", () => {
     await tick(5_000);
     expect(seen.events.length).toBeGreaterThan(before);
     await screen.findByText(/^更新失败，展示截至/);
-    await screen.findByText(/速率更新失败，展示截至/);
+    await screen.findByText(/速度更新失败，展示截至/);
     expect(screen.getByTestId("request-row")).toBeTruthy();
     expect(screen.getByTestId("rate-value").textContent).toBe("200");
   });
@@ -431,7 +431,7 @@ describe("request log panel", () => {
       "2026-09-02T00:00:00Z",
     );
     expect(seen.events.at(-1)?.searchParams.has("cursor")).toBe(false);
-    // 速率不受明细范围影响。
+    // 生成速度不受明细范围影响。
     expect(seen.rates.at(-1)?.searchParams.has("start")).toBe(false);
 
     await user.click(await screen.findByRole("button", { name: "下一页" }));
@@ -625,7 +625,7 @@ describe("request log panel", () => {
             : page([item("e1")], "c1"),
         ),
       rate: () =>
-        offline ? HttpResponse.error() : HttpResponse.json(rateBody()),
+        offline ? HttpResponse.error() : HttpResponse.json(speedBody()),
     });
     renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
@@ -637,13 +637,13 @@ describe("request log panel", () => {
     const e = seen.events.length;
     offline = true;
     await tick(5_000);
-    await screen.findByText(/速率更新失败，展示截至/);
+    await screen.findByText(/速度更新失败，展示截至/);
     offline = false;
     act(() => {
       window.dispatchEvent(new Event("online"));
     });
     await tick(5_000);
-    await waitFor(() => expect(screen.queryByText(/速率更新失败/)).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/速度更新失败/)).toBeNull());
     expect(screen.getByTestId("rate-value").textContent).toBe("200");
     expect(screen.getAllByTestId("request-row")).toHaveLength(1);
     expect(seen.events.length).toBe(e);

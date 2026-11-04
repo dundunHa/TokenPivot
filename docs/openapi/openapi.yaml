@@ -2485,6 +2485,112 @@ paths:
                 error:
                   code: UNAVAILABLE
                   message: service is unavailable
+  /api/v1/workspaces/{workspaceID}/usage-speed:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceID'
+    get:
+      tags:
+        - usage
+      operationId: getUsageSpeed
+      summary: 查询生成速度：输出 Token ÷ 请求耗时（近 60 秒 + 最近 60 分钟逐分钟）
+      description: |
+        生成速度 = 可测量请求的 `output_tokens` 之和 ÷ 这些请求的 `duration_ms` 之和（tokens/s）。分母是模型实际在处理请求的时间，空闲时间不计入；分子只含输出，不含输入与缓存读取。接口返回两个和而不是商：客户端用精确整数相除（`output_tokens / duration_ms * 1000`）。
+
+        **可测量请求**：`output_tokens_quality` 为 `known` 或 `estimated`，且 `duration_ms` 非空且大于 0。其余请求（旧数据没有耗时、输出缺失、耗时为 0）不进入两个和，但计入 `event_count`，`event_count - measured_count` 就是未覆盖的条数，调用方必须标出部分覆盖。`duration_ms` 由数据源上报；DSH 插件上报模型调用开始（`step/start`）到最终消息提交的时间，包含首 token 之前的等待。已入库的旧事件没有耗时，不会被补算。
+
+        **窗口**：`current` 是精确滚动窗口 `[as_of-60s,as_of)`，按 `occurred_at`（请求完成时间）归入；`points` 是 `[series_start, as_of)` 内按 UTC 自然分钟分组的和，只返回有可测量请求的分钟（没有数据的分钟不出现，不是 0），升序。`as_of` 是数据库单条语句的开始时间，客户端不能指定。只接受 `provider`/`model`/`project` 筛选，其他参数返回 `400`。
+
+        **授权**与筛选规则同 `usage-events`。
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestProvider'
+        - $ref: '#/components/parameters/RequestModel'
+        - $ref: '#/components/parameters/RequestProject'
+      responses:
+        '200':
+          description: '当前 60 秒窗口与最近 60 分钟的生成速度输入。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSpeedResponse'
+              example:
+                as_of: '2026-10-28T12:00:30Z'
+                window_seconds: 60
+                series_start: '2026-10-28T11:00:00Z'
+                unit: tokens/s
+                current: {output_tokens: '150', duration_ms: '3000', event_count: 6, measured_count: 3, estimated_count: 1}
+                points:
+                  - {bucket_start: '2026-10-28T11:50:00Z', output_tokens: '300', duration_ms: '3000', measured_count: 1, estimated_count: 0}
+                  - {bucket_start: '2026-10-28T12:00:00Z', output_tokens: '150', duration_ms: '3000', measured_count: 2, estimated_count: 1}
+        '400':
+          description: '`INVALID_ARGUMENT`：路径 UUID、参数非法，或 Project UUID 不属于该 workspace。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INVALID_ARGUMENT
+                  message: request is not acceptable
+        '401':
+          description: '`UNAUTHENTICATED`：无有效浏览器会话。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: authentication required
+        '403':
+          description: '`PERMISSION_DENIED`：不是该 workspace 成员。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: PERMISSION_DENIED
+                  message: workspace membership required
+        '500':
+          description: '`INTERNAL`：成员角色或查询的非数据库不可用故障（含客户端取消）；不含 SQL 细节。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: INTERNAL
+                  message: internal error
+        '503':
+          description: '`UNAVAILABLE`：会话续期等认证依赖不可用，或成员检查/查询时数据库不可用（连接失败、连接已关闭、超时），请求停止；不含驱动或 SQL 细节。'
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageError'
+              example:
+                error:
+                  code: UNAVAILABLE
+                  message: service is unavailable
 components:
   securitySchemes:
     bearerAuth:
@@ -3802,6 +3908,38 @@ components:
             estimated_count: {type: integer, minimum: 0}
             missing_count: {type: integer, minimum: 0}
         window_last_received_at: {type: [string, 'null'], format: date-time}
+
+    UsageSpeedResponse:
+      type: object
+      additionalProperties: false
+      required: [as_of, window_seconds, series_start, unit, current, points]
+      properties:
+        as_of: {type: string, format: date-time}
+        window_seconds: {type: integer, const: 60}
+        series_start: {type: string, format: date-time, description: '序列起点：as_of 往前 60 分钟并向下取整到分钟。'}
+        unit: {type: string, const: tokens/s}
+        current:
+          type: object
+          additionalProperties: false
+          required: [output_tokens, duration_ms, event_count, measured_count, estimated_count]
+          properties:
+            output_tokens: {type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$', description: '可测量请求的输出 token 精确和；没有可测量请求为 null。'}
+            duration_ms: {type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$', description: '同一批请求的耗时精确和（毫秒）；没有可测量请求为 null。'}
+            event_count: {type: integer, minimum: 0, description: '窗口内完成的全部请求数（含无法测量的）。'}
+            measured_count: {type: integer, minimum: 0, description: '其中输出与耗时都可用的请求数。'}
+            estimated_count: {type: integer, minimum: 0, description: '可测量请求中输出为估算值的条数。'}
+        points:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [bucket_start, output_tokens, duration_ms, measured_count, estimated_count]
+            properties:
+              bucket_start: {type: string, format: date-time, description: 'UTC 分钟起点。'}
+              output_tokens: {type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$'}
+              duration_ms: {type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$'}
+              measured_count: {type: integer, minimum: 1}
+              estimated_count: {type: integer, minimum: 0}
 
     ProjectList:
       type: array

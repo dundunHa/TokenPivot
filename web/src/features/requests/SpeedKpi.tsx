@@ -5,70 +5,72 @@ import type { OverviewFilters } from "@/features/overview/overviewFilters";
 import type { QueryScope } from "@/features/overview/overviewQueries";
 import { formatInstant } from "@/features/overview/overviewView";
 import { GeekKpiShell } from "@/features/overview/geek/GeekKpis";
-import { describeRate } from "./model";
-import { useRate } from "./useRequestLogs";
+import { describeSpeed } from "./model";
+import { useSpeed } from "./useRequestLogs";
 
-/** 实时速率指标卡：近 60 秒 tokens/min，与请求明细共用同一个速率查询。 */
-export function RateKpi({
+/** 生成速度指标卡：近 60 秒内模型实际输出的 tokens/s（输出 ÷ 请求耗时），不含空闲时间。 */
+export function SpeedKpi({
   scope,
   filters,
   children,
 }: {
   scope: QueryScope;
   filters: OverviewFilters;
-  /** 总速率下方的补充内容（总览页放各模型速率）。 */
+  /** 总体速度下方的补充内容（总览页放各模型速度）。 */
   children?: ReactNode;
 }) {
-  const rate = useRate(scope, filters);
+  const speed = useSpeed(scope, filters);
   const timezone = filters.timezone;
   return (
-    <GeekKpiShell label="实时速率">
-      {rate.isPending ? (
+    <GeekKpiShell label="生成速度">
+      {speed.isPending ? (
         <div
           role="status"
-          aria-label="速率加载中"
+          aria-label="速度加载中"
           className="geek-skeleton geek-skeleton-sm"
         />
-      ) : rate.data === undefined ? (
+      ) : speed.data === undefined ? (
         <div className="geek-kpi-error">
           <p role="alert" className="geek-err">
-            速率：{describeError(rate.error).message}
+            速度：{describeError(speed.error).message}
           </p>
-          {describeError(rate.error).kind === "forbidden" ? null : (
+          {describeError(speed.error).kind === "forbidden" ? null : (
             <Button
               variant="outline"
               size="sm"
-              onClick={() => void rate.refetch()}
+              onClick={() => void speed.refetch()}
             >
-              重试速率
+              重试速度
             </Button>
           )}
         </div>
       ) : (
-        <RateView data={rate.data} stale={rate.isError} timezone={timezone} />
+        <SpeedView
+          data={speed.data}
+          stale={speed.isError}
+          timezone={timezone}
+        />
       )}
       {children}
     </GeekKpiShell>
   );
 }
 
-function RateView({
+function SpeedView({
   data,
   stale,
   timezone,
 }: {
-  data: NonNullable<ReturnType<typeof useRate>["data"]>;
+  data: NonNullable<ReturnType<typeof useSpeed>["data"]>;
   stale: boolean;
   timezone: string;
 }) {
-  const view = describeRate(data);
-  const fresh = data.windowLastReceivedAt
-    ? `窗口内最后接收 ${formatInstant(data.windowLastReceivedAt, timezone, true)}`
-    : "暂无数据";
+  const view = describeSpeed(data.current);
+  const asOf = formatInstant(data.asOf, timezone, true);
   return (
     <div
       data-testid="rate"
-      title={`窗口截至 ${formatInstant(data.end, timezone, true)} · ${fresh}`}
+      title={`近 60 秒，截至 ${asOf} · 输出 token ÷ 请求耗时，不含空闲时间`}
     >
       <div className="geek-kpi-row">
         <div className="geek-kpi-number geek-num geek-live">
@@ -84,12 +86,11 @@ function RateView({
         </p>
       ) : null}
       <p className="sr-only" data-testid="rate-fresh">
-        窗口截至 {formatInstant(data.end, timezone, true)} · {fresh}
+        近 60 秒，截至 {asOf}
       </p>
       {stale ? (
         <p role="alert" className="geek-err geek-kpi-note">
-          速率更新失败，展示截至 {formatInstant(data.asOf, timezone, true)}{" "}
-          的旧结果
+          速度更新失败，展示截至 {asOf} 的旧结果
         </p>
       ) : null}
     </div>

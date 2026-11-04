@@ -413,3 +413,42 @@ test('collector: session events → queue → upload; restart replays leftovers'
   await c2.stop()
   await s.close()
 })
+
+test('collector: duration_ms is measured from step/start, restarted by a failed attempt, unknown without a start', async () => {
+  const dir = await tmp()
+  const c = new Collector({
+    stateDir: dir,
+    endpoint: null,
+    getToken: () => TOKEN,
+    logger: logs(),
+    setTimer: () => 1,
+    clearTimer: () => {},
+  })
+  await c.start()
+  const session = { id: 's', header: { id: 's', cwd: '/w' } }
+  const message = (id, turn, step, time) => ({ type: 'assistant/message', time, data: {
+    turn, step,
+    message: { role: 'assistant', id, source: { provider: 'p', model: 'm' } },
+    usage: { inputTokens: 3, outputTokens: 40, totalTokens: 43 },
+  } })
+  const sent = () => c.queue.items.map((item) => item.duration_ms)
+
+  // 1) plain step: start → completion
+  await c.handle(session, { type: 'step/start', time: 10_000, data: { turn: 1, step: 1 } })
+  await c.handle(session, message('m-1', 1, 1, 12_500))
+  // 2) a failed attempt restarts the clock for the final attempt
+  await c.handle(session, { type: 'step/start', time: 20_000, data: { turn: 1, step: 2 } })
+  await c.handle(session, { type: 'assistant/attempt', time: 29_000, data: { turn: 1, step: 2, stream: [] } })
+  await c.handle(session, message('m-2', 1, 2, 31_000))
+  // 3) no step/start seen (plugin enabled mid-step): unknown, not guessed
+  await c.handle(session, message('m-3', 1, 3, 40_000))
+  // 4) the same step of another session does not borrow this session's start
+  await c.handle({ id: 'other', header: { id: 'other' } }, { type: 'step/start', time: 50_000, data: { turn: 1, step: 4 } })
+  await c.handle(session, message('m-4', 1, 4, 52_000))
+  // 5) a start is consumed once; a retransmitted message is deduped by id and leaves no stale start
+  assert.equal(c.steps.has('s:1:1'), false)
+  await c.handle(session, message('m-1', 1, 1, 99_000))
+
+  assert.deepEqual(sent(), [2500, 2000, null, null])
+  await c.stop()
+})

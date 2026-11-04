@@ -10,9 +10,9 @@ import { GeekComposition } from "./geek/GeekComposition";
 import { GeekHeatmap } from "./geek/GeekHeatmap";
 import { GeekKpis } from "./geek/GeekKpis";
 import { GeekTrend } from "./geek/GeekTrend";
-import { ModelRateList } from "@/features/requests/ModelRateList";
-import { RateTrend } from "@/features/requests/RateTrend";
-import { RateKpi } from "@/features/requests/RateKpi";
+import { ModelSpeedList } from "@/features/requests/ModelSpeedList";
+import { SpeedTrend } from "@/features/requests/SpeedTrend";
+import { SpeedKpi } from "@/features/requests/SpeedKpi";
 import {
   browserTimezone,
   DEFAULT_OVERVIEW_FILTERS,
@@ -218,9 +218,9 @@ function OverviewContent({
           data={data}
           previous={previous.data?.totals}
           rate={
-            <RateKpi scope={scope} filters={filters}>
-              <ModelRateList scope={scope} filters={filters} range={range} />
-            </RateKpi>
+            <SpeedKpi scope={scope} filters={filters}>
+              <ModelSpeedList scope={scope} filters={filters} range={range} />
+            </SpeedKpi>
           }
         />
       ) : null}
@@ -265,7 +265,7 @@ function OverviewContent({
       </div>
 
       <div className="geek-split">
-        <RateTrend scope={scope} filters={filters} range={range} nowMs={now} />
+        <SpeedTrend scope={scope} filters={filters} range={range} />
         {data ? <GeekComposition data={data} /> : null}
       </div>
 
