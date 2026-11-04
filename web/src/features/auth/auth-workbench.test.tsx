@@ -59,7 +59,7 @@ describe("dashboard snapshot", () => {
       screen.getByRole("img", { name: "按模型 Token 速率趋势" }),
     ).toBeTruthy();
     expect(screen.getByTestId("snapshot-readout").textContent).toBe(
-      "最新: 234K tok/min",
+      "最新 · Top 3 217K tok/min",
     );
     expect(document.querySelector(".shell-bar, .tmux-bar")).toBeNull();
     expect(screen.queryByText(/快捷键/)).toBeNull();
@@ -105,6 +105,32 @@ describe("dashboard snapshot", () => {
         .getAttribute("aria-pressed"),
     ).toBe("true");
   });
+
+  it("reads historical trend values with keyboard navigation", async () => {
+    authorizeEnabled();
+    renderApp("/login");
+    const user = userEvent.setup();
+    const chart = screen.getByRole("group", {
+      name: "历史趋势读数，使用左右方向键",
+    });
+
+    chart.focus();
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.getByTestId("snapshot-readout").textContent).toContain(
+      "T-1m · Top 3",
+    );
+    await user.keyboard("{Home}");
+    expect(screen.getByTestId("snapshot-readout").textContent).toContain(
+      "T-33m · Top 3",
+    );
+    await user.keyboard("{End}");
+    expect(screen.getByTestId("snapshot-readout").textContent).toContain(
+      "T-0m · Top 3",
+    );
+    expect(
+      document.getElementById("usage-readout")?.getAttribute("aria-live"),
+    ).toBe("polite");
+  });
 });
 
 describe("feishu cabin", () => {
@@ -126,11 +152,13 @@ describe("feishu cabin", () => {
         /有效期 (180|179)s/,
       );
     });
-    expect(
-      screen
-        .getByRole("button", { name: "使用飞书账号继续" })
-        .hasAttribute("disabled"),
-    ).toBe(false);
+    await waitFor(() => {
+      expect(
+        screen
+          .getByRole("button", { name: "使用飞书账号继续" })
+          .hasAttribute("disabled"),
+      ).toBe(false);
+    });
   });
 
   it("ignores global launch and refresh shortcuts", async () => {

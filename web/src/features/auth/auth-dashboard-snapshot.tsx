@@ -1,4 +1,9 @@
-import { useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 
 /** 公开登录页的确定性演示数据，不创建统计或会话请求。 */
 const IN_SERIES: readonly number[] = [
@@ -16,7 +21,7 @@ const TOTAL_SERIES = IN_SERIES.map(
 const METRICS = [
   { label: "输入 Token", value: "52.4M", note: "77.9% 总量" },
   { label: "输出 Token", value: "14.8M", note: "22.1% 总量" },
-  { label: "请求数", value: "4,812", note: "99.4% 用量已知" },
+  { label: "请求数", value: "4,812", note: "99.4% 有 Token 明细" },
   { label: "当前速率", value: "234K", note: "tok / min" },
 ] as const;
 
@@ -56,13 +61,11 @@ const TRENDS: Record<TrendDimension, readonly TrendSeries[]> = {
   ],
 };
 
-const WIDTH = 720;
 const HEIGHT = 260;
 const LEFT = 48;
 const RIGHT = 16;
 const TOP = 18;
 const BOTTOM = 34;
-const PLOT_WIDTH = WIDTH - LEFT - RIGHT;
 const PLOT_HEIGHT = HEIGHT - TOP - BOTTOM;
 const BASE_Y = HEIGHT - BOTTOM;
 const X_LABELS = [
@@ -77,9 +80,13 @@ interface Point {
   y: number;
 }
 
-function makePoints(values: readonly number[], maxY: number): Point[] {
+function makePoints(
+  values: readonly number[],
+  maxY: number,
+  plotWidth: number,
+): Point[] {
   return values.map((value, index) => ({
-    x: LEFT + (index / (values.length - 1)) * PLOT_WIDTH,
+    x: LEFT + (index / (values.length - 1)) * plotWidth,
     y: TOP + (1 - value / maxY) * PLOT_HEIGHT,
   }));
 }
@@ -112,14 +119,52 @@ function formatK(value: number): string {
 export function AuthDashboardSnapshot() {
   const [dimension, setDimension] = useState<TrendDimension>("model");
   const [hovered, setHovered] = useState<number | null>(null);
+  const [chartWidth, setChartWidth] = useState(720);
+  const chartRef = useRef<HTMLDivElement>(null);
   const series = TRENDS[dimension];
   const latest = TOTAL_SERIES.length - 1;
   const active = hovered ?? latest;
+  const plotWidth = chartWidth - LEFT - RIGHT;
+  const selectedTotal = series.reduce(
+    (total, item) => total + (item.values[active] ?? 0),
+    0,
+  );
+
+  useEffect(() => {
+    const element = chartRef.current;
+    if (!element) return;
+    const updateWidth = () => {
+      const width = Math.round(element.clientWidth);
+      if (width > 0) setChartWidth(width);
+    };
+    updateWidth();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateWidth);
+      return () => window.removeEventListener("resize", updateWidth);
+    }
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
   const maxY =
     Math.ceil(Math.max(...series.flatMap((item) => [...item.values])) / 40) *
     40;
   const yTicks = [1, 0.75, 0.5, 0.25, 0];
   const activeTime = hovered === null ? "最新" : `T-${latest - active}m`;
+
+  function handleChartKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    const { key } = event;
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(key)) return;
+    event.preventDefault();
+    setHovered((current) => {
+      const base = current ?? latest;
+      if (key === "Home") return 0;
+      if (key === "End") return latest;
+      if (key === "ArrowLeft") return Math.max(0, base - 1);
+      return Math.min(latest, base + 1);
+    });
+  }
 
   return (
     <section className="dash-snapshot" aria-label="TokenPivot Token 用量仪表盘">
@@ -155,8 +200,8 @@ export function AuthDashboardSnapshot() {
         <div className="usage-trend-head">
           <div>
             <h3>Token 速率</h3>
-            <p>
-              {activeTime} · {formatK(TOTAL_SERIES[active] ?? 0)} tok/min
+            <p data-testid="snapshot-readout">
+              {activeTime} · Top 3 {formatK(selectedTotal)} tok/min
             </p>
           </div>
           <div className="usage-tabs" role="group" aria-label="趋势维度">
@@ -177,9 +222,18 @@ export function AuthDashboardSnapshot() {
           </div>
         </div>
 
-        <div className="usage-chart" data-testid="usage-trend-chart">
+        <div
+          ref={chartRef}
+          className="usage-chart"
+          data-testid="usage-trend-chart"
+          role="group"
+          aria-label="历史趋势读数，使用左右方向键"
+          aria-describedby="usage-readout"
+          tabIndex={0}
+          onKeyDown={handleChartKeyDown}
+        >
           <svg
-            viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+            viewBox={`0 0 ${chartWidth} ${HEIGHT}`}
             role="img"
             aria-label={`${dimension === "model" ? "按模型" : "按提供商"} Token 速率趋势`}
             onMouseLeave={() => setHovered(null)}
@@ -204,7 +258,7 @@ export function AuthDashboardSnapshot() {
               const y = TOP + tick * PLOT_HEIGHT;
               return (
                 <g key={tick} className="usage-grid">
-                  <line x1={LEFT} x2={WIDTH - RIGHT} y1={y} y2={y} />
+                  <line x1={LEFT} x2={chartWidth - RIGHT} y1={y} y2={y} />
                   <text x={LEFT - 10} y={y + 3} textAnchor="end">
                     {formatK(maxY * (1 - tick))}
                   </text>
@@ -215,7 +269,7 @@ export function AuthDashboardSnapshot() {
               <text
                 key={item.label}
                 className="usage-x-label"
-                x={LEFT + (item.index / latest) * PLOT_WIDTH}
+                x={LEFT + (item.index / latest) * plotWidth}
                 y={HEIGHT - 10}
                 textAnchor={
                   item.index === 0
@@ -230,7 +284,10 @@ export function AuthDashboardSnapshot() {
             ))}
 
             {series.map((item) => {
-              const points = makePoints(item.values, maxY);
+              const points = makePoints(item.values, maxY, plotWidth);
+              const markerX = points[active]?.x ?? 0;
+              const markerY = points[active]?.y ?? 0;
+              const markerSize = hovered === null ? 4 : 5;
               return (
                 <g key={`${dimension}-${item.name}`}>
                   <path
@@ -243,12 +300,30 @@ export function AuthDashboardSnapshot() {
                     d={smoothPath(points)}
                     pathLength={1}
                   />
-                  <circle
-                    className={`usage-point usage-${item.tone}`}
-                    cx={points[active]?.x}
-                    cy={points[active]?.y}
-                    r={hovered === null ? 3.5 : 4.5}
-                  />
+                  {item.tone === "amber" ? (
+                    <circle
+                      className="usage-point usage-amber"
+                      cx={markerX}
+                      cy={markerY}
+                      r={markerSize}
+                    />
+                  ) : null}
+                  {item.tone === "green" ? (
+                    <rect
+                      className="usage-point usage-green"
+                      x={markerX - markerSize}
+                      y={markerY - markerSize}
+                      width={markerSize * 2}
+                      height={markerSize * 2}
+                      rx={1}
+                    />
+                  ) : null}
+                  {item.tone === "copper" ? (
+                    <path
+                      className="usage-point usage-copper"
+                      d={`M ${markerX} ${markerY - markerSize - 1} L ${markerX + markerSize + 1} ${markerY} L ${markerX} ${markerY + markerSize + 1} L ${markerX - markerSize - 1} ${markerY} Z`}
+                    />
+                  ) : null}
                 </g>
               );
             })}
@@ -256,8 +331,8 @@ export function AuthDashboardSnapshot() {
             {hovered !== null ? (
               <line
                 className="usage-cursor"
-                x1={LEFT + (active / latest) * PLOT_WIDTH}
-                x2={LEFT + (active / latest) * PLOT_WIDTH}
+                x1={LEFT + (active / latest) * plotWidth}
+                x2={LEFT + (active / latest) * plotWidth}
                 y1={TOP}
                 y2={BASE_Y}
               />
@@ -265,11 +340,9 @@ export function AuthDashboardSnapshot() {
             {TOTAL_SERIES.map((_, index) => (
               <rect
                 key={index}
-                x={
-                  LEFT + (index / latest) * PLOT_WIDTH - PLOT_WIDTH / latest / 2
-                }
+                x={LEFT + (index / latest) * plotWidth - plotWidth / latest / 2}
                 y={TOP}
-                width={PLOT_WIDTH / latest}
+                width={plotWidth / latest}
                 height={PLOT_HEIGHT}
                 fill="transparent"
                 onMouseEnter={() => setHovered(index)}
@@ -287,8 +360,16 @@ export function AuthDashboardSnapshot() {
             </div>
           ))}
         </div>
-        <p className="sr-only" data-testid="snapshot-readout">
-          {activeTime}: {formatK(TOTAL_SERIES[active] ?? 0)} tok/min
+        <p
+          id="usage-readout"
+          className="sr-only"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {activeTime}，Top 3 {formatK(selectedTotal)} tok/min；
+          {series
+            .map((item) => `${item.name} ${formatK(item.values[active] ?? 0)}`)
+            .join("，")}
         </p>
       </div>
     </section>

@@ -633,6 +633,12 @@
   margin-top: 18px;
 }
 
+.usage-chart:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+
 .usage-chart svg {
   display: block;
   width: 100%;
@@ -648,11 +654,12 @@
 .usage-grid text,
 .usage-x-label {
   fill: var(--olive-dim);
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .usage-line {
   fill: none;
+  vector-effect: non-scaling-stroke;
   stroke-width: 2.25;
   stroke-linecap: round;
   stroke-linejoin: round;
@@ -677,6 +684,7 @@
 }
 
 .usage-point {
+  vector-effect: non-scaling-stroke;
   stroke-width: 2;
   transition: r 120ms ease;
 }
@@ -751,17 +759,20 @@
   width: 7px;
   height: 7px;
   flex: 0 0 auto;
-  border-radius: 50%;
 }
 
 .usage-dot.usage-amber {
+  border-radius: 50%;
   background: var(--amber-bright);
 }
 .usage-dot.usage-green {
+  border-radius: 1px;
   background: var(--green);
 }
 .usage-dot.usage-copper {
+  border-radius: 1px;
   background: var(--copper);
+  transform: rotate(45deg);
 }
 
 @keyframes usage-draw {
