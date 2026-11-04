@@ -34,7 +34,7 @@ export interface RateView {
 }
 
 /** 窗口为 60 秒、值为窗口内总量（tokens/min），换算成 tokens/s 展示。 */
-function perSecond(value: string): string {
+export function perSecond(value: string): string {
   const rate = Number(value) / 60;
   if (rate === 0) return "0";
   if (rate >= 100) return formatExact(String(Math.round(rate)));

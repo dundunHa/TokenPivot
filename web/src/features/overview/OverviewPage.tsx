@@ -6,8 +6,11 @@ import { useUsageOptions } from "@/features/workspace/queries";
 import { OverviewFilterBar } from "./OverviewFilterBar";
 import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
+import { GeekComposition } from "./geek/GeekComposition";
+import { GeekHeatmap } from "./geek/GeekHeatmap";
 import { GeekKpis } from "./geek/GeekKpis";
 import { GeekTrend } from "./geek/GeekTrend";
+import { ModelRates } from "@/features/requests/ModelRates";
 import { RateKpi } from "@/features/requests/RateKpi";
 import {
   browserTimezone,
@@ -22,6 +25,7 @@ import {
 import {
   useAggregate,
   usePreviousTotals,
+  useWeekActivity,
   useProjects,
   type QueryScope,
 } from "./overviewQueries";
@@ -190,6 +194,7 @@ function OverviewContent({
 
   const data = aggregate.data;
   const previous = usePreviousTotals(scope, filters, range, now);
+  const week = useWeekActivity(scope, filters, now);
 
   return (
     <div className="geek-main">
@@ -253,6 +258,13 @@ function OverviewContent({
           }}
         />
       </div>
+
+      <div className="geek-split">
+        <ModelRates scope={scope} filters={filters} range={range} />
+        {data ? <GeekComposition data={data} /> : null}
+      </div>
+
+      {week.data ? <GeekHeatmap data={week.data} timezone={tz} /> : null}
     </div>
   );
 }

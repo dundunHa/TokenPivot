@@ -25,6 +25,9 @@ const stats = (
   input: metric(i),
   output: metric(o),
   total: metric(t),
+  cacheRead: metric(null),
+  cacheWrite: metric(null),
+  reasoning: metric(null),
 });
 const point = (
   s: string,
