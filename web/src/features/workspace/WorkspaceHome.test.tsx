@@ -790,7 +790,10 @@ describe("workspace home", () => {
       ),
     );
     const user = userEvent.setup();
-    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    renderHome(
+      createAppQueryClient(),
+      `/?workspace=${WS_A}&tz=UTC&granularity=auto`,
+    );
     await waitFor(() => expect(backend.calls.aggregate).toContain(WS_A));
     expect(signals.get(WS_A)).toBeInstanceOf(AbortSignal);
 
@@ -836,7 +839,10 @@ describe("workspace home", () => {
       ),
     );
     const user = userEvent.setup();
-    renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
+    renderHome(
+      createAppQueryClient(),
+      `/?workspace=${WS_A}&tz=UTC&granularity=auto`,
+    );
     await screen.findByTestId("metric-total");
     await user.click(screen.getByRole("button", { name: "Beta" }));
     await waitFor(() => expect(search().get("workspace")).toBe(WS_B));

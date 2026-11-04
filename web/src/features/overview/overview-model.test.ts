@@ -66,10 +66,12 @@ describe("effectiveGranularity", () => {
 
   it("falls back to auto when an explicit granularity would exceed the point limit", () => {
     expect(effectiveGranularity("minute", range(24 * 7))).toBe("auto");
-    expect(effectiveGranularity("hour", range(24 * 60))).toBe("auto");
-    // 1000 小时刚好在边缘：估算多留 2 个桶，保守地交给服务端。
-    expect(effectiveGranularity("hour", range(999))).toBe("auto");
-    expect(effectiveGranularity("hour", range(990))).toBe("hour");
+    expect(effectiveGranularity("hour", range(24 * 70))).toBe("auto");
+    // 1500 个桶是上限：估算多留 2 个桶，保守地交给服务端。
+    expect(effectiveGranularity("hour", range(1499))).toBe("auto");
+    expect(effectiveGranularity("hour", range(1490))).toBe("hour");
+    // 默认的“近 24 小时 + 分钟”（1441 个桶）放得下。
+    expect(effectiveGranularity("minute", range(24))).toBe("minute");
   });
 
   it("uses the supplied now when the range end is open", () => {
@@ -77,7 +79,7 @@ describe("effectiveGranularity", () => {
       effectiveGranularity("minute", { startMs: 0, endMs: null }, 2 * H),
     ).toBe("minute");
     expect(
-      effectiveGranularity("minute", { startMs: 0, endMs: null }, 24 * H),
+      effectiveGranularity("minute", { startMs: 0, endMs: null }, 48 * H),
     ).toBe("auto");
   });
 });
@@ -97,11 +99,11 @@ describe("URL filters", () => {
     expect(out.get("x")).toBe("1");
   });
 
-  it("defaults to today+auto granularity and marks an implied timezone", () => {
+  it("defaults to the last 24 hours by minute and marks an implied timezone", () => {
     const r = parseFilters(new URLSearchParams(), "UTC");
     if (!r.ok) throw new Error(r.reason);
-    expect(r.filters.range).toBe("today");
-    expect(r.filters.granularity).toBe("auto");
+    expect(r.filters.range).toBe("24h");
+    expect(r.filters.granularity).toBe("minute");
     expect(r.timezoneImplied).toBe(true);
   });
 

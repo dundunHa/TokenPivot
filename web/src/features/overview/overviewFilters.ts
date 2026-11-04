@@ -2,6 +2,7 @@
 
 export const RANGE_PRESETS = [
   "1h",
+  "24h",
   "today",
   "yesterday",
   "7d",
@@ -24,13 +25,13 @@ export interface OverviewFilters {
   end: string | null;
 }
 
-/** 默认值只在此处：今天 + 小时，空选择表示全部。时区由调用方补入。 */
+/** 默认值只在此处：近 24 小时 + 分钟，空选择表示全部。时区由调用方补入。 */
 export const DEFAULT_OVERVIEW_FILTERS: Omit<OverviewFilters, "timezone"> = {
   providers: [],
   models: [],
   projects: [],
-  range: "today",
-  granularity: "auto",
+  range: "24h",
+  granularity: "minute",
   start: null,
   end: null,
 };
@@ -324,7 +325,7 @@ export function floorMinute(ms: number): number {
 }
 
 /** 服务端单次趋势查询的点数上限（与后端 MaxPoints 一致）。 */
-export const MAX_TREND_POINTS = 1000;
+export const MAX_TREND_POINTS = 1500;
 const BUCKET_MS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 } as const;
 
 /**
@@ -358,6 +359,8 @@ export function resolveRange(
   switch (filters.range) {
     case "1h":
       return { startMs: now - 60 * MINUTE_MS, endMs: null };
+    case "24h":
+      return { startMs: now - 24 * 60 * MINUTE_MS, endMs: null };
     case "7d":
       return { startMs: now - 7 * 24 * 60 * MINUTE_MS, endMs: null };
     case "today":

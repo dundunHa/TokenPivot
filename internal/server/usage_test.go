@@ -259,12 +259,12 @@ func TestUsageTooManyPointsDetails(t *testing.T) {
 	if w.Code != http.StatusBadRequest || code != "TOO_MANY_POINTS" {
 		t.Fatalf("status %d code %s: %s", w.Code, code, w.Body.String())
 	}
-	if details["max_points"] != float64(1000) || details["suggested_granularity"] != "hour" {
+	if details["max_points"] != float64(usage.MaxPoints) || details["suggested_granularity"] != "hour" {
 		t.Fatalf("details = %v", details)
 	}
 	// Day granularity over 13 months fits; a finer request over a long span may
 	// have no suggestion, which must be an explicit JSON null.
-	if !strings.Contains(w.Body.String(), `"max_points":1000`) {
+	if !strings.Contains(w.Body.String(), `"max_points":1500`) {
 		t.Fatalf("body = %s", w.Body.String())
 	}
 	if f.store.calls != 0 {

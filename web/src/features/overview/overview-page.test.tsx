@@ -136,6 +136,16 @@ const mainCalls = (calls: URL[]) =>
       !["hour", "minute"].includes(c.searchParams.get("granularity") ?? ""),
   );
 
+/** 默认趋势请求：分钟粒度、约 24 小时、不带模型筛选（区别于速率趋势与按模型的分组序列）。 */
+const defaultTrendCalls = (calls: URL[]) =>
+  calls.filter(
+    (c) =>
+      c.searchParams.get("granularity") === "minute" &&
+      !c.searchParams.has("model") &&
+      Date.now() - Date.parse(c.searchParams.get("start") ?? "") >
+        23 * 3_600_000,
+  );
+
 describe("overview page", () => {
   it("shows the four metrics from the server and queries with the URL timezone", async () => {
     const calls = useBackend();
@@ -143,9 +153,11 @@ describe("overview page", () => {
     const total = await screen.findByTestId("metric-total");
     expect(total.textContent).toContain("120");
     expect(screen.getByTestId("metric-requests").textContent).toContain("7");
-    expect(mainCalls(calls)[0]?.searchParams.get("timezone")).toBe("UTC");
-    expect(mainCalls(calls)[0]?.searchParams.get("granularity")).toBe("auto");
-    expect(mainCalls(calls)[0]?.searchParams.has("provider")).toBe(false);
+    // 默认：近 24 小时、按分钟（1h 的速率趋势同为分钟粒度，靠起点区分）。
+    const trend = defaultTrendCalls(calls);
+    expect(trend.length).toBeGreaterThan(0);
+    expect(trend[0]?.searchParams.get("timezone")).toBe("UTC");
+    expect(trend[0]?.searchParams.has("provider")).toBe(false);
   });
 
   it("does not send a query for an invalid link and offers a reset", async () => {
@@ -156,7 +168,7 @@ describe("overview page", () => {
     expect(calls).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "重置筛选" }));
     await screen.findByTestId("metric-total");
-    expect(mainCalls(calls)).toHaveLength(1);
+    expect(defaultTrendCalls(calls)).toHaveLength(1);
   });
 
   it("writes the browser timezone back to the URL when missing", async () => {
