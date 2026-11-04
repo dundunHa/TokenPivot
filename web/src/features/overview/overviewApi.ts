@@ -1,5 +1,9 @@
 import { ApiError, getJson } from "@/lib/api";
-import { type OverviewFilters, type ResolvedRange } from "./overviewFilters";
+import {
+  effectiveGranularity,
+  type OverviewFilters,
+  type ResolvedRange,
+} from "./overviewFilters";
 
 /** 唯一读取聚合 / 排名 / 项目列表响应结构的位置：unknown 在此收窄，形状不对按数据错误抛出。 */
 
@@ -219,7 +223,7 @@ export function aggregateParams(
 ): string {
   const params = rangeParams(filters, range);
   params.set("timezone", filters.timezone);
-  params.set("granularity", filters.granularity);
+  params.set("granularity", effectiveGranularity(filters.granularity, range));
   return params.toString();
 }
 

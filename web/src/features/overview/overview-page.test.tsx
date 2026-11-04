@@ -137,7 +137,7 @@ describe("overview page", () => {
     expect(total.textContent).toContain("120");
     expect(screen.getByTestId("metric-requests").textContent).toContain("7");
     expect(calls[0]?.searchParams.get("timezone")).toBe("UTC");
-    expect(calls[0]?.searchParams.get("granularity")).toBe("hour");
+    expect(calls[0]?.searchParams.get("granularity")).toBe("auto");
     expect(calls[0]?.searchParams.has("provider")).toBe(false);
   });
 
@@ -281,7 +281,7 @@ describe("overview page", () => {
     await within(ranking).findByText(/服务暂不可用/);
   });
 
-  it("shows actionable text for TOO_MANY_POINTS without changing granularity", async () => {
+  it("shows actionable text for TOO_MANY_POINTS without changing a fitting explicit granularity", async () => {
     const calls = useBackend({
       aggregate: () =>
         HttpResponse.json(
@@ -295,10 +295,21 @@ describe("overview page", () => {
           { status: 400 },
         ),
     });
-    renderApp("/?tz=UTC&granularity=minute&range=7d");
+    renderApp("/?tz=UTC&granularity=hour&range=today");
     await screen.findAllByText(/趋势点数超过上限 1000.*天/);
     expect(
-      calls.every((c) => c.searchParams.get("granularity") === "minute"),
+      calls.every((c) => c.searchParams.get("granularity") === "hour"),
     ).toBe(true);
+  });
+
+  it("lets the server choose when an explicit granularity is too fine for the range", async () => {
+    const calls = useBackend();
+    renderApp("/?tz=UTC&granularity=minute&range=7d");
+    await screen.findByTestId("metric-total");
+    expect(calls.length).toBeGreaterThan(0);
+    expect(
+      calls.every((c) => c.searchParams.get("granularity") === "auto"),
+    ).toBe(true);
+    expect(screen.queryByText(/趋势点数超过上限/)).toBeNull();
   });
 });

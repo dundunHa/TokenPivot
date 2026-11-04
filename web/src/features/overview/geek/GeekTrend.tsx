@@ -55,6 +55,12 @@ interface TrendProps {
   timezone: string;
 }
 
+const GRAN_NAME: Record<string, string> = {
+  minute: "分钟",
+  hour: "小时",
+  day: "天",
+};
+
 /** 趋势卡：总量（输入/输出）与按模型、按提供商的折线。 */
 export function GeekTrend({
   scope,
@@ -143,6 +149,15 @@ export function GeekTrend({
     return { rows, series };
   }, [grouped, trend.points, data.points, groupKeys, results]);
 
+  // 实际粒度以服务端回传为准：自动模式下它由范围决定；显式粒度过细时服务端也会改用自动。
+  const actual = data.range.granularity;
+  const label = GRAN_NAME[actual];
+  const overridden =
+    filters.granularity !== "auto" && actual !== filters.granularity;
+  const granularityText = label
+    ? `按${label}${overridden ? "（范围较长，已自动调整）" : ""}`
+    : null;
+
   // 输入/输出不完整或含估算时，总量虚线取自服务端，提示读者以它为准。
   const showTotalLine = !grouped && !trend.stackable;
   const note =
@@ -153,7 +168,14 @@ export function GeekTrend({
   return (
     <div className="geek-card geek-trend-card">
       <div className="geek-card-head">
-        <h2 className="geek-card-title">趋势</h2>
+        <h2 className="geek-card-title">
+          趋势
+          {granularityText ? (
+            <span className="geek-card-sub" data-testid="trend-granularity">
+              {granularityText}
+            </span>
+          ) : null}
+        </h2>
         <div className="geek-segmented" role="group" aria-label="趋势维度">
           {MODES.map((m) => (
             <button

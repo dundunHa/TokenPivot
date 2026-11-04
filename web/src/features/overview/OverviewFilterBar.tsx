@@ -17,6 +17,7 @@ const PRESETS: { id: RangePreset; label: string }[] = [
   { id: "custom", label: "自定义" },
 ];
 const GRAN_LABEL: Record<Granularity, string> = {
+  auto: "自动",
   minute: "分钟",
   hour: "小时",
   day: "天",
