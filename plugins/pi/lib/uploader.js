@@ -2,14 +2,20 @@
  * 上报：POST /api/v1/ingestion/events（Bearer 凭证），逐项应用结果。
  *
  * 结果分类（docs/openapi/openapi.yaml 的 ItemResult）：
- *   accepted / duplicate            → 确认出队
- *   conflict / expired / rejected   → 写死信后出队（同身份原内容不可能再成功）
- *   rejected + FUTURE_EVENT         → 保留并退避（服务端零时钟偏差，等一下就能过）
- *   retryable / 未知状态 / 缺结果    → 保留并退避，绝不推断成功
+ *   accepted / duplicate            → 确认出队（不得带 error）
+ *   conflict / expired              → 写死信后出队（不得带 error）
+ *   rejected + 白名单错误码          → FUTURE_EVENT 保留退避，其余死信
+ *   rejected 未知错误码 / 缺 error   → 畸形项：整批保留退避，不入库服务端字符串
+ *   retryable                       → 保留并退避（错误码须在白名单内）
+ *   未知状态 / 缺结果 / 数量不符     → 保留并退避，绝不推断成功
  *   HTTP 413 多条                   → 对半拆批；单条仍超限 → 死信
  *   HTTP 400/401/403/415            → 暂停自动发送，保持队列
  *   HTTP 429 / 其它 4xx·5xx / 网络  → 保留并按 Retry-After 或指数退避
  *   3xx（不跟随重定向）              → 保留并退避
+ *
+ * 凭证与超时：每批发车前重新读取当前地址与凭证；响应处理前再确认本批实际使用的
+ * 地址/指纹/revision 仍是当前绑定，变了就整批保留并结束本轮 drain。
+ * 超时覆盖到响应体读完为止：头已到而 body 挂起同样超时，也能被 stop() 打断。
  *
  * 安全：Authorization 只发往配置端点；不跟随重定向；日志只含固定错误码、计数与 HTTP status。
  */
@@ -21,6 +27,19 @@ const BODY_BUDGET = MAX_BODY_BYTES - 1024
 const DEQUEUE = new Set(['accepted', 'duplicate'])
 const TERMINAL = new Set(['conflict', 'expired', 'rejected'])
 const PAUSE_STATUSES = new Set([400, 401, 403, 415])
+/** 不得携带 error 的状态（OpenAPI：前四种状态没有 error 字段）。 */
+const WITHOUT_ERROR = new Set(['accepted', 'duplicate', 'conflict', 'expired'])
+/** 只有文档列出的错误码才允许落进死信；其余一律按畸形项保留。 */
+const REJECTED_CODES = new Set([
+  'INVALID_ARGUMENT',
+  'FUTURE_EVENT',
+  'PROJECT_INVALID',
+  'USAGE_UNSUPPORTED',
+  'USAGE_OVERFLOW',
+  'NORMALIZATION_INCOMPATIBLE',
+])
+const RETRYABLE_CODES = new Set(['UNAVAILABLE', 'INTERNAL', 'DEADLINE_EXCEEDED'])
+const DEAD_OUTCOME = { conflict: 'conflict', expired: 'expired', rejected: 'rejected' }
 
 /** Retry-After：delta-seconds 或 HTTP-date，返回毫秒或 undefined。 */
 export function parseRetryAfter(value, now = Date.now()) {
@@ -35,18 +54,19 @@ export class Uploader {
   /**
    * @param {{
    *   queue: import('./queue.js').SqliteQueue,
-   *   getEndpoint: () => string|null,
-   *   getToken: () => string|undefined,
+   *   identity: () => ({endpoint: string, token: string, fingerprint: string|null, revision: number|null}|null),
+   *   isIdentityCurrent?: (snapshot: object) => boolean,
    *   fetch?: Function, logger?: {log: Function},
    *   timeoutMs?: number, batchSize?: number, baseDelayMs?: number, maxDelayMs?: number,
    *   now?: () => number, random?: () => number,
-   *   isBindingCurrent?: () => boolean,
    * }} options
    */
   constructor(options) {
     this.queue = options.queue
-    this.getEndpoint = options.getEndpoint
-    this.getToken = options.getToken
+    // 每批发送前调用：返回本批要用的地址与凭证快照；返回 null 表示当前不可发送。
+    this.getIdentity = options.identity ?? (() => null)
+    // 响应处理前调用：本批实际使用的地址/凭证是否仍是当前绑定。
+    this.isIdentityCurrent = options.isIdentityCurrent ?? (() => true)
     this.fetch = options.fetch ?? globalThis.fetch
     this.logger = options.logger
     this.timeoutMs = options.timeoutMs ?? 30000
@@ -55,8 +75,6 @@ export class Uploader {
     this.maxDelayMs = options.maxDelayMs ?? 5 * 60 * 1000
     this.now = options.now ?? Date.now
     this.random = options.random ?? Math.random
-    // 响应确认前再对比一次绑定与配置：期间被改过就不落结果，整批保留等下一轮。
-    this.isBindingCurrent = options.isBindingCurrent ?? (() => true)
     this.limit = this.batchSize
     this.failures = 0
     this.paused = false
@@ -89,7 +107,7 @@ export class Uploader {
     return { state: 'backoff', delayMs }
   }
 
-  /** 停止调度：取消在途网络请求，未确认事件留在库里。 */
+  /** 停止调度：取消在途网络请求（含挂起的响应体），未确认事件留在库里。 */
   stop() {
     this.stopped = true
     this.controller?.abort()
@@ -122,9 +140,7 @@ export class Uploader {
   async drain() {
     if (this.stopped) return { state: 'stopped' }
     if (this.paused) return { state: 'paused', reason: this.pauseReason }
-    const endpoint = this.getEndpoint()
-    const token = this.getToken()
-    if (!endpoint || !token) return { state: 'disabled' }
+    if (!this.getIdentity()) return { state: 'disabled' }
     let pending
     try {
       pending = this.queue.counts().pending
@@ -134,11 +150,15 @@ export class Uploader {
     if (pending === 0) return { state: 'idle' }
 
     while (!this.stopped) {
+      if (this.paused) return { state: 'paused', reason: this.pauseReason }
+      // 每批都重新读一次：在途期间凭证被轮换，后续批次不得沿用旧凭证。
+      const identity = this.getIdentity()
+      if (!identity) return { state: 'disabled' }
       const batch = this.nextBatch()
       if (batch.busy) return this.backoff()
       if (batch.failed) return { state: 'failed', reason: batch.failed }
       if (batch.items.length === 0) break
-      const outcome = await this.send(batch.items, endpoint, token)
+      const outcome = await this.send(batch.items, identity)
       if (outcome.state !== 'continue') return outcome
     }
     this.limit = this.batchSize
@@ -150,95 +170,158 @@ export class Uploader {
     return `{"events":[${items.map((item) => item.payloadText).join(',')}]}`
   }
 
-  async send(items, endpoint, token) {
-    this.controller = new AbortController()
-    const timer = setTimeout(() => this.controller?.abort(), this.timeoutMs)
+  /** 收尾：超时、停止、网络失败都保留整批，不推断成功。 */
+  failed(items) {
+    const reason = this.stopped ? 'stopped' : this.timedOut ? 'timeout' : 'network'
+    this.logger?.log('upload_failed', { reason, count: items.length })
+    return this.stopped ? { state: 'stopped' } : this.backoff()
+  }
+
+  /**
+   * 发一批。超时定时器一路覆盖到响应体读完；abort 同时能打断挂起的 body，
+   * 因此 stop() 不会留下一个永远挂起的 Promise。
+   */
+  async send(items, identity) {
+    const controller = new AbortController()
+    this.controller = controller
+    this.timedOut = false
+    const timer = setTimeout(() => {
+      this.timedOut = true
+      controller.abort()
+    }, this.timeoutMs)
     timer.unref?.()
-    let response
+    const aborted = new Promise((_resolve, reject) => {
+      if (controller.signal.aborted) return reject(new Error('aborted'))
+      controller.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+    })
+    // abort 可能发生在 race 已结束之后：接住这次拒绝，避免未处理的 rejection。
+    aborted.catch(() => {})
+    const readBody = (response, format) => Promise.race([
+      format === 'json' ? response.json() : response.text(),
+      aborted,
+    ])
+
     try {
-      response = await this.fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json',
-          authorization: `Bearer ${token}`,
-        },
-        body: this.body(items),
-        // 不跟随重定向：3xx 一律保留重试，Authorization 不会发往 Location。
-        redirect: 'manual',
-        signal: this.controller.signal,
-      })
-    } catch (error) {
-      const aborted = this.controller?.signal?.aborted === true
-      this.logger?.log('upload_failed', { reason: aborted ? 'timeout' : 'network', count: items.length })
-      return this.backoff()
+      let response
+      try {
+        response = await this.fetch(identity.endpoint, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json',
+            authorization: `Bearer ${identity.token}`,
+          },
+          body: this.body(items),
+          // 不跟随重定向：3xx 一律保留重试，Authorization 不会发往 Location。
+          redirect: 'manual',
+          signal: controller.signal,
+        })
+      } catch {
+        return this.failed(items)
+      }
+
+      // 本批实际使用的地址/凭证是否仍是当前绑定：变了就整批保留并结束本轮。
+      if (!this.isIdentityCurrent(identity)) {
+        this.logger?.log('upload_binding_changed', { count: items.length })
+        return this.backoff()
+      }
+
+      const status = response?.status
+      if (status === 200) {
+        let body
+        try {
+          body = await readBody(response, 'json')
+        } catch {
+          // 中止（超时/停止）与「200 但正文不是 JSON」要分开记：后者属于畸形响应。
+          if (this.stopped || this.timedOut) return this.failed(items)
+          return this.malformed(items)
+        }
+        if (!this.isIdentityCurrent(identity)) {
+          this.logger?.log('upload_binding_changed', { count: items.length })
+          return this.backoff()
+        }
+        return this.applyResults(items, body)
+      }
+
+      // 读完响应体以复用连接，内容不记录；挂起同样算超时。
+      try {
+        await readBody(response, 'text')
+      } catch {
+        return this.failed(items)
+      }
+
+      if (typeof status !== 'number') {
+        this.logger?.log('upload_failed', { reason: 'no_status', count: items.length })
+        return this.backoff()
+      }
+      if (status >= 300 && status < 400) {
+        this.logger?.log('upload_redirect_refused', { status })
+        return this.backoff()
+      }
+      if (PAUSE_STATUSES.has(status)) {
+        if (!this.isIdentityCurrent(identity)) {
+          this.logger?.log('upload_binding_changed', { count: items.length })
+          return this.backoff()
+        }
+        return this.pause(`http_${status}`)
+      }
+      if (status === 413) {
+        if (!this.isIdentityCurrent(identity)) {
+          this.logger?.log('upload_binding_changed', { count: items.length })
+          return this.backoff()
+        }
+        if (items.length > 1) {
+          this.limit = Math.max(1, Math.floor(items.length / 2))
+          this.logger?.log('upload_split', { status, count: items.length })
+          return { state: 'continue' }
+        }
+        const item = items[0]
+        const applied = this.queue.applyOutcome({
+          dead: [{ id: item.id, outcome: 'http_413', code: null }],
+        })
+        if (applied.busy || applied.failed) return this.backoff()
+        this.logger?.log('event_dead', { reason: 'payload_too_large', count: 1 })
+        return { state: 'continue' }
+      }
+      this.logger?.log('upload_failed', { status, count: items.length })
+      return this.backoff(parseRetryAfter(response.headers?.get?.('retry-after'), this.now()))
     } finally {
       clearTimeout(timer)
       this.controller = null
     }
+  }
 
-    const status = response?.status
-    if (status === 200) {
-      let body
-      try {
-        body = await response.json()
-      } catch {
-        this.logger?.log('upload_malformed', { status })
-        return this.backoff()
-      }
-      return this.applyResults(items, body)
-    }
+  /**
+   * 单项结果校验：字段缺失、禁止字段、未知状态、白名单外错误码都算畸形，
+   * 整批保留退避——服务端的自由文本不会被写进队列。
+   */
+  validResult(result) {
+    const status = result?.status
+    if (typeof status !== 'string') return false
+    if (WITHOUT_ERROR.has(status)) return result.error === undefined
+    const error = result.error
+    if (!error || typeof error !== 'object' || typeof error.code !== 'string') return false
+    if (status === 'rejected') return REJECTED_CODES.has(error.code)
+    if (status === 'retryable') return RETRYABLE_CODES.has(error.code)
+    return false
+  }
 
-    // 读完响应体以复用连接，内容不记录。
-    await response.text().catch(() => {})
-
-    if (typeof status !== 'number') {
-      this.logger?.log('upload_failed', { reason: 'no_status', count: items.length })
-      return this.backoff()
-    }
-    if (status >= 300 && status < 400) {
-      this.logger?.log('upload_redirect_refused', { status })
-      return this.backoff()
-    }
-    if (PAUSE_STATUSES.has(status)) {
-      return this.pause(`http_${status}`)
-    }
-    if (status === 413) {
-      if (items.length > 1) {
-        this.limit = Math.max(1, Math.floor(items.length / 2))
-        this.logger?.log('upload_split', { status, count: items.length })
-        return { state: 'continue' }
-      }
-      const item = items[0]
-      const applied = this.queue.applyOutcome({
-        dead: [{ id: item.id, outcome: 'http_413', code: null }],
-      })
-      if (applied.busy || applied.failed) return this.backoff()
-      this.logger?.log('event_dead', { reason: 'payload_too_large', count: 1 })
-      return { state: 'continue' }
-    }
-    this.logger?.log('upload_failed', { status, count: items.length })
-    return this.backoff(parseRetryAfter(response.headers?.get?.('retry-after'), this.now()))
+  malformed(items) {
+    this.logger?.log('upload_malformed', { status: 200, count: items.length })
+    return this.backoff()
   }
 
   applyResults(items, body) {
-    if (!this.isBindingCurrent()) {
-      this.logger?.log('upload_binding_changed', { count: items.length })
-      return this.backoff()
-    }
     const results = Array.isArray(body?.results) ? body.results : null
     // 畸形 200：results 必须与输入等长、index 必须一一覆盖；否则整批保留，绝不推断成功。
-    if (!results || results.length !== items.length) {
-      this.logger?.log('upload_malformed', { status: 200 })
-      return this.backoff()
-    }
+    if (!results || results.length !== items.length) return this.malformed(items)
     const byIndex = new Map()
     for (const result of results) {
       const index = result?.index
       if (!Number.isInteger(index) || index < 0 || index >= items.length || byIndex.has(index)) {
-        this.logger?.log('upload_malformed', { status: 200 })
-        return this.backoff()
+        return this.malformed(items)
       }
+      if (!this.validResult(result)) return this.malformed(items)
       byIndex.set(index, result)
     }
 
@@ -247,19 +330,14 @@ export class Uploader {
     let keep = 0
     items.forEach((item, index) => {
       const result = byIndex.get(index)
-      const status = result?.status
+      const status = result.status
       if (DEQUEUE.has(status)) {
         remove.push(item.id)
+      } else if (status === 'rejected' && result.error.code === 'FUTURE_EVENT') {
+        keep += 1
       } else if (TERMINAL.has(status)) {
-        const code = result?.error?.code
-        if (status === 'rejected' && code === 'FUTURE_EVENT') {
-          keep += 1
-        } else if (status === 'rejected' && typeof code !== 'string') {
-          keep += 1 // 永久拒绝却没给稳定码：不替服务端判死刑
-        } else {
-          remove.push(item.id)
-          dead.push({ id: item.id, outcome: status, code: typeof code === 'string' ? code : null })
-        }
+        remove.push(item.id)
+        dead.push({ id: item.id, outcome: DEAD_OUTCOME[status], code: result.error?.code ?? null })
       } else {
         keep += 1
       }

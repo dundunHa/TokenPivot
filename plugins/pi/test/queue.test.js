@@ -11,6 +11,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { DatabaseSync } from 'node:sqlite'
 import { SqliteQueue, QueueError, QUEUE_FILE } from '../lib/queue.js'
 
@@ -56,6 +57,8 @@ function spawnAndWait(script, args, marker) {
   })
   const ready = new Promise((resolve, reject) => {
     let buffer = ''
+    let errors = ''
+    child.stderr.on('data', (chunk) => { errors += chunk.toString() })
     const timer = setTimeout(() => reject(new Error(`child did not reach ${marker}`)), 15000)
     child.stdout.on('data', (chunk) => {
       buffer += chunk.toString()
@@ -71,7 +74,7 @@ function spawnAndWait(script, args, marker) {
     child.on('exit', (code) => {
       if (!buffer.includes(marker)) {
         clearTimeout(timer)
-        reject(new Error(`child exited early (code ${code})`))
+        reject(new Error(`child exited early (code ${code}): ${errors}`))
       }
     })
   })
@@ -236,23 +239,77 @@ test('死信与确认出队原子生效：只删已确认 ID，死信保留原�
   assert.equal(queue.counts().dead, 1)
 })
 
-test('两写者并发入队不丢事件', (t) => {
+test('两写者并发入队不丢事件（两个进程 + barrier 同步起跑）', async (t) => {
   const dir = tempDir(t)
-  const writerA = new SqliteQueue({ dir })
-  const writerB = new SqliteQueue({ dir })
-  writerA.open()
-  writerB.open()
-  t.after(() => {
-    writerA.close()
-    writerB.close()
-  })
-
-  for (let i = 0; i < 20; i += 1) {
-    writerA.enqueue({ event: event(`a${i}`), serverUrl: SERVER_A, fingerprint: FP_A })
-    writerB.enqueue({ event: event(`b${i}`), serverUrl: SERVER_A, fingerprint: FP_A })
+  const go = path.join(dir, 'go')
+  const script = `
+import fs from 'node:fs'
+import { SqliteQueue } from ${JSON.stringify(QUEUE_URL)}
+const [dir, prefix, go] = process.argv.slice(1)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+let queue = null
+for (let attempt = 0; attempt < 100; attempt += 1) {
+  try {
+    queue = new SqliteQueue({ dir })
+    queue.open()
+    break
+  } catch (error) {
+    queue = null
+    if (attempt === 99) { process.stdout.write('open-failed\\n'); process.exit(5) }
+    await sleep(5)
   }
-  assert.equal(writerA.counts().pending, 40)
-  assert.equal(writerB.counts().pending, 40)
+}
+process.stdout.write('ready\\n')
+for (let spin = 0; !fs.existsSync(go); spin += 1) {
+  if (spin > 5000) { process.stdout.write('barrier-timeout\\n'); process.exit(3) }
+  await sleep(2)
+}
+const event = (id) => ({
+  source_event_id: id,
+  provider: 'anthropic',
+  model: 'claude-x',
+  occurred_at: '2026-11-05T00:00:01.200Z',
+  usage: { input_tokens: { value: 100, quality: 'known' } },
+  status: null,
+  duration_ms: 1200,
+})
+for (let i = 0; i < 20;) {
+  const result = queue.enqueue({ event: event(prefix + i), serverUrl: ${JSON.stringify(SERVER_A)}, fingerprint: ${JSON.stringify(FP_A)} })
+  if (result.busy) { await sleep(2); continue }
+  if (result.state === 'paused' || result.state === 'failed') {
+    process.stdout.write('failed ' + result.state + '\\n')
+    process.exit(4)
+  }
+  i += 1
+}
+queue.close()
+process.stdout.write('done 20\\n')
+`
+  // 先把 schema 建好：两个进程同时首次 open 会在 PRAGMA journal_mode 上抢写锁。
+  new SqliteQueue({ dir }).open().close()
+
+  const a = spawnAndWait(script, [dir, 'a', go], 'ready')
+  const b = spawnAndWait(script, [dir, 'b', go], 'ready')
+  let outA = ''
+  let outB = ''
+  a.child.stdout.on('data', (chunk) => { outA += chunk })
+  b.child.stdout.on('data', (chunk) => { outB += chunk })
+
+  // barrier：两个进程都打开数据库并停在起跑线上，再一起放行。
+  await Promise.all([a.ready, b.ready])
+  const exits = Promise.all([once(a.child, 'close'), once(b.child, 'close')])
+  fs.writeFileSync(go, 'go')
+  const codes = await exits
+  assert.deepEqual(codes.map((entry) => entry[0]), [0, 0])
+  assert.match(outA, /done 20/)
+  assert.match(outB, /done 20/)
+
+  const queue = new SqliteQueue({ dir }).open()
+  t.after(() => queue.close())
+  assert.deepEqual(queue.counts(), { pending: 40, dead: 0, overflow: 0 })
+  const ids = queue.peek(100).items.map((item) => item.id)
+  assert.equal(ids.filter((id) => id.startsWith('a')).length, 20)
+  assert.equal(ids.filter((id) => id.startsWith('b')).length, 20)
 })
 
 test('双 uploader：各自按快照删自己的确认 ID，不删对方未确认的事件', (t) => {
@@ -399,27 +456,33 @@ test('软链 stateDir 与数据库：拒绝打开，不跟随后改别人文件�
   assert.throws(() => queue.open(), (error) => error instanceof QueueError && error.code === 'state_dir_symlink')
 })
 
-test('队列里没有明文 token，也没有 Prompt / 路径 / 会话标题', (t) => {
-  const { queue, dir } = openQueue(t)
-  queue.enqueue({
-    event: event('e1', {
-      usage: { input_tokens: { value: 100, quality: 'known' } },
-    }),
-    serverUrl: SERVER_A,
-    fingerprint: FP_A,
-  })
+test('队列里没有明文 token（pending/dead/overflow 三态都检查 DB 与 journal 字节）', (t) => {
+  const { queue, dir } = openQueue(t, { maxItems: 1 })
+  // e1 → pending；e2 → overflow；e1 转 dead；e3 再次 pending
+  queue.enqueue({ event: event('e1'), serverUrl: SERVER_A, fingerprint: FP_A })
+  queue.enqueue({ event: event('e2'), serverUrl: SERVER_A, fingerprint: FP_A })
+  queue.applyOutcome({ dead: [{ id: 'e1', outcome: 'conflict', code: 'USAGE_UNSUPPORTED' }] })
+  queue.enqueue({ event: event('e3'), serverUrl: SERVER_A, fingerprint: FP_A })
+  assert.deepEqual(queue.counts(), { pending: 1, dead: 1, overflow: 1 })
   queue.close()
 
-  const bytes = fs.readFileSync(path.join(dir, QUEUE_FILE))
-  assert.equal(bytes.includes(Buffer.from(TOKEN, 'utf8')), false)
+  for (const name of [QUEUE_FILE, `${QUEUE_FILE}-journal`]) {
+    const file = path.join(dir, name)
+    if (!fs.existsSync(file)) continue
+    const bytes = fs.readFileSync(file)
+    assert.equal(bytes.includes(Buffer.from(TOKEN, 'utf8')), false, `${name} 不得包含明文 token`)
+    assert.equal(bytes.includes(Buffer.from('PRIVATE', 'utf8')), false, `${name} 不得包含标记`)
+  }
+
   const binding = new SqliteQueue({ dir })
   binding.open()
   const stored = binding.binding()
+  const rows = binding.peek(10)
   binding.close()
   assert.match(stored.fingerprint, /^[a-f0-9]{64}$/)
-
-  const journal = path.join(dir, `${QUEUE_FILE}-journal`)
-  if (fs.existsSync(journal)) {
-    assert.equal(fs.readFileSync(journal).includes(Buffer.from(TOKEN, 'utf8')), false)
-  }
+  assert.deepEqual(rows.items.map((item) => item.id), ['e3'])
+  // payload 只含事件字段，不夹带 token 或额外键
+  assert.deepEqual(Object.keys(JSON.parse(rows.items[0].payloadText)).sort(), [
+    'duration_ms', 'model', 'occurred_at', 'provider', 'source_event_id', 'status', 'usage',
+  ])
 })

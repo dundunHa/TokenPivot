@@ -90,7 +90,7 @@ const isNonNegativeInt = (v) => Number.isSafeInteger(v) && v >= 0
  *
  * status 语义：
  *   ok            地址与凭证齐备，可采集并发送
- *   no_token      地址有效、凭证为空：入队但不发送（不丢）
+ *   no_token      地址有效、凭证为空：已安装待配置，不开始新采集，已有队列保留
  *   unconfigured  没有服务地址：已安装待配置，不开始采集
  *   paused        权限/软链/地址不合法：暂停采集与发送，保留既有队列
  *   error         配置文件读不了或不是合法 JSON：暂停，不覆盖既有数据
@@ -149,12 +149,12 @@ export function loadConfig(options = {}) {
 
   const envToken = typeof env.TOKENPIVOT_PI_TOKEN === 'string' ? env.TOKENPIVOT_PI_TOKEN.trim() : ''
   const fileToken = typeof parsed.token === 'string' ? parsed.token.trim() : ''
-  const tokenFromFile = envToken === '' && fileToken !== ''
   config.token = envToken !== '' ? envToken : fileToken !== '' ? fileToken : undefined
   config.fingerprint = tokenFingerprint(config.token ?? null)
 
-  // 配置文件里存 token 时要求 0600/0700；不满足就暂停启用，不改动任何权限位。
-  if (tokenFromFile) {
+  // 配置文件里只要写了非空 token，就要求 0600/0700：与最终选用哪个凭证无关，
+  // 否则「文件存着凭证但环境变量优先」就会让宽松权限的文件一路放行。
+  if (fileToken !== '') {
     const denied = checkPrivatePerms(fsImpl, configPath, path.dirname(configPath))
     if (denied) return fail('paused', denied)
   }

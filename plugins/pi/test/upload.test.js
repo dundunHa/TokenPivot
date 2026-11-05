@@ -8,7 +8,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { SqliteQueue } from '../lib/queue.js'
+import { DatabaseSync } from 'node:sqlite'
+import { SqliteQueue, QUEUE_FILE } from '../lib/queue.js'
 import { Uploader, parseRetryAfter } from '../lib/uploader.js'
 
 const SERVER = 'https://tokenpivot.example.com/api/v1/ingestion/events'
@@ -62,8 +63,8 @@ function makeUploader(queue, fetchImpl, overrides = {}) {
   const calls = []
   const uploader = new Uploader({
     queue,
-    getEndpoint: () => SERVER,
-    getToken: () => TOKEN,
+    identity: () => ({ endpoint: SERVER, token: TOKEN, fingerprint: FP, revision: 1 }),
+    isIdentityCurrent: () => true,
     fetch: (url, init) => {
       calls.push({ url, init, body: init.body })
       return fetchImpl(url, init)
@@ -82,7 +83,15 @@ test('逐项混合结果：accepted/duplicate 出队，conflict 死信，retryab
   let round = 0
   const { uploader, logs, calls } = makeUploader(queue, () => {
     round += 1
-    return jsonResponse(200, resultsOf('accepted', 'duplicate', { status: 'conflict', code: 'USAGE_UNSUPPORTED' }, { status: 'retryable', code: 'UNAVAILABLE' }))
+    return jsonResponse(200, {
+      request_id: 'req-1',
+      results: [
+        { index: 0, status: 'accepted' },
+        { index: 1, status: 'duplicate' },
+        { index: 2, status: 'conflict' },
+        { index: 3, status: 'retryable', error: { code: 'UNAVAILABLE' } },
+      ],
+    })
   })
 
   const outcome = await uploader.flush()
@@ -281,8 +290,7 @@ test('没有凭证时不发送；有凭证时 Authorization 只在请求头，�
   let called = 0
   const disabled = new Uploader({
     queue,
-    getEndpoint: () => SERVER,
-    getToken: () => undefined,
+    identity: () => null,
     fetch: () => {
       called += 1
       return jsonResponse(200, resultsOf('accepted'))
@@ -297,4 +305,126 @@ test('没有凭证时不发送；有凭证时 Authorization 只在请求头，�
   assert.equal(calls[0].init.headers.authorization, `Bearer ${TOKEN}`)
   assert.equal(calls[0].body.includes(TOKEN), false)
   assert.equal(JSON.stringify(logs).includes(TOKEN), false)
+})
+
+test('响应头已到但响应体挂起：超时仍然生效，整批保留', async (t) => {
+  const { queue } = setup(t)
+  seed(queue, 1)
+  const started = Date.now()
+  const { uploader, logs } = makeUploader(
+    queue,
+    () => new Response(new ReadableStream({ start() {} }), { status: 200 }),
+    { timeoutMs: 60 },
+  )
+  const outcome = await uploader.flush()
+  assert.equal(outcome.state, 'backoff')
+  assert.equal(Date.now() - started < 2000, true)
+  assert.equal(queue.counts().pending, 1)
+  assert.equal(logs.some((l) => l.code === 'upload_failed' && l.data.reason === 'timeout'), true)
+})
+
+test('响应体挂起时 stop() 立即打断，不留永远挂起的 Promise', async (t) => {
+  const { queue } = setup(t)
+  seed(queue, 1)
+  let responded
+  const respondedPromise = new Promise((resolve) => {
+    responded = resolve
+  })
+  const { uploader } = makeUploader(
+    queue,
+    () => {
+      responded()
+      return new Response(new ReadableStream({ start() {} }), { status: 200 })
+    },
+    { timeoutMs: 10000 },
+  )
+  const flushing = uploader.flush()
+  await respondedPromise
+  const started = Date.now()
+  uploader.stop()
+  const outcome = await flushing
+  assert.equal(outcome.state, 'stopped')
+  assert.equal(Date.now() - started < 1000, true)
+  assert.equal(queue.counts().pending, 1)
+})
+
+test('逐项结果严格校验：禁止字段、白名单外错误码与缺 error 都按畸形整批保留', async (t) => {
+  const malformed = [
+    // accepted / duplicate / conflict / expired 不得携带 error
+    { request_id: 'r', results: [{ index: 0, status: 'accepted', error: { code: 'INVALID_ARGUMENT' } }] },
+    { request_id: 'r', results: [{ index: 0, status: 'duplicate', error: { code: 'UNAVAILABLE' } }] },
+    { request_id: 'r', results: [{ index: 0, status: 'conflict', error: { code: 'USAGE_UNSUPPORTED' } }] },
+    // rejected / retryable 必须带白名单内的错误码
+    { request_id: 'r', results: [{ index: 0, status: 'rejected', error: { code: 'MADE_UP_CODE' } }] },
+    { request_id: 'r', results: [{ index: 0, status: 'rejected' }] },
+    { request_id: 'r', results: [{ index: 0, status: 'retryable', error: { code: 'WHATEVER' } }] },
+    { request_id: 'r', results: [{ index: 0, status: 'retryable' }] },
+    { request_id: 'r', results: [{ index: 0, status: 'rejected', error: { code: 'usage_overflow' } }] },
+  ]
+  for (const body of malformed) {
+    const { queue } = setup(t)
+    seed(queue, 1)
+    const { uploader, logs } = makeUploader(queue, () => jsonResponse(200, body))
+    const outcome = await uploader.flush()
+    assert.equal(outcome.state, 'backoff')
+    assert.deepEqual(queue.counts(), { pending: 1, dead: 0, overflow: 0 })
+    assert.equal(logs.some((l) => l.code === 'upload_malformed'), true)
+  }
+})
+
+test('rejected 白名单错误码写死信，码原样落库；服务端自由文本不入库', async (t) => {
+  const { queue, dir } = setup(t)
+  seed(queue, 2)
+  const { uploader } = makeUploader(queue, () => jsonResponse(200, {
+    request_id: 'req-1',
+    results: [
+      { index: 0, status: 'rejected', error: { code: 'USAGE_UNSUPPORTED' } },
+      { index: 1, status: 'conflict' },
+    ],
+  }))
+  await uploader.flush()
+  assert.deepEqual(queue.counts(), { pending: 0, dead: 2, overflow: 0 })
+
+  const db = new DatabaseSync(path.join(dir, QUEUE_FILE), { timeout: 0 })
+  const rows = db.prepare('SELECT id, status, outcome, code FROM events ORDER BY id').all()
+  db.close()
+  assert.deepEqual(rows.map((r) => [r.id, r.status, r.outcome, r.code]), [
+    ['e0', 'dead', 'rejected', 'USAGE_UNSUPPORTED'],
+    ['e1', 'dead', 'conflict', null],
+  ])
+})
+
+test('在途期间凭证轮换：本批保留、本轮终止，后续批次不再用旧凭证', async (t) => {
+  const { queue } = setup(t)
+  seed(queue, 2)
+  let current = { endpoint: SERVER, token: TOKEN, fingerprint: FP, revision: 1 }
+  const calls = []
+  const { uploader, logs } = makeUploader(
+    queue,
+    (_url, init) => {
+      calls.push(init.headers.authorization)
+      // 第一批在途时用户换了凭证：collector 会重新读配置与绑定。
+      current = {
+        endpoint: SERVER,
+        token: 'tpk_rotated_after_first_batch',
+        fingerprint: 'a'.repeat(64),
+        revision: 2,
+      }
+      return jsonResponse(200, resultsOf('accepted'))
+    },
+    {
+      batchSize: 1,
+      identity: () => ({ ...current }),
+      isIdentityCurrent: (snapshot) => snapshot.token === current.token &&
+        snapshot.fingerprint === current.fingerprint &&
+        snapshot.revision === current.revision,
+    },
+  )
+
+  const outcome = await uploader.flush()
+  assert.equal(outcome.state, 'backoff')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0], `Bearer ${TOKEN}`)
+  assert.deepEqual(queue.counts(), { pending: 2, dead: 0, overflow: 0 })
+  assert.equal(logs.some((l) => l.code === 'upload_binding_changed'), true)
 })

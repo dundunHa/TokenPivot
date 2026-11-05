@@ -293,23 +293,32 @@ test('绑定缺失但队列有事件：暂停并保留事件，不擅自重新�
   assert.deepEqual(pendingIds(ws), ['pi:msg:session-1:entry-1'])
 })
 
-test('服务端已提交但响应丢失：重传同一 ID 与同一字节，不会产生第二条事件', async (t) => {
+test('服务端已提交但响应丢失：重传同一 ID 与同一字节，返回 duplicate 且不重计', async (t) => {
   const ws = workspace(t)
   writeConfig(ws)
-  const seen = new Map()
+  // 有状态桩：第一次真的接收并记录（提交），然后在返回响应前断开；
+  // 第二次按「已存在」返回 duplicate。
+  const committed = new Map()
   const bodies = []
+  const seenStatuses = []
   let attempt = 0
   const { collector } = makeCollector(ws, {
     fetch: (_url, init) => {
       bodies.push(init.body)
       attempt += 1
-      if (attempt === 1) throw new Error('socket hang up')
       const body = JSON.parse(init.body)
-      for (const event of body.events) {
-        const count = seen.get(event.source_event_id) ?? 0
-        seen.set(event.source_event_id, count + 1)
+      if (attempt === 1) {
+        for (const event of body.events) {
+          committed.set(event.source_event_id, (committed.get(event.source_event_id) ?? 0) + 1)
+        }
+        throw new Error('socket hang up after commit')
       }
-      return jsonResponse(200, acceptedFor(init))
+      const results = body.events.map((event, index) => {
+        const status = committed.has(event.source_event_id) ? 'duplicate' : 'accepted'
+        seenStatuses.push(status)
+        return { index, status }
+      })
+      return jsonResponse(200, { request_id: 'req', results })
     },
   })
   t.after(() => collector.stop())
@@ -325,7 +334,9 @@ test('服务端已提交但响应丢失：重传同一 ID 与同一字节，不�
   assert.equal(collector.queue.counts().pending, 0)
   assert.equal(bodies.length, 2)
   assert.equal(bodies[0], bodies[1])
-  assert.deepEqual([...seen.entries()], [['pi:msg:session-1:entry-1', 1]])
+  // 服务端只提交一次；第二次是幂等 duplicate，没有新增事件。
+  assert.deepEqual([...committed.entries()], [['pi:msg:session-1:entry-1', 1]])
+  assert.deepEqual(seenStatuses, ['duplicate'])
 })
 
 test('断网补报：重启即发上一轮未确认事件；退出不清空；限时等待', async (t) => {
@@ -356,37 +367,81 @@ test('断网补报：重启即发上一轮未确认事件；退出不清空；�
   assert.deepEqual(recovered.collector.status().counts, { pending: 0, dead: 0, overflow: 0 })
 })
 
-test('隐私：上报正文、日志与队列都不含 token、Prompt、路径或会话标题', async (t) => {
+test('隐私：真实采集事件分别落 pending/dead/overflow，DB 字节与日志都不含标记', async (t) => {
   const ws = workspace(t)
-  writeConfig(ws)
+  // pending 上限 1：第二条走 overflow。
+  writeConfig(ws, { maxQueueItems: 1 })
   const stream = { lines: [], write(chunk) { this.lines.push(chunk) } }
+  const markerPrompt = 'PRIVATE-PROMPT-不要上传'
+  const markerTitle = 'PRIVATE-SESSION-TITLE'
+  const markerCwd = '/work/PRIVATE-CWD-MARKER/sub'
   const { collector, calls } = makeCollector(ws, {
     collector: { logger: createLogger(stream) },
+    fetch: (_url, init) => {
+      const body = JSON.parse(init.body)
+      // 让已提交的事件变成死信，覆盖 dead 状态。
+      return jsonResponse(200, {
+        request_id: 'req',
+        results: body.events.map((_event, index) => ({ index, status: 'conflict' })),
+      })
+    },
   })
   t.after(() => collector.stop())
   await collector.start()
 
-  const secretPrompt = 'PRIVATE-PROMPT-不要上传'
-  const title = 'PRIVATE-SESSION-TITLE'
-  const ctx = context('session-1', '/work/project-a/sub')
-  const event = turn()
-  event.message.content = [{ type: 'text', text: secretPrompt }]
-  event.entries = [{ type: 'session_info', name: title }]
-  await collector.handleTurnEnd(event, ctx)
-  await collector.runFlush()
-
-  const posted = calls[0].init.body
-  for (const needle of [TOKEN_A, secretPrompt, title, '/work/project-a', 'PRIVATE']) {
-    assert.equal(posted.includes(needle), false, `请求正文不得包含 ${needle}`)
+  const secretTurn = (entryId) => {
+    const event = turn({}, entryId)
+    event.message.content = [{ type: 'text', text: markerPrompt }]
+    event.entries = [{ type: 'session_info', name: markerTitle }]
+    return event
   }
+
+  // e1 → pending；e2 → overflow
+  await collector.handleTurnEnd(secretTurn('entry-1'), context('session-1', markerCwd))
+  await collector.handleTurnEnd(secretTurn('entry-2'), context('session-1', markerCwd))
+  assert.deepEqual(collector.status().counts, { pending: 1, dead: 0, overflow: 1 })
+
+  // 上报 e1：服务端 conflict → dead
+  await collector.runFlush()
+  assert.deepEqual(collector.status().counts, { pending: 0, dead: 1, overflow: 1 })
+  assert.equal(calls.length, 1)
+
+  // e3 → 再次 pending
+  await collector.handleTurnEnd(secretTurn('entry-3'), context('session-1', markerCwd))
+  assert.deepEqual(collector.status().counts, { pending: 1, dead: 1, overflow: 1 })
+  await collector.stop()
+
+  // 队列文件与 rollback journal 的原始字节
+  for (const name of [QUEUE_FILE, `${QUEUE_FILE}-journal`]) {
+    const file = path.join(ws.stateDir, name)
+    if (!fs.existsSync(file)) continue
+    const bytes = fs.readFileSync(file)
+    for (const needle of [TOKEN_A, markerPrompt, markerTitle, 'PRIVATE', markerCwd]) {
+      assert.equal(bytes.includes(Buffer.from(needle, 'utf8')), false, `${name} 不得包含 ${needle}`)
+    }
+  }
+
+  // 真实 stderr 行
   const logText = stream.lines.join('')
-  for (const needle of [TOKEN_A, tokenFingerprint(TOKEN_A), secretPrompt, title, '/work/project-a', ws.stateDir]) {
+  for (const needle of [TOKEN_A, tokenFingerprint(TOKEN_A), markerPrompt, markerTitle, 'PRIVATE', ws.stateDir]) {
     assert.equal(logText.includes(needle), false, `日志不得包含 ${needle}`)
   }
-  // 事件键集合固定：不夹带任何额外字段
-  assert.deepEqual(Object.keys(JSON.parse(posted).events[0]).sort(), [
-    'duration_ms', 'model', 'occurred_at', 'project_id', 'provider', 'source_event_id', 'status', 'usage',
+
+  // 三种状态都留下了记录，且 payload 键集合固定：不夹带 prompt、路径或会话标题。
+  const db = new DatabaseSync(path.join(ws.stateDir, QUEUE_FILE), { timeout: 0 })
+  const rows = db.prepare('SELECT status, payload FROM events ORDER BY id').all()
+  db.close()
+  assert.deepEqual(rows.map((row) => row.status), ['dead', 'overflow', 'pending'])
+  assert.deepEqual(rows.map((row) => JSON.parse(row.payload).source_event_id), [
+    'pi:msg:session-1:entry-1',
+    'pi:msg:session-1:entry-2',
+    'pi:msg:session-1:entry-3',
   ])
+  for (const row of rows) {
+    assert.deepEqual(Object.keys(JSON.parse(row.payload)).sort(), [
+      'duration_ms', 'model', 'occurred_at', 'project_id', 'provider', 'source_event_id', 'status', 'usage',
+    ])
+  }
 })
 
 test('配置文件权限不足时不启用，且不擅自 chmod', async (t) => {
@@ -499,4 +554,200 @@ test('响应确认前再对比绑定与配置：在途期间配置被改则保�
   await collector.pollConfig()
   await collector.runFlush()
   assert.equal(collector.queue.counts().pending, 0)
+})
+
+test('配置换 stateDir：停旧库、按新目录重开，旧事件留在旧目录', async (t) => {
+  const ws = workspace(t)
+  const dirA = ws.stateDir
+  const dirB = path.join(ws.root, 'state-b')
+  writeConfig(ws)
+  const { collector, calls } = makeCollector(ws)
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  assert.equal(collector.queueDir, dirA)
+
+  // 同一个服务与凭证，只是换了队列目录：不用等 30 秒检查，采集时立刻换库。
+  writeConfig(ws, { stateDir: dirB })
+  const queued = await collector.handleTurnEnd(turn({}, 'entry-2'), context())
+  assert.equal(queued.state, 'queued')
+  assert.equal(collector.queueDir, dirB)
+  assert.deepEqual(collector.status().counts, { pending: 1, dead: 0, overflow: 0 })
+
+  // 之后的配置检查也得是同一个目录，不会把库再换回去。
+  const polled = await collector.pollConfig()
+  assert.equal(polled.state, 'ready')
+  assert.equal(collector.queueDir, dirB)
+  assert.equal(collector.status().counts.pending, 1)
+  await collector.runFlush()
+  assert.equal(calls.length, 1)
+  assert.equal(JSON.parse(calls[0].init.body).events[0].source_event_id, 'pi:msg:session-1:entry-2')
+
+  // 旧目录的事件没有被迁移或删除。
+  assert.deepEqual(pendingIds({ stateDir: dirA }), ['pi:msg:session-1:entry-1'])
+})
+
+test('队列目录打不开时不要求重启：修正配置后下一次配置检查自动重开', async (t) => {
+  const ws = workspace(t)
+  const realDir = path.join(ws.root, 'real')
+  const linkDir = path.join(ws.root, 'link')
+  fs.mkdirSync(realDir)
+  fs.symlinkSync(realDir, linkDir)
+  writeConfig(ws, { stateDir: linkDir })
+  const { collector } = makeCollector(ws)
+  t.after(() => collector.stop())
+  await collector.start()
+  assert.equal(collector.blocked, 'state_dir_symlink')
+  assert.deepEqual(await collector.handleTurnEnd(turn(), context()), { skipped: 'not_ready' })
+
+  writeConfig(ws, { stateDir: realDir })
+  const polled = await collector.pollConfig()
+  assert.equal(polled.state, 'ready')
+  assert.equal(collector.blocked, null)
+  await collector.handleTurnEnd(turn(), context())
+  assert.equal(collector.status().counts.pending, 1)
+})
+
+test('缺凭证不开始新采集：跳过并计数；补齐凭证后无需重启即恢复采集', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws, { token: '' })
+  const { collector, calls } = makeCollector(ws)
+  t.after(() => collector.stop())
+  await collector.start()
+
+  assert.deepEqual(await collector.handleTurnEnd(turn(), context()), { skipped: 'collect_disabled_no_token' })
+  assert.equal(collector.counters.skip_collect_disabled_no_token, 1)
+  assert.deepEqual(collector.status().counts, { pending: 0, dead: 0, overflow: 0 })
+  assert.equal(calls.length, 0)
+
+  // 已有队列保留；补齐凭证后由配置检查恢复采集。
+  writeConfig(ws, { token: TOKEN_A })
+  await collector.pollConfig()
+  const queued = await collector.handleTurnEnd(turn(), context())
+  assert.equal(queued.state, 'queued')
+  await collector.runFlush()
+  assert.equal(calls.length, 1)
+  assert.equal(collector.queue.counts().pending, 0)
+})
+
+test('HTTP 401 暂停后，配置未改时轮询不会自行恢复发送', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  let calls = 0
+  let fail = true
+  const { collector } = makeCollector(ws, {
+    fetch: (_url, init) => {
+      calls += 1
+      return fail
+        ? jsonResponse(401, { error: { code: 'INVALID_ARGUMENT' } })
+        : jsonResponse(200, acceptedFor(init))
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn(), context())
+  assert.equal((await collector.runFlush()).state, 'paused')
+  assert.equal(collector.uploader.pauseReason, 'http_401')
+  assert.equal(calls, 1)
+
+  // 配置一个字节都没改：连续几次配置检查都必须保持暂停。
+  for (let round = 0; round < 3; round += 1) {
+    assert.equal((await collector.pollConfig()).state, 'ready')
+    assert.equal(collector.uploader.paused, true)
+    assert.equal(collector.uploader.pauseReason, 'http_401')
+  }
+  assert.equal(calls, 1)
+  assert.equal(collector.queue.counts().pending, 1)
+
+  // 用户换凭证并确认同源后，才恢复发送。
+  writeConfig(ws, { token: TOKEN_B })
+  await collector.pollConfig()
+  assert.equal(collector.uploader.paused, true)
+  fail = false
+  assert.equal((await collector.confirmSameSource()).ok, true)
+  assert.equal((await collector.runFlush()).state, 'idle')
+  assert.equal(calls, 2)
+  assert.equal(collector.queue.counts().pending, 0)
+})
+
+test('上报在途时轮换凭证：该批保留，后续批次不再用旧凭证', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  let collector
+  let first = true
+  const auths = []
+  const built = makeCollector(ws, {
+    collector: { uploaderOptions: { batchSize: 1 } },
+    fetch: async (_url, init) => {
+      auths.push(init.headers.authorization)
+      if (first) {
+        first = false
+        // 第一批在途时只改配置文件：没有新事件、也没轮到 30 秒配置检查。
+        writeConfig(ws, { token: TOKEN_B })
+      }
+      return jsonResponse(200, acceptedFor(init))
+    },
+  })
+  collector = built.collector
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  await collector.handleTurnEnd(turn({}, 'entry-2'), context())
+
+  const outcome = await collector.runFlush()
+  assert.equal(outcome.state, 'backoff')
+  assert.equal(auths.length, 1)
+  assert.equal(auths[0], `Bearer ${TOKEN_A}`)
+  // 第一批没有落结果、第二批没有被发送：两批都还在库里。
+  assert.equal(collector.queue.counts().pending, 2)
+})
+
+test('退出时等入队落地；限时到了仍未落地则明确计数未采集事件', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const { collector } = makeCollector(ws, {
+    collector: {
+      enqueueAttempts: 5,
+      enqueueRetryMs: 200,
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle),
+    },
+  })
+  await collector.start()
+
+  const raw = new DatabaseSync(path.join(ws.stateDir, QUEUE_FILE), { timeout: 0 })
+  raw.exec('BEGIN IMMEDIATE')
+  const pending = collector.handleTurnEnd(turn(), context())
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(collector.counters.queue_busy, 1)
+  assert.equal(collector.inflight.size, 1)
+
+  const started = Date.now()
+  await collector.stop({ timeoutMs: 100 })
+  assert.equal(Date.now() - started < 1000, true)
+  assert.equal(collector.counters.enqueue_unflushed, 1)
+
+  raw.exec('ROLLBACK')
+  raw.close()
+  const result = await pending
+  assert.equal(result.state, 'failed')
+  assert.equal(result.reason, 'stopped')
+  assert.equal(collector.inflight.size, 0)
+  assert.equal(collector.counters.enqueue_aborted, 1)
+})
+
+test('配置文件里存着 token 时，即使环境变量优先生效也要求 0600/0700', (t) => {
+  const ws = workspace(t)
+  writeConfig(ws, { token: TOKEN_A })
+  fs.chmodSync(ws.configPath, 0o644)
+  const withFileToken = loadConfig({ env: { TOKENPIVOT_PI_CONFIG: ws.configPath, TOKENPIVOT_PI_TOKEN: TOKEN_B } })
+  assert.equal(withFileToken.status, 'paused')
+  assert.equal(withFileToken.reason, 'config_permissions')
+
+  // 文件里没有凭证时，宽松权限没有可泄露的东西，不因此暂停。
+  writeConfig(ws, { token: '' })
+  fs.chmodSync(ws.configPath, 0o644)
+  const withoutFileToken = loadConfig({ env: { TOKENPIVOT_PI_CONFIG: ws.configPath, TOKENPIVOT_PI_TOKEN: TOKEN_B } })
+  assert.equal(withoutFileToken.status, 'ok')
+  assert.equal(withoutFileToken.config.token, TOKEN_B)
 })
