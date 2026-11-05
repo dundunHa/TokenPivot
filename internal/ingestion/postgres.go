@@ -25,6 +25,17 @@ const (
 
 	projectExistsQuery = `SELECT 1 FROM projects WHERE workspace_id = $1 AND id = $2`
 
+	// projectByKeyQuery reads a project by its reserved key, archived rows included.
+	projectByKeyQuery = `SELECT id FROM projects WHERE workspace_id = $1 AND project_key = $2`
+
+	// createProjectQuery creates the project unless the workspace is at the limit or the key
+	// was just created by a concurrent item (DO NOTHING: the caller reads it again). The name
+	// starts as the key and can be renamed later through the management API.
+	createProjectQuery = `INSERT INTO projects (workspace_id, project_key, name)
+SELECT $1, $2, $2 WHERE (SELECT count(*) FROM projects WHERE workspace_id = $1) < $3
+ON CONFLICT (workspace_id, project_key) DO NOTHING
+RETURNING id`
+
 	// insertEventQuery relies on the identity unique constraint as the only
 	// duplicate arbiter: no read-before-write and no overwrite. RETURNING tells the
 	// caller whether a row was actually inserted.
@@ -228,6 +239,37 @@ func (t *postgresTx) ProjectExists(ctx context.Context, workspaceID, projectID c
 		return false, database.SafeError("ingestion project", err)
 	}
 	return true, nil
+}
+
+// EnsureProject finds or creates the project with this key. Three outcomes: found (the
+// common case), created, or the workspace is full and the key is new. A concurrent item that
+// creates the same key between the read and the insert is covered by DO NOTHING plus a
+// second read.
+func (t *postgresTx) EnsureProject(ctx context.Context, workspaceID credentials.ID, projectKey string) (credentials.ID, bool, error) {
+	find := func() (credentials.ID, bool, error) {
+		var id credentials.ID
+		err := t.tx.QueryRow(ctx, projectByKeyQuery, pgx.QueryExecModeExec, workspaceID, projectKey).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return credentials.ID{}, false, nil
+		}
+		if err != nil {
+			return credentials.ID{}, false, database.SafeError("ingestion project key", err)
+		}
+		return id, true, nil
+	}
+	if id, found, err := find(); err != nil || found {
+		return id, found, err
+	}
+	var id credentials.ID
+	err := t.tx.QueryRow(ctx, createProjectQuery, pgx.QueryExecModeExec, workspaceID, projectKey, MaxAutoProjects).Scan(&id)
+	if err == nil {
+		return id, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return credentials.ID{}, false, database.SafeError("ingestion project create", err)
+	}
+	// No row: a concurrent item created the key, or the workspace is full.
+	return find()
 }
 
 // InsertEvent inserts the detail row once. A false result means this identity

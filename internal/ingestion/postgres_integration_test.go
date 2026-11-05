@@ -880,6 +880,160 @@ func TestArchivedProjectStillAccepts(t *testing.T) {
 	}
 }
 
+func keyedEventJSON(sourceEventID, projectKey string, occurredAt time.Time) string {
+	return fmt.Sprintf(`{"source_event_id":%q,"project_key":%q,"provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`,
+		sourceEventID, projectKey, occurredAt.UTC().Format(microLayout))
+}
+
+func (e *integrationEnv) projectKeys(t *testing.T, ctx context.Context, workspaceID pgtype.UUID) map[string]pgtype.UUID {
+	t.Helper()
+	rows, err := e.owner.Query(ctx, "SELECT project_key, id FROM projects WHERE workspace_id = $1", workspaceID)
+	if err != nil {
+		t.Fatal(database.SafeError("read projects", err))
+	}
+	defer rows.Close()
+	keys := map[string]pgtype.UUID{}
+	for rows.Next() {
+		var key string
+		var id pgtype.UUID
+		if err := rows.Scan(&key, &id); err != nil {
+			t.Fatal(database.SafeError("scan projects", err))
+		}
+		keys[key] = id
+	}
+	return keys
+}
+
+// A project_key creates the project once, attributes the row and the minute bucket to it, and
+// reuses it for later events, including an archived one (its key stays reserved).
+func TestProjectKeyCreatesOnceAndAttributes(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	otherWorkspace := e.newWorkspace(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	results := runBatch(t, service, credential, encodedBatch(t,
+		keyedEventJSON("k-1", "TokenPivot", occurredAt),
+		keyedEventJSON("k-2", "TokenPivot", occurredAt.Add(time.Second)),
+		keyedEventJSON("k-3", "other", occurredAt)))
+	requireResultStatuses(t, results, statusAccepted, statusAccepted, statusAccepted)
+	keys := e.projectKeys(t, ctx, workspaceID)
+	if len(keys) != 2 || !keys["TokenPivot"].Valid || !keys["other"].Valid {
+		t.Fatalf("projects = %v, want exactly TokenPivot and other", keys)
+	}
+	if len(e.projectKeys(t, ctx, otherWorkspace)) != 0 {
+		t.Fatal("another workspace gained a project")
+	}
+	var name string
+	if err := e.owner.QueryRow(ctx, "SELECT name FROM projects WHERE id = $1", keys["TokenPivot"]).Scan(&name); err != nil || name != "TokenPivot" {
+		t.Fatalf("name = %q err = %v, want the key as the initial name", name, err)
+	}
+	if row := e.readRow(t, ctx, workspaceID, sourceID, "k-1"); row.projectID != keys["TokenPivot"] {
+		t.Fatal("event is not attributed to the created project")
+	}
+	if bucket := e.readBucket(t, ctx, workspaceID, sourceID, keys["TokenPivot"], "example-provider", "example-model", occurredAt); bucket.eventCount < 1 {
+		t.Fatalf("minute bucket event_count = %d, want at least 1 for the project", bucket.eventCount)
+	}
+
+	// Archive it: the key stays reserved and the project is reused, not recreated.
+	if _, err := e.owner.Exec(ctx, "UPDATE projects SET archived_at = now() WHERE id = $1", keys["TokenPivot"]); err != nil {
+		t.Fatal(database.SafeError("archive project", err))
+	}
+	results = runBatch(t, service, credential, encodedBatch(t, keyedEventJSON("k-4", "TokenPivot", occurredAt)))
+	requireResultStatuses(t, results, statusAccepted)
+	if again := e.projectKeys(t, ctx, workspaceID); len(again) != 2 || again["TokenPivot"] != keys["TokenPivot"] {
+		t.Fatalf("archived project was not reused: %v", again)
+	}
+
+	// Retransmission with the key, or with the id it resolved to, is a duplicate.
+	results = runBatch(t, service, credential, encodedBatch(t,
+		keyedEventJSON("k-1", "TokenPivot", occurredAt),
+		acceptedEventJSON("k-1", occurredAt, keys["TokenPivot"])))
+	requireResultStatuses(t, results, statusDuplicate, statusConflict)
+}
+
+// Many writers racing to create the same key end with one project and every event accepted.
+func TestConcurrentProjectKeyCreationYieldsOneProject(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	const writers = 8
+	start := make(chan struct{})
+	results := make([][]result, writers)
+	batches := make([][]item, writers)
+	for i := range batches {
+		batches[i] = decodeOneBatch(t, encodedBatch(t, keyedEventJSON(fmt.Sprintf("race-%d", i), "RacedKey", occurredAt)))
+	}
+	var wait sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			results[index] = service.process(context.Background(), credential, batches[index])
+		}(i)
+	}
+	close(start)
+	wait.Wait()
+	for i, batch := range results {
+		if len(batch) != 1 || batch[0].status != statusAccepted {
+			t.Fatalf("writer %d: %+v, want accepted", i, batch)
+		}
+	}
+	keys := e.projectKeys(t, ctx, workspaceID)
+	if len(keys) != 1 || !keys["RacedKey"].Valid {
+		t.Fatalf("projects = %v, want exactly one RacedKey", keys)
+	}
+	for i := 0; i < writers; i++ {
+		if row := e.readRow(t, ctx, workspaceID, sourceID, fmt.Sprintf("race-%d", i)); row.projectID != keys["RacedKey"] {
+			t.Fatalf("event race-%d attributed to a different project", i)
+		}
+	}
+}
+
+// An expired event and a rolled-back item create no project; a full workspace rejects only a new key.
+func TestProjectKeyLimitExpiryAndRollback(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	expired := now.Add(-181 * 24 * time.Hour)
+	results := runBatch(t, service, credential, encodedBatch(t, keyedEventJSON("old", "ghost", expired)))
+	requireResultStatuses(t, results, statusExpired)
+	if len(e.projectKeys(t, ctx, workspaceID)) != 0 {
+		t.Fatal("an expired event created a project")
+	}
+
+	// Fill the workspace to the limit with one statement, then check the boundary.
+	if _, err := e.owner.Exec(ctx, `INSERT INTO projects (workspace_id, project_key, name)
+SELECT $1, 'bulk-' || g, 'bulk' FROM generate_series(1, $2) g`, workspaceID, MaxAutoProjects); err != nil {
+		t.Fatal(database.SafeError("fill projects", err))
+	}
+	results = runBatch(t, service, credential, encodedBatch(t,
+		keyedEventJSON("full-new", "brand-new", now.Add(-time.Hour)),
+		keyedEventJSON("full-old", "bulk-7", now.Add(-time.Hour))))
+	requireResultStatuses(t, results, statusRejected, statusAccepted)
+	if results[0].code != codeProjectInvalid {
+		t.Fatalf("limit rejection code = %q, want %s", results[0].code, codeProjectInvalid)
+	}
+	if _, found := e.projectKeys(t, ctx, workspaceID)["brand-new"]; found {
+		t.Fatal("a rejected key still created a project")
+	}
+}
+
 func TestSourceStampMovesForwardOnly(t *testing.T) {
 	e := newIntegrationEnv(t)
 	ctx := context.Background()
@@ -1610,6 +1764,10 @@ func (t *hookTx) Now(ctx context.Context) (time.Time, error) {
 		return t.hooks.now(ctx)
 	}
 	return t.inner.Now(ctx)
+}
+
+func (t *hookTx) EnsureProject(ctx context.Context, workspaceID credentials.ID, projectKey string) (credentials.ID, bool, error) {
+	return t.inner.EnsureProject(ctx, workspaceID, projectKey)
 }
 
 func (t *hookTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
