@@ -27,7 +27,7 @@ const stats = (extra?: {
 });
 
 function useBackend(extra?: Parameters<typeof stats>[0]) {
-  const rateModels: (string | null)[] = [];
+  const speedModels: (string | null)[] = [];
   const aggregateGran: (string | null)[] = [];
   server.use(
     http.get("/api/v1/auth/session", () =>
@@ -82,24 +82,33 @@ function useBackend(extra?: Parameters<typeof stats>[0]) {
         retention_cutoff: "2026-04-01T00:00:00Z",
       }),
     ),
-    http.get(`${BASE}/usage-rate`, ({ request }) => {
+    http.get(`${BASE}/usage-speed`, ({ request }) => {
       const model = new URL(request.url).searchParams.get("model");
-      rateModels.push(model);
-      const value = model === "m1" ? "6000" : model === "m2" ? "3000" : "9000";
+      speedModels.push(model);
+      // 100 s 请求耗时内的输出 token：m1 = 100 tok/s，m2 = 50 tok/s，总体 = 90 tok/s。
+      const output =
+        model === "m1" ? "10000" : model === "m2" ? "5000" : "9000";
       return HttpResponse.json({
-        start: "2026-10-28T01:59:00Z",
-        end: "2026-10-28T02:00:00Z",
-        as_of: "2026-10-28T02:00:00Z",
+        as_of: "2026-10-28T02:00:30Z",
+        series_start: "2026-10-28T01:00:00Z",
         window_seconds: 60,
-        unit: "tokens/min",
-        total_tokens: {
-          value,
+        unit: "tokens/s",
+        current: {
+          output_tokens: output,
+          duration_ms: "100000",
           event_count: 3,
-          known_count: 3,
+          measured_count: 3,
           estimated_count: 0,
-          missing_count: 0,
         },
-        window_last_received_at: "2026-10-28T01:59:59Z",
+        points: [
+          {
+            bucket_start: "2026-10-28T01:58:00Z",
+            output_tokens: output,
+            duration_ms: "100000",
+            measured_count: 3,
+            estimated_count: 0,
+          },
+        ],
       });
     }),
     http.get(`${BASE}/usage/rankings`, ({ request }) => {
@@ -120,7 +129,7 @@ function useBackend(extra?: Parameters<typeof stats>[0]) {
       });
     }),
   );
-  return { rateModels, aggregateGran };
+  return { speedModels, aggregateGran };
 }
 
 describe("overview panels", () => {
@@ -147,7 +156,7 @@ describe("overview panels", () => {
     expect(screen.queryByTestId("cache-hit")).toBeNull();
   });
 
-  it("lists the top models by live rate in the rate card, in tokens/s, highest first", async () => {
+  it("lists the top models by generation speed in the speed card, in tokens/s, highest first", async () => {
     const seen = useBackend();
     renderApp("/?tz=UTC");
     await waitFor(() =>
@@ -161,8 +170,8 @@ describe("overview panels", () => {
     const texts = screen.getAllByTestId("model-rate").map((r) => r.textContent);
     expect(texts[0]).toContain("100");
     expect(texts[1]).toContain("50");
-    expect(seen.rateModels).toEqual(expect.arrayContaining(["m1", "m2"]));
-    // 分模型明细在顶部“实时速率”指标卡内，总速率仍在。
+    expect(seen.speedModels).toEqual(expect.arrayContaining(["m1", "m2"]));
+    // 分模型明细在顶部“生成速度”指标卡内，总体速度仍在。
     const rate = screen.getByTestId("rate");
     expect(
       rate
@@ -171,17 +180,20 @@ describe("overview panels", () => {
     ).toBe(true);
   });
 
-  it("draws the per-minute rate trend for the total and each model", async () => {
+  it("draws the per-minute generation speed trend from output ÷ request time, for the total and each model", async () => {
     const seen = useBackend();
     renderApp("/?tz=UTC");
-    const card = await screen.findByRole("region", { name: "实时速率趋势" });
-    await waitFor(() => expect(seen.aggregateGran).toContain("minute"));
+    const card = await screen.findByRole("region", { name: "生成速度趋势" });
     expect(within(card).getByText(/近 60 分钟/)).toBeTruthy();
-    // 总量 + 两个模型各一条分钟聚合。
+    expect(within(card).getByText(/输出 ÷ 请求耗时/)).toBeTruthy();
+    // 总体 + 两个模型各取一条速度序列（来自 usage-speed，分钟聚合表没有请求耗时）。
     await waitFor(() =>
-      expect(
-        seen.aggregateGran.filter((g) => g === "minute").length,
-      ).toBeGreaterThanOrEqual(3),
+      expect(seen.speedModels).toEqual(
+        expect.arrayContaining([null, "m1", "m2"]),
+      ),
+    );
+    await waitFor(() =>
+      expect(within(card).getByLabelText("图例")).toBeTruthy(),
     );
   });
 

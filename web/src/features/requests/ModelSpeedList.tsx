@@ -5,11 +5,11 @@ import type {
 import type { QueryScope } from "@/features/overview/overviewQueries";
 import { SERIES_PALETTE } from "@/features/overview/geek/chartScale";
 import { useTopModels } from "./modelRates";
-import { perSecond } from "./model";
-import { useModelRates } from "./useRequestLogs";
+import { formatSpeed, speedOf } from "./model";
+import { useModelSpeeds } from "./useRequestLogs";
 
-/** 实时速率卡里的分模型明细：近 60 秒 tokens/s，高→低排序，带相对长度。 */
-export function ModelRateList({
+/** 生成速度卡里的分模型明细：近 60 秒 tokens/s，高→低排序，带相对长度。 */
+export function ModelSpeedList({
   scope,
   filters,
   range,
@@ -19,18 +19,18 @@ export function ModelRateList({
   range: ResolvedRange;
 }) {
   const { models, isPending, isError } = useTopModels(scope, filters, range);
-  const results = useModelRates(scope, filters, models);
+  const results = useModelSpeeds(scope, filters, models);
 
   const rows = models
     .map((model, i) => {
-      const data = results[i]?.data;
-      const known = data && data.eventCount > 0 && data.value !== null;
+      const current = results[i]?.data?.current;
+      const value = current ? speedOf(current) : null;
       return {
         model,
         color: SERIES_PALETTE[i % SERIES_PALETTE.length] ?? "#e0a64b",
-        value: known ? Number(data.value) / 60 : null,
-        text: known ? perSecond(data.value ?? "0") : null,
-        estimated: (data?.estimatedCount ?? 0) > 0,
+        value,
+        text: value === null ? null : formatSpeed(value),
+        estimated: (current?.estimatedCount ?? 0) > 0,
         loading: results[i]?.isPending ?? true,
       };
     })
@@ -41,7 +41,7 @@ export function ModelRateList({
     return (
       <div
         role="status"
-        aria-label="模型速率加载中"
+        aria-label="模型速度加载中"
         className="geek-skeleton geek-skeleton-md"
       />
     );
@@ -49,13 +49,13 @@ export function ModelRateList({
   if (isError) {
     return (
       <p role="alert" className="geek-kpi-note geek-err">
-        模型速率加载失败。
+        模型速度加载失败。
       </p>
     );
   }
   if (rows.length === 0) return null;
   return (
-    <ul className="geek-model-rates" aria-label="按模型的实时速率">
+    <ul className="geek-model-rates" aria-label="按模型的生成速度">
       {rows.map((r) => (
         <li
           key={r.model}

@@ -37,6 +37,9 @@ export function expandHome(dir) {
   return dir
 }
 
+/** Step starts waiting for their message; bounded so a cancelled step cannot leak memory. */
+const MAX_PENDING_STEPS = 512
+
 export class Collector {
   /**
    * @param {{
@@ -66,6 +69,22 @@ export class Collector {
     this.timerDue = Infinity
     this.stopped = false
     this.ready = null
+    /** session id + turn + step → ms epoch when that model call started (in memory only). */
+    this.steps = new Map()
+  }
+
+  stepKey(session, data) {
+    const id = session?.id ?? session?.header?.id
+    if (typeof id !== 'string' || !Number.isInteger(data?.turn) || !Number.isInteger(data?.step)) return null
+    return `${id}:${data.turn}:${data.step}`
+  }
+
+  /** Remember when a model call started, or restarted after a failed attempt; evict the oldest beyond the cap. */
+  noteStep(key, time) {
+    if (key === null || !Number.isFinite(time)) return
+    this.steps.delete(key)
+    this.steps.set(key, time)
+    if (this.steps.size > MAX_PENDING_STEPS) this.steps.delete(this.steps.keys().next().value)
   }
 
   /**
@@ -84,12 +103,26 @@ export class Collector {
   /** session/event listener body. Must not throw into DSH. */
   async handle(session, event) {
     if (this.stopped) return
+    if (event?.type === 'step/start') return this.noteStep(this.stepKey(session, event.data), event.time)
+    if (event?.type === 'assistant/attempt') {
+      // A failed attempt settled; the next attempt of the same step starts after it.
+      const key = this.stepKey(session, event.data)
+      if (key !== null && this.steps.has(key)) this.noteStep(key, event.time)
+      return
+    }
     if (event?.type !== 'assistant/message' && event?.type !== 'compaction/summary') return
+    let startedAt
+    if (event.type === 'assistant/message') {
+      const key = this.stepKey(session, event.data)
+      startedAt = key === null ? undefined : this.steps.get(key)
+      if (key !== null) this.steps.delete(key)
+    }
     let usageEvent
     try {
       usageEvent = mapSessionEvent(session, event, {
         cwd: this.options.resolveCwd?.(session),
         projects: this.options.projects,
+        startedAt,
       })
     } catch (error) {
       this.logger?.warn?.(`skipped ${event.type}: ${error?.message ?? error}`)

@@ -16,7 +16,8 @@
 | 稳定事件 ID | `data.message.id`（UUID）。fork/seed 出的会话复制父事件时 id 不变 | 跨文件重复 1758 个 id，时间、用量、模型全部一致；同文件内重复 0 |
 | compaction 的 ID | `data.compactionId`，只在单个会话内唯一，需加会话 id 前缀 | 类型声明 |
 | provider / model | `message.source.provider/model`；provider 是 DSH 里配置的**路由名**（如 nebius、deepseek-official、anthropic-bf），不是厂商名 | 样本取值 |
-| 请求状态 / 耗时 | 拿不到。成功的 `assistant/message` 没有状态与耗时字段；上报 null | 类型声明 |
+| 请求状态 | 拿不到。成功的 `assistant/message` 没有状态字段；上报 null | 类型声明 |
+| 请求耗时 | 事件本身没有耗时字段，但可以测量：`step/start` 与同一 turn、step 的最终 `assistant/message` 的事件时间差，即一次模型调用从发出到提交的时间（含首 token 之前的等待）。插件在内存里记下每个 step 的开始时间，失败重试（`assistant/attempt`）后重新计时；没见过开始事件（插件在 step 中途启用）、`compaction/summary`、差值为负或超过 1 小时的，上报 null。`request/header` 的时间不可用（可能是数小时前） | 本机真实会话日志实测：1,270 条 `assistant/message` 全部能与 `step/start` 配对，耗时中位数约 2.1 秒 |
 | 失败调用 | `assistant/attempt`（失败的尝试，如 TIMEOUT）没有 usage，失败请求的消耗无法得知 | 类型声明与样本 |
 | 无用量的模型调用 | `session/title-llm-request`、`web/deepseek-search-llm-request` 没有 usage，无法采集 | 样本 |
 | 无 usage 的 assistant 消息 | 极少（57186 条中 33 条），多为中断；跳过，不当 0 上报 | 统计 |

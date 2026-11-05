@@ -1,6 +1,6 @@
 import { parseInstant } from "@/features/overview/overviewFilters";
 import { formatExact } from "@/features/overview/overviewView";
-import type { RateData, RequestRange, TokenField } from "./api";
+import type { RequestRange, SpeedSums, TokenField } from "./api";
 
 /** 纯展示与轮询决策；不重新计算后端口径。 */
 
@@ -28,35 +28,49 @@ export function formatStatus(status: string | null): string {
   return status === null ? "状态不可用" : status;
 }
 
-export interface RateView {
+export interface SpeedView {
   headline: string;
   notes: string[];
 }
 
-/** 窗口为 60 秒、值为窗口内总量（tokens/min），换算成 tokens/s 展示。 */
-export function perSecond(value: string): string {
-  const rate = Number(value) / 60;
-  if (rate === 0) return "0";
-  if (rate >= 100) return formatExact(String(Math.round(rate)));
-  return rate.toFixed(1).replace(/\.0$/, "");
+/**
+ * 生成速度（tokens/s）= 可测量请求的输出 token 之和 ÷ 请求耗时之和。
+ * 只看模型在跑的时间：空闲时段不进分母，缓存读取与输入不进分子。无法测量返回 null。
+ */
+export function speedOf(sums: {
+  outputTokens: string | null;
+  durationMs: string | null;
+}): number | null {
+  if (sums.outputTokens === null || sums.durationMs === null) return null;
+  const duration = Number(sums.durationMs);
+  if (!(duration > 0)) return null;
+  return (Number(sums.outputTokens) / duration) * 1000;
 }
 
-/** 速率文案（tokens/s）：无数据显示“—”；真实 0 与缺失分开；含估算 / 部分覆盖必须标出。 */
-export function describeRate(rate: RateData): RateView {
+/** ≥100 取整并加千分位，其余保留一位小数（去掉多余的 .0）。 */
+export function formatSpeed(speed: number): string {
+  if (speed === 0) return "0";
+  if (speed >= 100) return formatExact(String(Math.round(speed)));
+  return speed.toFixed(1).replace(/\.0$/, "");
+}
+
+/** 速度文案（tokens/s）：无数据与无法测量显示“—”并说明原因；含估算 / 部分覆盖必须标出。 */
+export function describeSpeed(current: SpeedSums): SpeedView {
+  if (current.eventCount === 0) return { headline: "—", notes: ["暂无数据"] };
+  const speed = speedOf(current);
+  const unmeasured = current.eventCount - current.measuredCount;
+  if (speed === null) {
+    return {
+      headline: "—",
+      notes: [`${current.eventCount} 条请求无耗时，无法计算`],
+    };
+  }
   const notes: string[] = [];
-  if (rate.eventCount === 0) {
-    return { headline: "—", notes: ["暂无数据"] };
+  if (current.estimatedCount > 0) {
+    notes.push(`含估算 ${current.estimatedCount} 条`);
   }
-  if (rate.value === null) {
-    notes.push(`缺失 ${rate.missingCount} 条`);
-    return { headline: "—", notes };
-  }
-  const headline = perSecond(rate.value);
-  if (rate.estimatedCount > 0) notes.push(`含估算 ${rate.estimatedCount} 条`);
-  if (rate.missingCount > 0) {
-    notes.push(`部分覆盖：缺失 ${rate.missingCount} 条`);
-  }
-  return { headline, notes };
+  if (unmeasured > 0) notes.push(`部分覆盖：${unmeasured} 条无耗时`);
+  return { headline: formatSpeed(speed), notes };
 }
 
 const FRACTION = /\.(\d+)(?=Z|[+-]\d{2}:\d{2}$)/;

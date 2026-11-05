@@ -4,7 +4,7 @@ import type { QueryScope } from "@/features/overview/overviewQueries";
 import {
   eventsQueryString,
   type RequestRange,
-  fetchRate,
+  fetchSpeed,
   fetchRequests,
   filterParams,
 } from "./api";
@@ -31,17 +31,17 @@ export function eventsQuery(
   });
 }
 
-export function rateQuery(scope: QueryScope, filters: OverviewFilters) {
+export function speedQuery(scope: QueryScope, filters: OverviewFilters) {
   const query = filterParams(filters).toString();
   return queryOptions({
     queryKey: [
       "requests",
-      "rate",
+      "speed",
       scope.userId,
       scope.workspaceId,
       query,
     ] as const,
-    queryFn: ({ signal }) => fetchRate(scope.workspaceId, query, signal),
+    queryFn: ({ signal }) => fetchSpeed(scope.workspaceId, query, signal),
     meta: { userId: scope.userId, workspaceId: scope.workspaceId },
   });
 }
@@ -58,24 +58,27 @@ export function useRequestEvents(
   });
 }
 
-/** 速率始终轮询当前 60 秒窗口，与明细翻页无关；隐藏页由 Query 默认暂停。 */
-export function useRate(scope: QueryScope, filters: OverviewFilters) {
+/** 生成速度始终轮询（滚动 60 秒窗口 + 最近 60 分钟序列），与明细翻页无关；隐藏页由 Query 默认暂停。 */
+export function useSpeed(scope: QueryScope, filters: OverviewFilters) {
   return useQuery({
-    ...rateQuery(scope, filters),
+    ...speedQuery(scope, filters),
     refetchInterval: POLL_MS,
     refetchOnWindowFocus: "always",
   });
 }
 
-/** 按模型的实时速率：每个模型各取一条带单值模型筛选的速率，请求数等于模型数。 */
-export function useModelRates(
+/**
+ * 按模型的生成速度：每个模型各取一条带单值模型筛选的结果，请求数等于模型数。
+ * 指标卡里的分模型列表与速度趋势共用这些查询（同键同缓存）。
+ */
+export function useModelSpeeds(
   scope: QueryScope,
   filters: OverviewFilters,
   models: string[],
 ) {
   return useQueries({
     queries: models.map((model) => ({
-      ...rateQuery(scope, { ...filters, models: [model] }),
+      ...speedQuery(scope, { ...filters, models: [model] }),
       refetchInterval: POLL_MS,
       refetchOnWindowFocus: "always" as const,
     })),

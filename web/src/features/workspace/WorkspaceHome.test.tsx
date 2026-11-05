@@ -258,21 +258,20 @@ function useBackend(initial: Workspace[]): Backend {
         retention_cutoff: "2026-04-01T00:00:00Z",
       }),
     ),
-    http.get(`${base}/:id/usage-rate`, () =>
+    http.get(`${base}/:id/usage-speed`, () =>
       HttpResponse.json({
-        start: "2026-10-28T01:59:00Z",
-        end: "2026-10-28T02:00:00Z",
         as_of: "2026-10-28T02:00:00Z",
+        series_start: "2026-10-28T01:00:00Z",
         window_seconds: 60,
-        unit: "tokens/min",
-        total_tokens: {
-          value: null,
+        unit: "tokens/s",
+        current: {
+          output_tokens: null,
+          duration_ms: null,
           event_count: 0,
-          known_count: 0,
+          measured_count: 0,
           estimated_count: 0,
-          missing_count: 0,
         },
-        window_last_received_at: null,
+        points: [],
       }),
     ),
   );

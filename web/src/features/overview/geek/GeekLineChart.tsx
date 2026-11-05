@@ -70,6 +70,7 @@ export function GeekLineChart({
   format,
   showSum = false,
   height = 300,
+  connectNulls = false,
 }: {
   rows: ChartRow[];
   series: ChartSeries[];
@@ -78,6 +79,8 @@ export function GeekLineChart({
   /** 悬浮提示末尾是否追加“合计”（各线之和或行内 total）。 */
   showSum?: boolean;
   height?: number;
+  /** 空值连线跨过（速度趋势：没有请求的分钟没有速度，不是 0）。 */
+  connectNulls?: boolean;
 }) {
   // 跨度不超过 36 小时时横轴只留“时:分”，日期交给悬浮提示，标签更干净。
   const labels = useMemo(() => {
@@ -185,7 +188,7 @@ export function GeekLineChart({
               )
             }
             activeDot={{ r: 4.5, fill: s.color, stroke: BG, strokeWidth: 2 }}
-            connectNulls={false}
+            connectNulls={connectNulls}
             isAnimationActive={false}
           />
         ))}

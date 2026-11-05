@@ -12,6 +12,7 @@ import (
 
 type fakeStore struct {
 	rows     []EventRow
+	speed    SpeedRow
 	events   EventsParams
 	projects int
 }
@@ -24,6 +25,9 @@ func (f *fakeStore) Events(_ context.Context, p EventsParams) ([]EventRow, error
 	return f.rows, nil
 }
 func (f *fakeStore) Rate(context.Context, RateParams) (RateRow, error) { return RateRow{}, nil }
+func (f *fakeStore) Speed(context.Context, SpeedParams) (SpeedRow, error) {
+	return f.speed, nil
+}
 
 func TestEventsLimitPlusOneAndCursor(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
