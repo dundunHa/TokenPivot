@@ -5,7 +5,8 @@
  * docs/research/2026-10-28-dsh-platform-capabilities.md):
  *   - assistant/message   data.message.id (UUID, stable across forked sessions), data.message.source.{provider,model}, data.usage
  *   - compaction/summary  data.compactionId, data.provider, data.model, data.usage
- * Nothing else leaves this module: no prompt/response text, no cwd/path, no session title.
+ * Nothing else leaves this module: no prompt/response text, no cwd/path, no session title. The only
+ * project information is a mapped project_id or, with automatic detection, the repository's directory name.
  */
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -138,7 +139,7 @@ export function requestDuration(startedAt, completedAt) {
 /**
  * @param {{ id?: string, header?: { id?: string, cwd?: string } }} session
  * @param {{ type: string, time: number, data: any }} event
- * @param {{ cwd?: string, projects?: {path: string, projectId: string}[], startedAt?: number }} options
+ * @param {{ cwd?: string, projects?: {path: string, projectId: string}[], detectProject?: (cwd: string|undefined) => string|null, startedAt?: number }} options
  * @returns {object|null} UsageEvent, or null when the event carries no reportable usage
  */
 export function mapSessionEvent(session, event, options = {}) {
@@ -172,9 +173,16 @@ export function mapSessionEvent(session, event, options = {}) {
   const occurredAt = formatTime(event.time)
   if (!occurredAt) return null
 
+  // An explicit directory → project_id mapping wins; otherwise the repository name is sent as project_key
+  // (the server finds or creates that project). Never both: the server rejects an event that carries both.
+  const cwd = options.cwd ?? session?.header?.cwd
+  const projectId = resolveProject(cwd, options.projects)
+  const projectKey = projectId === null ? options.detectProject?.(cwd) ?? null : null
+
   return {
     source_event_id: sourceEventId,
-    project_id: resolveProject(options.cwd ?? session?.header?.cwd, options.projects),
+    project_id: projectId,
+    ...(projectKey ? { project_key: projectKey } : {}),
     provider,
     model,
     occurred_at: occurredAt,

@@ -3121,6 +3121,25 @@ components:
             参与规范化：第 1 个元素，写小写 UUID 或 `null`。
 
             校验方式：schema（UUID 形态）+ 实现（归属与可用性）。
+        project_key:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+          maxLength: 128
+          pattern: '^[^\u0000-\u001F\u007F\u0080-\u009F]+$'
+          description: |
+            可选。让服务端按项目标识归属：该 workspace 里已有同 `project_key` 的项目就用它，没有就**当场创建**（名称先取同一个值，之后可在管理接口里改名）。`null` 或省略表示不使用，含义与省略 `project_id` 相同。
+
+            - 与 `project_id` **互斥**：同一事件两者都给，整项以 `INVALID_ARGUMENT` 拒绝。
+            - 1–128 个 **UTF-8 字节**，无控制字符，首尾无 Unicode 空白（与 `provider`/`model` 同一规则），**逐字节比较**（区分大小写）。
+            - 已归档项目的 key 仍被占用，事件照常归到该项目，不会新建。
+            - 每个 workspace 自动创建受上限保护（1000 个项目）；已满时对**新** key 返回 `PROJECT_INVALID`，已有 key 不受影响。
+            - 创建发生在该事件自己的事务里，且在时间窗口判定之后：过期或回滚的事件不会留下项目。
+            - **不参与规范化**：比较前先解析成项目 id，再按第 1 个元素写入，所以「用 key 上报」与「用它解析出的 id 上报」是同一内容（重传为 `duplicate`）。
+            - 老版本服务端会因未知字段整项拒绝（`INVALID_ARGUMENT`）；DSH 插件遇到时会去掉这个字段重发。
+
+            校验方式：schema（长度、字符集）+ 实现（UTF-8 字节长度、首尾空白、互斥、上限）。
         provider:
           type: string
           minLength: 1

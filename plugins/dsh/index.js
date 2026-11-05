@@ -10,6 +10,7 @@
  */
 import Schema from '@deepseek-ai/schemastery'
 import { Collector, expandHome, ingestionEndpoint } from './lib/collector.js'
+import { cachedProjectKeyDetector } from './lib/project.js'
 
 export const name = 'tokenpivot-usage'
 
@@ -19,7 +20,8 @@ export const Config = Schema.object({
   projects: Schema.array(Schema.object({
     path: Schema.string().required().description('本地项目目录（会话工作目录在它下面即归属该项目）'),
     projectId: Schema.string().required().description('TokenPivot 项目 ID（UUID）'),
-  })).default([]).description('本地目录 → 项目映射；没匹配上的用量上报为未归属。目录只在本机用于匹配，不上报'),
+  })).default([]).description('本地目录 → 项目映射（优先）；目录路径只在本机用于匹配，不上报'),
+  autoProject: Schema.boolean().default(true).description('没匹配上映射时，按会话所在 git 仓库的目录名自动归属项目（只上报目录名，不上报路径；服务端首次见到时自动建项目）。关闭后没匹配上的用量上报为未归属'),
   stateDir: Schema.string().default('~/.tokenpivot/dsh').description('本地队列目录'),
   maxQueueItems: Schema.natural().min(100).default(10000).description('本地队列上限，超出丢弃最旧的事件'),
 })
@@ -39,6 +41,7 @@ export function apply(ctx, config) {
       return typeof token === 'string' && token.trim() !== '' ? token.trim() : undefined
     },
     projects: config.projects,
+    detectProject: config.autoProject === false ? undefined : cachedProjectKeyDetector(),
     // Session header cwd is the directory the session was opened in; it stays on this machine.
     resolveCwd: (session) => session?.header?.cwd,
     maxQueueItems: config.maxQueueItems,

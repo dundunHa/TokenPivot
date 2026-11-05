@@ -88,6 +88,39 @@ test('accepted and duplicate dequeue; bearer token sent; body is {events}', asyn
   await s.close()
 })
 
+test('an older server that refuses project_key: the key is dropped and the event is resent unattributed', async () => {
+  const keyed = { ...ev(1), project_key: 'TokenPivot' }
+  const s = await server((body) => ({
+    status: 200,
+    json: {
+      request_id: 'r',
+      results: body.events.map((e, index) => 'project_key' in e
+        ? { index, status: 'rejected', error: { code: 'INVALID_ARGUMENT', message: 'event contains an unknown field' } }
+        : { index, status: 'accepted' }),
+    },
+  }))
+  const { queue, up, logger } = await uploader(s.endpoint, [keyed, ev(2)])
+  assert.equal((await up.flush()).state, 'idle')
+  assert.equal(queue.size, 0)
+  assert.equal(s.calls.length, 2)
+  assert.ok(!('project_key' in s.calls[1].body.events[0]))
+  assert.equal(s.calls[1].body.events[0].source_event_id, 'dsh:msg:1')
+  assert.ok(logger.lines.some((l) => l.includes('refused project_key')))
+  await s.close()
+})
+
+test('INVALID_ARGUMENT on an event without project_key is still a terminal rejection', async () => {
+  const s = await server((body) => ({
+    status: 200,
+    json: { request_id: 'r', results: body.events.map((_, index) => ({ index, status: 'rejected', error: { code: 'INVALID_ARGUMENT', message: 'x' } })) },
+  }))
+  const { queue, up } = await uploader(s.endpoint, [ev(1)])
+  await up.flush()
+  assert.equal(queue.size, 0)
+  assert.equal(s.calls.length, 1)
+  await s.close()
+})
+
 test('terminal results dequeue into dead letter without usage payload', async () => {
   const s = await server(() => ({ status: 200, json: { request_id: 'r', results: [
     { index: 0, status: 'conflict' },

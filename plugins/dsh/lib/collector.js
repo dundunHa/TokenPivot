@@ -44,7 +44,7 @@ export class Collector {
   /**
    * @param {{
    *   stateDir: string, endpoint: string|null, getToken: () => string|undefined,
-   *   projects?: {path: string, projectId: string}[], resolveCwd?: (session) => string|undefined,
+   *   projects?: {path: string, projectId: string}[], detectProject?: (cwd: string|undefined) => string|null, resolveCwd?: (session) => string|undefined,
    *   maxQueueItems?: number, flushDelayMs?: number, logger?: any, fetch?: Function,
    *   setTimer?: (fn: Function, ms: number) => any, clearTimer?: (handle: any) => void,
    *   uploaderOptions?: object,
@@ -122,6 +122,7 @@ export class Collector {
       usageEvent = mapSessionEvent(session, event, {
         cwd: this.options.resolveCwd?.(session),
         projects: this.options.projects,
+        detectProject: this.options.detectProject,
         startedAt,
       })
     } catch (error) {

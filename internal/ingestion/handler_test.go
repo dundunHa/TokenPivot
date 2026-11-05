@@ -80,9 +80,12 @@ type fakeStore struct {
 	mu       sync.Mutex
 	clock    fakeClock
 	projects map[[16]byte]struct{}
-	events   map[string]fakeEvent // source_event_id -> row
-	calls    []string
-	touched  int
+	// byKey maps project_key -> id for auto-created projects; projectLimit > 0 caps its size.
+	byKey        map[string]credentials.ID
+	projectLimit int
+	events       map[string]fakeEvent // source_event_id -> row
+	calls        []string
+	touched      int
 	// failure injects one error per named step.
 	failure map[string]error
 	// onStep runs after a step has been recorded, so a test can cancel a context
@@ -112,6 +115,7 @@ type fakeStore struct {
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		projects:     map[[16]byte]struct{}{},
+		byKey:        map[string]credentials.ID{},
 		events:       map[string]fakeEvent{},
 		failure:      map[string]error{},
 		insertResult: -1,
@@ -187,6 +191,25 @@ func (t *fakeTx) ProjectExists(ctx context.Context, workspaceID, projectID crede
 	defer t.store.mu.Unlock()
 	_, ok := t.store.projects[projectID.Bytes]
 	return ok, nil
+}
+
+func (t *fakeTx) EnsureProject(ctx context.Context, workspaceID credentials.ID, projectKey string) (credentials.ID, bool, error) {
+	t.store.record("ensure-project")
+	if err := t.failure("ensure-project"); err != nil {
+		return credentials.ID{}, false, err
+	}
+	t.store.mu.Lock()
+	defer t.store.mu.Unlock()
+	if id, ok := t.store.byKey[projectKey]; ok {
+		return id, true, nil
+	}
+	if t.store.projectLimit > 0 && len(t.store.byKey) >= t.store.projectLimit {
+		return credentials.ID{}, false, nil
+	}
+	id := syntheticID(byte(0x60 + len(t.store.byKey)))
+	t.store.byKey[projectKey] = id
+	t.store.projects[id.Bytes] = struct{}{}
+	return id, true, nil
 }
 
 func (t *fakeTx) InsertEvent(ctx context.Context, event storedEvent) (bool, error) {
@@ -1014,6 +1037,97 @@ func TestProjectRules(t *testing.T) {
 	})
 }
 
+func TestProjectKeyAutoCreatesAndResolves(t *testing.T) {
+	event := func(id, key string) string {
+		return `{"source_event_id":"` + id + `","project_key":"` + key + `","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+	}
+	t.Run("first sight creates the project, later events reuse it", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		body := decodeResults(t, environment.send(t, encodedBatch(t, event("k-1", "TokenPivot"), event("k-2", "TokenPivot"), event("k-3", "other"))), 3)
+		requireStatuses(t, body, statusAccepted, statusAccepted, statusAccepted)
+		if len(environment.store.byKey) != 2 {
+			t.Fatalf("created projects = %d, want 2 (one per distinct key)", len(environment.store.byKey))
+		}
+	})
+	t.Run("a key and the id it resolves to are the same content", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		body := decodeResults(t, environment.send(t, encodedBatch(t, event("same", "TokenPivot"))), 1)
+		requireStatuses(t, body, statusAccepted)
+		id := environment.store.byKey["TokenPivot"]
+		again := `{"source_event_id":"same","project_id":"` + projectText(id) + `","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+		body = decodeResults(t, environment.send(t, encodedBatch(t, again)), 1)
+		requireStatuses(t, body, statusDuplicate)
+		body = decodeResults(t, environment.send(t, encodedBatch(t, event("same", "TokenPivot"))), 1)
+		requireStatuses(t, body, statusDuplicate)
+	})
+	t.Run("a different key for the same event id is a conflict", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		decodeResults(t, environment.send(t, encodedBatch(t, event("c-1", "a"))), 1)
+		body := decodeResults(t, environment.send(t, encodedBatch(t, event("c-1", "b"))), 1)
+		requireStatuses(t, body, statusConflict)
+	})
+	t.Run("project_id and project_key together are rejected before any lookup", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		both := `{"source_event_id":"both","project_id":"44444444-4444-4444-4444-444444444445","project_key":"x","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+		body := decodeResults(t, environment.send(t, encodedBatch(t, both)), 1)
+		requireStatuses(t, body, statusRejected)
+		requireCodes(t, body, codeInvalidArgument)
+		if environment.store.called("ensure-project") != 0 || environment.store.called("begin") != 0 {
+			t.Fatal("a rejected item must not touch the store")
+		}
+	})
+	t.Run("invalid keys are rejected permanently", func(t *testing.T) {
+		for _, key := range []string{`""`, `" lead"`, `"trail "`, `"ctl\u0001"`, `1`, `["a"]`} {
+			environment := newTestEnvironment(t)
+			bad := `{"source_event_id":"bad","project_key":` + key + `,"provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+			body := decodeResults(t, environment.send(t, encodedBatch(t, bad)), 1)
+			requireStatuses(t, body, statusRejected)
+			if environment.store.called("ensure-project") != 0 {
+				t.Fatalf("key %s reached the store", key)
+			}
+		}
+	})
+	t.Run("null project_key means unattributed", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		nullKey := `{"source_event_id":"nk","project_key":null,"provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+		body := decodeResults(t, environment.send(t, encodedBatch(t, nullKey)), 1)
+		requireStatuses(t, body, statusAccepted)
+		if environment.store.called("ensure-project") != 0 {
+			t.Fatal("a null key must not create a project")
+		}
+	})
+	t.Run("an expired event creates no project", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		old := `{"source_event_id":"old","project_key":"ghost","provider":"p","model":"m","occurred_at":"2020-01-01T00:00:00Z","usage":{}}`
+		body := decodeResults(t, environment.send(t, encodedBatch(t, old)), 1)
+		requireStatuses(t, body, statusExpired)
+		if len(environment.store.byKey) != 0 {
+			t.Fatal("an expired event must not create a project")
+		}
+	})
+	t.Run("the workspace project limit rejects a new key but keeps existing ones working", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		environment.store.projectLimit = 1
+		body := decodeResults(t, environment.send(t, encodedBatch(t, event("l-1", "first"), event("l-2", "second"), event("l-3", "first"))), 3)
+		requireStatuses(t, body, statusAccepted, statusRejected, statusAccepted)
+		if body.Results[1].Error == nil || body.Results[1].Error.Code != codeProjectInvalid {
+			t.Fatalf("limit rejection = %+v, want %s", body.Results[1].Error, codeProjectInvalid)
+		}
+	})
+	t.Run("a store failure is retryable and stores nothing", func(t *testing.T) {
+		environment := newTestEnvironment(t)
+		environment.store.failure["ensure-project"] = errors.New("synthetic: driver detail")
+		body := decodeResults(t, environment.send(t, encodedBatch(t, event("f-1", "x"))), 1)
+		requireStatuses(t, body, statusRetryable)
+		if environment.store.called("insert") != 0 {
+			t.Fatal("nothing may be inserted after a failed project resolution")
+		}
+		if strings.Contains(environment.logs.String(), "driver detail") {
+			t.Fatal("driver detail leaked into logs")
+		}
+	})
+}
+
 func TestCancellationStopsRemainingItemsWithoutAccepted(t *testing.T) {
 	environment := newTestEnvironment(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1656,6 +1770,10 @@ type contextRecordingTx struct {
 
 func (t *contextRecordingTx) Now(ctx context.Context) (time.Time, error) {
 	return t.inner.Now(ctx)
+}
+
+func (t *contextRecordingTx) EnsureProject(ctx context.Context, workspaceID credentials.ID, projectKey string) (credentials.ID, bool, error) {
+	return t.inner.EnsureProject(ctx, workspaceID, projectKey)
 }
 
 func (t *contextRecordingTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {
