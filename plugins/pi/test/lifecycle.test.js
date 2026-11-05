@@ -409,6 +409,20 @@ test('隐私：真实采集事件分别落 pending/dead/overflow，DB 字节与�
   // e3 → 再次 pending
   await collector.handleTurnEnd(secretTurn('entry-3'), context('session-1', markerCwd))
   assert.deepEqual(collector.status().counts, { pending: 1, dead: 1, overflow: 1 })
+
+  // journal 只在写事务期间存在：这里故意开一个写事务把页面写进 journal，
+  // 断言文件确实存在（否则下面的字节检查等于没做），再检查它的原始字节。
+  const raw = new DatabaseSync(path.join(ws.stateDir, QUEUE_FILE), { timeout: 0 })
+  raw.exec('BEGIN IMMEDIATE')
+  raw.exec('UPDATE events SET updated_at = updated_at + 1')
+  const journalPath = path.join(ws.stateDir, `${QUEUE_FILE}-journal`)
+  assert.equal(fs.existsSync(journalPath), true, 'journal 必须存在，字节检查才有意义')
+  const journalBytes = fs.readFileSync(journalPath)
+  for (const needle of [TOKEN_A, markerPrompt, markerTitle, 'PRIVATE', markerCwd]) {
+    assert.equal(journalBytes.includes(Buffer.from(needle, 'utf8')), false, `journal 不得包含 ${needle}`)
+  }
+  raw.exec('ROLLBACK')
+  raw.close()
   await collector.stop()
 
   // 队列文件与 rollback journal 的原始字节
@@ -545,13 +559,15 @@ test('响应确认前再对比绑定与配置：在途期间配置被改则保�
   await collector.handleTurnEnd(turn(), context())
 
   const outcome = await collector.runFlush()
-  assert.equal(outcome.state, 'backoff')
+  assert.equal(outcome.state, 'paused')
+  assert.equal(collector.uploader.pauseReason, 'server_changed')
   assert.equal(collector.queue.counts().pending, 1)
   assert.equal(built.logs.some((l) => l.code === 'upload_binding_changed'), true)
 
-  // 配置改回原服务地址后重传同一 ID，服务端幂等。
+  // 配置改回原服务地址后恢复，重传同一 ID，服务端幂等。
   writeConfig(ws)
   await collector.pollConfig()
+  assert.equal(collector.uploader.paused, false)
   await collector.runFlush()
   assert.equal(collector.queue.counts().pending, 0)
 })
@@ -695,7 +711,8 @@ test('上报在途时轮换凭证：该批保留，后续批次不再用旧凭�
   await collector.handleTurnEnd(turn({}, 'entry-2'), context())
 
   const outcome = await collector.runFlush()
-  assert.equal(outcome.state, 'backoff')
+  assert.equal(outcome.state, 'paused')
+  assert.equal(outcome.reason, 'token_changed')
   assert.equal(auths.length, 1)
   assert.equal(auths[0], `Bearer ${TOKEN_A}`)
   // 第一批没有落结果、第二批没有被发送：两批都还在库里。
@@ -723,8 +740,12 @@ test('退出时等入队落地；限时到了仍未落地则明确计数未采�
   assert.equal(collector.inflight.size, 1)
 
   const started = Date.now()
+  const beforeStop = collector.inflight.size
   await collector.stop({ timeoutMs: 100 })
   assert.equal(Date.now() - started < 1000, true)
+  // stop 返回当刻：在途入队仍然存在（已被明确计数），不是等它落地后才有状态。
+  assert.equal(beforeStop, 1)
+  assert.equal(collector.inflight.size, 1)
   assert.equal(collector.counters.enqueue_unflushed, 1)
 
   raw.exec('ROLLBACK')
@@ -750,4 +771,207 @@ test('配置文件里存着 token 时，即使环境变量优先生效也要求 
   const withoutFileToken = loadConfig({ env: { TOKENPIVOT_PI_CONFIG: ws.configPath, TOKENPIVOT_PI_TOKEN: TOKEN_B } })
   assert.equal(withoutFileToken.status, 'ok')
   assert.equal(withoutFileToken.config.token, TOKEN_B)
+})
+
+test('切目录时有上传在途：新事件暂停采集，不写进旧库；上传结束后才换库', async (t) => {
+  const ws = workspace(t)
+  const dirA = ws.stateDir
+  const dirB = path.join(ws.root, 'state-b')
+  writeConfig(ws)
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const { collector } = makeCollector(ws, {
+    fetch: async (_url, init) => {
+      // 上传在途时配置换了目录
+      writeConfig(ws, { stateDir: dirB })
+      await gate
+      return jsonResponse(200, acceptedFor(init))
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  const flushing = collector.runFlush()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  // 换库还没完成：新的 turn_end 必须暂停采集，而不是写进旧目录
+  assert.deepEqual(await collector.handleTurnEnd(turn({}, 'entry-2'), context()), { skipped: 'queue_moving' })
+  assert.equal(collector.counters.skip_queue_moving, 1)
+  assert.equal(collector.status().queueMoving, true)
+  assert.deepEqual(pendingIds({ stateDir: dirA }), ['pi:msg:session-1:entry-1'])
+
+  release()
+  await flushing
+  const polled = await collector.pollConfig()
+  assert.equal(polled.state, 'ready')
+  assert.equal(collector.queueDir, dirB)
+  assert.equal(collector.status().queueMoving, false)
+  assert.deepEqual(collector.status().counts, { pending: 0, dead: 0, overflow: 0 })
+
+  // 换库之后的新事件落在新目录，旧目录不再变化
+  assert.equal((await collector.handleTurnEnd(turn({}, 'entry-3'), context())).state, 'queued')
+  assert.deepEqual(pendingIds({ stateDir: dirB }), ['pi:msg:session-1:entry-3'])
+  assert.deepEqual(pendingIds({ stateDir: dirA }), [])
+})
+
+test('入队 BUSY 重试期间换目录：重试仍落原库，切库推迟到入队结束', async (t) => {
+  const ws = workspace(t)
+  const dirA = ws.stateDir
+  const dirB = path.join(ws.root, 'state-b')
+  writeConfig(ws)
+  const { collector } = makeCollector(ws, {
+    collector: {
+      enqueueAttempts: 4,
+      enqueueRetryMs: 30,
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle),
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+
+  const raw = new DatabaseSync(path.join(ws.stateDir, QUEUE_FILE), { timeout: 0 })
+  raw.exec('BEGIN IMMEDIATE')
+  const pending = collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(collector.counters.queue_busy >= 1, true)
+
+  writeConfig(ws, { stateDir: dirB })
+  const polled = await collector.pollConfig()
+  assert.deepEqual(polled, { state: 'deferred', reason: 'queue_busy' })
+  assert.equal(collector.queueDir, dirA)
+
+  raw.exec('COMMIT')
+  raw.close()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal((await pending).state, 'queued')
+  // 归属：重试落在开始时那个库
+  assert.deepEqual(pendingIds({ stateDir: dirA }), ['pi:msg:session-1:entry-1'])
+  assert.deepEqual(pendingIds({ stateDir: dirB }), [])
+
+  const swapped = await collector.pollConfig()
+  assert.equal(swapped.state, 'ready')
+  assert.equal(collector.queueDir, dirB)
+})
+
+test('采集后、发送前换凭证：零发送并暂停', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const { collector, calls } = makeCollector(ws)
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn(), context())
+  assert.equal(collector.queue.counts().pending, 1)
+
+  // 事件已按 A 入队；发送前配置换成 B
+  writeConfig(ws, { token: TOKEN_B })
+  const outcome = await collector.runFlush()
+  assert.equal(outcome.state, 'paused')
+  assert.equal(outcome.reason, 'token_changed')
+  assert.equal(calls.length, 0)
+  assert.equal(collector.queue.counts().pending, 1)
+})
+
+test('其他进程在途更新绑定：本进程响应前发现并暂停，不落结果', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const { collector } = makeCollector(ws, {
+    fetch: (_url, init) => {
+      // 另一个进程把 bindingRevision 加一（同地址、同指纹）
+      const other = new SqliteQueue({ dir: ws.stateDir }).open()
+      other.writeBindingRaw({ serverUrl: SERVER, fingerprint: tokenFingerprint(TOKEN_A), revision: 2 })
+      other.close()
+      return jsonResponse(200, acceptedFor(init))
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn(), context())
+
+  const outcome = await collector.runFlush()
+  assert.equal(outcome.state, 'paused')
+  assert.equal(outcome.reason, 'binding_changed')
+  assert.equal(collector.queue.counts().pending, 1)
+})
+
+test('HTTP 暂停不被临时配置错误冲掉：恢复原配置后仍暂停、零新增请求', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  let calls = 0
+  const { collector } = makeCollector(ws, {
+    fetch: () => {
+      calls += 1
+      return jsonResponse(401, { error: { code: 'INVALID_ARGUMENT', message: 'bad token' } })
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn(), context())
+  assert.equal((await collector.runFlush()).state, 'paused')
+  assert.equal(collector.uploader.pauseReason, 'http_401')
+
+  // 临时写坏配置：几轮检查都看到配置错误
+  fs.writeFileSync(ws.configPath, '{ not json')
+  for (let round = 0; round < 2; round += 1) {
+    assert.equal((await collector.pollConfig()).state, 'error')
+    assert.equal(collector.uploader.paused, true)
+  }
+
+  // 配置恢复成暂停时的同一地址+同一凭证：HTTP 暂停必须保留
+  writeConfig(ws)
+  assert.equal((await collector.pollConfig()).state, 'ready')
+  assert.equal(collector.uploader.paused, true)
+  assert.equal(collector.uploader.pauseReason, 'http_401')
+  assert.equal(calls, 1)
+  assert.equal(collector.queue.counts().pending, 1)
+})
+
+test('配置里的 flushDelayMs/requestTimeoutMs/maxQueueItems 生效，运行中修改也生效', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws, { flushDelayMs: 7000, requestTimeoutMs: 40, maxQueueItems: 2 })
+  const { collector } = makeCollector(ws, {
+    // 清掉测试默认的显式覆盖，让这三个参数跟随配置文件
+    collector: { flushDelayMs: undefined, requestTimeoutMs: undefined },
+    fetch: () => new Response(new ReadableStream({ start() {} }), { status: 200 }),
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  assert.equal(collector.flushDelayMs, 7000)
+  assert.equal(collector.requestTimeoutMs, 40)
+  assert.equal(collector.uploader.timeoutMs, 40)
+  assert.equal(collector.queue.maxItems, 2)
+
+  writeConfig(ws, { flushDelayMs: 3000, requestTimeoutMs: 25, maxQueueItems: 1 })
+  await collector.pollConfig()
+  assert.equal(collector.flushDelayMs, 3000)
+  assert.equal(collector.requestTimeoutMs, 25)
+  assert.equal(collector.uploader.timeoutMs, 25)
+  assert.equal(collector.queue.maxItems, 1)
+
+  // 超时按新值生效：挂起的响应体在 25ms 左右被打断
+  await collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  const started = Date.now()
+  const outcome = await collector.runFlush()
+  assert.equal(outcome.state, 'backoff')
+  assert.equal(Date.now() - started < 120, true)
+  assert.equal(collector.queue.counts().pending, 1)
+})
+
+test('配置读坏时不换目录：不会把队列挪去默认 stateDir', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const { collector } = makeCollector(ws)
+  t.after(() => collector.stop())
+  await collector.start()
+  const before = collector.queueDir
+  assert.equal(before, ws.stateDir)
+
+  fs.writeFileSync(ws.configPath, '{ not json')
+  assert.equal((await collector.pollConfig()).state, 'error')
+  assert.equal(collector.queueDir, before)
+  assert.equal(collector.swapPending, false)
+  // 恢复原配置后仍在原目录
+  writeConfig(ws)
+  assert.equal((await collector.pollConfig()).state, 'ready')
+  assert.equal(collector.queueDir, before)
 })

@@ -65,6 +65,12 @@ export class Collector {
     this.flushDelayMs = options.flushDelayMs ?? 2000
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30000
     this.configPollMs = options.configPollMs ?? CONFIG_POLL_MS
+    // 显式构造参数优先；没给的跟随配置文件，运行中改配置也能生效。
+    this.flushDelayOption = Number.isSafeInteger(options.flushDelayMs) ? options.flushDelayMs : null
+    this.timeoutOption = Number.isSafeInteger(options.requestTimeoutMs) ? options.requestTimeoutMs : null
+    this.maxItemsOption = Number.isSafeInteger(options.maxQueueItems) && options.maxQueueItems > 0
+      ? options.maxQueueItems
+      : null
 
     this.counters = {}
     this.loggedCounters = {}
@@ -81,8 +87,12 @@ export class Collector {
     this.startPromise = null
     /** 当前队列所在目录：配置里的 stateDir 变了就要换库。 */
     this.queueDir = null
-    /** 暂停时的有效配置快照（地址+指纹）：配置没变就不自动解除 HTTP 暂停。 */
-    this.pauseSnapshot = null
+    /** 换库已排定但还没完成：期间新事件不入旧库。 */
+    this.swapPending = false
+    /** 当前配置与绑定不一致的原因码（发送前核对时给出）。 */
+    this.identityIssue = null
+    /** HTTP 4xx 暂停的状态与当时的身份；与「配置暂不可用」分离保存。 */
+    this.httpPause = null
     /** 在途入队任务：stop 时限时等待，超时明确计数未采集事件。 */
     this.inflight = new Set()
   }
@@ -102,6 +112,7 @@ export class Collector {
       counts,
       paused: this.uploader ? this.uploader.paused : false,
       pauseReason: this.uploader ? this.uploader.pauseReason : null,
+      queueMoving: this.swapPending,
     }
   }
 
@@ -142,6 +153,7 @@ export class Collector {
         fetch: this.options.fetch,
         logger: this.logger,
         timeoutMs: this.requestTimeoutMs,
+        // timeoutMs 由 applyRuntimeConfig 跟随配置更新；这里给的是初始值。
         now: this.now,
         random: this.random,
         ...this.options.uploaderOptions,
@@ -171,8 +183,10 @@ export class Collector {
     this.uploader = null
     this.queueDir = null
     this.blocked = null
-    this.pauseSnapshot = null
+    this.httpPause = null
     const opened = this.openQueue()
+    // 打不开就保持 pending，等下一轮配置检查重试同一目录，不要求重启。
+    this.swapPending = !opened
     if (opened) {
       this.logger.log('queue_dir_changed')
       if (this.queue.counts().pending > 0) this.schedule(0)
@@ -189,20 +203,52 @@ export class Collector {
   }
 
   /**
-   * 本批要用的地址与凭证快照；不可发送时返回 null。
-   * 每次调用都重读配置：在途轮换凭证能被下一批/下一次响应校验立刻发现。
+   * 本批要用的地址与凭证快照；不可发送时返回 null 并给出原因码。
+   * 每次调用都重读配置，并用**同一次读取**的结果核对队列绑定（地址+指纹+revision）：
+   * 采集后、发送前换了凭证，这里就会返回 null，不会拿新凭证发旧队列的事件。
    */
   requestIdentity() {
     this.refreshConfig()
-    if (this.configState() !== 'ready') return null
-    const config = this.configResult?.config
-    if (!config?.serverUrl || !config.token) return null
-    const binding = this.queue?.isOpen ? this.queue.binding() : null
+    return this.currentIdentity()
+  }
+
+  /** 用当前 configResult 与队列绑定算身份；不一致时置 identityIssue 并返回 null。 */
+  currentIdentity() {
+    const state = this.configState()
+    if (state !== 'ready') {
+      this.identityIssue = state === 'blocked' ? 'queue_unavailable' : `config_${state}`
+      return null
+    }
+    const config = this.configResult.config
+    if (!config.serverUrl || !config.token) {
+      this.identityIssue = 'config_incomplete'
+      return null
+    }
+    if (!this.queue?.isOpen) {
+      this.identityIssue = 'queue_unavailable'
+      return null
+    }
+    const binding = this.queue.binding()
+    if (!binding) {
+      this.identityIssue = 'binding_missing'
+      return null
+    }
+    if (binding.serverUrl !== config.serverUrl) {
+      this.identityIssue = 'server_changed'
+      return null
+    }
+    const fingerprint = config.fingerprint ?? null
+    if (binding.fingerprint !== fingerprint) {
+      // 空指纹 + 现在有凭证：由 bindFirstCredential 在发送前完成首次绑定。
+      this.identityIssue = binding.fingerprint === null ? 'pending_credential' : 'token_changed'
+      return null
+    }
+    this.identityIssue = null
     return {
       endpoint: config.serverUrl,
       token: config.token,
-      fingerprint: binding?.fingerprint ?? null,
-      revision: binding?.revision ?? null,
+      fingerprint: binding.fingerprint,
+      revision: binding.revision,
     }
   }
 
@@ -217,37 +263,54 @@ export class Collector {
       now.revision === snapshot.revision
   }
 
-  /** 暂停上报并记下当时的有效配置；同一原因重复暂停不重复写日志。 */
+  /** 暂停上报；HTTP 4xx 暂停单独保存状态与当时身份，配置错误不会冲掉它。 */
   pauseUploader(reason) {
     if (!this.uploader) return { state: 'disabled', reason }
     if (!(this.uploader.paused && this.uploader.pauseReason === reason)) this.uploader.pause(reason)
-    const config = this.configResult?.config
-    this.pauseSnapshot = {
-      reason,
-      serverUrl: config?.serverUrl ?? null,
-      fingerprint: config?.fingerprint ?? null,
+    if (typeof reason === 'string' && reason.startsWith('http_')) {
+      const config = this.configResult?.config
+      this.httpPause = {
+        reason,
+        serverUrl: config?.serverUrl ?? null,
+        fingerprint: config?.fingerprint ?? null,
+      }
     }
     return { state: 'paused', reason }
   }
 
+  /** 显式解除暂停（用户确认同源、或有效身份确实变了）。 */
+  resumeUploader() {
+    this.httpPause = null
+    this.uploader?.resume()
+  }
+
   /**
-   * 只有配置真的变过（或用户确认后显式 resume）才解除 HTTP 暂停。
-   * 配置没改时每 30 秒的检查不会把 400/401/403/415 的暂停悄悄解除后重发。
+   * 自动解除暂停的条件：
+   *  - 有 HTTP 暂停：只有当前身份与暂停时不同（确实换过配置）才解除；
+   *    身份恢复成暂停时那份（中途读过临时错误配置）就继续暂停。
+   *  - 没有 HTTP 暂停：配置不可用或绑定问题修好即可恢复。
    */
   maybeResume() {
     if (!this.uploader?.paused) return false
-    const reason = this.uploader.pauseReason
-    if (typeof reason === 'string' && reason.startsWith('http_')) {
-      const snapshot = this.pauseSnapshot
+    if (this.httpPause) {
       const config = this.configResult?.config
-      const same = !!snapshot &&
-        snapshot.serverUrl === (config?.serverUrl ?? null) &&
-        snapshot.fingerprint === (config?.fingerprint ?? null)
-      if (same) return false
+      const same = this.httpPause.serverUrl === (config?.serverUrl ?? null) &&
+        this.httpPause.fingerprint === (config?.fingerprint ?? null)
+      if (same) {
+        // 配置回到暂停时的同一身份：保持暂停，只把原因码归位，别让 30 秒检查把 401 冲掉。
+        if (this.uploader.pauseReason !== this.httpPause.reason) this.uploader.pause(this.httpPause.reason)
+        return false
+      }
+      this.resumeUploader()
+      return true
     }
     this.uploader.resume()
-    this.pauseSnapshot = null
     return true
+  }
+
+  /** 换库前提：没有在途上报，也没有在途入队。 */
+  canSwapQueue() {
+    return !this.pendingFlush && this.inflight.size === 0
   }
 
   refreshConfig() {
@@ -263,7 +326,23 @@ export class Collector {
     if (loaded.reason && (loaded.reason !== previous?.reason || loaded.status !== previous?.status)) {
       this.logger.log('config_state', { reason: loaded.reason })
     }
+    this.applyRuntimeConfig()
     return loaded
+  }
+
+  /**
+   * 运行时可变的配置参数：flushDelayMs / requestTimeoutMs / maxQueueItems。
+   * 显式构造参数优先；没给的就跟随配置文件，同目录下改配置也立即生效。
+   */
+  applyRuntimeConfig() {
+    const config = this.configResult?.config
+    if (!config) return
+    if (this.flushDelayOption === null) this.flushDelayMs = config.flushDelayMs
+    if (this.timeoutOption === null) {
+      this.requestTimeoutMs = config.requestTimeoutMs
+      if (this.uploader) this.uploader.timeoutMs = this.requestTimeoutMs
+    }
+    if (this.maxItemsOption === null && this.queue) this.queue.maxItems = config.maxQueueItems
   }
 
   /**
@@ -275,10 +354,12 @@ export class Collector {
     this.logChangedCounters()
     this.refreshConfig()
 
-    const desiredDir = this.configResult?.config?.stateDir
-    if (desiredDir && this.queueDir && desiredDir !== this.queueDir) {
-      // 在途 flush 还在用旧库：这一轮不动，等它落地后下一轮再换。
-      if (this.pendingFlush) return { state: 'deferred', reason: 'flush_in_flight' }
+    // 只有解析成功的配置才决定目录：读坏了（或没写地址）不能把队列挪去默认目录。
+    const desiredDir = this.configResult?.status === 'ok' ? this.configResult.config.stateDir : null
+    if (desiredDir && this.queueDir && desiredDir !== this.queueDir) this.swapPending = true
+    if (this.swapPending && desiredDir) {
+      // 换库要等上传与在途入队都结束：旧库关掉时在途操作无处落地。
+      if (!this.canSwapQueue()) return { state: 'deferred', reason: 'queue_busy' }
       if (!this.swapQueue()) return { state: 'blocked', reason: this.blocked }
     } else if (!this.queue?.isOpen && this.configResult?.config) {
       // 上次打开失败（损坏/权限/临时 IO）：每个检查周期重试同一目录，不要求重启 PI。
@@ -353,9 +434,14 @@ export class Collector {
     this.refreshConfig()
 
     // 配置已指向新目录、但 30 秒检查还没轮到：采集前先换库，别把新事件写进旧目录。
-    // 在途上报期间不换（关库会让在途响应无处落地），交给下一轮配置检查。
-    const desiredDir = this.configResult?.config?.stateDir
-    if (!this.pendingFlush && desiredDir && this.queueDir && desiredDir !== this.queueDir) {
+    // 有在途上报或入队时不换，也不往旧队列写——这期间暂停新采集并计数。
+    const desiredDir = this.configResult?.status === 'ok' ? this.configResult.config.stateDir : null
+    if (desiredDir && this.queueDir && desiredDir !== this.queueDir) this.swapPending = true
+    if (this.swapPending) {
+      if (!this.canSwapQueue()) {
+        this.count('skip_queue_moving')
+        return { skipped: 'queue_moving' }
+      }
       if (!this.swapQueue()) return { skipped: 'blocked' }
     }
 
@@ -401,8 +487,12 @@ export class Collector {
     return task
   }
 
-  /** 入队；SQLITE_BUSY 用异步退避重试，绝不同步等待。 */
+  /**
+   * 入队；SQLITE_BUSY 用异步退避重试，绝不同步等待。
+   * 队列实例在进入时固定：切库或关库不会让这批重试落到另一个库。
+   */
   async enqueue(event) {
+    const queue = this.queue
     const config = this.configResult.config
     const payload = { event, serverUrl: config.serverUrl, fingerprint: config.fingerprint ?? null }
     const maxAttempts = this.options.enqueueAttempts ?? 5
@@ -412,7 +502,7 @@ export class Collector {
         this.logger.log('enqueue_aborted', { reason: 'stopped' })
         return { state: 'failed', reason: 'stopped' }
       }
-      const result = this.queue.enqueue(payload)
+      const result = queue.enqueue(payload)
       if (result.busy) {
         this.count('queue_busy')
         await this.sleep(this.options.enqueueRetryMs ?? 50, attempt)
@@ -431,7 +521,7 @@ export class Collector {
         this.logger.log('queue_conflict')
       } else if (result.state === 'paused') {
         this.count(`paused_${result.reason}`)
-        this.uploader?.pause(result.reason)
+        this.pauseUploader(result.reason)
       } else {
         this.count('queue_failed')
         this.logger.log('queue_failed', { reason: result.reason ?? 'io' })
@@ -485,7 +575,15 @@ export class Collector {
   /** 锁外发送：先做绑定与配置检查，再交给 uploader 走 HTTP。 */
   async flushOnce() {
     if (this.stopped) return { state: 'stopped' }
+    if (this.swapPending) return { state: 'deferred', reason: 'queue_moving' }
     if (this.configState() !== 'ready') return { state: 'disabled' }
+    let pending
+    try {
+      pending = this.queue.counts().pending
+    } catch {
+      return { state: 'failed', reason: 'queue_unavailable' }
+    }
+    if (pending === 0) return { state: 'idle' }
     let binding = this.checkBinding()
     if (binding.ok && binding.pendingCredential) {
       // 上次只有地址、没有凭证；现在首次拿到凭证：先把空指纹绑定掉，再发旧事件。
@@ -504,6 +602,12 @@ export class Collector {
       this.count(`paused_${binding.reason}`)
       return this.pauseUploader(binding.reason)
     }
+    // 发送前用同一次读取核对地址+指纹+revision；不一致立即暂停，绝不拿新凭证发旧队列。
+    if (!this.currentIdentity()) {
+      const reason = this.identityIssue ?? 'identity_unavailable'
+      this.count(`paused_${reason}`)
+      return this.pauseUploader(reason)
+    }
     let outcome
     try {
       outcome = await this.uploader.flush()
@@ -516,6 +620,12 @@ export class Collector {
     else if (outcome.state === 'paused') {
       this.count('upload_paused')
       this.pauseUploader(outcome.reason)
+    } else if (outcome.state === 'unavailable' || outcome.state === 'identity_changed') {
+      // 在途期间配置/绑定变了（含其他进程更新了绑定）：整批保留并暂停。
+      const reason = this.identityIssue ??
+        (outcome.state === 'identity_changed' ? 'binding_changed' : 'identity_unavailable')
+      this.count(`paused_${reason}`)
+      return this.pauseUploader(reason)
     }
     return outcome
   }
@@ -541,7 +651,7 @@ export class Collector {
     })
     if (result.ok) {
       this.logger.log('binding_confirmed', { revision: this.queue.binding()?.revision ?? 0 })
-      this.uploader?.resume()
+      this.resumeUploader()
       this.schedule(0)
     } else {
       this.logger.log('binding_confirm_failed', { reason: result.reason ?? 'unknown' })

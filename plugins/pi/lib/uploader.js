@@ -140,7 +140,7 @@ export class Uploader {
   async drain() {
     if (this.stopped) return { state: 'stopped' }
     if (this.paused) return { state: 'paused', reason: this.pauseReason }
-    if (!this.getIdentity()) return { state: 'disabled' }
+    if (!this.getIdentity()) return { state: 'unavailable' }
     let pending
     try {
       pending = this.queue.counts().pending
@@ -152,8 +152,9 @@ export class Uploader {
     while (!this.stopped) {
       if (this.paused) return { state: 'paused', reason: this.pauseReason }
       // 每批都重新读一次：在途期间凭证被轮换，后续批次不得沿用旧凭证。
+      // 每批都重新读：配置与绑定在同一次读取里核对，不一致时 getIdentity() 返回 null。
       const identity = this.getIdentity()
-      if (!identity) return { state: 'disabled' }
+      if (!identity) return { state: 'unavailable' }
       const batch = this.nextBatch()
       if (batch.busy) return this.backoff()
       if (batch.failed) return { state: 'failed', reason: batch.failed }
@@ -220,11 +221,8 @@ export class Uploader {
         return this.failed(items)
       }
 
-      // 本批实际使用的地址/凭证是否仍是当前绑定：变了就整批保留并结束本轮。
-      if (!this.isIdentityCurrent(identity)) {
-        this.logger?.log('upload_binding_changed', { count: items.length })
-        return this.backoff()
-      }
+      // 本批实际使用的地址/凭证是否仍是当前绑定：变了就整批保留并暂停，不再发下一批。
+      if (!this.isIdentityCurrent(identity)) return this.identityChanged(items)
 
       const status = response?.status
       if (status === 200) {
@@ -236,10 +234,7 @@ export class Uploader {
           if (this.stopped || this.timedOut) return this.failed(items)
           return this.malformed(items)
         }
-        if (!this.isIdentityCurrent(identity)) {
-          this.logger?.log('upload_binding_changed', { count: items.length })
-          return this.backoff()
-        }
+        if (!this.isIdentityCurrent(identity)) return this.identityChanged(items)
         return this.applyResults(items, body)
       }
 
@@ -259,17 +254,11 @@ export class Uploader {
         return this.backoff()
       }
       if (PAUSE_STATUSES.has(status)) {
-        if (!this.isIdentityCurrent(identity)) {
-          this.logger?.log('upload_binding_changed', { count: items.length })
-          return this.backoff()
-        }
+        if (!this.isIdentityCurrent(identity)) return this.identityChanged(items)
         return this.pause(`http_${status}`)
       }
       if (status === 413) {
-        if (!this.isIdentityCurrent(identity)) {
-          this.logger?.log('upload_binding_changed', { count: items.length })
-          return this.backoff()
-        }
+        if (!this.isIdentityCurrent(identity)) return this.identityChanged(items)
         if (items.length > 1) {
           this.limit = Math.max(1, Math.floor(items.length / 2))
           this.logger?.log('upload_split', { status, count: items.length })
@@ -301,9 +290,25 @@ export class Uploader {
     if (WITHOUT_ERROR.has(status)) return result.error === undefined
     const error = result.error
     if (!error || typeof error !== 'object' || typeof error.code !== 'string') return false
+    // error.message 必填：1–512 字符，只供人读；缺了就不算可用的逐项结果。
+    const message = error.message
+    if (typeof message !== 'string' || message.length < 1 || message.length > 512) return false
     if (status === 'rejected') return REJECTED_CODES.has(error.code)
     if (status === 'retryable') return RETRYABLE_CODES.has(error.code)
     return false
+  }
+
+  /** 本批身份在途变化：整批保留，交给 collector 暂停并记原因。 */
+  identityChanged(items) {
+    this.logger?.log('upload_binding_changed', { count: items.length })
+    return { state: 'identity_changed' }
+  }
+
+  /** 响应信封：request_id 必填（1–128 字符），results 必填数组。 */
+  validBody(body) {
+    const requestId = body?.request_id
+    if (typeof requestId !== 'string' || requestId.length < 1 || requestId.length > 128) return false
+    return Array.isArray(body?.results)
   }
 
   malformed(items) {
@@ -312,7 +317,8 @@ export class Uploader {
   }
 
   applyResults(items, body) {
-    const results = Array.isArray(body?.results) ? body.results : null
+    if (!this.validBody(body)) return this.malformed(items)
+    const results = body.results
     // 畸形 200：results 必须与输入等长、index 必须一一覆盖；否则整批保留，绝不推断成功。
     if (!results || results.length !== items.length) return this.malformed(items)
     const byIndex = new Map()

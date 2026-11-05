@@ -89,7 +89,7 @@ test('逐项混合结果：accepted/duplicate 出队，conflict 死信，retryab
         { index: 0, status: 'accepted' },
         { index: 1, status: 'duplicate' },
         { index: 2, status: 'conflict' },
-        { index: 3, status: 'retryable', error: { code: 'UNAVAILABLE' } },
+        { index: 3, status: 'retryable', error: { code: 'UNAVAILABLE', message: 'try later' } },
       ],
     })
   })
@@ -297,7 +297,7 @@ test('没有凭证时不发送；有凭证时 Authorization 只在请求头，�
     },
     logger: { log: () => {} },
   })
-  assert.equal((await disabled.flush()).state, 'disabled')
+  assert.equal((await disabled.flush()).state, 'unavailable')
   assert.equal(called, 0)
 
   const { uploader, logs, calls } = makeUploader(queue, () => jsonResponse(200, resultsOf('accepted')))
@@ -378,7 +378,7 @@ test('rejected 白名单错误码写死信，码原样落库；服务端自由�
   const { uploader } = makeUploader(queue, () => jsonResponse(200, {
     request_id: 'req-1',
     results: [
-      { index: 0, status: 'rejected', error: { code: 'USAGE_UNSUPPORTED' } },
+      { index: 0, status: 'rejected', error: { code: 'USAGE_UNSUPPORTED', message: 'unsupported' } },
       { index: 1, status: 'conflict' },
     ],
   }))
@@ -422,9 +422,48 @@ test('在途期间凭证轮换：本批保留、本轮终止，后续批次不�
   )
 
   const outcome = await uploader.flush()
-  assert.equal(outcome.state, 'backoff')
+  assert.equal(outcome.state, 'identity_changed')
   assert.equal(calls.length, 1)
   assert.equal(calls[0], `Bearer ${TOKEN}`)
   assert.deepEqual(queue.counts(), { pending: 2, dead: 0, overflow: 0 })
   assert.equal(logs.some((l) => l.code === 'upload_binding_changed'), true)
+})
+
+test('响应必填字段缺失或非法按畸形整批保留：request_id 与 error.message', async (t) => {
+  const ok = [{ index: 0, status: 'accepted' }]
+  const malformed = [
+    { results: ok },                                                        // 缺 request_id
+    { request_id: '', results: ok },                                        // 空串
+    { request_id: 'x'.repeat(129), results: ok },                           // 超过 128
+    { request_id: 42, results: ok },                                        // 类型不对
+    { request_id: 'r', results: [{ index: 0, status: 'rejected', error: { code: 'USAGE_UNSUPPORTED' } }] },
+    { request_id: 'r', results: [{ index: 0, status: 'rejected', error: { code: 'USAGE_UNSUPPORTED', message: '' } }] },
+    { request_id: 'r', results: [{ index: 0, status: 'retryable', error: { code: 'UNAVAILABLE', message: 42 } }] },
+    { request_id: 'r', results: [{ index: 0, status: 'rejected', error: { code: 'USAGE_UNSUPPORTED', message: 'x'.repeat(513) } }] },
+  ]
+  for (const body of malformed) {
+    const { queue } = setup(t)
+    seed(queue, 1)
+    const { uploader, logs } = makeUploader(queue, () => jsonResponse(200, body))
+    const outcome = await uploader.flush()
+    assert.equal(outcome.state, 'backoff')
+    assert.deepEqual(queue.counts(), { pending: 1, dead: 0, overflow: 0 })
+    assert.equal(logs.some((l) => l.code === 'upload_malformed'), true)
+  }
+
+  // 必填字段齐全时正常处理：message 内容不参与分支判断，未知扩展字段放行。
+  const { queue } = setup(t)
+  seed(queue, 1)
+  const { uploader } = makeUploader(queue, () => jsonResponse(200, {
+    request_id: 'req-1',
+    results: [{
+      index: 0,
+      status: 'rejected',
+      error: { code: 'USAGE_UNSUPPORTED', message: 'per item', future_field: 'ignored' },
+      future_result_field: 1,
+    }],
+    future_envelope_field: true,
+  }))
+  await uploader.flush()
+  assert.deepEqual(queue.counts(), { pending: 0, dead: 1, overflow: 0 })
 })

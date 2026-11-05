@@ -54,6 +54,15 @@ PI 的扩展发现规则是「`extensions/*/package.json` 带 `pi.extensions` �
 | `flushDelayMs` | 新事件后延迟多久开始上报 | `2000` |
 | `requestTimeoutMs` | 单次 HTTP 请求超时 | `30000` |
 
+这三个参数在启动时按配置生效，运行中改配置也会在下次配置检查/下一次采集时生效
+（`maxQueueItems` 同目录下立即生效）。显式传入的构造参数优先，用于测试。
+
+生效时刻与语义：
+
+- `flushDelayMs`：新事件入队后多久安排上报；之后到来的事件不会推后已排定的时间。
+- `requestTimeoutMs`：覆盖到响应体读完；响应头已到而正文卡住同样按超时处理。
+- `maxQueueItems`：只限制 `pending`；超出写 `overflow`，不删除、不自动清理。
+
 环境变量（优先于配置文件，改了要重启 PI）：
 
 - `TOKENPIVOT_PI_CONFIG`：配置文件的绝对路径。
@@ -154,6 +163,28 @@ PI 的扩展发现规则是「`extensions/*/package.json` 带 `pi.extensions` �
 
 暂停恢复不依赖新事件：插件每 30 秒独立检查一次配置，配置修好就唤醒上报。
 环境变量的变更需要重启 PI。
+
+暂停状态是分开记的：HTTP 4xx 暂停会保存当时的地址与凭证指纹，
+中途读到临时写坏的配置（`config_error`）不会冲掉它；配置恢复成暂停时的同一身份后仍然保持暂停，
+只有有效身份真的变了（换了地址或凭证）或用户执行确认同源才解除。
+
+绑定核对贯穿发送全过程：每批发车前用**同一次读取**的配置与队列绑定核对地址、凭证指纹与
+`bindingRevision`；响应处理前再核对一次。任一不一致都整批保留并暂停：
+
+| 原因码 | 含义 |
+|---|---|
+| `token_changed` | 配置里的凭证与队列绑定的指纹不同，需要确认同源 |
+| `server_changed` | 配置里的服务地址与绑定不同，必须换新的 `stateDir` |
+| `binding_missing` | 队列有事件但没有绑定元数据，需要人工处理 |
+| `binding_changed` | 在途期间别的进程更新了 `bindingRevision`，本批保留 |
+
+换目录期间（`status().queueMoving = true`）暂停新采集并计 `skip_queue_moving`：
+不把事件写进即将废弃的旧库，也不压在内存里。切库要等上传与在途入队都结束；
+每个在途入队任务固定它开始时那个队列实例，重试不会落到新库。
+
+退出语义：`session_shutdown` 限时等待在途上报与在途入队。返回时可能仍有未落地的入队，
+这些事件已计 `enqueue_unflushed` 并在 stderr 记一行，退出后由 SQLite 回滚未提交事务；
+已提交事件原样保留。
 
 ## 6. 更换凭证（同一 source）
 
