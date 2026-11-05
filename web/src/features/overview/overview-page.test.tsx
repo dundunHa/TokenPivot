@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "@/test/render";
 import {
@@ -145,6 +145,10 @@ const defaultTrendCalls = (calls: URL[]) =>
         23 * 3_600_000,
   );
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe("overview page", () => {
   it("shows the four metrics from the server and queries with the URL timezone", async () => {
     const calls = useBackend();
@@ -283,6 +287,77 @@ describe("overview page", () => {
       await waitFor(() => expect(calls.length).toBeGreaterThan(before));
     } finally {
       Reflect.deleteProperty(document, "visibilityState");
+    }
+  });
+
+  it("keeps the numbers and charts on screen while a relative range rolls over to the next minute", async () => {
+    // 假定时器必须在渲染前装上，页面里的 10 秒定时器才会被它推进。
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    const calls = useBackend();
+    renderApp("/?tz=UTC");
+    expect((await screen.findByTestId("metric-total")).textContent).toContain(
+      "120",
+    );
+    await screen.findByRole("region", { name: "排名" });
+    const firstStart = defaultTrendCalls(calls)[0]?.searchParams.get("start");
+
+    // 下一分钟的查询（start 不同）一直不返回：旧数据必须继续显示，不能退回加载骨架。
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    server.use(
+      http.get(`${BASE}/usage/aggregate`, async () => {
+        await gate;
+        return HttpResponse.json({});
+      }),
+      http.get(`${BASE}/usage/rankings`, async () => {
+        await gate;
+        return HttpResponse.json({});
+      }),
+    );
+    try {
+      vi.setSystemTime(Date.now() + 61_000);
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      await act(() => new Promise<void>((resolve) => setTimeout(resolve, 80)));
+      // 新分钟的请求已发出（start 变了）但还没返回。
+      const starts = new Set(calls.map((c) => c.searchParams.get("start")));
+      expect(starts.size).toBeGreaterThan(1);
+      expect(firstStart).toBeTruthy();
+      expect(screen.getByTestId("metric-total").textContent).toContain("120");
+      expect(
+        screen
+          .queryAllByRole("status")
+          .map((e) => e.getAttribute("aria-label")),
+      ).toEqual([]);
+      const ranking = screen.getByRole("region", { name: "排名" });
+      expect(within(ranking).queryByRole("status")).toBeNull();
+    } finally {
+      release();
+    }
+  });
+
+  it("still shows the loading state when the filters change, not the previous result", async () => {
+    useBackend();
+    const user = userEvent.setup();
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("metric-total");
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    server.use(
+      http.get(`${BASE}/usage/aggregate`, async () => {
+        await gate;
+        return HttpResponse.json({});
+      }),
+    );
+    try {
+      await user.click(screen.getByRole("button", { name: "最近七天" }));
+      await screen.findByRole("status", { name: "趋势加载中" });
+      expect(screen.queryByTestId("metric-total")).toBeNull();
+    } finally {
+      release();
     }
   });
 
