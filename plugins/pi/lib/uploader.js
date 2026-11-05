@@ -41,6 +41,17 @@ const REJECTED_CODES = new Set([
 const RETRYABLE_CODES = new Set(['UNAVAILABLE', 'INTERNAL', 'DEADLINE_EXCEEDED'])
 const DEAD_OUTCOME = { conflict: 'conflict', expired: 'expired', rejected: 'rejected' }
 
+/**
+ * 长度按 Unicode code point 计：OpenAPI 的 128/512 是字符数，
+ * JS 的 .length 数 UTF-16 code unit（一个 emoji 算 2），会把合法值误判成超长。
+ * 截断的 surrogate 在 for...of 里各算一个码点，不抛异常。
+ */
+function codePointLength(value) {
+  let count = 0
+  for (const _codePoint of value) count += 1
+  return count
+}
+
 /** Retry-After：delta-seconds 或 HTTP-date，返回毫秒或 undefined。 */
 export function parseRetryAfter(value, now = Date.now()) {
   if (typeof value !== 'string' || value.trim() === '') return undefined
@@ -290,9 +301,11 @@ export class Uploader {
     if (WITHOUT_ERROR.has(status)) return result.error === undefined
     const error = result.error
     if (!error || typeof error !== 'object' || typeof error.code !== 'string') return false
-    // error.message 必填：1–512 字符，只供人读；缺了就不算可用的逐项结果。
+    // error.message 必填：1–512 个 Unicode 字符，只供人读；缺了就不算可用的逐项结果。
     const message = error.message
-    if (typeof message !== 'string' || message.length < 1 || message.length > 512) return false
+    if (typeof message !== 'string') return false
+    const messageLength = codePointLength(message)
+    if (messageLength < 1 || messageLength > 512) return false
     if (status === 'rejected') return REJECTED_CODES.has(error.code)
     if (status === 'retryable') return RETRYABLE_CODES.has(error.code)
     return false
@@ -307,7 +320,9 @@ export class Uploader {
   /** 响应信封：request_id 必填（1–128 字符），results 必填数组。 */
   validBody(body) {
     const requestId = body?.request_id
-    if (typeof requestId !== 'string' || requestId.length < 1 || requestId.length > 128) return false
+    if (typeof requestId !== 'string') return false
+    const length = codePointLength(requestId)
+    if (length < 1 || length > 128) return false
     return Array.isArray(body?.results)
   }
 

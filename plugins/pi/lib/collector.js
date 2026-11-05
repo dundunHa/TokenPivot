@@ -177,6 +177,8 @@ export class Collector {
    * 调用方需确保没有在途 flush（否则关库会让在途响应无处落地）。
    */
   swapQueue() {
+    // 读坏的配置没有可信目录：不能拿默认 stateDir 去换库（会关掉旧队列）。
+    if (this.configResult?.status !== 'ok') return false
     this.uploader?.stop()
     this.queue?.close()
     this.queue = null
@@ -335,14 +337,20 @@ export class Collector {
    * 显式构造参数优先；没给的就跟随配置文件，同目录下改配置也立即生效。
    */
   applyRuntimeConfig() {
-    const config = this.configResult?.config
+    // 只有解析成功的配置才谈参数生效；读坏时的默认值不是用户意图。
+    if (this.configResult?.status !== 'ok') return
+    const config = this.configResult.config
     if (!config) return
     if (this.flushDelayOption === null) this.flushDelayMs = config.flushDelayMs
     if (this.timeoutOption === null) {
       this.requestTimeoutMs = config.requestTimeoutMs
       if (this.uploader) this.uploader.timeoutMs = this.requestTimeoutMs
     }
-    if (this.maxItemsOption === null && this.queue) this.queue.maxItems = config.maxQueueItems
+    // 容量属于目录：切库尚未完成时，新目录的容量不能穿透到仍在用的旧队列。
+    if (this.maxItemsOption === null && this.queue && this.configResult?.status === 'ok' &&
+        this.queueDir === config.stateDir) {
+      this.queue.maxItems = config.maxQueueItems
+    }
   }
 
   /**
@@ -357,11 +365,11 @@ export class Collector {
     // 只有解析成功的配置才决定目录：读坏了（或没写地址）不能把队列挪去默认目录。
     const desiredDir = this.configResult?.status === 'ok' ? this.configResult.config.stateDir : null
     if (desiredDir && this.queueDir && desiredDir !== this.queueDir) this.swapPending = true
-    if (this.swapPending && desiredDir) {
+    if (this.swapPending && this.configResult?.status === 'ok' && desiredDir) {
       // 换库要等上传与在途入队都结束：旧库关掉时在途操作无处落地。
       if (!this.canSwapQueue()) return { state: 'deferred', reason: 'queue_busy' }
       if (!this.swapQueue()) return { state: 'blocked', reason: this.blocked }
-    } else if (!this.queue?.isOpen && this.configResult?.config) {
+    } else if (!this.swapPending && !this.queue?.isOpen && this.configResult?.config) {
       // 上次打开失败（损坏/权限/临时 IO）：每个检查周期重试同一目录，不要求重启 PI。
       this.blocked = null
       if (!this.openQueue()) return { state: 'blocked', reason: this.blocked }
@@ -437,7 +445,7 @@ export class Collector {
     // 有在途上报或入队时不换，也不往旧队列写——这期间暂停新采集并计数。
     const desiredDir = this.configResult?.status === 'ok' ? this.configResult.config.stateDir : null
     if (desiredDir && this.queueDir && desiredDir !== this.queueDir) this.swapPending = true
-    if (this.swapPending) {
+    if (this.swapPending && desiredDir) {
       if (!this.canSwapQueue()) {
         this.count('skip_queue_moving')
         return { skipped: 'queue_moving' }

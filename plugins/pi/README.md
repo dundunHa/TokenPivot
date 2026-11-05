@@ -62,6 +62,8 @@ PI 的扩展发现规则是「`extensions/*/package.json` 带 `pi.extensions` �
 - `flushDelayMs`：新事件入队后多久安排上报；之后到来的事件不会推后已排定的时间。
 - `requestTimeoutMs`：覆盖到响应体读完；响应头已到而正文卡住同样按超时处理。
 - `maxQueueItems`：只限制 `pending`；超出写 `overflow`，不删除、不自动清理。
+  容量属于目录：换目录尚未完成时新目录的容量不会作用于仍在用的旧队列，
+  换库完成后由新队列按新容量执行。
 
 环境变量（优先于配置文件，改了要重启 PI）：
 

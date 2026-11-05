@@ -975,3 +975,91 @@ test('配置读坏时不换目录：不会把队列挪去默认 stateDir', async
   assert.equal((await collector.pollConfig()).state, 'ready')
   assert.equal(collector.queueDir, before)
 })
+
+test('待切目录时配置读坏：保留旧队列零切换，配置恢复后正常切', async (t) => {
+  const ws = workspace(t)
+  const dirA = ws.stateDir
+  const dirB = path.join(ws.root, 'state-b')
+  writeConfig(ws)
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const { collector } = makeCollector(ws, {
+    fetch: async (_url, init) => {
+      await gate
+      return jsonResponse(200, acceptedFor(init))
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  const flushing = collector.runFlush()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  // 切目录已排定（在途），新的采集被暂停
+  writeConfig(ws, { stateDir: dirB })
+  assert.deepEqual(await collector.handleTurnEnd(turn({}, 'entry-2'), context()), { skipped: 'queue_moving' })
+  assert.equal(collector.swapPending, true)
+
+  // 此时配置读坏：不能拿默认目录去换库
+  fs.writeFileSync(ws.configPath, '{ not json')
+  assert.deepEqual(await collector.handleTurnEnd(turn({}, 'entry-3'), context()), { skipped: 'error' })
+  assert.equal(collector.queueDir, dirA)
+  assert.equal(collector.swapPending, true)
+  assert.deepEqual(pendingIds({ stateDir: dirA }), ['pi:msg:session-1:entry-1'])
+
+  // 配置恢复（仍指向 B）：在途结束后正常换库
+  writeConfig(ws, { stateDir: dirB })
+  release()
+  await flushing
+  assert.equal((await collector.pollConfig()).state, 'ready')
+  assert.equal(collector.queueDir, dirB)
+  assert.equal(collector.swapPending, false)
+})
+
+test('切库未完成时新容量不穿透旧队列；换库后新队列用新容量', async (t) => {
+  const ws = workspace(t)
+  const dirA = ws.stateDir
+  const dirB = path.join(ws.root, 'state-b')
+  writeConfig(ws, { maxQueueItems: 10 })
+  const { collector } = makeCollector(ws, {
+    collector: {
+      enqueueAttempts: 4,
+      enqueueRetryMs: 30,
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle),
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  assert.equal(collector.queue.maxItems, 10)
+
+  const raw = new DatabaseSync(path.join(ws.stateDir, QUEUE_FILE), { timeout: 0 })
+  raw.exec('BEGIN IMMEDIATE')
+  const pending = collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  await new Promise((resolve) => setTimeout(resolve, 15))
+
+  // 切到 B 并把上限调到 1：旧队列仍在用，容量不能被改
+  writeConfig(ws, { stateDir: dirB, maxQueueItems: 1 })
+  const polled = await collector.pollConfig()
+  assert.deepEqual(polled, { state: 'deferred', reason: 'queue_busy' })
+  assert.equal(collector.queueDir, dirA)
+  assert.equal(collector.queue.maxItems, 10)
+
+  raw.exec('COMMIT')
+  raw.close()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  // 在途事件按旧队列的容量入队：仍是 pending，不是 overflow
+  assert.equal((await pending).state, 'queued')
+  assert.deepEqual(collector.status().counts, { pending: 1, dead: 0, overflow: 0 })
+
+  const swapped = await collector.pollConfig()
+  assert.equal(swapped.state, 'ready')
+  assert.equal(collector.queueDir, dirB)
+  assert.equal(collector.queue.maxItems, 1)
+  assert.deepEqual(pendingIds({ stateDir: dirA }), ['pi:msg:session-1:entry-1'])
+
+  // 新队列按新容量 1 生效：第二条转 overflow
+  await collector.handleTurnEnd(turn({}, 'entry-2'), context())
+  await collector.handleTurnEnd(turn({}, 'entry-3'), context())
+  assert.deepEqual(collector.status().counts, { pending: 1, dead: 0, overflow: 1 })
+})

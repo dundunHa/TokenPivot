@@ -53,7 +53,9 @@ function resultsOf(...statuses) {
   return {
     request_id: 'req-1',
     results: statuses.map((entry, index) => (
-      typeof entry === 'string' ? { index, status: entry } : { index, status: entry.status, error: { code: entry.code } }
+      typeof entry === 'string'
+        ? { index, status: entry }
+        : { index, status: entry.status, error: { code: entry.code, message: 'test detail' } }
     )),
   }
 }
@@ -108,10 +110,13 @@ test('逐项混合结果：accepted/duplicate 出队，conflict 死信，retryab
 test('FUTURE_EVENT 是永久 rejected 里的例外：保留并退避，不写死信', async (t) => {
   const { queue } = setup(t)
   seed(queue, 1)
-  const { uploader } = makeUploader(queue, () => jsonResponse(200, resultsOf({ status: 'rejected', code: 'FUTURE_EVENT' })))
+  const { uploader, logs } = makeUploader(queue, () => jsonResponse(200, resultsOf({ status: 'rejected', code: 'FUTURE_EVENT' })))
 
   const outcome = await uploader.flush()
   assert.equal(outcome.state, 'backoff')
+  // 走的是「保留待重试」分支，不是畸形响应退避
+  assert.equal(logs.some((l) => l.code === 'upload_malformed'), false)
+  assert.equal(typeof outcome.delayMs, 'number')
   assert.deepEqual(queue.counts(), { pending: 1, dead: 0, overflow: 0 })
 })
 
@@ -466,4 +471,51 @@ test('响应必填字段缺失或非法按畸形整批保留：request_id 与 er
   }))
   await uploader.flush()
   assert.deepEqual(queue.counts(), { pending: 0, dead: 1, overflow: 0 })
+})
+
+test('长度按 Unicode 码点计：512 个 emoji 合法，513 个整批保留', async (t) => {
+  const emoji = '😀' // 1 个码点 / 2 个 UTF-16 code unit
+  const ok = setup(t)
+  seed(ok.queue, 1)
+  const okUploader = makeUploader(ok.queue, () => jsonResponse(200, {
+    request_id: emoji.repeat(128),
+    results: [{
+      index: 0,
+      status: 'rejected',
+      error: { code: 'USAGE_UNSUPPORTED', message: emoji.repeat(512) },
+    }],
+  }))
+  await okUploader.uploader.flush()
+  assert.deepEqual(ok.queue.counts(), { pending: 0, dead: 1, overflow: 0 })
+
+  const tooLong = [
+    { request_id: emoji.repeat(129), results: [{ index: 0, status: 'accepted' }] },
+    {
+      request_id: 'r',
+      results: [{
+        index: 0,
+        status: 'rejected',
+        error: { code: 'USAGE_UNSUPPORTED', message: emoji.repeat(513) },
+      }],
+    },
+  ]
+  for (const body of tooLong) {
+    const { queue } = setup(t)
+    seed(queue, 1)
+    const { uploader, logs } = makeUploader(queue, () => jsonResponse(200, body))
+    assert.equal((await uploader.flush()).state, 'backoff')
+    assert.deepEqual(queue.counts(), { pending: 1, dead: 0, overflow: 0 })
+    assert.equal(logs.some((l) => l.code === 'upload_malformed'), true)
+  }
+
+  // 截断的 surrogate 按码点各算一个，不抛异常，也不误判超长。
+  const lone = setup(t)
+  seed(lone.queue, 1)
+  const loneUploader = makeUploader(lone.queue, () => jsonResponse(200, {
+    request_id: '\uD800'.repeat(128),
+    results: [{ index: 0, status: 'accepted' }],
+  }))
+  const loneOutcome = await loneUploader.uploader.flush()
+  assert.notEqual(loneOutcome.state, 'backoff')
+  assert.deepEqual(lone.queue.counts(), { pending: 0, dead: 0, overflow: 0 })
 })
