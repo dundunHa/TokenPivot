@@ -1,0 +1,502 @@
+/**
+ * 生命周期验收（计划 §3、§7、§9.2/§9.5/§9.6）：采集→入队→上报、跳过计数、
+ * 压缩只计数、凭证轮换暂停与确认后补报、无新事件也能恢复、服务地址变化、
+ * 绑定缺失暂停、响应丢失后同 ID 重传、退出限时且不清空未确认事件、隐私断言。
+ */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { Collector, createLogger } from '../lib/collector.js'
+import { loadConfig, tokenFingerprint, normalizeServerUrl } from '../lib/config.js'
+import { SqliteQueue, QUEUE_FILE } from '../lib/queue.js'
+
+const TOKEN_A = 'tpk_token_a_0123456789'
+const TOKEN_B = 'tpk_token_b_9876543210'
+const PROJECT = '0199a0b0-0000-7000-8000-00000000000a'
+const START = Date.parse('2026-11-05T00:00:00.000Z')
+const SERVER = 'https://tokenpivot.example.com/api/v1/ingestion/events'
+
+function workspace(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tokenpivot-pi-life-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  return { root, stateDir: path.join(root, 'state'), configPath: path.join(root, 'config.json') }
+}
+
+function writeConfig(ws, over = {}) {
+  const body = {
+    serverUrl: 'https://tokenpivot.example.com',
+    token: TOKEN_A,
+    stateDir: ws.stateDir,
+    projects: [{ path: '/work/project-a', projectId: PROJECT }],
+    ...over,
+  }
+  fs.writeFileSync(ws.configPath, JSON.stringify(body))
+  fs.chmodSync(ws.configPath, 0o600)
+  return ws.configPath
+}
+
+function idleTimers() {
+  return {
+    setTimer: () => ({ unref() {} }),
+    clearTimer: () => {},
+    setInterval: () => ({ unref() {} }),
+    clearInterval: () => {},
+  }
+}
+
+function message(over = {}) {
+  return {
+    role: 'assistant',
+    provider: 'anthropic',
+    model: 'claude-x',
+    usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 120 },
+    stopReason: 'stop',
+    timestamp: START,
+    durationMs: 1200,
+    ...over,
+  }
+}
+
+function turn(over = {}, entryId = 'entry-1') {
+  return {
+    type: 'turn_end',
+    turnIndex: 0,
+    message: message(over),
+    messageEntryId: entryId,
+    toolResults: [],
+    entries: [],
+    continue: false,
+    context: {},
+    outcome: 'completed',
+  }
+}
+
+function context(sessionId = 'session-1', cwd = '/work/project-a/sub') {
+  return { cwd, sessionManager: { getSessionId: () => sessionId } }
+}
+
+function makeCollector(ws, overrides = {}) {
+  const logs = []
+  const calls = []
+  const collector = new Collector({
+    env: { TOKENPIVOT_PI_CONFIG: ws.configPath },
+    logger: { log: (code, data) => logs.push({ code, data }) },
+    fetch: (url, init) => {
+      calls.push({ url, init })
+      return overrides.fetch ? overrides.fetch(url, init) : jsonResponse(200, acceptedFor(init))
+    },
+    configPollMs: 1e9,
+    flushDelayMs: 0,
+    requestTimeoutMs: 200,
+    ...idleTimers(),
+    ...overrides.collector,
+  })
+  return { collector, logs, calls }
+}
+
+function jsonResponse(status, body) {
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+}
+
+function acceptedFor(init) {
+  const body = JSON.parse(init.body)
+  return {
+    request_id: 'req',
+    results: body.events.map((event, index) => ({ index, status: 'accepted', source_event_id: event.source_event_id })),
+  }
+}
+
+function pendingIds(ws) {
+  const queue = new SqliteQueue({ dir: ws.stateDir }).open()
+  try {
+    return queue.peek(1000).items.map((item) => item.id)
+  } finally {
+    queue.close()
+  }
+}
+
+test('配置齐备：turn_end 采集、入队、上报，字段与映射口径一致', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const { collector, calls } = makeCollector(ws)
+  t.after(() => collector.stop())
+  await collector.start()
+  assert.equal(collector.status().state, 'ok')
+
+  const result = await collector.handleTurnEnd(turn(), context())
+  assert.equal(result.state, 'queued')
+  assert.equal(collector.counters.queued, 1)
+
+  await collector.runFlush()
+  assert.equal(calls.length, 1)
+  const body = JSON.parse(calls[0].init.body)
+  assert.equal(body.events.length, 1)
+  const event = body.events[0]
+  assert.equal(event.source_event_id, 'pi:msg:session-1:entry-1')
+  assert.equal(event.project_id, PROJECT)
+  assert.equal(event.provider, 'anthropic')
+  assert.equal(event.model, 'claude-x')
+  assert.equal(event.occurred_at, '2026-11-05T00:00:01.200Z')
+  assert.deepEqual(event.usage.input_tokens, { value: 100, quality: 'known' })
+  assert.deepEqual(event.usage.total_tokens, { value: 120, quality: 'known' })
+  assert.equal(event.status, null)
+  assert.equal(event.duration_ms, 1200)
+  assert.equal(calls[0].init.headers.authorization, `Bearer ${TOKEN_A}`)
+  assert.deepEqual(collector.status().counts, { pending: 0, dead: 0, overflow: 0 })
+  // 队列清空后绑定必须保留
+  assert.equal(collector.queue.binding().serverUrl, SERVER)
+})
+
+test('跳过原因计数：非终态、缺耗时、非 assistant、压缩只计数', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const { collector, calls } = makeCollector(ws)
+  t.after(() => collector.stop())
+  await collector.start()
+
+  await collector.handleTurnEnd(turn({ stopReason: 'pending' }), context())
+  await collector.handleTurnEnd(turn({ stopReason: 'deferred' }), context())
+  const withoutDuration = message()
+  delete withoutDuration.durationMs
+  await collector.handleTurnEnd({ ...turn(), message: withoutDuration }, context())
+  await collector.handleTurnEnd({ ...turn(), message: message({ role: 'user' }) }, context())
+  collector.handleCompact()
+  collector.handleCompact()
+
+  assert.equal(collector.counters.skip_pending, 1)
+  assert.equal(collector.counters.skip_deferred, 1)
+  assert.equal(collector.counters.skip_no_duration, 1)
+  assert.equal(collector.counters.skip_not_assistant, 1)
+  assert.equal(collector.counters.compact_skipped, 2)
+  assert.equal((await collector.runFlush()).state, 'idle')
+  assert.equal(calls.length, 0)
+  assert.equal(collector.queue.counts().pending, 0)
+})
+
+test('凭证轮换：新 token 下不采集也不发送旧事件；确认后立即补报', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const first = makeCollector(ws)
+  await first.collector.start()
+  await first.collector.handleTurnEnd(turn(), context())
+  assert.equal(first.collector.queue.counts().pending, 1)
+  const frozenPayload = first.collector.queue.peek(10).items[0].payloadText
+  await first.collector.stop()
+  assert.deepEqual(pendingIds(ws), ['pi:msg:session-1:entry-1'])
+
+  // 换 token（B）重启：绑定仍是 A → 暂停
+  writeConfig(ws, { token: TOKEN_B })
+  const second = makeCollector(ws)
+  t.after(() => second.collector.stop())
+  await second.collector.start()
+  const queued = await second.collector.handleTurnEnd(turn(), context('session-2', '/work/project-a'))
+  assert.deepEqual(queued, { state: 'paused', reason: 'token_changed' })
+  assert.equal(second.collector.counters.paused_token_changed, 1)
+  assert.equal(second.collector.queue.counts().pending, 1)
+  assert.equal((await second.collector.runFlush()).state, 'paused')
+  assert.equal(second.calls.length, 0)
+
+  // 用户确认「新凭证仍属原 source」
+  const confirmed = await second.collector.confirmSameSource()
+  assert.equal(confirmed.ok, true)
+  assert.equal(second.collector.queue.binding().fingerprint, tokenFingerprint(TOKEN_B))
+
+  await second.collector.runFlush()
+  assert.equal(second.calls.length, 1)
+  assert.equal(second.calls[0].init.headers.authorization, `Bearer ${TOKEN_B}`)
+  assert.equal(second.collector.queue.counts().pending, 0)
+  // 配置/凭证变化不重算已入队事件：发出的字节与入队时冻结的 payload 完全一致。
+  const sent = JSON.parse(second.calls[0].init.body).events[0]
+  assert.deepEqual(sent, JSON.parse(frozenPayload))
+  // 换 token 后新事件照常采集
+  const next = await second.collector.handleTurnEnd(turn({}, 'entry-2'), context('session-2'))
+  assert.equal(next.state, 'queued')
+
+  // 旧进程（仍然持旧 token 的配置）在下一次操作检查时暂停，不会继续发旧队列。
+  writeConfig(ws, { token: TOKEN_A })
+  const stale = makeCollector(ws)
+  t.after(() => stale.collector.stop())
+  await stale.collector.start()
+  const staleResult = await stale.collector.handleTurnEnd(turn({}, 'entry-3'), context('session-3'))
+  assert.deepEqual(staleResult, { state: 'paused', reason: 'token_changed' })
+  assert.equal((await stale.collector.runFlush()).state, 'paused')
+  assert.equal(stale.calls.length, 0)
+})
+
+test('暂停后没有新事件也能恢复：配置回到已绑定凭证，配置检查唤醒 flush', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const first = makeCollector(ws)
+  await first.collector.start()
+  await first.collector.handleTurnEnd(turn(), context())
+  await first.collector.stop()
+
+  writeConfig(ws, { token: TOKEN_B })
+  const paused = makeCollector(ws)
+  await paused.collector.start()
+  assert.equal((await paused.collector.runFlush()).state, 'paused')
+  assert.equal(paused.calls.length, 0)
+
+  // 没有新 turn_end，只把配置改回原 token，然后做一次独立配置检查。
+  writeConfig(ws, { token: TOKEN_A })
+  const polled = await paused.collector.pollConfig()
+  assert.equal(polled.state, 'ready')
+  assert.equal(paused.collector.uploader.paused, false)
+  t.after(() => paused.collector.stop())
+
+  await paused.collector.runFlush()
+  assert.equal(paused.calls.length, 1)
+  assert.equal(paused.collector.queue.counts().pending, 0)
+})
+
+test('服务地址变化必须新 stateDir：不采集、不发送、绑定不被覆盖', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const first = makeCollector(ws)
+  await first.collector.start()
+  await first.collector.handleTurnEnd(turn(), context())
+  await first.collector.stop()
+
+  writeConfig(ws, { serverUrl: 'https://other.example.com' })
+  const other = makeCollector(ws)
+  t.after(() => other.collector.stop())
+  await other.collector.start()
+  const result = await other.collector.handleTurnEnd(turn({}, 'entry-2'), context('session-2'))
+  assert.deepEqual(result, { state: 'paused', reason: 'server_changed' })
+  assert.equal((await other.collector.runFlush()).state, 'paused')
+  assert.equal(other.calls.length, 0)
+  assert.equal(other.collector.queue.binding().serverUrl, SERVER)
+  assert.equal(other.collector.queue.counts().pending, 1)
+})
+
+test('绑定缺失但队列有事件：暂停并保留事件，不擅自重新绑定', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const first = makeCollector(ws)
+  await first.collector.start()
+  await first.collector.handleTurnEnd(turn(), context())
+  await first.collector.stop()
+
+  const raw = new DatabaseSync(path.join(ws.stateDir, QUEUE_FILE), { timeout: 0 })
+  raw.exec('DELETE FROM meta')
+  raw.close()
+
+  const second = makeCollector(ws)
+  t.after(() => second.collector.stop())
+  await second.collector.start()
+  assert.equal((await second.collector.runFlush()).state, 'paused')
+  assert.equal(second.collector.queue.binding(), null)
+  assert.equal(second.calls.length, 0)
+  assert.deepEqual(pendingIds(ws), ['pi:msg:session-1:entry-1'])
+})
+
+test('服务端已提交但响应丢失：重传同一 ID 与同一字节，不会产生第二条事件', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const seen = new Map()
+  const bodies = []
+  let attempt = 0
+  const { collector } = makeCollector(ws, {
+    fetch: (_url, init) => {
+      bodies.push(init.body)
+      attempt += 1
+      if (attempt === 1) throw new Error('socket hang up')
+      const body = JSON.parse(init.body)
+      for (const event of body.events) {
+        const count = seen.get(event.source_event_id) ?? 0
+        seen.set(event.source_event_id, count + 1)
+      }
+      return jsonResponse(200, acceptedFor(init))
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn(), context())
+
+  const first = await collector.runFlush()
+  assert.equal(first.state, 'backoff')
+  assert.equal(collector.queue.counts().pending, 1)
+
+  const second = await collector.runFlush()
+  assert.equal(second.state, 'idle')
+  assert.equal(collector.queue.counts().pending, 0)
+  assert.equal(bodies.length, 2)
+  assert.equal(bodies[0], bodies[1])
+  assert.deepEqual([...seen.entries()], [['pi:msg:session-1:entry-1', 1]])
+})
+
+test('断网补报：重启即发上一轮未确认事件；退出不清空；限时等待', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+
+  // 第一轮：服务端一直挂起，退出时取消网络请求，事件保留。
+  const hanging = makeCollector(ws, {
+    fetch: (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new Error('aborted')))
+    }),
+  })
+  await hanging.collector.start()
+  await hanging.collector.handleTurnEnd(turn(), context())
+  const inFlight = hanging.collector.runFlush()
+  const started = Date.now()
+  await hanging.collector.stop({ timeoutMs: 2000 })
+  await inFlight.catch(() => {})
+  assert.equal(Date.now() - started < 2000, true)
+  assert.deepEqual(pendingIds(ws), ['pi:msg:session-1:entry-1'])
+
+  // 第二轮：启动即补报，无需新的 turn_end。
+  const recovered = makeCollector(ws)
+  t.after(() => recovered.collector.stop())
+  await recovered.collector.start()
+  await recovered.collector.runFlush()
+  assert.equal(recovered.calls.length, 1)
+  assert.deepEqual(recovered.collector.status().counts, { pending: 0, dead: 0, overflow: 0 })
+})
+
+test('隐私：上报正文、日志与队列都不含 token、Prompt、路径或会话标题', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const stream = { lines: [], write(chunk) { this.lines.push(chunk) } }
+  const { collector, calls } = makeCollector(ws, {
+    collector: { logger: createLogger(stream) },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+
+  const secretPrompt = 'PRIVATE-PROMPT-不要上传'
+  const title = 'PRIVATE-SESSION-TITLE'
+  const ctx = context('session-1', '/work/project-a/sub')
+  const event = turn()
+  event.message.content = [{ type: 'text', text: secretPrompt }]
+  event.entries = [{ type: 'session_info', name: title }]
+  await collector.handleTurnEnd(event, ctx)
+  await collector.runFlush()
+
+  const posted = calls[0].init.body
+  for (const needle of [TOKEN_A, secretPrompt, title, '/work/project-a', 'PRIVATE']) {
+    assert.equal(posted.includes(needle), false, `请求正文不得包含 ${needle}`)
+  }
+  const logText = stream.lines.join('')
+  for (const needle of [TOKEN_A, tokenFingerprint(TOKEN_A), secretPrompt, title, '/work/project-a', ws.stateDir]) {
+    assert.equal(logText.includes(needle), false, `日志不得包含 ${needle}`)
+  }
+  // 事件键集合固定：不夹带任何额外字段
+  assert.deepEqual(Object.keys(JSON.parse(posted).events[0]).sort(), [
+    'duration_ms', 'model', 'occurred_at', 'project_id', 'provider', 'source_event_id', 'status', 'usage',
+  ])
+})
+
+test('配置文件权限不足时不启用，且不擅自 chmod', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  fs.chmodSync(ws.configPath, 0o644)
+  const { collector, calls } = makeCollector(ws)
+  t.after(() => collector.stop())
+  await collector.start()
+
+  assert.equal(collector.status().state, 'paused')
+  assert.equal(collector.status().reason, 'config_permissions')
+  await collector.handleTurnEnd(turn(), context())
+  assert.equal(collector.counters.skip_paused, 1)
+  assert.equal(calls.length, 0)
+  assert.equal(fs.statSync(ws.configPath).mode & 0o777, 0o644)
+})
+
+test('环境变量 token 优先于配置文件，且不要求配置文件里存凭证', (t) => {
+  const ws = workspace(t)
+  writeConfig(ws, { token: TOKEN_A })
+  const fromEnv = loadConfig({ env: { TOKENPIVOT_PI_CONFIG: ws.configPath, TOKENPIVOT_PI_TOKEN: TOKEN_B } })
+  assert.equal(fromEnv.status, 'ok')
+  assert.equal(fromEnv.config.token, TOKEN_B)
+  assert.equal(fromEnv.config.fingerprint, tokenFingerprint(TOKEN_B))
+
+  const withoutToken = loadConfig({ env: { TOKENPIVOT_PI_CONFIG: ws.configPath, TOKENPIVOT_PI_TOKEN: '  ' } })
+  assert.equal(withoutToken.status, 'ok')
+  assert.equal(withoutToken.config.token, TOKEN_A)
+})
+
+test('服务地址校验收紧：仅 https（回环可 http）、拒绝 userinfo 与查询串、强制接口路径', (t) => {
+  assert.equal(normalizeServerUrl('http://tokenpivot.example.com').error, 'server_url_scheme')
+  assert.equal(normalizeServerUrl('http://127.0.0.1:8080').endpoint, 'http://127.0.0.1:8080/api/v1/ingestion/events')
+  assert.equal(normalizeServerUrl('http://localhost:3000/base/').endpoint, 'http://localhost:3000/base/api/v1/ingestion/events')
+  assert.equal(normalizeServerUrl('https://u:p@host.example.com').error, 'server_url_userinfo')
+  assert.equal(normalizeServerUrl('https://host.example.com?tenant=1').error, 'server_url_query')
+  assert.equal(
+    normalizeServerUrl('https://host.example.com/api/v1/ingestion/events').endpoint,
+    'https://host.example.com/api/v1/ingestion/events',
+  )
+  assert.equal(normalizeServerUrl('').error, 'server_url_missing')
+
+  const ws = workspace(t)
+  writeConfig(ws, { serverUrl: 'ftp://host.example.com' })
+  assert.equal(loadConfig({ env: { TOKENPIVOT_PI_CONFIG: ws.configPath } }).reason, 'server_url_scheme')
+})
+
+test('持锁时入队按异步退避重试，耗尽后明确记为未采集（不同步阻塞 PI）', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  const { collector } = makeCollector(ws, {
+    collector: {
+      enqueueAttempts: 2,
+      enqueueRetryMs: 5,
+      // 这里要真的 await 异步退避，所以用真实定时器而不是 idleTimers。
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle),
+    },
+  })
+  await collector.start()
+  t.after(() => collector.stop())
+
+  const raw = new DatabaseSync(path.join(ws.stateDir, QUEUE_FILE), { timeout: 0 })
+  raw.exec('BEGIN IMMEDIATE')
+  const started = Date.now()
+  try {
+    const result = await collector.handleTurnEnd(turn(), context())
+    assert.equal(result.state, 'failed')
+    assert.equal(result.reason, 'busy')
+    // 异步退避，不是长同步等待：总耗时应远小于请求超时。
+    assert.equal(Date.now() - started < 1000, true)
+    assert.equal(collector.counters.queue_busy, 2)
+    assert.equal(collector.counters.queue_failed, 1)
+    assert.equal(collector.queue.counts().pending, 0)
+  } finally {
+    raw.exec('ROLLBACK')
+    raw.close()
+  }
+})
+
+test('响应确认前再对比绑定与配置：在途期间配置被改则保留事件，不落结果', async (t) => {
+  const ws = workspace(t)
+  writeConfig(ws)
+  let collector
+  let firstAttempt = true
+  const built = makeCollector(ws, {
+    fetch: async (_url, init) => {
+      if (firstAttempt) {
+        firstAttempt = false
+        // 请求在途时配置检查跑了一次，服务地址已被改成另一个地址。
+        writeConfig(ws, { serverUrl: 'https://other.example.com' })
+        await collector.pollConfig()
+      }
+      return jsonResponse(200, acceptedFor(init))
+    },
+  })
+  collector = built.collector
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn(), context())
+
+  const outcome = await collector.runFlush()
+  assert.equal(outcome.state, 'backoff')
+  assert.equal(collector.queue.counts().pending, 1)
+  assert.equal(built.logs.some((l) => l.code === 'upload_binding_changed'), true)
+
+  // 配置改回原服务地址后重传同一 ID，服务端幂等。
+  writeConfig(ws)
+  await collector.pollConfig()
+  await collector.runFlush()
+  assert.equal(collector.queue.counts().pending, 0)
+})
