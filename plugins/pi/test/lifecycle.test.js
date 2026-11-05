@@ -1063,3 +1063,104 @@ test('切库未完成时新容量不穿透旧队列；换库后新队列用新�
   await collector.handleTurnEnd(turn({}, 'entry-3'), context())
   assert.deepEqual(collector.status().counts, { pending: 1, dead: 0, overflow: 1 })
 })
+
+test('待切目录期间不再拉旧队列的下一批；切换后新队列继续上报', async (t) => {
+  const ws = workspace(t)
+  const dirB = path.join(ws.root, 'state-b')
+  writeConfig(ws)
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const batches = []
+  const { collector } = makeCollector(ws, {
+    collector: { uploaderOptions: { batchSize: 1 } },
+    fetch: async (_url, init) => {
+      const body = JSON.parse(init.body)
+      batches.push(body.events.map((event) => event.source_event_id))
+      if (batches.length === 1) await gate
+      return jsonResponse(200, acceptedFor(init))
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  await collector.handleTurnEnd(turn({}, 'entry-2'), context())
+  assert.deepEqual(collector.status().counts, { pending: 2, dead: 0, overflow: 0 })
+
+  const flushing = collector.runFlush()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(batches.length, 1)
+
+  writeConfig(ws, { stateDir: dirB })
+  assert.deepEqual(await collector.pollConfig(), { state: 'deferred', reason: 'queue_busy' })
+  assert.equal(collector.swapPending, true)
+
+  release()
+  const outcome = await flushing
+  // 第二批没有被拉走：drain 在批次边界停手，旧队列还剩 1 条
+  assert.equal(outcome.state, 'deferred')
+  assert.equal(batches.length, 1)
+  assert.deepEqual(collector.status().counts, { pending: 1, dead: 0, overflow: 0 })
+
+  // 在途结束后配置检查完成切换，新队列继续上报
+  assert.equal((await collector.pollConfig()).state, 'ready')
+  assert.equal(collector.queueDir, dirB)
+  await collector.handleTurnEnd(turn({}, 'entry-3'), context())
+  await collector.runFlush()
+  assert.equal(batches.length, 2)
+  assert.deepEqual(batches[1], ['pi:msg:session-1:entry-3'])
+  assert.deepEqual(pendingIds({ stateDir: dirB }), [])
+})
+
+test('目录 A→B→A 往返不清掉 A 的 HTTP 暂停：同身份不再发请求', async (t) => {
+  const ws = workspace(t)
+  const dirA = ws.stateDir
+  const dirB = path.join(ws.root, 'state-b')
+  writeConfig(ws)
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  let calls = 0
+  const { collector } = makeCollector(ws, {
+    collector: { uploaderOptions: { batchSize: 1 } },
+    fetch: async (_url, init) => {
+      calls += 1
+      if (calls === 1) {
+        await gate
+        return jsonResponse(401, { error: { code: 'INVALID_ARGUMENT', message: 'expired' } })
+      }
+      return jsonResponse(200, acceptedFor(init))
+    },
+  })
+  t.after(() => collector.stop())
+  await collector.start()
+  await collector.handleTurnEnd(turn({}, 'entry-1'), context())
+  const flushing = collector.runFlush()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  // 在途时切 B，再切回 A
+  writeConfig(ws, { stateDir: dirB })
+  assert.deepEqual(await collector.pollConfig(), { state: 'deferred', reason: 'queue_busy' })
+  writeConfig(ws)
+  release()
+  await flushing
+  assert.equal(collector.uploader.paused, true)
+  assert.equal(collector.uploader.pauseReason, 'http_401')
+
+  // 目录回到 A：只取消待切换，保留 HTTP 暂停，不重开队列、不再发请求
+  assert.equal((await collector.pollConfig()).state, 'ready')
+  assert.equal(collector.queueDir, dirA)
+  assert.equal(collector.swapPending, false)
+  assert.equal(collector.uploader.paused, true)
+  assert.equal(collector.uploader.pauseReason, 'http_401')
+  assert.equal(calls, 1)
+  assert.equal(collector.queue.counts().pending, 1)
+
+  // 只有凭证身份真的变了（换 B 并确认同源）才解除
+  writeConfig(ws, { token: TOKEN_B })
+  await collector.pollConfig()
+  assert.equal(collector.uploader.pauseReason, 'token_changed')
+  assert.equal((await collector.confirmSameSource()).ok, true)
+  assert.equal(collector.uploader.paused, false)
+  await collector.runFlush()
+  assert.equal(calls, 2)
+  assert.equal(collector.queue.counts().pending, 0)
+})

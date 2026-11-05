@@ -87,6 +87,8 @@ export class Uploader {
     this.now = options.now ?? Date.now
     this.random = options.random ?? Math.random
     this.limit = this.batchSize
+    // 换库在途时由 collector 叫停：不再从旧队列拉新批次。
+    this.shouldContinueBatch = options.shouldContinueBatch ?? (() => true)
     this.failures = 0
     this.paused = false
     this.pauseReason = null
@@ -162,6 +164,8 @@ export class Uploader {
 
     while (!this.stopped) {
       if (this.paused) return { state: 'paused', reason: this.pauseReason }
+      // 目录正在切换：本批之后停手，剩下的交给切换后的新队列，不在旧库上继续发。
+      if (!this.shouldContinueBatch()) return { state: 'deferred', reason: 'queue_moving' }
       // 每批都重新读一次：在途期间凭证被轮换，后续批次不得沿用旧凭证。
       // 每批都重新读：配置与绑定在同一次读取里核对，不一致时 getIdentity() 返回 null。
       const identity = this.getIdentity()

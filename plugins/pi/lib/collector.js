@@ -89,6 +89,8 @@ export class Collector {
     this.queueDir = null
     /** 换库已排定但还没完成：期间新事件不入旧库。 */
     this.swapPending = false
+    /** 被在途上报挡住的换库：安排一次尽快执行的配置检查。 */
+    this.pollSoonTimer = null
     /** 当前配置与绑定不一致的原因码（发送前核对时给出）。 */
     this.identityIssue = null
     /** HTTP 4xx 暂停的状态与当时的身份；与「配置暂不可用」分离保存。 */
@@ -152,6 +154,8 @@ export class Collector {
         isIdentityCurrent: (snapshot) => this.isIdentityCurrent(snapshot),
         fetch: this.options.fetch,
         logger: this.logger,
+        // 换库在途时不拉旧队列的下一批：批次边界停手，等切换完成再由新队列调度。
+        shouldContinueBatch: () => !this.swapPending,
         timeoutMs: this.requestTimeoutMs,
         // timeoutMs 由 applyRuntimeConfig 跟随配置更新；这里给的是初始值。
         now: this.now,
@@ -179,6 +183,11 @@ export class Collector {
   swapQueue() {
     // 读坏的配置没有可信目录：不能拿默认 stateDir 去换库（会关掉旧队列）。
     if (this.configResult?.status !== 'ok') return false
+    // A→B→A 的往返：目录没变就不重开队列、不清 HTTP 暂停，只取消待切换。
+    if (this.queueDir && this.configResult.config.stateDir === this.queueDir) {
+      this.swapPending = false
+      return true
+    }
     this.uploader?.stop()
     this.queue?.close()
     this.queue = null
@@ -308,6 +317,16 @@ export class Collector {
     }
     this.uploader.resume()
     return true
+  }
+
+  /** 在途上报挡住换库时，安排一次尽快执行的配置检查。 */
+  nudgeConfigCheck() {
+    if (this.stopped || this.pollSoonTimer) return
+    this.pollSoonTimer = this.setTimer(() => {
+      this.pollSoonTimer = null
+      this.pollConfig().catch(() => {})
+    }, 0)
+    this.pollSoonTimer?.unref?.()
   }
 
   /** 换库前提：没有在途上报，也没有在途入队。 */
@@ -624,7 +643,10 @@ export class Collector {
       this.logger.log('flush_failed', { reason: 'internal' })
       return this.uploader.backoff()
     }
-    if (outcome.state === 'backoff') this.schedule(outcome.delayMs)
+    if (outcome.state === 'deferred') {
+      // 换库被在途上报挡住：尽快做一次配置检查把切换推进去，不重复上报。
+      this.nudgeConfigCheck()
+    } else if (outcome.state === 'backoff') this.schedule(outcome.delayMs)
     else if (outcome.state === 'paused') {
       this.count('upload_paused')
       this.pauseUploader(outcome.reason)
@@ -674,6 +696,8 @@ export class Collector {
     if (this.timer) this.clearTimer(this.timer)
     this.timer = null
     this.timerDue = Infinity
+    if (this.pollSoonTimer) this.clearTimer(this.pollSoonTimer)
+    this.pollSoonTimer = null
     if (this.pollTimer) this.clearInterval(this.pollTimer)
     this.pollTimer = null
     this.uploader?.stop()
