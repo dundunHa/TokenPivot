@@ -8,6 +8,12 @@ import {
   type OverviewFilters,
   type RangePreset,
 } from "./overviewFilters";
+import {
+  REFRESH_CHOICES,
+  refreshLabel,
+  setRefreshMs,
+  useRefreshMs,
+} from "./refreshInterval";
 
 const PRESETS: { id: RangePreset; label: string }[] = [
   { id: "1h", label: "最近一小时" },
@@ -111,6 +117,7 @@ export function OverviewFilterBar({
   const [draftStart, setDraftStart] = useState(filters.start ?? "");
   const [draftEnd, setDraftEnd] = useState(filters.end ?? "");
   const [customError, setCustomError] = useState<string | null>(null);
+  const refreshMs = useRefreshMs();
 
   const names = new Map(projectOptions.map((o) => [o.value, o.label]));
   const chips: { key: string; text: string; remove: () => void }[] = [
@@ -189,6 +196,26 @@ export function OverviewFilterBar({
                   onClick={() => onChange({ ...filters, granularity: g })}
                 >
                   {GRAN_LABEL[g]}
+                </button>
+              ))}
+            </div>
+            <div
+              role="group"
+              aria-label="刷新间隔"
+              className="geek-segmented geek-segmented-labeled"
+            >
+              <span className="geek-segmented-label" aria-hidden="true">
+                刷新
+              </span>
+              {REFRESH_CHOICES.map((ms) => (
+                <button
+                  key={ms}
+                  type="button"
+                  className="geek-ranking-tab"
+                  aria-pressed={refreshMs === ms}
+                  onClick={() => setRefreshMs(ms)}
+                >
+                  {refreshLabel(ms)}
                 </button>
               ))}
             </div>

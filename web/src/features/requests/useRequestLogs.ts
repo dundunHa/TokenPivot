@@ -59,10 +59,14 @@ export function useRequestEvents(
 }
 
 /** 生成速度始终轮询（滚动 60 秒窗口 + 最近 60 分钟序列），与明细翻页无关；隐藏页由 Query 默认暂停。 */
-export function useSpeed(scope: QueryScope, filters: OverviewFilters) {
+export function useSpeed(
+  scope: QueryScope,
+  filters: OverviewFilters,
+  intervalMs: number = POLL_MS,
+) {
   return useQuery({
     ...speedQuery(scope, filters),
-    refetchInterval: POLL_MS,
+    refetchInterval: intervalMs,
     refetchOnWindowFocus: "always",
   });
 }
@@ -75,11 +79,12 @@ export function useModelSpeeds(
   scope: QueryScope,
   filters: OverviewFilters,
   models: string[],
+  intervalMs: number = POLL_MS,
 ) {
   return useQueries({
     queries: models.map((model) => ({
       ...speedQuery(scope, { ...filters, models: [model] }),
-      refetchInterval: POLL_MS,
+      refetchInterval: intervalMs,
       refetchOnWindowFocus: "always" as const,
     })),
   });

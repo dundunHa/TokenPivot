@@ -14,6 +14,7 @@ import {
   type RankingDimension,
   type RankingsData,
 } from "./overviewApi";
+import { useRefreshMs } from "./refreshInterval";
 import { aggregateParams, rankingsParams } from "./overviewApi";
 import {
   resolveRange,
@@ -21,10 +22,7 @@ import {
   type ResolvedRange,
 } from "./overviewFilters";
 
-/** 页面可见时的刷新间隔；隐藏页不轮询（refetchIntervalInBackground 默认 false）。 */
-export const REFRESH_MS = 1_000;
-
-/** 近 7 天活跃热力图的刷新间隔；节律变化缓慢，不需要跟随页面的高频刷新。 */
+/** 近 7 天活跃热力图的刷新间隔；节律变化缓慢，不跟随页面选择的刷新间隔。 */
 export const HEATMAP_REFRESH_MS = 60_000;
 
 /**
@@ -163,9 +161,10 @@ export function useAggregate(
   filters: OverviewFilters,
   range: ResolvedRange,
 ) {
+  const refreshMs = useRefreshMs();
   return useQuery({
     ...aggregateQuery(scope, filters, range),
-    refetchInterval: REFRESH_MS,
+    refetchInterval: refreshMs,
     // 共享 staleTime 为 Infinity；"always" 使固定范围从隐藏恢复可见时也立即刷新。
     refetchOnWindowFocus: "always",
   });
@@ -179,10 +178,11 @@ export function useRankings(
   groupBy: RankingDimension,
   cursor: string | null,
 ) {
+  const refreshMs = useRefreshMs();
   const tail = cursor !== null;
   return useQuery({
     ...rankingsQuery(scope, filters, range, groupBy, cursor),
-    refetchInterval: tail ? false : REFRESH_MS,
+    refetchInterval: tail ? false : refreshMs,
     refetchOnWindowFocus: tail ? false : "always",
   });
 }
@@ -198,6 +198,7 @@ export function usePreviousTotals(
   range: ResolvedRange,
   nowMs: number,
 ) {
+  const refreshMs = useRefreshMs();
   const length = (range.endMs ?? nowMs) - range.startMs;
   const previous: ResolvedRange = {
     startMs: range.startMs - length,
@@ -207,7 +208,7 @@ export function usePreviousTotals(
     ...aggregateQuery(scope, { ...filters, granularity: "day" }, previous),
     enabled: length > 0,
     retry: false,
-    refetchInterval: REFRESH_MS,
+    refetchInterval: refreshMs,
   });
 }
 
@@ -219,6 +220,7 @@ export function useGroupSeries(
   dimension: "model" | "provider",
   keys: string[],
 ) {
+  const refreshMs = useRefreshMs();
   const client = useQueryClient();
   return useQueries({
     queries: keys.map((key) => {
@@ -236,7 +238,7 @@ export function useGroupSeries(
         // 新观察者没有“上一份结果”，改从缓存取上一分钟的同条件数据，避免整张趋势图闪回骨架。
         placeholderData: () =>
           cachedSibling<AggregateData>(client, options.queryKey, filters.range),
-        refetchInterval: REFRESH_MS,
+        refetchInterval: refreshMs,
       };
     }),
   });
