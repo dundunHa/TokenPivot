@@ -187,8 +187,22 @@ export function useRankings(
   });
 }
 
-export function useProjects(scope: QueryScope) {
-  return useQuery(projectsQuery(scope));
+/** 项目列表缺省刷新间隔：插件上报会自动建项目，页面打开后才出现的项目要能补上名称。 */
+export const PROJECTS_REFRESH_MS = 10_000;
+
+/**
+ * 项目列表随页面轮询（共享 staleTime 为 Infinity，不轮询就永远是首次加载的快照，
+ * 之后新建的项目会在排名里显示成裸 UUID）。
+ */
+export function useProjects(
+  scope: QueryScope,
+  intervalMs: number = PROJECTS_REFRESH_MS,
+) {
+  return useQuery({
+    ...projectsQuery(scope),
+    refetchInterval: intervalMs,
+    refetchOnWindowFocus: "always",
+  });
 }
 
 /** 上一周期（同长度、紧邻当前起点之前）的总量，用于环比；失败时调用方不展示环比。 */
