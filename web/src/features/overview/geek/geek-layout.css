@@ -50,6 +50,15 @@
 .geek-segmented {
   display: inline-flex;
 }
+.geek-segmented-labeled {
+  align-items: center;
+}
+.geek-segmented-label {
+  margin-right: 8px;
+  font-family: var(--geek-mono);
+  font-size: 12px;
+  color: var(--geek-text-dim);
+}
 .geek-ranking-tab {
   background: transparent;
   border: 1px solid var(--geek-border-light);

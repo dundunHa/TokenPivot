@@ -17,14 +17,17 @@ export function SpeedTrend({
   scope,
   filters,
   range,
+  intervalMs,
 }: {
   scope: QueryScope;
   filters: OverviewFilters;
   range: ResolvedRange;
+  /** 轮询间隔（毫秒）；缺省沿用请求页的 5 秒。 */
+  intervalMs?: number;
 }) {
   const { models } = useTopModels(scope, filters, range);
-  const total = useSpeed(scope, filters);
-  const perModel = useModelSpeeds(scope, filters, models);
+  const total = useSpeed(scope, filters, intervalMs);
+  const perModel = useModelSpeeds(scope, filters, models, intervalMs);
 
   const inputs: SpeedInput[] = [
     {

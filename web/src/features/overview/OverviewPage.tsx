@@ -30,6 +30,7 @@ import {
   useProjects,
   type QueryScope,
 } from "./overviewQueries";
+import { useRefreshMs } from "./refreshInterval";
 import { buildTrend } from "./overviewView";
 
 const TICK_MS = 10_000;
@@ -168,6 +169,7 @@ function OverviewContent({
   update: (next: OverviewFilters) => void;
 }) {
   const now = useMinuteNow();
+  const refreshMs = useRefreshMs();
   const range = useMemo(() => resolveRange(filters, now), [filters, now]);
   const aggregate = useAggregate(scope, filters, range);
   const options = useUsageOptions(scope.userId, scope.workspaceId);
@@ -218,8 +220,13 @@ function OverviewContent({
           data={data}
           previous={previous.data?.totals}
           rate={
-            <SpeedKpi scope={scope} filters={filters}>
-              <ModelSpeedList scope={scope} filters={filters} range={range} />
+            <SpeedKpi scope={scope} filters={filters} intervalMs={refreshMs}>
+              <ModelSpeedList
+                scope={scope}
+                filters={filters}
+                range={range}
+                intervalMs={refreshMs}
+              />
             </SpeedKpi>
           }
         />
@@ -265,7 +272,12 @@ function OverviewContent({
       </div>
 
       <div className="geek-split">
-        <SpeedTrend scope={scope} filters={filters} range={range} />
+        <SpeedTrend
+          scope={scope}
+          filters={filters}
+          range={range}
+          intervalMs={refreshMs}
+        />
         {data ? <GeekComposition data={data} /> : null}
       </div>
 

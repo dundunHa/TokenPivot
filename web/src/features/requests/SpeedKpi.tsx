@@ -13,13 +13,16 @@ export function SpeedKpi({
   scope,
   filters,
   children,
+  intervalMs,
 }: {
   scope: QueryScope;
   filters: OverviewFilters;
+  /** 轮询间隔（毫秒）；缺省沿用请求页的 5 秒。 */
+  intervalMs?: number;
   /** 总体速度下方的补充内容（总览页放各模型速度）。 */
   children?: ReactNode;
 }) {
-  const speed = useSpeed(scope, filters);
+  const speed = useSpeed(scope, filters, intervalMs);
   const timezone = filters.timezone;
   return (
     <GeekKpiShell label="生成速度">

@@ -13,13 +13,16 @@ export function ModelSpeedList({
   scope,
   filters,
   range,
+  intervalMs,
 }: {
   scope: QueryScope;
   filters: OverviewFilters;
   range: ResolvedRange;
+  /** 轮询间隔（毫秒）；缺省沿用请求页的 5 秒。 */
+  intervalMs?: number;
 }) {
   const { models, isPending, isError } = useTopModels(scope, filters, range);
-  const results = useModelSpeeds(scope, filters, models);
+  const results = useModelSpeeds(scope, filters, models, intervalMs);
 
   const rows = models
     .map((model, i) => {
