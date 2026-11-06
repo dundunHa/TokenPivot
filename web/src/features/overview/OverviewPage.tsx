@@ -173,7 +173,7 @@ function OverviewContent({
   const range = useMemo(() => resolveRange(filters, now), [filters, now]);
   const aggregate = useAggregate(scope, filters, range);
   const options = useUsageOptions(scope.userId, scope.workspaceId);
-  const projects = useProjects(scope);
+  const projects = useProjects(scope, refreshMs);
 
   const projectNames = useMemo(
     () => new Map((projects.data ?? []).map((p) => [p.projectId, p.name])),
