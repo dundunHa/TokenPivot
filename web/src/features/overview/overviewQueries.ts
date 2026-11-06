@@ -22,7 +22,10 @@ import {
 } from "./overviewFilters";
 
 /** 页面可见时的刷新间隔；隐藏页不轮询（refetchIntervalInBackground 默认 false）。 */
-export const REFRESH_MS = 10_000;
+export const REFRESH_MS = 1_000;
+
+/** 近 7 天活跃热力图的刷新间隔；节律变化缓慢，不需要跟随页面的高频刷新。 */
+export const HEATMAP_REFRESH_MS = 60_000;
 
 /**
  * 业务查询键不以 "auth" 开头；meta.userId 标明发起身份，供身份清理识别。
@@ -257,7 +260,7 @@ export function useWeekActivity(
   };
   return useQuery({
     ...aggregateQuery(scope, weekFilters, resolveRange(weekFilters, nowMs)),
-    refetchInterval: REFRESH_MS * 6,
+    refetchInterval: HEATMAP_REFRESH_MS,
     retry: false,
   });
 }
