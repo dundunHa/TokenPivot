@@ -26,7 +26,11 @@ const stats = (extra?: {
   reasoning_tokens: metric(extra?.reasoning ?? null),
 });
 
-function useBackend(extra?: Parameters<typeof stats>[0]) {
+function useBackend(
+  extra?: Parameters<typeof stats>[0],
+  /** 按模型的排行统计覆盖；缺省沿用同一份总量。 */
+  byModel?: Record<string, Parameters<typeof stats>[0]>,
+) {
   const speedModels: (string | null)[] = [];
   const aggregateGran: (string | null)[] = [];
   server.use(
@@ -122,7 +126,7 @@ function useBackend(extra?: Parameters<typeof stats>[0]) {
               ? { provider: "anthropic", model }
               : { provider: "anthropic", model },
           share: i === 0 ? 0.6 : 0.4,
-          stats: stats(extra),
+          stats: stats(byModel?.[model] ?? extra),
         })),
         other: null,
         next_cursor: null,
@@ -133,15 +137,29 @@ function useBackend(extra?: Parameters<typeof stats>[0]) {
 }
 
 describe("overview panels", () => {
-  it("shows cache hit rate and the cache / reasoning subsets", async () => {
-    useBackend({ cacheRead: "600", cacheWrite: "100", reasoning: "50" });
-    renderApp("/?tz=UTC");
-    expect((await screen.findByTestId("cache-hit")).textContent).toBe("60%");
-    expect(screen.getByTestId("comp-cache-read").textContent).toContain(
-      "占输入 60%",
+  it("shows cache read / write hit rate per model and the cache / reasoning subsets", async () => {
+    useBackend(
+      { cacheRead: "600", cacheWrite: "100", reasoning: "50" },
+      {
+        m1: { cacheRead: "600", cacheWrite: "100" },
+        m2: { cacheRead: "200", cacheWrite: "250" },
+      },
     );
-    expect(screen.getByTestId("comp-cache-write").textContent).toContain(
-      "占输入 10%",
+    renderApp("/?tz=UTC");
+    await waitFor(() =>
+      expect(
+        screen.getAllByTestId("cache-hit").map((r) => r.textContent),
+      ).toEqual([
+        expect.stringMatching(/m1.*读取 60%.*写入 10%/),
+        expect.stringMatching(/m2.*读取 20%.*写入 25%/),
+      ]),
+    );
+    // 缓存读取 / 写入只留总量，不再展示总体平均命中率。
+    expect(screen.getByTestId("comp-cache-read").textContent).not.toContain(
+      "占输入",
+    );
+    expect(screen.getByTestId("comp-cache-write").textContent).not.toContain(
+      "占输入",
     );
     expect(screen.getByTestId("comp-reasoning").textContent).toContain(
       "占输出 10%",

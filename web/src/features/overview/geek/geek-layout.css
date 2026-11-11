@@ -627,6 +627,21 @@
   font-weight: 300;
   color: var(--geek-amber);
 }
+/* 按模型命中率：与下方子集列表分开，避免与总量口径混淆 */
+.geek-comp-models {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.geek-comp-note {
+  margin: 0;
+  font-size: 12px;
+}
+.geek-comp-row b {
+  margin-right: 4px;
+  font-weight: 500;
+  color: var(--geek-amber);
+}
 .geek-comp-list {
   display: flex;
   flex-direction: column;
