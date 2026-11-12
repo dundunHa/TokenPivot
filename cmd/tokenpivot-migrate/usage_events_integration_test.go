@@ -797,30 +797,31 @@ func TestUsageEvents(t *testing.T) {
 }
 
 const (
-	generationMetricsVersion = 8
-	beforeGenerationMetrics  = sourceArchivalVersion
+	generationMetricsVersion = 9
+	beforeGenerationMetrics  = 8
 )
 
-// TestGenerationMetricsMigration pins the 00008 upgrade and rollback so later
+// TestGenerationMetricsMigration pins the 00009 upgrade and rollback so later
 // migrations cannot silently change them: the two nullable raw millisecond columns
 // arrive with no default, existing rows keep NULL instead of a backfill, no index or
-// grant changes, and down removes only those two columns.
+// grant changes, and down removes only those two columns while the 00008 Feishu
+// objects stay applied.
 func TestGenerationMetricsMigration(t *testing.T) {
 	migrationURL, _ := integrationSchema(t)
 	p, db := testProvider(t, migrationURL, migrations.Files)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if _, err := p.UpTo(ctx, beforeGenerationMetrics); err != nil {
-		t.Fatal(database.SafeError("up to 7", err))
+		t.Fatal(database.SafeError("up to 8", err))
 	}
-	// Seed a row with the column set that existed before 00008, so the upgrade has real
+	// Seed a row with the column set that existed before 00009, so the upgrade has real
 	// history to leave alone.
 	old := syntheticUsageEvent(t)
 	if _, err := db.ExecContext(ctx, "INSERT INTO usage_events (workspace_id, source_id, source_event_id, provider, model, occurred_at, received_at, normalization_version, payload_hash, input_tokens, input_tokens_quality, output_tokens, output_tokens_quality, total_tokens, total_tokens_quality, cache_read_tokens_quality, cache_write_tokens_quality, reasoning_tokens_quality, status, duration_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)", old.workspaceID, old.sourceID, old.sourceEventID, old.provider, old.model, old.occurredAt, old.receivedAt, old.normalizationVersion, old.payloadHash, old.input.value, old.input.quality, old.output.value, old.output.quality, old.total.value, old.total.quality, old.cacheRead.quality, old.cacheWrite.quality, old.reasoning.quality, old.status, old.durationMS); err != nil {
-		t.Fatal(database.SafeError("seed pre-00008 row", err))
+		t.Fatal(database.SafeError("seed pre-00009 row", err))
 	}
 	if _, err := p.UpTo(ctx, generationMetricsVersion); err != nil {
-		t.Fatal(database.SafeError("up to 8", err))
+		t.Fatal(database.SafeError("up to 9", err))
 	}
 	version, err := p.GetDBVersion(ctx)
 	if err != nil || version != generationMetricsVersion {
@@ -851,7 +852,7 @@ func TestGenerationMetricsMigration(t *testing.T) {
 	}
 	var duration, ttft *int64
 	if err := db.QueryRowContext(ctx, "SELECT generation_duration_ms, ttft_ms FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", old.workspaceID, old.sourceID, old.sourceEventID).Scan(&duration, &ttft); err != nil {
-		t.Fatal(database.SafeError("read pre-00008 row", err))
+		t.Fatal(database.SafeError("read pre-00009 row", err))
 	}
 	if duration != nil || ttft != nil {
 		t.Fatalf("upgrade backfilled duration=%v ttft=%v for an existing row", duration, ttft)
@@ -867,15 +868,16 @@ func TestGenerationMetricsMigration(t *testing.T) {
 		t.Fatalf("grants=%q want=INSERT,SELECT", privileges)
 	}
 	if _, err := p.DownTo(ctx, beforeGenerationMetrics); err != nil {
-		t.Fatal(database.SafeError("down to 7", err))
+		t.Fatal(database.SafeError("down to 8", err))
 	}
 	var columns int
 	var usageEvents, archivedAt bool
 	if err := db.QueryRowContext(ctx, "SELECT count(*)::int FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='usage_events' AND column_name IN ('generation_duration_ms','ttft_ms')").Scan(&columns); err != nil || columns != 0 {
 		t.Fatalf("down left %d generation metric columns: err=%v", columns, err)
 	}
-	if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.usage_events') IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='sources' AND column_name='archived_at')").Scan(&usageEvents, &archivedAt); err != nil || !usageEvents || !archivedAt {
-		t.Fatalf("down removed an object of an earlier migration: table=%t archived_at=%t err=%v", usageEvents, archivedAt, err)
+	var identityTable, nullablePassword bool
+	if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.usage_events') IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='sources' AND column_name='archived_at'), to_regclass(current_schema()||'.user_identities') IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='users' AND column_name='password_hash' AND is_nullable='YES')").Scan(&usageEvents, &archivedAt, &identityTable, &nullablePassword); err != nil || !usageEvents || !archivedAt || !identityTable || !nullablePassword {
+		t.Fatalf("down removed an object of an earlier migration: table=%t archived_at=%t identities=%t nullable_password=%t err=%v", usageEvents, archivedAt, identityTable, nullablePassword, err)
 	}
 	var provider string
 	if err := db.QueryRowContext(ctx, "SELECT provider FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", old.workspaceID, old.sourceID, old.sourceEventID).Scan(&provider); err != nil || provider != old.provider {

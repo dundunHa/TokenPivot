@@ -2,13 +2,15 @@
 
 export const RANGE_PRESETS = [
   "1h",
+  "24h",
   "today",
   "yesterday",
   "7d",
   "custom",
 ] as const;
 export type RangePreset = (typeof RANGE_PRESETS)[number];
-export const GRANULARITIES = ["minute", "hour", "day"] as const;
+/** auto 由服务端按范围选最细且点数适中的粒度；其余为显式粒度。 */
+export const GRANULARITIES = ["auto", "minute", "hour", "day"] as const;
 export type Granularity = (typeof GRANULARITIES)[number];
 
 export interface OverviewFilters {
@@ -23,13 +25,13 @@ export interface OverviewFilters {
   end: string | null;
 }
 
-/** 默认值只在此处：今天 + 小时，空选择表示全部。时区由调用方补入。 */
+/** 默认值只在此处：近 24 小时 + 分钟，空选择表示全部。时区由调用方补入。 */
 export const DEFAULT_OVERVIEW_FILTERS: Omit<OverviewFilters, "timezone"> = {
   providers: [],
   models: [],
   projects: [],
-  range: "today",
-  granularity: "hour",
+  range: "24h",
+  granularity: "minute",
   start: null,
   end: null,
 };
@@ -322,6 +324,26 @@ export function floorMinute(ms: number): number {
   return Math.floor(ms / MINUTE_MS) * MINUTE_MS;
 }
 
+/** 服务端单次趋势查询的点数上限（与后端 MaxPoints 一致）。 */
+export const MAX_TREND_POINTS = 1500;
+const BUCKET_MS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 } as const;
+
+/**
+ * 实际发给服务端的粒度：显式粒度在该范围内会超过点数上限时，自动改用 auto，
+ * 由服务端选择可用粒度，避免用户先看到 TOO_MANY_POINTS 错误。
+ * 估算多留 2 个桶，覆盖首尾不完整桶与夏令时造成的偏差。
+ */
+export function effectiveGranularity(
+  granularity: Granularity,
+  range: ResolvedRange,
+  nowMs: number = Date.now(),
+): Granularity {
+  if (granularity === "auto") return "auto";
+  const span = (range.endMs ?? nowMs) - range.startMs;
+  const buckets = Math.ceil(span / BUCKET_MS[granularity]) + 2;
+  return buckets > MAX_TREND_POINTS ? "auto" : granularity;
+}
+
 export interface ResolvedRange {
   startMs: number;
   /** 省略表示由服务端采样当前时刻（含未完成分钟）。 */
@@ -337,6 +359,8 @@ export function resolveRange(
   switch (filters.range) {
     case "1h":
       return { startMs: now - 60 * MINUTE_MS, endMs: null };
+    case "24h":
+      return { startMs: now - 24 * 60 * MINUTE_MS, endMs: null };
     case "7d":
       return { startMs: now - 7 * 24 * 60 * MINUTE_MS, endMs: null };
     case "today":

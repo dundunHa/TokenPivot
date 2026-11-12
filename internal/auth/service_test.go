@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -20,12 +21,6 @@ type fakeStore struct {
 	users map[string]Credential
 	// sessions maps token digest to the session owner and its expiry.
 	sessions map[string]fakeSession
-	// personal maps a created user to the display name of its personal
-	// workspace, so the tests can prove each account got exactly one.
-	personal map[ID]string
-	// owners marks the users that received the owner membership of their
-	// personal workspace.
-	owners map[ID]bool
 	// tokens records every token digest handed to the store, in call order.
 	tokens []string
 	// hashes records every password encoding handed to registration.
@@ -34,20 +29,24 @@ type fakeStore struct {
 	registrations []string
 	// nextID is the identity assigned to the next created account.
 	nextID ID
+	// feishuIdentities maps a Feishu open_id to the account bound to it.
+	feishuIdentities map[string]User
+	// identities records the binding written for each account.
+	identities map[ID]FeishuIdentity
 
-	errCredential     error
-	errCreate         error
-	errCreatePersonal error
-	errHasUsers       error
-	errLock           error
-	errCreateSess     error
-	errAuthenticate   error
-	errRevoke         error
-	createCalls       int
-	personalCalls     int
-	hasUsersCalls     int
-	lockCalls         int
-	revokeCalls       int
+	errCredential   error
+	errCreate       error
+	errHasUsers     error
+	errLock         error
+	errCreateSess   error
+	errAuthenticate error
+	errRevoke       error
+	errFeishuLookup error
+	errFeishuUpsert error
+	createCalls     int
+	hasUsersCalls   int
+	lockCalls       int
+	revokeCalls     int
 }
 
 type fakeSession struct {
@@ -58,10 +57,10 @@ type fakeSession struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		users:    make(map[string]Credential),
-		sessions: make(map[string]fakeSession),
-		personal: make(map[ID]string),
-		owners:   make(map[ID]bool),
+		users:            make(map[string]Credential),
+		sessions:         make(map[string]fakeSession),
+		feishuIdentities: make(map[string]User),
+		identities:       make(map[ID]FeishuIdentity),
 	}
 }
 
@@ -76,6 +75,83 @@ func (f *fakeStore) seedUser(email, password string) User {
 	user := User{ID: f.identifier(), Email: email}
 	f.users[email] = Credential{User: user, PasswordHash: hash}
 	return user
+}
+
+// seedFeishuUser inserts an account that has no local password, as the Feishu
+// callback creates it.
+func (f *fakeStore) seedFeishuUser(email string) User {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	user := User{ID: f.identifier(), Email: email}
+	f.users[email] = Credential{User: user}
+	return user
+}
+
+// seedFeishuBinding binds an open_id to an existing account.
+func (f *fakeStore) seedFeishuBinding(openID string, user User) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.feishuIdentities[openID] = user
+	f.identities[user.ID] = FeishuIdentity{OpenID: openID, Email: user.Email}
+}
+
+// UserByFeishuOpenID reports the account bound to an open_id.
+func (f *fakeStore) UserByFeishuOpenID(ctx context.Context, openID string) (User, bool, error) {
+	if f.errFeishuLookup != nil {
+		return User{}, false, f.errFeishuLookup
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	user, ok := f.feishuIdentities[openID]
+	return user, ok, nil
+}
+
+// CreateFeishuUser inserts an account without a local password.
+func (f *fakeStore) CreateFeishuUser(ctx context.Context, email string) (User, error) {
+	f.createCalls++
+	f.recordRegistration("feishu_user")
+	if f.errCreate != nil {
+		return User{}, f.errCreate
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.users[email]; exists {
+		return User{}, ErrEmailUnavailable
+	}
+	user := User{ID: f.identifier(), Email: email}
+	f.users[email] = Credential{User: user}
+	f.hashes = append(f.hashes, "")
+	return user, nil
+}
+
+// UpsertFeishuIdentity writes the binding once per (user, provider) and reports
+// an open_id already owned by another account or a second open_id for an account
+// that is already bound.
+func (f *fakeStore) UpsertFeishuIdentity(ctx context.Context, userID ID, identity FeishuIdentity) error {
+	f.recordRegistration("identity")
+	if f.errFeishuUpsert != nil {
+		return f.errFeishuUpsert
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if owner, exists := f.feishuIdentities[identity.OpenID]; exists && owner.ID != userID {
+		return ErrFeishuIdentityConflict
+	}
+	if current, exists := f.identities[userID]; exists && current.OpenID != identity.OpenID {
+		return ErrFeishuIdentityConflict
+	}
+	var user User
+	for _, credential := range f.users {
+		if credential.User.ID == userID {
+			user = credential.User
+			break
+		}
+	}
+	if user.ID != (ID{}) {
+		f.feishuIdentities[identity.OpenID] = user
+	}
+	f.identities[userID] = identity
+	return nil
 }
 
 // identifier produces a deterministic distinct uuid for each fake account.
@@ -142,23 +218,6 @@ func (f *fakeStore) CreateUser(ctx context.Context, email, passwordHash string) 
 	f.users[email] = Credential{User: user, PasswordHash: passwordHash}
 	f.hashes = append(f.hashes, passwordHash)
 	return user, nil
-}
-
-// CreatePersonal records the personal workspace and owner membership of a user.
-func (f *fakeStore) CreatePersonal(ctx context.Context, userID ID) error {
-	f.personalCalls++
-	f.recordRegistration("personal")
-	if f.errCreatePersonal != nil {
-		return f.errCreatePersonal
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if _, exists := f.personal[userID]; exists {
-		return nil
-	}
-	f.personal[userID] = "Personal"
-	f.owners[userID] = true
-	return nil
 }
 
 func (f *fakeStore) CreateSession(ctx context.Context, userID ID, tokenHash []byte) (time.Time, error) {
@@ -238,7 +297,7 @@ func newTestServiceWithRegistration(t *testing.T, registrationOpen bool) (*Servi
 	return New(store, runner, NewLimiter(clock.Now), registrationOpen), store, runner, clock
 }
 
-func TestRegisterCreatesUserPersonalWorkspaceAndSessionInOneTransaction(t *testing.T) {
+func TestRegisterCreatesUserAndSessionInOneTransaction(t *testing.T) {
 	service, store, runner, _ := newTestService(t)
 	session, err := service.Register(context.Background(), "  Synthetic@Example.COM  ", "synthetic-password", "127.0.0.1")
 	if err != nil {
@@ -259,11 +318,11 @@ func TestRegisterCreatesUserPersonalWorkspaceAndSessionInOneTransaction(t *testi
 	if _, exists := store.users["synthetic@example.com"]; !exists {
 		t.Fatal("account was not stored under the normalized email")
 	}
-	if name, exists := store.personal[session.User.ID]; !exists || name != "Personal" {
-		t.Fatalf("personal workspace = %q exists=%t, want one named Personal", name, exists)
-	}
-	if !store.owners[session.User.ID] {
-		t.Fatal("the first user did not receive the owner membership")
+	// Registration writes only the account and its first session: a new account
+	// starts with zero workspaces, so no workspace or membership step exists.
+	want := []string{"user", "session"}
+	if !slices.Equal(store.registrations, want) {
+		t.Fatalf("registration steps = %v, want %v", store.registrations, want)
 	}
 	sum := sha256.Sum256([]byte(session.Token))
 	if _, exists := store.sessions[string(sum[:])]; !exists {
@@ -275,8 +334,8 @@ func TestRegisterCreatesUserPersonalWorkspaceAndSessionInOneTransaction(t *testi
 }
 
 // TestRegisterOpenSkipsTheClosedPath pins the open deployment: no registration
-// lock, no users existence query, and every account still gets its own personal
-// workspace and owner membership.
+// lock, no users existence query, and each account is created with only its own
+// first session.
 func TestRegisterOpenSkipsTheClosedPath(t *testing.T) {
 	service, store, _, _ := newTestServiceWithRegistration(t, true)
 	first, err := service.Register(context.Background(), "first@example.com", "synthetic-password", "127.0.0.1")
@@ -291,31 +350,25 @@ func TestRegisterOpenSkipsTheClosedPath(t *testing.T) {
 		t.Fatalf("open registration used the closed path: lock=%d hasUsers=%d", store.lockCalls, store.hasUsersCalls)
 	}
 	for _, session := range []Session{first, second} {
-		if _, exists := store.personal[session.User.ID]; !exists {
-			t.Fatalf("user %s has no personal workspace", session.User.Email)
+		if _, exists := store.sessions[string(sessionTokenHash(session.Token))]; !exists {
+			t.Fatalf("user %s has no session", session.User.Email)
 		}
-		if !store.owners[session.User.ID] {
-			t.Fatalf("user %s has no owner membership", session.User.Email)
-		}
+	}
+	if len(store.users) != 2 {
+		t.Fatalf("users = %d, want the two registered accounts", len(store.users))
 	}
 }
 
 // TestRegisterClosedUsesTheDocumentedOrder proves the closed deployment runs the
-// steps in the documented order: lock, empty-database check, user, personal
-// workspace, session.
+// steps in the documented order: lock, empty-database check, user, session.
 func TestRegisterClosedUsesTheDocumentedOrder(t *testing.T) {
 	service, store, _, _ := newTestServiceWithRegistration(t, false)
 	if _, err := service.Register(context.Background(), "first@example.com", "synthetic-password", "127.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"lock", "has_users", "user", "personal", "session"}
-	if len(store.registrations) != len(want) {
+	want := []string{"lock", "has_users", "user", "session"}
+	if !slices.Equal(store.registrations, want) {
 		t.Fatalf("registration steps = %v, want %v", store.registrations, want)
-	}
-	for i, step := range want {
-		if store.registrations[i] != step {
-			t.Fatalf("registration steps = %v, want %v", store.registrations, want)
-		}
 	}
 }
 
@@ -327,7 +380,7 @@ func TestRegisterClosedRejectsAnyEmailOnceAUserExists(t *testing.T) {
 	if _, err := service.Register(context.Background(), "first@example.com", "synthetic-password", "127.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
-	store.createCalls, store.personalCalls = 0, 0
+	store.createCalls = 0
 	store.registrations = nil
 	for _, email := range []string{"first@example.com", "second@example.com"} {
 		_, err := service.Register(context.Background(), email, "synthetic-password", "127.0.0.2")
@@ -338,8 +391,8 @@ func TestRegisterClosedRejectsAnyEmailOnceAUserExists(t *testing.T) {
 			t.Fatalf("%s leaked the email unique conflict", email)
 		}
 	}
-	if store.createCalls != 0 || store.personalCalls != 0 {
-		t.Fatalf("a rejected registration wrote: users=%d personal=%d", store.createCalls, store.personalCalls)
+	if store.createCalls != 0 {
+		t.Fatalf("a rejected registration wrote: users=%d", store.createCalls)
 	}
 	for _, step := range store.registrations {
 		if step != "lock" && step != "has_users" {
@@ -362,10 +415,7 @@ func TestRegisterPropagatesEveryStageFailure(t *testing.T) {
 		"registration lock": {false, func(s *fakeStore) { s.errLock = errors.New("synthetic lock failure") }, "lock"},
 		"users check":       {false, func(s *fakeStore) { s.errHasUsers = errors.New("synthetic check failure") }, "has_users"},
 		"user insert":       {true, func(s *fakeStore) { s.errCreate = errors.New("synthetic user failure") }, "user"},
-		"personal workspace": {true, func(s *fakeStore) {
-			s.errCreatePersonal = errors.New("synthetic workspace failure")
-		}, "personal"},
-		"session insert": {true, func(s *fakeStore) { s.errCreateSess = errors.New("synthetic session failure") }, "session"},
+		"session insert":    {true, func(s *fakeStore) { s.errCreateSess = errors.New("synthetic session failure") }, "session"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			service, store, runner, _ := newTestServiceWithRegistration(t, tt.registrationOpen)
@@ -512,6 +562,21 @@ func TestLoginHidesWhetherAccountExists(t *testing.T) {
 	}
 	if _, err := service.Login(context.Background(), "synthetic@example.com", "synthetic-wrong-password", "127.0.0.1"); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("wrong password returned %v", err)
+	}
+}
+
+// TestLoginRefusesPasswordlessAccountAsWrongPassword proves an account created by
+// Feishu, which stores no local password, cannot be signed in with a password and
+// is indistinguishable from an account that simply has a different password.
+func TestLoginRefusesPasswordlessAccountAsWrongPassword(t *testing.T) {
+	service, store, _, _ := newTestService(t)
+	store.seedFeishuUser("feishu-only@example.com")
+	_, err := service.Login(context.Background(), "feishu-only@example.com", "synthetic-password", "127.0.0.1")
+	if !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("passwordless login error = %v, want ErrInvalidCredentials", err)
+	}
+	if len(store.sessions) != 0 {
+		t.Fatal("a passwordless account received a session")
 	}
 }
 

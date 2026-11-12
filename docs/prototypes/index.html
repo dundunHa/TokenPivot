@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>TokenPivot · 设计预览（三版）</title>
+<title>TokenPivot · 设计预览（两辑）</title>
 <style>
   :root{
     --bg:#08090b;
@@ -89,11 +89,11 @@
 
   .thumb{display:flex;justify-content:center;padding:0 16px}
   .thumbbox{
-    width:348px;height:218px;position:relative;overflow:hidden;border:1px solid var(--line-2);
+    width:100%;height:280px;position:relative;overflow:hidden;border:1px solid var(--line-2);
     border-radius:8px;background:#05060a;flex:0 0 auto;
   }
   .thumbbox iframe{
-    width:1450px;height:908px;border:0;transform:scale(.24);transform-origin:top left;
+    width:1450px;height:1100px;border:0;transform:scale(.32);transform-origin:top left;
     pointer-events:none;display:block;
   }
   .thumbbox::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 62%,rgba(0,0,0,.42))}
@@ -157,18 +157,151 @@
   <header>
     <div style="flex:1;min-width:260px">
       <div class="mark"><i></i>TOKENPIVOT · 设计预览</div>
-      <h1>极客终端主推，其余六版备选</h1>
+      <h1>两辑方向：第一辑深色极客，第二辑反差重构</h1>
       <p class="lede">
-        <b>F 极客终端</b>按「极客风」重做：C 的暖白琥珀配色不变，密度和图形语言加回来——
-        整屏等宽字体、图表用字符块画、右侧一条 <code>tail -f</code> 请求流，画布固定 1920×1080 等比缩放。
-        <b>D 大屏</b>是另一条密排路线，三种配色可切；往下是三版 <b>桌面工作台</b>，
-        共用「总量 → 趋势 → 排名 → 请求明细」的骨架。
+        <b>第二辑 G/H/I/J</b> 是与 a–f 的反差实验：<b>G 浅色编辑版面</b>（纸底+衬线+红蓝双 accent）、
+        <b>H 瑞士网格</b>（白底+实黑线+国际橙）、<b>I 克制暗夜</b>（Raycast 式深灰+细体+尘蓝）、
+        <b>J 极客重奏 F++</b>（60/40 双栏+braille 点阵+可输入命令）。<br />
+        <b>第一辑 F 极客终端</b>仍是深色路线主推：等宽字体、字符块图、tail -f 请求流；
+        <b>D 大屏</b>为墙上指挥屏；往下 A/B/C 共用「总量 → 趋势 → 排名 → 请求明细」骨架。
       </p>
     </div>
     <div class="badge">示例数据 · 未接采集接口<br /><em>参考站核验未完成</em></div>
   </header>
 
   <hr />
+
+  <h3 class="sec" style="margin-top:34px">第二辑 · 反差重构（G / H / I / J）</h3>
+
+  <div class="cards" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+
+    <!-- G -->
+    <article class="card">
+      <div class="card-top">
+        <div class="tagm" style="background:linear-gradient(135deg,#f7f4ef,#b7372a);color:#1d1b16">G</div>
+        <div>
+          <h2>浅色编辑数据版</h2>
+          <p>纸白底 + 衬线大数 + 印红/钴蓝双 accent，NYT 数据版面。</p>
+        </div>
+        <div class="num">V2·01</div>
+      </div>
+      <div class="thumb">
+        <div class="thumbbox">
+          <iframe src="dashboard-g.html" title="G 浅色编辑数据版预览" loading="lazy" tabindex="-1" aria-hidden="true"></iframe>
+        </div>
+      </div>
+      <div class="swatches" aria-label="配色">
+        <span class="swatch" style="background:#f7f4ef"></span>
+        <span class="swatch" style="background:#1d1b16"></span>
+        <span class="swatch" style="background:#b7372a"></span>
+        <span class="swatch" style="background:#2453a6"></span>
+        <span class="swatch" style="background:#6f6a5f"></span>
+      </div>
+      <div class="hex">#f7f4ef · #1d1b16 · #b7372a · #2453a6</div>
+      <div class="card-meta">
+        <div class="mrow"><span class="k">信息密度</span><span class="v">中，12 栏编辑栅格 + 区块刊号</span></div>
+        <div class="mrow"><span class="k">图表语言</span><span class="v">发丝网格 + 斜体注释 + 子弹图</span></div>
+        <div class="mrow"><span class="k">签名细节</span><span class="v">Georgia 衬线大数、墨色 hover tip</span></div>
+        <a class="open" href="dashboard-g.html" target="_blank" rel="noopener">打开编辑版面 <span>G ↗</span></a>
+      </div>
+    </article>
+
+    <!-- H -->
+    <article class="card">
+      <div class="card-top">
+        <div class="tagm" style="background:linear-gradient(135deg,#ffffff,#ff4a00);color:#111">H</div>
+        <div>
+          <h2>瑞士精密网格版</h2>
+          <p>白底 + 实黑 1px + 国际橙单 accent，24 栏国际主义。</p>
+        </div>
+        <div class="num">V2·02</div>
+      </div>
+      <div class="thumb">
+        <div class="thumbbox">
+          <iframe src="dashboard-h.html" title="H 瑞士网格版预览" loading="lazy" tabindex="-1" aria-hidden="true"></iframe>
+        </div>
+      </div>
+      <div class="swatches" aria-label="配色">
+        <span class="swatch" style="background:#ffffff"></span>
+        <span class="swatch" style="background:#111111"></span>
+        <span class="swatch" style="background:#ff4a00"></span>
+        <span class="swatch" style="background:#707070"></span>
+        <span class="swatch" style="background:#e3e3e0"></span>
+      </div>
+      <div class="hex">#ffffff · #111111 · #ff4a00 · #e3e3e0</div>
+      <div class="card-meta">
+        <div class="mrow"><span class="k">信息密度</span><span class="v">高，24 栏基准 + 区块编号</span></div>
+        <div class="mrow"><span class="k">图表语言</span><span class="v">实黑轴 + 方块 tick + 100% 横棒</span></div>
+        <div class="mrow"><span class="k">签名细节</span><span class="v">24 栏坐标丝印图、直角、[分][时][天]</span></div>
+        <a class="open" href="dashboard-h.html" target="_blank" rel="noopener">打开瑞士网格 <span>H ↗</span></a>
+      </div>
+    </article>
+
+    <!-- I -->
+    <article class="card">
+      <div class="card-top">
+        <div class="tagm" style="background:linear-gradient(135deg,#16181d,#7aa2ff);color:#e8eaee">I</div>
+        <div>
+          <h2>克制暗夜版</h2>
+          <p>Raycast 式深灰 + 细体大数 + 单一尘蓝，去眩光噪点。</p>
+        </div>
+        <div class="num">V2·03</div>
+      </div>
+      <div class="thumb">
+        <div class="thumbbox">
+          <iframe src="dashboard-i.html" title="I 克制暗夜版预览" loading="lazy" tabindex="-1" aria-hidden="true"></iframe>
+        </div>
+      </div>
+      <div class="swatches" aria-label="配色">
+        <span class="swatch" style="background:#101114"></span>
+        <span class="swatch" style="background:#16181d"></span>
+        <span class="swatch" style="background:#7aa2ff"></span>
+        <span class="swatch" style="background:#4ecb7d"></span>
+        <span class="swatch" style="background:#e0b36b"></span>
+      </div>
+      <div class="hex">#101114 · #16181d · #7aa2ff · #4ecb7d</div>
+      <div class="card-meta">
+        <div class="mrow"><span class="k">信息密度</span><span class="v">中，主图为王 + 安静服务模块</span></div>
+        <div class="mrow"><span class="k">图表语言</span><span class="v">1.5px 细线 + 单点 12px 发光</span></div>
+        <div class="mrow"><span class="k">签名细节</span><span class="v">2–3% 噪点纹理、玻璃读数卡、细体大数</span></div>
+        <a class="open" href="dashboard-i.html" target="_blank" rel="noopener">打开克制暗夜 <span>I ↗</span></a>
+      </div>
+    </article>
+
+    <!-- J -->
+    <article class="card">
+      <div class="card-top">
+        <div class="tagm" style="background:linear-gradient(135deg,#0b0a08,#e0a64b);color:#f4f1ea">J</div>
+        <div>
+          <h2>极客重奏 F++</h2>
+          <p>琥珀暖黑保留，60/40 双栏 + braille 点阵 + 命令输入。</p>
+        </div>
+        <div class="num">V2·04</div>
+      </div>
+      <div class="thumb">
+        <div class="thumbbox">
+          <iframe src="dashboard-j.html" title="J 极客重奏版预览" loading="lazy" tabindex="-1" aria-hidden="true"></iframe>
+        </div>
+      </div>
+      <div class="swatches" aria-label="配色">
+        <span class="swatch" style="background:#0b0a08"></span>
+        <span class="swatch" style="background:#120f0a"></span>
+        <span class="swatch" style="background:#e0a64b"></span>
+        <span class="swatch" style="background:#7a6435"></span>
+        <span class="swatch" style="background:#d1604f"></span>
+      </div>
+      <div class="hex">#0b0a08 · #e0a64b · #7a6435 · #d1604f</div>
+      <div class="card-meta">
+        <div class="mrow"><span class="k">信息密度</span><span class="v">高，60/40 工作台 + rail 日志</span></div>
+        <div class="mrow"><span class="k">图表语言</span><span class="v">braille 4×2 点阵曲线（非 8 级块）</span></div>
+        <div class="mrow"><span class="k">签名细节</span><span class="v">可输入命令过滤、j/k/1/2/3 键盘导航、tmux 状态行</span></div>
+        <a class="open" href="dashboard-j.html" target="_blank" rel="noopener">打开极客重奏 <span>J ↗</span></a>
+      </div>
+    </article>
+
+  </div>
+
+  <h3 class="sec">第一辑 · 深色极客路线（A / B / C / D / E / F）</h3>
 
   <section class="herocard">
     <div class="hb">
@@ -398,8 +531,8 @@
   </div>
 
   <footer>
-    TOKENPIVOT · design previews v0.2 · 2026-10-27
-    <span>|</span> 7 files: index.html + dashboard-a/b/c/d/e/f.html
+    TOKENPIVOT · design previews v0.3 · 2026-11-02
+    <span>|</span> 13 files: index.html + dashboard-a/b/c/d/d-b/d-c/e/f/g/h/i/j.html
     <span>|</span> 术语：口径=同一指标用哪套算法与范围来算
   </footer>
 </div>

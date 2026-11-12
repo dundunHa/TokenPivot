@@ -19,13 +19,15 @@ import (
 
 // Limits of the detail list and the fixed rate window.
 const (
-	DefaultLimit  = 50
-	MaxLimit      = 100
-	DefaultRange  = time.Hour
-	RateWindow    = 60 * time.Second
-	RetentionDays = 180
-	cursorVersion = 1
-	unattributed  = "unattributed"
+	DefaultLimit = 50
+	MaxLimit     = 100
+	DefaultRange = time.Hour
+	RateWindow   = 60 * time.Second
+	// SpeedSeriesMinutes is how many minutes of per-minute speed points the speed endpoint returns.
+	SpeedSeriesMinutes = 60
+	RetentionDays      = 180
+	cursorVersion      = 1
+	unattributed       = "unattributed"
 )
 
 // ErrInvalidArgument reports a rejected parameter, range or cursor. It carries
@@ -102,11 +104,40 @@ type RateRow struct {
 	SpeedSamples, TTFTSamples int64
 }
 
+// SpeedParams selects the speed window; AsOf is only set by tests.
+type SpeedParams struct {
+	WorkspaceID pgtype.UUID
+	AsOf        *time.Time
+	Filter      Filter
+}
+
+// SpeedSums is output tokens and request time summed over the events that can be
+// measured. Both sums are nil when no event in the group can be measured.
+type SpeedSums struct {
+	OutputTokens, DurationMS *string
+	Events, Measured         int64
+	Estimated                int64
+}
+
+// SpeedPoint is one UTC minute of the series.
+type SpeedPoint struct {
+	BucketStart time.Time
+	SpeedSums
+}
+
+// SpeedRow is the current 60 second window plus the minute series ending at AsOf.
+type SpeedRow struct {
+	AsOf    time.Time
+	Current SpeedSums
+	Points  []SpeedPoint
+}
+
 // Store is the parameterised read surface over usage_events.
 type Store interface {
 	CountProjects(ctx context.Context, workspaceID pgtype.UUID, ids []pgtype.UUID) (int, error)
 	Events(ctx context.Context, params EventsParams) ([]EventRow, error)
 	Rate(ctx context.Context, params RateParams) (RateRow, error)
+	Speed(ctx context.Context, params SpeedParams) (SpeedRow, error)
 }
 
 // Service validates queries and shapes results.
@@ -201,6 +232,34 @@ type RateResponse struct {
 	GenerationSpeed    RateMetric `json:"generation_speed"`
 	TTFT               RateMetric `json:"ttft"`
 	WindowLastReceived *string    `json:"window_last_received_at"`
+}
+
+// SpeedCurrent is the generation speed inputs of the rolling 60 second window.
+type SpeedCurrent struct {
+	OutputTokens   *string `json:"output_tokens"`
+	DurationMS     *string `json:"duration_ms"`
+	EventCount     int64   `json:"event_count"`
+	MeasuredCount  int64   `json:"measured_count"`
+	EstimatedCount int64   `json:"estimated_count"`
+}
+
+// SpeedMinute is one minute of the speed series.
+type SpeedMinute struct {
+	BucketStart    string  `json:"bucket_start"`
+	OutputTokens   *string `json:"output_tokens"`
+	DurationMS     *string `json:"duration_ms"`
+	MeasuredCount  int64   `json:"measured_count"`
+	EstimatedCount int64   `json:"estimated_count"`
+}
+
+// SpeedResponse is the body of the speed endpoint.
+type SpeedResponse struct {
+	AsOf          string        `json:"as_of"`
+	WindowSeconds int           `json:"window_seconds"`
+	SeriesStart   string        `json:"series_start"`
+	Unit          string        `json:"unit"`
+	Current       SpeedCurrent  `json:"current"`
+	Points        []SpeedMinute `json:"points"`
 }
 
 type cursorPayload struct {
@@ -354,6 +413,51 @@ func (s *Service) rateAt(ctx context.Context, workspaceID pgtype.UUID, values ur
 	if row.LastReceived != nil {
 		text := formatTime(*row.LastReceived)
 		response.WindowLastReceived = &text
+	}
+	return response, nil
+}
+
+// Speed returns the generation speed inputs: output tokens and request time of the
+// events completing in the rolling 60 second window and in each of the last
+// SpeedSeriesMinutes UTC minutes. Speed = output_tokens / duration_ms * 1000; the
+// sums are returned (not the quotient) so the client divides exact integers.
+func (s *Service) Speed(ctx context.Context, workspaceID pgtype.UUID, values url.Values) (*SpeedResponse, error) {
+	return s.speedAt(ctx, workspaceID, values, nil)
+}
+
+// SpeedAt is Speed with a fixed as_of; the HTTP layer never exposes it.
+func (s *Service) SpeedAt(ctx context.Context, workspaceID pgtype.UUID, values url.Values, asOf time.Time) (*SpeedResponse, error) {
+	asOf = asOf.UTC().Truncate(time.Microsecond)
+	return s.speedAt(ctx, workspaceID, values, &asOf)
+}
+
+func (s *Service) speedAt(ctx context.Context, workspaceID pgtype.UUID, values url.Values, asOf *time.Time) (*SpeedResponse, error) {
+	if err := validateValues(values, rateKeys); err != nil {
+		return nil, err
+	}
+	filter, err := s.parseFilter(ctx, workspaceID, values)
+	if err != nil {
+		return nil, err
+	}
+	row, err := s.store.Speed(ctx, SpeedParams{WorkspaceID: workspaceID, AsOf: asOf, Filter: filter})
+	if err != nil {
+		return nil, err
+	}
+	end := row.AsOf.UTC()
+	response := &SpeedResponse{
+		AsOf: formatTime(end), WindowSeconds: int(RateWindow / time.Second), Unit: "tokens/s",
+		SeriesStart: formatTime(end.Add(-SpeedSeriesMinutes * time.Minute).Truncate(time.Minute)),
+		Current: SpeedCurrent{
+			OutputTokens: row.Current.OutputTokens, DurationMS: row.Current.DurationMS,
+			EventCount: row.Current.Events, MeasuredCount: row.Current.Measured, EstimatedCount: row.Current.Estimated,
+		},
+		Points: make([]SpeedMinute, 0, len(row.Points)),
+	}
+	for _, p := range row.Points {
+		response.Points = append(response.Points, SpeedMinute{
+			BucketStart: formatTime(p.BucketStart.UTC()), OutputTokens: p.OutputTokens, DurationMS: p.DurationMS,
+			MeasuredCount: p.Measured, EstimatedCount: p.Estimated,
+		})
 	}
 	return response, nil
 }

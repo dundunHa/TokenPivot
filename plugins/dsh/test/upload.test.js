@@ -88,6 +88,39 @@ test('accepted and duplicate dequeue; bearer token sent; body is {events}', asyn
   await s.close()
 })
 
+test('an older server that refuses project_key: the key is dropped and the event is resent unattributed', async () => {
+  const keyed = { ...ev(1), project_key: 'TokenPivot' }
+  const s = await server((body) => ({
+    status: 200,
+    json: {
+      request_id: 'r',
+      results: body.events.map((e, index) => 'project_key' in e
+        ? { index, status: 'rejected', error: { code: 'INVALID_ARGUMENT', message: 'event contains an unknown field' } }
+        : { index, status: 'accepted' }),
+    },
+  }))
+  const { queue, up, logger } = await uploader(s.endpoint, [keyed, ev(2)])
+  assert.equal((await up.flush()).state, 'idle')
+  assert.equal(queue.size, 0)
+  assert.equal(s.calls.length, 2)
+  assert.ok(!('project_key' in s.calls[1].body.events[0]))
+  assert.equal(s.calls[1].body.events[0].source_event_id, 'dsh:msg:1')
+  assert.ok(logger.lines.some((l) => l.includes('refused project_key')))
+  await s.close()
+})
+
+test('INVALID_ARGUMENT on an event without project_key is still a terminal rejection', async () => {
+  const s = await server((body) => ({
+    status: 200,
+    json: { request_id: 'r', results: body.events.map((_, index) => ({ index, status: 'rejected', error: { code: 'INVALID_ARGUMENT', message: 'x' } })) },
+  }))
+  const { queue, up } = await uploader(s.endpoint, [ev(1)])
+  await up.flush()
+  assert.equal(queue.size, 0)
+  assert.equal(s.calls.length, 1)
+  await s.close()
+})
+
 test('terminal results dequeue into dead letter without usage payload', async () => {
   const s = await server(() => ({ status: 200, json: { request_id: 'r', results: [
     { index: 0, status: 'conflict' },
@@ -510,4 +543,43 @@ test('old host through the collector: unchanged v1 body end to end', async () =>
   assert.deepEqual(body.usage.output_tokens, { value: 1, quality: 'known' })
   await c.stop()
   await s.close()
+})
+
+test('collector: duration_ms is measured from step/start, restarted by a failed attempt, unknown without a start', async () => {
+  const dir = await tmp()
+  const c = new Collector({
+    stateDir: dir,
+    endpoint: null,
+    getToken: () => TOKEN,
+    logger: logs(),
+    setTimer: () => 1,
+    clearTimer: () => {},
+  })
+  await c.start()
+  const session = { id: 's', header: { id: 's', cwd: '/w' } }
+  const message = (id, turn, step, time) => ({ type: 'assistant/message', time, data: {
+    turn, step,
+    message: { role: 'assistant', id, source: { provider: 'p', model: 'm' } },
+    usage: { inputTokens: 3, outputTokens: 40, totalTokens: 43 },
+  } })
+  const sent = () => c.queue.items.map((item) => item.duration_ms)
+
+  // 1) plain step: start → completion
+  await c.handle(session, { type: 'step/start', time: 10_000, data: { turn: 1, step: 1 } })
+  await c.handle(session, message('m-1', 1, 1, 12_500))
+  // 2) a failed attempt restarts the clock for the final attempt
+  await c.handle(session, { type: 'step/start', time: 20_000, data: { turn: 1, step: 2 } })
+  await c.handle(session, { type: 'assistant/attempt', time: 29_000, data: { turn: 1, step: 2, stream: [] } })
+  await c.handle(session, message('m-2', 1, 2, 31_000))
+  // 3) no step/start seen (plugin enabled mid-step): unknown, not guessed
+  await c.handle(session, message('m-3', 1, 3, 40_000))
+  // 4) the same step of another session does not borrow this session's start
+  await c.handle({ id: 'other', header: { id: 'other' } }, { type: 'step/start', time: 50_000, data: { turn: 1, step: 4 } })
+  await c.handle(session, message('m-4', 1, 4, 52_000))
+  // 5) a start is consumed once; a retransmitted message is deduped by id and leaves no stale start
+  assert.equal(c.steps.has('s:1:1'), false)
+  await c.handle(session, message('m-1', 1, 1, 99_000))
+
+  assert.deepEqual(sent(), [2500, 2000, null, null])
+  await c.stop()
 })

@@ -37,11 +37,14 @@ export function expandHome(dir) {
   return dir
 }
 
+/** Step starts waiting for their message; bounded so a cancelled step cannot leak memory. */
+const MAX_PENDING_STEPS = 512
+
 export class Collector {
   /**
    * @param {{
    *   stateDir: string, endpoint: string|null, getToken: () => string|undefined,
-   *   projects?: {path: string, projectId: string}[], resolveCwd?: (session) => string|undefined,
+   *   projects?: {path: string, projectId: string}[], detectProject?: (cwd: string|undefined) => string|null, resolveCwd?: (session) => string|undefined,
    *   maxQueueItems?: number, flushDelayMs?: number, logger?: any, fetch?: Function,
    *   setTimer?: (fn: Function, ms: number) => any, clearTimer?: (handle: any) => void,
    *   microtask?: (fn: Function) => void, uploaderOptions?: object,
@@ -74,6 +77,22 @@ export class Collector {
     /** Batches being mapped and written; `stop()` waits for every one of them. */
     this.batches = new Set()
     this.flushScheduled = false
+    /** session id + turn + step → ms epoch when that model call started (in memory only). */
+    this.steps = new Map()
+  }
+
+  stepKey(session, data) {
+    const id = session?.id ?? session?.header?.id
+    if (typeof id !== 'string' || !Number.isInteger(data?.turn) || !Number.isInteger(data?.step)) return null
+    return `${id}:${data.turn}:${data.step}`
+  }
+
+  /** Remember when a model call started, or restarted after a failed attempt; evict the oldest beyond the cap. */
+  noteStep(key, time) {
+    if (key === null || !Number.isFinite(time)) return
+    this.steps.delete(key)
+    this.steps.set(key, time)
+    if (this.steps.size > MAX_PENDING_STEPS) this.steps.delete(this.steps.keys().next().value)
   }
 
   /**
@@ -97,13 +116,33 @@ export class Collector {
    * synchronously on the same stack, so this method stages the event synchronously — before its
    * first `await` — and settles the whole batch in one microtask. A host that never publishes the
    * notice therefore costs no wait: the staged event is reported without timing as before.
+   *
+   * `step/start` and `assistant/attempt` only maintain the in-memory step clock the request
+   * duration is measured from; they never produce an event of their own.
    */
   handle(session, event) {
     if (this.stopped) return Promise.resolve()
+    if (event?.type === 'step/start') {
+      this.noteStep(this.stepKey(session, event.data), event.time)
+      return Promise.resolve()
+    }
+    if (event?.type === 'assistant/attempt') {
+      // A failed attempt settled; the next attempt of the same step starts after it.
+      const key = this.stepKey(session, event.data)
+      if (key !== null && this.steps.has(key)) this.noteStep(key, event.time)
+      return Promise.resolve()
+    }
     if (event?.type !== 'assistant/message' && event?.type !== 'compaction/summary') return Promise.resolve()
+    // The step clock is read synchronously, before the batch is frozen in the microtask below.
+    let startedAt
+    if (event.type === 'assistant/message') {
+      const key = this.stepKey(session, event.data)
+      startedAt = key === null ? undefined : this.steps.get(key)
+      if (key !== null) this.steps.delete(key)
+    }
     let done
     const settled = new Promise((resolve) => { done = resolve })
-    const entry = { session, event, timing: null, seq: event.seq, done }
+    const entry = { session, event, timing: null, seq: event.seq, startedAt, done }
     // Staged synchronously: the notice for this event may arrive on this very stack.
     this.waiting.push(entry)
     this.link(entry)
@@ -207,6 +246,8 @@ export class Collector {
           const usageEvent = mapSessionEvent(entry.session, entry.event, {
             cwd: this.options.resolveCwd?.(entry.session),
             projects: this.options.projects,
+            detectProject: this.options.detectProject,
+            startedAt: entry.startedAt,
           }, entry.timing ?? undefined)
           if (usageEvent && this.queue.enqueue(usageEvent)) queued += 1
         } catch (error) {

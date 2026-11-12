@@ -5,7 +5,8 @@
  * docs/research/2026-10-28-dsh-platform-capabilities.md):
  *   - assistant/message   data.message.id (UUID, stable across forked sessions), data.message.source.{provider,model}, data.usage
  *   - compaction/summary  data.compactionId, data.provider, data.model, data.usage
- * Nothing else leaves this module: no prompt/response text, no cwd/path, no session title.
+ * Nothing else leaves this module: no prompt/response text, no cwd/path, no session title. The only
+ * project information is a mapped project_id or, with automatic detection, the repository's directory name.
  */
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -188,8 +189,10 @@ export function recoverUsage(u) {
     total_tokens: total === null ? MISSING : known(total),
     cache_read_tokens: cacheRead === null ? MISSING : known(cacheRead),
     cache_write_tokens: cacheWrite === null ? MISSING : known(cacheWrite),
-    // reasoning is a subset of output: only a confirmed subset is reported.
-    reasoning_tokens: reasoning !== null && output !== null && reasoning <= output ? known(reasoning) : MISSING,
+    // reasoning is a subset of output, but the server only applies that check when both are known
+    // (internal/ingestion/handler.go normalizeUsage). A confirmed reasoning count therefore stands
+    // on its own when the output is unknown; only a known output can rule it out.
+    reasoning_tokens: reasoning !== null && (output === null || reasoning <= output) ? known(reasoning) : MISSING,
   }
   return Object.values(usage).some((m) => m.quality === 'known') ? usage : null
 }
@@ -231,10 +234,27 @@ export function resolveProject(cwd, mappings) {
   return best
 }
 
+/** A single model call longer than this is treated as a bad measurement and reported as unknown. */
+export const MAX_DURATION_MS = 3_600_000
+
+/**
+ * Request duration: from the step's `step/start` (or the last failed attempt) to the commit of the
+ * final `assistant/message`. DSH does not record a duration itself; this is the model-call latency
+ * (request preparation, time to first token and generation) measured on DSH's own event clock.
+ * Unknown (null) when the start was not seen or the value is implausible; never a guess.
+ * @param {number|undefined} startedAt ms epoch of the step start
+ * @param {number} completedAt ms epoch of the final message
+ */
+export function requestDuration(startedAt, completedAt) {
+  if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt)) return null
+  const ms = Math.round(completedAt - startedAt)
+  return ms >= 0 && ms <= MAX_DURATION_MS ? ms : null
+}
+
 /**
  * @param {{ id?: string, header?: { id?: string, cwd?: string } }} session
  * @param {{ type: string, time: number, data: any }} event
- * @param {{ cwd?: string, projects?: {path: string, projectId: string}[] }} options
+ * @param {{ cwd?: string, projects?: {path: string, projectId: string}[], detectProject?: (cwd: string|undefined) => string|null, startedAt?: number }} options
  * @param {object} [timing] the host's `GenerationTiming` for this final event, when it published one
  * @returns {object|null} UsageEvent, or null when the event carries no reportable usage or timing
  */
@@ -275,16 +295,24 @@ export function mapSessionEvent(session, event, options = {}, timing) {
   const occurredAt = formatTime(event.time)
   if (!occurredAt) return null
 
+  // An explicit directory → project_id mapping wins; otherwise the repository name is sent as project_key
+  // (the server finds or creates that project). Never both: the server rejects an event that carries both.
+  const cwd = options.cwd ?? session?.header?.cwd
+  const projectId = resolveProject(cwd, options.projects)
+  const projectKey = projectId === null ? options.detectProject?.(cwd) ?? null : null
+
   return {
     source_event_id: sourceEventId,
-    project_id: resolveProject(options.cwd ?? session?.header?.cwd, options.projects),
+    project_id: projectId,
+    ...(projectKey ? { project_key: projectKey } : {}),
     provider,
     model,
     occurred_at: occurredAt,
     usage: usage ?? (timed ? recoverUsage(data.usage) : null) ?? missingUsage(),
     ...generation,
-    // DSH records neither a request status nor a request duration for successful calls.
+    // DSH records no request status for successful calls. Only assistant/message has a measurable
+    // model call (compaction has no step/start of its own), so compaction stays unknown.
     status: null,
-    duration_ms: null,
+    duration_ms: event.type === 'assistant/message' ? requestDuration(options.startedAt, event.time) : null,
   }
 }

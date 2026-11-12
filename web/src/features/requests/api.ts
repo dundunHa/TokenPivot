@@ -1,7 +1,7 @@
 import { ApiError, getJson } from "@/lib/api";
 import type { OverviewFilters } from "@/features/overview/overviewFilters";
 
-/** 请求明细与 60 秒速率：唯一读取 usage-events、usage-rate 响应结构的位置。 */
+/** 请求明细、生成速度与 60 秒速率：唯一读取 usage-events、usage-speed、usage-rate 响应结构的位置。 */
 
 export type Quality = "known" | "estimated" | "missing";
 
@@ -24,9 +24,9 @@ export interface RequestRow {
   total: TokenField;
   status: string | null;
   durationMs: number | null;
-  /** 十进制字符串（最多 6 位小数）；null = 缺失，不是 0。 */
+  /** 十进制字符串（最多 6 位小数）；null = 缺失，不是 0。旧后端省略该键。 */
   generationSpeedTps: string | null;
-  /** 整数毫秒；null = 缺失，0 是真实观测值。 */
+  /** 整数毫秒；null = 缺失，0 是真实观测值。旧后端省略该键。 */
   ttftMs: number | null;
 }
 
@@ -38,6 +38,36 @@ export interface RequestPage {
   end: string;
   asOf: string;
   retentionCutoff: string;
+}
+
+/** 一段时间内可测量请求的输出 token 与请求耗时之和（速度 = 输出 ÷ 耗时）。null = 没有可测量的请求。 */
+export interface SpeedSums {
+  outputTokens: string | null;
+  durationMs: string | null;
+  /** 这段时间内完成的请求数（含无法测量的）。 */
+  eventCount: number;
+  /** 其中输出与耗时都可用的请求数。 */
+  measuredCount: number;
+  /** 可测量请求中输出为估算值的条数。 */
+  estimatedCount: number;
+}
+
+export interface SpeedMinute {
+  /** 该 UTC 分钟的起点。 */
+  bucketStart: string;
+  outputTokens: string | null;
+  durationMs: string | null;
+  measuredCount: number;
+  estimatedCount: number;
+}
+
+export interface SpeedData {
+  asOf: string;
+  seriesStart: string;
+  /** 滚动 60 秒窗口。 */
+  current: SpeedSums;
+  /** 最近 60 分钟，只含有可测量请求的分钟。 */
+  points: SpeedMinute[];
 }
 
 /** 一项窗口平均：值缺失（无有效样本）与真实的 0 用 null / 十进制字符串区分。 */
@@ -104,7 +134,6 @@ function nullableSafeInteger(value: unknown): number | null {
   return value;
 }
 
-const DECIMAL = /^(0|[1-9][0-9]*)$/;
 /** 后端口径：非负十进制字符串，最多 6 位小数；不用 JSON 浮点。 */
 const METRIC_DECIMAL = /^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$/;
 
@@ -206,6 +235,41 @@ function parsePage(body: unknown): RequestPage {
   };
 }
 
+const DECIMAL = /^(0|[1-9][0-9]*)$/;
+
+function decimalOrNull(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || !DECIMAL.test(value)) throw badResponse();
+  return value;
+}
+
+function parseSpeed(body: unknown): SpeedData {
+  const r = record(body);
+  const current = record(r.current);
+  if (!Array.isArray(r.points)) throw badResponse();
+  return {
+    asOf: text(r.as_of),
+    seriesStart: text(r.series_start),
+    current: {
+      outputTokens: decimalOrNull(current.output_tokens),
+      durationMs: decimalOrNull(current.duration_ms),
+      eventCount: count(current.event_count),
+      measuredCount: count(current.measured_count),
+      estimatedCount: count(current.estimated_count),
+    },
+    points: r.points.map((item): SpeedMinute => {
+      const p = record(item);
+      return {
+        bucketStart: text(p.bucket_start),
+        outputTokens: decimalOrNull(p.output_tokens),
+        durationMs: decimalOrNull(p.duration_ms),
+        measuredCount: count(p.measured_count),
+        estimatedCount: count(p.estimated_count),
+      };
+    }),
+  };
+}
+
 function parseRate(body: unknown): RateData {
   const r = record(body);
   const total = record(r.total_tokens);
@@ -275,6 +339,16 @@ export async function fetchRequests(
 ): Promise<RequestPage> {
   return parsePage(
     await getJson(`${base(workspaceId)}-events?${query}`, signal),
+  );
+}
+
+export async function fetchSpeed(
+  workspaceId: string,
+  query: string,
+  signal: AbortSignal,
+): Promise<SpeedData> {
+  return parseSpeed(
+    await getJson(`${base(workspaceId)}-speed?${query}`, signal),
   );
 }
 

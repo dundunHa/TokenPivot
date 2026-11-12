@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mapSessionEvent, mapUsage, mapGenerationTiming, resolveProject, formatTime } from '../lib/mapper.js'
+import {
+  mapSessionEvent, mapUsage, mapGenerationTiming, resolveProject, formatTime, requestDuration, MAX_DURATION_MS,
+} from '../lib/mapper.js'
 
 const PID = '018f3c5e-2b3c-7d4e-9f0a-1b2c3d4e5f60'
 const session = { id: 's-1', header: { id: 's-1', cwd: '/work/app/sub' } }
@@ -334,7 +336,7 @@ test('partial usage: reasoning is kept only when it is a confirmed subset of the
   const kept = mapSessionEvent(session, timedPartial({ outputTokens: 100, reasoningTokens: 40 }), {}, timingOf(0, 8000, 10000))
   assert.deepEqual(kept.usage.reasoning_tokens, { value: 40, quality: 'known' })
   assert.deepEqual(kept.usage.output_tokens, { value: 100, quality: 'known' })
-  // an unusable input breaks mapUsage; reasoning larger than the output must still be dropped
+  // an unusable input breaks mapUsage; reasoning larger than the known output must still be dropped
   const dropped = mapSessionEvent(session, timedPartial({ inputTokens: -1, outputTokens: 100, reasoningTokens: 140 }), {}, timingOf(0, 8000, 10000))
   assert.deepEqual(dropped.usage.reasoning_tokens, { value: null, quality: 'missing' })
   assert.deepEqual(dropped.usage.output_tokens, { value: 100, quality: 'known' })
@@ -349,7 +351,29 @@ test('partial usage: a cache-free input is confirmed without any output', () => 
   assert.deepEqual(e.usage.input_tokens, { value: 10, quality: 'known' })
   assert.deepEqual(e.usage.output_tokens, { value: null, quality: 'missing' })
   assert.deepEqual(e.usage.total_tokens, { value: null, quality: 'missing' })
-  assert.deepEqual(e.usage.reasoning_tokens, { value: null, quality: 'missing' }) // no output to bound it
+  // the server bounds reasoning by output only when both are known, so it survives on its own
+  assert.deepEqual(e.usage.reasoning_tokens, { value: 5, quality: 'known' })
+})
+
+test('partial usage: reasoning alone is enough to report the request', () => {
+  // both input and output are unusable; the provider's reasoning count is still a real observation
+  const alone = mapSessionEvent(session, timedPartial({ inputTokens: -1, outputTokens: -1, reasoningTokens: 5 }), {}, timingOf(0, 8000, 10000))
+  assert.equal(alone.ttft_ms, 8000)
+  assert.equal(alone.generation_duration_ms, 2000)
+  assert.deepEqual(alone.usage.output_tokens, { value: null, quality: 'missing' })
+  assert.deepEqual(alone.usage.reasoning_tokens, { value: 5, quality: 'known' })
+  for (const key of ['input_tokens', 'total_tokens', 'cache_read_tokens', 'cache_write_tokens']) {
+    assert.deepEqual(alone.usage[key], { value: null, quality: 'missing' })
+  }
+})
+
+test('partial usage: a zero reasoning count is an observation, not an absence', () => {
+  const bounded = mapSessionEvent(session, timedPartial({ inputTokens: -1, outputTokens: 100, reasoningTokens: 0 }), {}, timingOf(0, 8000, 10000))
+  assert.deepEqual(bounded.usage.reasoning_tokens, { value: 0, quality: 'known' })
+  assert.deepEqual(bounded.usage.output_tokens, { value: 100, quality: 'known' })
+  const unbounded = mapSessionEvent(session, timedPartial({ inputTokens: -1, outputTokens: -1, reasoningTokens: 0 }), {}, timingOf(0, 8000, 10000))
+  assert.deepEqual(unbounded.usage.reasoning_tokens, { value: 0, quality: 'known' })
+  assert.deepEqual(unbounded.usage.output_tokens, { value: null, quality: 'missing' })
 })
 
 test('partial usage: a cache-bearing input still needs the output to pick a reading', () => {
@@ -359,8 +383,9 @@ test('partial usage: a cache-bearing input still needs the output to pick a read
   assert.deepEqual(e.usage.output_tokens, { value: null, quality: 'missing' })
 })
 
-test('partial usage: nothing confirmed at all is the same all-missing shape, with timing kept', () => {
-  const e = mapSessionEvent(session, timedPartial({ inputTokens: -1, outputTokens: -1, reasoningTokens: 5 }), {}, timingOf(0, 8000, 10000))
+test('partial usage: nothing usable at all is the same all-missing shape, with timing kept', () => {
+  // every count is unusable, reasoning included: only then is the all-missing shape reported
+  const e = mapSessionEvent(session, timedPartial({ inputTokens: -1, outputTokens: -1, reasoningTokens: 'x' }), {}, timingOf(0, 8000, 10000))
   assert.equal(e.ttft_ms, 8000)
   assert.deepEqual(e.usage, {
     input_tokens: { value: null, quality: 'missing' },
@@ -419,4 +444,28 @@ test('partial usage: a malformed total still leaves the no-cache input exact, to
   assert.deepEqual(e.usage.input_tokens, { value: 10, quality: 'known' })
   assert.deepEqual(e.usage.output_tokens, { value: 100, quality: 'known' })
   assert.deepEqual(e.usage.total_tokens, { value: null, quality: 'missing' })
+})
+
+test('requestDuration: step start to completion, unknown when absent or implausible', () => {
+  assert.equal(requestDuration(1000, 3500), 2500)
+  assert.equal(requestDuration(1000, 1000), 0) // a real zero is not unknown
+  assert.equal(requestDuration(undefined, 3500), null)
+  assert.equal(requestDuration(Number.NaN, 3500), null)
+  assert.equal(requestDuration(5000, 4000), null) // clock went backwards
+  assert.equal(requestDuration(0, MAX_DURATION_MS), MAX_DURATION_MS)
+  assert.equal(requestDuration(0, MAX_DURATION_MS + 1), null)
+  assert.equal(requestDuration(0.4, 10.6), 10)
+})
+
+test('duration_ms comes from options.startedAt for assistant/message only', () => {
+  const event = msg({ inputTokens: 1, outputTokens: 2 })
+  const startedAt = event.time - 1800
+  assert.equal(mapSessionEvent(session, event, { startedAt }).duration_ms, 1800)
+  assert.equal(mapSessionEvent(session, event, {}).duration_ms, null)
+  const compaction = {
+    type: 'compaction/summary',
+    time: event.time,
+    data: { compactionId: 'c-1', provider: 'p', model: 'm', usage: { inputTokens: 1, outputTokens: 1 } },
+  }
+  assert.equal(mapSessionEvent(session, compaction, { startedAt }).duration_ms, null)
 })

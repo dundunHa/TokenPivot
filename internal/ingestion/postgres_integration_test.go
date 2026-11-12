@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -256,6 +257,42 @@ func (e *integrationEnv) service(t *testing.T, pool *pgxpool.Pool, logs *syncBuf
 	return New(NewPostgres(pool), &fakeAuthenticator{token: "tpk_integration"}, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 }
 
+// countingPool opens one single-connection service pool whose dialer counts the
+// requests written on that socket, so a test can assert how many network round trips
+// one item transaction costs.
+func (e *integrationEnv) countingPool(t *testing.T, counter *roundTripCounter) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(e.appURL)
+	if err != nil {
+		t.Fatal(database.SafeError("parse app URL", err))
+	}
+	if config.ConnConfig.TLSConfig != nil {
+		t.Fatal("round trip counting needs a plaintext test connection")
+	}
+	// One connection keeps the counter attributable to one item transaction; a health
+	// check would add a request of its own, so it is pushed past the test's lifetime.
+	config.MaxConns = 1
+	config.MinConns = 0
+	config.MinIdleConns = 0
+	config.MaxConnLifetime = time.Hour
+	config.MaxConnIdleTime = time.Hour
+	config.HealthCheckPeriod = time.Hour
+	dialer := &net.Dialer{Timeout: database.ConnectTimeout}
+	config.ConnConfig.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &roundTripCountingConn{Conn: conn, counter: counter}, nil
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(database.SafeError("open counting pool", err))
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
 // syncBuffer is a goroutine-safe log sink.
 type syncBuffer struct {
 	mu  sync.Mutex
@@ -274,12 +311,26 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
+// seedCreator inserts one synthetic account that owns a seeded workspace, so the
+// required creator column holds a real users row.
+func (e *integrationEnv) seedCreator(t *testing.T, ctx context.Context) pgtype.UUID {
+	t.Helper()
+	var id pgtype.UUID
+	if err := e.owner.QueryRow(ctx, "INSERT INTO users (email, password_hash) VALUES ($1,$2) RETURNING id",
+		"seed-"+hex.EncodeToString(randomBytes(t, 8))+"@example.test", "synthetic-encoding").Scan(&id); err != nil {
+		t.Fatal(database.SafeError("seed workspace creator", err))
+	}
+	return id
+}
+
 // seedSource creates one workspace and one source and returns their identities.
 func (e *integrationEnv) seedSource(t *testing.T, ctx context.Context) (pgtype.UUID, pgtype.UUID) {
 	t.Helper()
 	workspaceID := newIntegrationID(t)
 	sourceID := newIntegrationID(t)
-	if _, err := e.owner.Exec(ctx, "INSERT INTO workspaces (id, name) VALUES ($1,$2)", workspaceID, "synthetic workspace"); err != nil {
+	createdBy := e.seedCreator(t, ctx)
+	if _, err := e.owner.Exec(ctx, "INSERT INTO workspaces (id, created_by_user_id, name) VALUES ($1,$2,$3)",
+		workspaceID, createdBy, "synthetic workspace"); err != nil {
 		t.Fatal(database.SafeError("seed workspace", err))
 	}
 	if _, err := e.owner.Exec(ctx, "INSERT INTO sources (id, workspace_id, platform, instance_key) VALUES ($1,$2,$3,$4)",
@@ -871,7 +922,9 @@ func TestBatchMixedItemsIsolateFailures(t *testing.T) {
 func (e *integrationEnv) newWorkspace(t *testing.T, ctx context.Context) pgtype.UUID {
 	t.Helper()
 	workspaceID := newIntegrationID(t)
-	if _, err := e.owner.Exec(ctx, "INSERT INTO workspaces (id, name) VALUES ($1,$2)", workspaceID, "synthetic other workspace"); err != nil {
+	createdBy := e.seedCreator(t, ctx)
+	if _, err := e.owner.Exec(ctx, "INSERT INTO workspaces (id, created_by_user_id, name) VALUES ($1,$2,$3)",
+		workspaceID, createdBy, "synthetic other workspace"); err != nil {
 		t.Fatal(database.SafeError("seed other workspace", err))
 	}
 	return workspaceID
@@ -1148,6 +1201,452 @@ func TestArchivedProjectStillAccepts(t *testing.T) {
 	if row := e.readRow(t, ctx, workspaceID, sourceID, "evt-archived"); row.projectID != projectID {
 		t.Fatal("archived project was not retained on the row")
 	}
+}
+
+func keyedEventJSON(sourceEventID, projectKey string, occurredAt time.Time) string {
+	return fmt.Sprintf(`{"source_event_id":%q,"project_key":%q,"provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`,
+		sourceEventID, projectKey, occurredAt.UTC().Format(microLayout))
+}
+
+func (e *integrationEnv) projectKeys(t *testing.T, ctx context.Context, workspaceID pgtype.UUID) map[string]pgtype.UUID {
+	t.Helper()
+	rows, err := e.owner.Query(ctx, "SELECT project_key, id FROM projects WHERE workspace_id = $1", workspaceID)
+	if err != nil {
+		t.Fatal(database.SafeError("read projects", err))
+	}
+	defer rows.Close()
+	keys := map[string]pgtype.UUID{}
+	for rows.Next() {
+		var key string
+		var id pgtype.UUID
+		if err := rows.Scan(&key, &id); err != nil {
+			t.Fatal(database.SafeError("scan projects", err))
+		}
+		keys[key] = id
+	}
+	return keys
+}
+
+// A project_key creates the project once, attributes the row and the minute bucket to it, and
+// reuses it for later events, including an archived one (its key stays reserved).
+func TestProjectKeyCreatesOnceAndAttributes(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	otherWorkspace := e.newWorkspace(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	results := runBatch(t, service, credential, encodedBatch(t,
+		keyedEventJSON("k-1", "TokenPivot", occurredAt),
+		keyedEventJSON("k-2", "TokenPivot", occurredAt.Add(time.Second)),
+		keyedEventJSON("k-3", "other", occurredAt)))
+	requireResultStatuses(t, results, statusAccepted, statusAccepted, statusAccepted)
+	keys := e.projectKeys(t, ctx, workspaceID)
+	if len(keys) != 2 || !keys["TokenPivot"].Valid || !keys["other"].Valid {
+		t.Fatalf("projects = %v, want exactly TokenPivot and other", keys)
+	}
+	if len(e.projectKeys(t, ctx, otherWorkspace)) != 0 {
+		t.Fatal("another workspace gained a project")
+	}
+	var name string
+	if err := e.owner.QueryRow(ctx, "SELECT name FROM projects WHERE id = $1", keys["TokenPivot"]).Scan(&name); err != nil || name != "TokenPivot" {
+		t.Fatalf("name = %q err = %v, want the key as the initial name", name, err)
+	}
+	if row := e.readRow(t, ctx, workspaceID, sourceID, "k-1"); row.projectID != keys["TokenPivot"] {
+		t.Fatal("event is not attributed to the created project")
+	}
+	if bucket := e.readBucket(t, ctx, workspaceID, sourceID, keys["TokenPivot"], "example-provider", "example-model", occurredAt); bucket.eventCount < 1 {
+		t.Fatalf("minute bucket event_count = %d, want at least 1 for the project", bucket.eventCount)
+	}
+
+	// Archive it: the key stays reserved and the project is reused, not recreated.
+	if _, err := e.owner.Exec(ctx, "UPDATE projects SET archived_at = now() WHERE id = $1", keys["TokenPivot"]); err != nil {
+		t.Fatal(database.SafeError("archive project", err))
+	}
+	results = runBatch(t, service, credential, encodedBatch(t, keyedEventJSON("k-4", "TokenPivot", occurredAt)))
+	requireResultStatuses(t, results, statusAccepted)
+	if again := e.projectKeys(t, ctx, workspaceID); len(again) != 2 || again["TokenPivot"] != keys["TokenPivot"] {
+		t.Fatalf("archived project was not reused: %v", again)
+	}
+
+	// Retransmission with the same key is a duplicate. The id based resend below is
+	// deliberately different content (acceptedEventJSON also carries status and
+	// duration_ms, which keyedEventJSON omits), so it is a conflict rather than a
+	// duplicate; the same-content key/id equivalence is proven in
+	// TestProjectKeyTimingsShareTheResolvedIdentity.
+	results = runBatch(t, service, credential, encodedBatch(t,
+		keyedEventJSON("k-1", "TokenPivot", occurredAt),
+		acceptedEventJSON("k-1", occurredAt, keys["TokenPivot"])))
+	requireResultStatuses(t, results, statusDuplicate, statusConflict)
+}
+
+// Many writers racing to create the same key end with one project and every event accepted.
+func TestConcurrentProjectKeyCreationYieldsOneProject(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	const writers = 8
+	start := make(chan struct{})
+	results := make([][]result, writers)
+	batches := make([][]item, writers)
+	for i := range batches {
+		batches[i] = decodeOneBatch(t, encodedBatch(t, keyedEventJSON(fmt.Sprintf("race-%d", i), "RacedKey", occurredAt)))
+	}
+	var wait sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			results[index] = service.process(context.Background(), credential, batches[index])
+		}(i)
+	}
+	close(start)
+	wait.Wait()
+	for i, batch := range results {
+		if len(batch) != 1 || batch[0].status != statusAccepted {
+			t.Fatalf("writer %d: %+v, want accepted", i, batch)
+		}
+	}
+	keys := e.projectKeys(t, ctx, workspaceID)
+	if len(keys) != 1 || !keys["RacedKey"].Valid {
+		t.Fatalf("projects = %v, want exactly one RacedKey", keys)
+	}
+	for i := 0; i < writers; i++ {
+		if row := e.readRow(t, ctx, workspaceID, sourceID, fmt.Sprintf("race-%d", i)); row.projectID != keys["RacedKey"] {
+			t.Fatalf("event race-%d attributed to a different project", i)
+		}
+	}
+}
+
+// An expired event and a rolled-back item create no project; a full workspace rejects only a new key.
+func TestProjectKeyLimitExpiryAndRollback(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	expired := now.Add(-181 * 24 * time.Hour)
+	results := runBatch(t, service, credential, encodedBatch(t, keyedEventJSON("old", "ghost", expired)))
+	requireResultStatuses(t, results, statusExpired)
+	if len(e.projectKeys(t, ctx, workspaceID)) != 0 {
+		t.Fatal("an expired event created a project")
+	}
+
+	// Fill the workspace to the limit with one statement, then check the boundary.
+	if _, err := e.owner.Exec(ctx, `INSERT INTO projects (workspace_id, project_key, name)
+SELECT $1, 'bulk-' || g, 'bulk' FROM generate_series(1, $2) g`, workspaceID, MaxAutoProjects); err != nil {
+		t.Fatal(database.SafeError("fill projects", err))
+	}
+	results = runBatch(t, service, credential, encodedBatch(t,
+		keyedEventJSON("full-new", "brand-new", now.Add(-time.Hour)),
+		keyedEventJSON("full-old", "bulk-7", now.Add(-time.Hour))))
+	requireResultStatuses(t, results, statusRejected, statusAccepted)
+	if results[0].code != codeProjectInvalid {
+		t.Fatalf("limit rejection code = %q, want %s", results[0].code, codeProjectInvalid)
+	}
+	if _, found := e.projectKeys(t, ctx, workspaceID)["brand-new"]; found {
+		t.Fatal("a rejected key still created a project")
+	}
+}
+
+// timedEventJSON renders one event whose project is given either as a raw
+// project_key fragment or as a project_id fragment, with the timing fragment
+// appended verbatim. Everything else stays byte identical between the two forms,
+// so key resolved and id given retransmissions compare as the same content.
+func timedEventJSON(sourceEventID, projectField string, occurredAt time.Time, timings string) string {
+	return fmt.Sprintf(`{"source_event_id":%q,%s,"provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}%s}`,
+		sourceEventID, projectField, occurredAt.UTC().Format(microLayout), timings)
+}
+
+// TestProjectKeyTimingsShareTheResolvedIdentity proves the real database path for
+// a keyed event that also carries timings: the key is resolved to a project id
+// before the content digest is computed, so the same content sent by key and by
+// the resolved id is one identity, v1 and v2 retransmissions meet in the common v1
+// projection, and duplicates or conflicts never rewrite the stored row, backfill
+// NULL timings or double count the minute aggregate.
+func TestProjectKeyTimingsShareTheResolvedIdentity(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	const bothTimings = `,"generation_duration_ms":1200,"ttft_ms":180`
+	keyField := func(key string) string { return fmt.Sprintf(`"project_key":%q`, key) }
+	idField := func(id pgtype.UUID) string { return fmt.Sprintf(`"project_id":%q`, uuidText(id)) }
+
+	// assertUnchanged proves no stored row and no minute row moved, which covers a
+	// rewritten timing, a backfilled NULL and a double counted aggregate alike.
+	assertUnchanged := func(t *testing.T, name string, beforeEvents, beforeMinutes []string) {
+		t.Helper()
+		afterEvents, afterMinutes := e.historySnapshot(t, ctx, workspaceID)
+		requireSubset(t, name+" events", beforeEvents, afterEvents, 0)
+		requireSubset(t, name+" minutes", beforeMinutes, afterMinutes, 0)
+	}
+
+	t.Run("a project_key resolves before a v2 event is accepted", func(t *testing.T) {
+		const key = "TimedKey"
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2", keyField(key), occurredAt, bothTimings)))
+		requireResultStatuses(t, results, statusAccepted)
+		projectID, found := e.projectKeys(t, ctx, workspaceID)[key]
+		if !found {
+			t.Fatalf("project_key %q was not created", key)
+		}
+		row := e.readRow(t, ctx, workspaceID, sourceID, "pk-v2")
+		if row.projectID != projectID {
+			t.Fatal("the stored row is not attributed to the resolved project")
+		}
+		if row.version != normalizationVersionV2 {
+			t.Fatalf("version=%q want=%q", row.version, normalizationVersionV2)
+		}
+		if row.generationDurationMS == nil || *row.generationDurationMS != 1200 || row.ttftMS == nil || *row.ttftMS != 180 {
+			t.Fatalf("timings=%v/%v want 1200/180", describeInteger(row.generationDurationMS), describeInteger(row.ttftMS))
+		}
+		// The minute aggregate is keyed by the resolved project, so exactly one bucket
+		// exists and it belongs to that project rather than to the unattributed slot.
+		if buckets := e.countBuckets(t, ctx, workspaceID, sourceID); buckets != 1 {
+			t.Fatalf("buckets=%d want exactly 1", buckets)
+		}
+		bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		if bucket.eventCount != 1 || bucket.sum[0] != 100 || bucket.sum[1] != 20 || bucket.sum[2] != 120 {
+			t.Fatalf("bucket=%+v want event_count=1 sums 100/20/120", bucket)
+		}
+	})
+
+	t.Run("the same v2 content by key and by the resolved id is one identity", func(t *testing.T) {
+		const key = "TimedKey"
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		beforeBucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2", keyField(key), occurredAt, bothTimings),
+			timedEventJSON("pk-v2", idField(projectID), occurredAt, bothTimings)))
+		requireResultStatuses(t, results, statusDuplicate, statusDuplicate)
+		assertUnchanged(t, "key and resolved id duplicate", beforeEvents, beforeMinutes)
+		if rows := e.countRows(t, ctx, workspaceID, sourceID, "pk-v2"); rows != 1 {
+			t.Fatalf("rows=%d want 1", rows)
+		}
+		if after := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt); after != beforeBucket {
+			t.Fatalf("bucket changed %+v -> %+v", beforeBucket, after)
+		}
+	})
+
+	t.Run("a changed timing on the same key and id is a conflict", func(t *testing.T) {
+		const key = "TimedKey"
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2", keyField(key), occurredAt, `,"generation_duration_ms":1201,"ttft_ms":180`),
+			timedEventJSON("pk-v2", idField(projectID), occurredAt, `,"generation_duration_ms":1200,"ttft_ms":181`)))
+		requireResultStatuses(t, results, statusConflict, statusConflict)
+		assertUnchanged(t, "changed timing conflict", beforeEvents, beforeMinutes)
+		kept := e.readRow(t, ctx, workspaceID, sourceID, "pk-v2")
+		if kept.generationDurationMS == nil || *kept.generationDurationMS != 1200 || kept.ttftMS == nil || *kept.ttftMS != 180 {
+			t.Fatalf("kept timings=%v/%v want the original 1200/180", describeInteger(kept.generationDurationMS), describeInteger(kept.ttftMS))
+		}
+		if kept.projectID != projectID {
+			t.Fatal("a conflict re-attributed the stored row")
+		}
+	})
+
+	// A v1 row under a key accepts an identical v2 resend as a duplicate: both sides
+	// rebuild the common v1 projection from the resolved project id, and the row is
+	// never upgraded or backfilled.
+	t.Run("a stored v1 keyed row accepts a v2 resend without backfilling", func(t *testing.T) {
+		const key = "TimedKeyV1Stored"
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v1", keyField(key), occurredAt.Add(time.Second), "")))
+		requireResultStatuses(t, results, statusAccepted)
+		projectID, found := e.projectKeys(t, ctx, workspaceID)[key]
+		if !found {
+			t.Fatalf("project_key %q was not created", key)
+		}
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		results = runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v1", keyField(key), occurredAt.Add(time.Second), bothTimings)))
+		requireResultStatuses(t, results, statusDuplicate)
+		assertUnchanged(t, "v1 keyed row v2 resend", beforeEvents, beforeMinutes)
+		kept := e.readRow(t, ctx, workspaceID, sourceID, "pk-v1")
+		if kept.version != normalizationVersion || kept.generationDurationMS != nil || kept.ttftMS != nil {
+			t.Fatalf("kept version=%q timings=%v/%v want v1 with NULL timings", kept.version,
+				describeInteger(kept.generationDurationMS), describeInteger(kept.ttftMS))
+		}
+		if kept.projectID != projectID {
+			t.Fatal("the v1 row lost its resolved project")
+		}
+	})
+
+	// The other direction: a stored v2 keyed row accepts a v1 resend and keeps the
+	// timings it was accepted with.
+	t.Run("a stored v2 keyed row accepts a v1 resend and keeps its timings", func(t *testing.T) {
+		const key = "TimedKeyV2Stored"
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2stored", keyField(key), occurredAt.Add(2*time.Second), bothTimings)))
+		requireResultStatuses(t, results, statusAccepted)
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		results = runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2stored", keyField(key), occurredAt.Add(2*time.Second), "")))
+		requireResultStatuses(t, results, statusDuplicate)
+		assertUnchanged(t, "v2 keyed row v1 resend", beforeEvents, beforeMinutes)
+		kept := e.readRow(t, ctx, workspaceID, sourceID, "pk-v2stored")
+		if kept.version != normalizationVersionV2 || kept.generationDurationMS == nil || *kept.generationDurationMS != 1200 || kept.ttftMS == nil || *kept.ttftMS != 180 {
+			t.Fatalf("kept version=%q timings=%v/%v want v2 with 1200/180", kept.version,
+				describeInteger(kept.generationDurationMS), describeInteger(kept.ttftMS))
+		}
+		if kept.projectID != projectID {
+			t.Fatal("the v2 row lost its resolved project")
+		}
+	})
+
+	// A changed v1 element is a conflict in both directions even though the project
+	// arrives as a key, so the comparison must use the resolved id rather than the
+	// key text.
+	for _, direction := range []struct {
+		name     string
+		stored   string
+		resend   string
+		sourceID string
+		offset   time.Duration
+	}{
+		{name: "v1 stored v2 resend", stored: "", resend: bothTimings, sourceID: "pk-cv-v1", offset: 3 * time.Second},
+		{name: "v2 stored v1 resend", stored: bothTimings, resend: "", sourceID: "pk-cv-v2", offset: 4 * time.Second},
+	} {
+		t.Run("a changed provider conflicts when "+direction.name, func(t *testing.T) {
+			key := "TimedKeyConflict" + direction.sourceID
+			at := occurredAt.Add(direction.offset)
+			results := runBatch(t, service, credential, encodedBatch(t,
+				timedEventJSON(direction.sourceID, keyField(key), at, direction.stored)))
+			requireResultStatuses(t, results, statusAccepted)
+			beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+			changed := strings.Replace(
+				timedEventJSON(direction.sourceID, keyField(key), at, direction.resend),
+				`"provider":"example-provider"`, `"provider":"other-provider"`, 1)
+			results = runBatch(t, service, credential, encodedBatch(t, changed))
+			requireResultStatuses(t, results, statusConflict)
+			assertUnchanged(t, "changed provider conflict "+direction.name, beforeEvents, beforeMinutes)
+			kept := e.readRow(t, ctx, workspaceID, sourceID, direction.sourceID)
+			if kept.provider != "example-provider" {
+				t.Fatalf("stored provider=%q want the original", kept.provider)
+			}
+		})
+	}
+
+	// One batch mixes a valid keyed v2 item, an expired keyed v2 item and an invalid
+	// keyed item: each item keeps its own transaction, so timings never widen the
+	// expired window or the rejected item into a project creation.
+	t.Run("each keyed item keeps its own transaction", func(t *testing.T) {
+		const (
+			okKey      = "TimedTxnKey"
+			expiredKey = "TimedExpiredKey"
+			badKey     = "TimedRejectedKey"
+		)
+		expiredAt := time.Now().UTC().Add(-181 * 24 * time.Hour).Truncate(time.Microsecond)
+		badEvent := strings.Replace(
+			timedEventJSON("pk-bad", keyField(badKey), occurredAt, bothTimings),
+			`"provider":"example-provider"`, `"provider":""`, 1)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-txn-ok", keyField(okKey), occurredAt.Add(5*time.Second), bothTimings),
+			timedEventJSON("pk-txn-expired", keyField(expiredKey), expiredAt, bothTimings),
+			badEvent,
+		))
+		requireResultStatuses(t, results, statusAccepted, statusExpired, statusRejected)
+		if results[2].code != codeInvalidArgument {
+			t.Fatalf("invalid item code=%q want %s", results[2].code, codeInvalidArgument)
+		}
+		keys := e.projectKeys(t, ctx, workspaceID)
+		okProject, found := keys[okKey]
+		if !found {
+			t.Fatalf("accepted item did not create %q", okKey)
+		}
+		if _, found := keys[expiredKey]; found {
+			t.Fatal("an expired item created a project")
+		}
+		if _, found := keys[badKey]; found {
+			t.Fatal("a rejected item created a project")
+		}
+		row := e.readRow(t, ctx, workspaceID, sourceID, "pk-txn-ok")
+		if row.projectID != okProject || row.generationDurationMS == nil || *row.generationDurationMS != 1200 {
+			t.Fatalf("accepted item project=%v generation=%v want %v/1200", row.projectID.Valid, describeInteger(row.generationDurationMS), okProject.Valid)
+		}
+		if rows := e.countRows(t, ctx, workspaceID, sourceID, "pk-txn-expired"); rows != 0 {
+			t.Fatalf("expired rows=%d want 0", rows)
+		}
+		if rows := e.countRows(t, ctx, workspaceID, sourceID, "pk-bad"); rows != 0 {
+			t.Fatalf("rejected rows=%d want 0", rows)
+		}
+	})
+
+	// Archiving the project does not release its key, and a keyed v2 event with
+	// timings is still accepted against that archived project.
+	t.Run("an archived keyed project still accepts a v2 event", func(t *testing.T) {
+		const key = "TimedKey"
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		if _, err := e.owner.Exec(ctx, "UPDATE projects SET archived_at = now() WHERE id = $1", projectID); err != nil {
+			t.Fatal(database.SafeError("archive project", err))
+		}
+		// A separate minute keeps this bucket independent of the earlier events.
+		archivedAt := occurredAt.Add(2 * time.Minute)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-archived", keyField(key), archivedAt, bothTimings)))
+		requireResultStatuses(t, results, statusAccepted)
+		if again := e.projectKeys(t, ctx, workspaceID); again[key] != projectID {
+			t.Fatal("the archived key was recreated instead of reused")
+		}
+		row := e.readRow(t, ctx, workspaceID, sourceID, "pk-archived")
+		if row.projectID != projectID || row.generationDurationMS == nil || *row.generationDurationMS != 1200 || row.ttftMS == nil || *row.ttftMS != 180 {
+			t.Fatalf("archived row project=%v timings=%v/%v want the reused project with 1200/180", row.projectID.Valid,
+				describeInteger(row.generationDurationMS), describeInteger(row.ttftMS))
+		}
+		bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", archivedAt)
+		if bucket.eventCount != 1 {
+			t.Fatalf("archived bucket event_count=%d want 1", bucket.eventCount)
+		}
+	})
+
+	// Filling the workspace to the auto-creation limit rejects only a new key: an
+	// existing key still accepts a v2 event with timings and still creates nothing.
+	t.Run("the project limit applies to a new key only", func(t *testing.T) {
+		const key = "TimedKey"
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		existing := len(e.projectKeys(t, ctx, workspaceID))
+		if existing >= MaxAutoProjects {
+			t.Fatalf("workspace already holds %d projects", existing)
+		}
+		if _, err := e.owner.Exec(ctx, `INSERT INTO projects (workspace_id, project_key, name)
+SELECT $1, 'timed-bulk-' || g, 'bulk' FROM generate_series(1, $2) g`, workspaceID, MaxAutoProjects-existing); err != nil {
+			t.Fatal(database.SafeError("fill projects", err))
+		}
+		limitAt := occurredAt.Add(7 * time.Second)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-limit-new", keyField("timed-brand-new"), limitAt, bothTimings),
+			timedEventJSON("pk-limit-existing", keyField(key), limitAt, bothTimings)))
+		requireResultStatuses(t, results, statusRejected, statusAccepted)
+		if results[0].code != codeProjectInvalid {
+			t.Fatalf("limit rejection code=%q want %s", results[0].code, codeProjectInvalid)
+		}
+		if _, found := e.projectKeys(t, ctx, workspaceID)["timed-brand-new"]; found {
+			t.Fatal("a rejected key still created a project")
+		}
+		row := e.readRow(t, ctx, workspaceID, sourceID, "pk-limit-existing")
+		if row.projectID != projectID || row.generationDurationMS == nil || *row.generationDurationMS != 1200 {
+			t.Fatalf("existing key row project=%v generation=%v want the resolved project with 1200", row.projectID.Valid, describeInteger(row.generationDurationMS))
+		}
+	})
 }
 
 func TestSourceStampMovesForwardOnly(t *testing.T) {
@@ -1564,6 +2063,287 @@ func TestLockWaitCrossesLowerBoundInsideMinute(t *testing.T) {
 	}
 }
 
+// TestBatchPipelineSamplesClockAfterLockWait drives the real pipelined statements
+// with no scripted clock: the second statement of each write must observe the
+// database server time after a lock wait released, and that value is cached for the
+// window re-check that follows. A sample taken while the write was still blocked is
+// therefore a lower bound the cached value may never undercut.
+func TestBatchPipelineSamplesClockAfterLockWait(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	store := NewPostgres(pool)
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	t.Run("pipelined statements keep their results", func(t *testing.T) {
+		service := e.service(t, pool, &syncBuffer{})
+		conflict := fmt.Sprintf(`{"source_event_id":"evt-batch-new","project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			uuidText(projectID), occurredAt.UTC().Format(microLayout))
+		results := runBatch(t, service, credential, encodedBatch(t,
+			acceptedEventJSON("evt-batch-new", occurredAt, projectID),
+			conflict,
+			acceptedEventJSON("evt-batch-new", occurredAt, projectID),
+		))
+		requireResultStatuses(t, results, statusAccepted, statusConflict, statusDuplicate)
+		if count := e.countRows(t, ctx, workspaceID, sourceID, "evt-batch-new"); count != 1 {
+			t.Fatalf("rows=%d want=1", count)
+		}
+		bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		if bucket.eventCount != 1 || bucket.sum[0] != 100 {
+			t.Fatalf("bucket=%+v want one count of 100", bucket)
+		}
+	})
+
+	t.Run("insert samples the clock after the identity lock", func(t *testing.T) {
+		observer := e.probeConn(t)
+		item := beginItem(t, ctx, store)
+		defer rollbackItem(t, ctx, item)
+		postgresItem, ok := item.(*postgresTx)
+		if !ok {
+			t.Fatal("NewPostgres did not return its own item transaction")
+		}
+		event := mustDecodeEvent(t, acceptedEventJSON("evt-batch-insert", occurredAt, projectID))
+
+		receivedAt, window, err := sampleWindow(ctx, item, event)
+		if err != nil || window != verdictValid {
+			t.Fatalf("initial window err=%v verdict=%v want valid", err, window)
+		}
+		exists, err := item.ProjectExists(ctx, credential.WorkspaceID, event.ProjectID)
+		if err != nil || !exists {
+			t.Fatalf("project exists=%v err=%v want true", exists, err)
+		}
+
+		release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
+			holdIdentityLock(t, ctx, tx, workspaceID, sourceID, "evt-batch-insert", receivedAt)
+		})
+		done := make(chan error, 1)
+		go func() {
+			_, insertErr := item.InsertEvent(ctx, storedEventFor(credential, event, receivedAt))
+			done <- insertErr
+		}()
+		waitForWaitingBackend(t, ctx, observer)
+		blocked := e.serverTime(t, ctx, observer)
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("blocked insert failed: %v", err)
+		}
+		sampled := postgresItem.sampledNow
+		if sampled == nil || sampled.err != nil {
+			t.Fatalf("insert cached sample=%+v want the pipelined server time", sampled)
+		}
+		if sampled.at.Before(blocked) {
+			t.Fatalf("sampled %s is earlier than the server time %s read while the insert was blocked", sampled.at, blocked)
+		}
+		now, err := item.Now(ctx)
+		if err != nil || !now.Equal(sampled.at) {
+			t.Fatalf("following sample now=%s err=%v want the cached %s", now, err, sampled.at)
+		}
+	})
+
+	t.Run("minute increment samples the clock after the bucket lock", func(t *testing.T) {
+		observer := e.probeConn(t)
+		seed := e.service(t, pool, &syncBuffer{})
+		requireResultStatuses(t, runBatch(t, seed, credential, encodedBatch(t,
+			acceptedEventJSON("evt-batch-minute-seed", occurredAt, projectID),
+		)), statusAccepted)
+
+		item := beginItem(t, ctx, store)
+		defer rollbackItem(t, ctx, item)
+		postgresItem, ok := item.(*postgresTx)
+		if !ok {
+			t.Fatal("NewPostgres did not return its own item transaction")
+		}
+		event := mustDecodeEvent(t, acceptedEventJSON("evt-batch-minute", occurredAt, projectID))
+
+		release := e.holdLock(t, ctx, func(ctx context.Context, tx pgx.Tx) {
+			holdMinuteLock(t, ctx, tx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		})
+		done := make(chan error, 1)
+		go func() {
+			done <- item.ApplyMinute(ctx, minuteInputFor(credential, event))
+		}()
+		waitForWaitingBackend(t, ctx, observer)
+		blocked := e.serverTime(t, ctx, observer)
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("blocked minute increment failed: %v", err)
+		}
+		sampled := postgresItem.sampledNow
+		if sampled == nil || sampled.err != nil {
+			t.Fatalf("minute increment cached sample=%+v want the pipelined server time", sampled)
+		}
+		if sampled.at.Before(blocked) {
+			t.Fatalf("sampled %s is earlier than the server time %s read while the increment was blocked", sampled.at, blocked)
+		}
+		now, err := item.Now(ctx)
+		if err != nil || !now.Equal(sampled.at) {
+			t.Fatalf("following sample now=%s err=%v want the cached %s", now, err, sampled.at)
+		}
+	})
+
+	// The window verdict is decided by the first sample, which is a statement of its
+	// own, so an expired or future event never reaches the ownership query. That
+	// ordering is covered by TestExpiryPrecedesAnyIdentityLookup.
+
+	// The first sample and the ownership query are separate statements, so an item
+	// costs one round trip more when it carries a project. The counts are identical
+	// on a cold connection and on a warm one, because every statement is sent as an
+	// unnamed extended-protocol message with a single Sync instead of being prepared
+	// first.
+	t.Run("cold and warm connections use five round trips without project and six with project", func(t *testing.T) {
+		conflictWithProject := fmt.Sprintf(`{"source_event_id":"evt-rtt-new","project_id":"%s","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			uuidText(projectID), occurredAt.UTC().Format(microLayout))
+
+		// With a project: begin, first sample, ownership query, insert with its clock
+		// sample, minute increment or comparison read with its clock sample, and the
+		// end of the transaction are six round trips.
+		projectService, projectCounter := e.countedService(t)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "cold accepted item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusAccepted)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm accepted item",
+			acceptedEventJSON("evt-rtt-warm", occurredAt, projectID), statusAccepted)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm duplicate item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusDuplicate)
+		requireItemRoundTrips(t, projectService, projectCounter, credential, 6, "warm conflict item",
+			conflictWithProject, statusConflict)
+
+		// A cold duplicate and a cold conflict are measured on their own connections.
+		// The identity is already stored by the previous service, so the insert
+		// conflicts and the comparison read replaces the aggregation write, but the
+		// number of round trips stays the same.
+		coldDuplicateService, coldDuplicateCounter := e.countedService(t)
+		requireItemRoundTrips(t, coldDuplicateService, coldDuplicateCounter, credential, 6, "cold duplicate item",
+			acceptedEventJSON("evt-rtt-new", occurredAt, projectID), statusDuplicate)
+		coldConflictService, coldConflictCounter := e.countedService(t)
+		requireItemRoundTrips(t, coldConflictService, coldConflictCounter, credential, 6, "cold conflict item",
+			conflictWithProject, statusConflict)
+
+		// Without a project: the ownership query is skipped, so every path costs one
+		// round trip less.
+		bareConflict := fmt.Sprintf(`{"source_event_id":"evt-rtt-bare","provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":101,"quality":"known"}}}`,
+			occurredAt.UTC().Format(microLayout))
+		bareService, bareCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "cold accepted item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusAccepted)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm accepted item without project",
+			acceptedEventJSON("evt-rtt-bare-warm", occurredAt, pgtype.UUID{}), statusAccepted)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm duplicate item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusDuplicate)
+		requireItemRoundTrips(t, bareService, bareCounter, credential, 5, "warm conflict item without project",
+			bareConflict, statusConflict)
+
+		bareColdDuplicateService, bareColdDuplicateCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareColdDuplicateService, bareColdDuplicateCounter, credential, 5, "cold duplicate item without project",
+			acceptedEventJSON("evt-rtt-bare", occurredAt, pgtype.UUID{}), statusDuplicate)
+		bareColdConflictService, bareColdConflictCounter := e.countedService(t)
+		requireItemRoundTrips(t, bareColdConflictService, bareColdConflictCounter, credential, 5, "cold conflict item without project",
+			bareConflict, statusConflict)
+	})
+}
+
+// requireItemRoundTrips runs one item transaction on a counted service and asserts both
+// its status and its exact number of network round trips. One item transaction owns the
+// single pooled connection for its whole lifetime, so a counter reset belongs to
+// exactly one of them.
+func requireItemRoundTrips(t *testing.T, service *Service, counter *roundTripCounter, credential credentials.Credential, wantRounds int64, label, eventJSON, wantStatus string) {
+	t.Helper()
+	event := mustDecodeEvent(t, eventJSON)
+	counter.reset()
+	got := service.processItem(context.Background(), credential, event, time.Time{})
+	rounds := counter.value()
+	if got.status != wantStatus {
+		t.Fatalf("%s status=%s code=%s want=%s", label, got.status, got.code, wantStatus)
+	}
+	if rounds != wantRounds {
+		t.Fatalf("%s round trips=%d want=%d", label, rounds, wantRounds)
+	}
+}
+
+// countedService returns a service on a single-connection pool whose requests are
+// counted, with the connection already established and idle. The startup exchange is
+// therefore never part of a measured item transaction, and the next item transaction
+// is the cold one.
+func (e *integrationEnv) countedService(t *testing.T) (*Service, *roundTripCounter) {
+	t.Helper()
+	counter := &roundTripCounter{}
+	countingPool := e.countingPool(t, counter)
+	conn, err := countingPool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(database.SafeError("acquire counting connection", err))
+	}
+	conn.Release()
+	return e.service(t, countingPool, &syncBuffer{}), counter
+}
+
+// roundTripCounter counts the client to server requests written on the sockets of one
+// pool. The pool under measurement holds a single connection, so the count is the
+// number of network round trips of one item transaction.
+type roundTripCounter struct {
+	requests atomic.Int64
+}
+
+// reset starts a new measurement. The socket state is left alone: the next write
+// still has to follow the previous response to be counted as a new request.
+func (c *roundTripCounter) reset() { c.requests.Store(0) }
+
+func (c *roundTripCounter) value() int64 { return c.requests.Load() }
+
+// roundTripCountingConn counts one request for every write that begins after the
+// previous response was read. pgx writes one buffer per request, so one counted write
+// is one network round trip.
+type roundTripCountingConn struct {
+	net.Conn
+	counter     *roundTripCounter
+	lastWasRead atomic.Bool
+}
+
+func (c *roundTripCountingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.lastWasRead.Store(true)
+	}
+	return n, err
+}
+
+func (c *roundTripCountingConn) Write(p []byte) (int, error) {
+	if c.lastWasRead.CompareAndSwap(true, false) {
+		c.counter.requests.Add(1)
+	}
+	return c.Conn.Write(p)
+}
+
+// beginItem opens one real item transaction on the test goroutine.
+func beginItem(t *testing.T, ctx context.Context, store *Postgres) itemTx {
+	t.Helper()
+	item, err := store.BeginItem(ctx)
+	if err != nil {
+		t.Fatal(database.SafeError("begin item", err))
+	}
+	return item
+}
+
+// rollbackItem discards an item transaction that must never commit.
+func rollbackItem(t *testing.T, ctx context.Context, item itemTx) {
+	t.Helper()
+	if err := item.Rollback(ctx); err != nil {
+		t.Error(database.SafeError("rollback item", err))
+	}
+}
+
+// serverTime reads the server clock on the observation connection, so a test can
+// record a lower bound for a sample taken by another transaction.
+func (e *integrationEnv) serverTime(t *testing.T, ctx context.Context, observer *pgx.Conn) time.Time {
+	t.Helper()
+	var now time.Time
+	if err := observer.QueryRow(ctx, nowQuery).Scan(&now); err != nil {
+		t.Fatal(database.SafeError("sample server time", err))
+	}
+	return now
+}
+
 // hookStore wraps the real store and lets a test act at one exact point of the item
 // transaction, so a race is created by ordering and never by a sleep.
 type hookStore struct {
@@ -1599,6 +2379,10 @@ func (t *hookTx) Now(ctx context.Context) (time.Time, error) {
 		return t.hooks.now(ctx)
 	}
 	return t.inner.Now(ctx)
+}
+
+func (t *hookTx) EnsureProject(ctx context.Context, workspaceID credentials.ID, projectKey string) (credentials.ID, bool, error) {
+	return t.inner.EnsureProject(ctx, workspaceID, projectKey)
 }
 
 func (t *hookTx) ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error) {

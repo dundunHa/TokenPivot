@@ -3,6 +3,7 @@
 package workspaces
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -111,7 +112,7 @@ func integrationSchema(t *testing.T) (string, string) {
 		_ = app.Close(ctx)
 		t.Fatal("test service role must have tokenpivot_app privileges")
 	}
-	schema := "t019_" + fmt.Sprintf("%x", rand.Text()[:12])
+	schema := "t064_" + fmt.Sprintf("%x", rand.Text()[:12])
 	quoted := pgx.Identifier{schema}.Sanitize()
 	if _, err := owner.Exec(ctx, "CREATE SCHEMA "+quoted); err != nil {
 		_ = app.Close(ctx)
@@ -122,7 +123,7 @@ func integrationSchema(t *testing.T) (string, string) {
 		defer cancel()
 		var actual string
 		err := owner.QueryRow(cleanupCtx, "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname=$1", schema).Scan(&actual)
-		if err != nil || actual != role || !strings.HasPrefix(schema, "t019_") {
+		if err != nil || actual != role || !strings.HasPrefix(schema, "t064_") {
 			t.Errorf("preserving schema %s: ownership check failed", schema)
 			return
 		}
@@ -177,8 +178,9 @@ func applyMigrations(t *testing.T, migrationURL string) {
 	}
 }
 
-// newWorkspaces returns the pool-bound service, the pool and the service-role
-// URL of a fresh schema. The URL is needed because a race test opens independent
+// newWorkspaces returns the service, the pool and the service-role URL of a
+// fresh schema. One PostgreSQL adapter serves both the reads and the creation
+// transaction runner. The URL is needed because a race test opens independent
 // connections instead of relying on how many pooled connections are free.
 func newWorkspaces(t *testing.T) (*Service, *pgxpool.Pool, string) {
 	t.Helper()
@@ -190,7 +192,8 @@ func newWorkspaces(t *testing.T) (*Service, *pgxpool.Pool, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	return New(NewPostgres(pool)), pool, appURL
+	store := NewPostgres(pool)
+	return New(store, store), pool, appURL
 }
 
 // openAppConn opens one independent service-role connection pinned to the test
@@ -209,33 +212,6 @@ func openAppConn(t *testing.T, ctx context.Context, appURL string) *pgx.Conn {
 	return conn
 }
 
-// waitForLockedBackend waits until the named backend is blocked on a lock. It
-// polls pg_stat_activity by pid with a deadline, so the race order is asserted
-// from observable server state instead of from a sleep, and an unrelated backend
-// that happens to wait on a lock can never be mistaken for the one under test.
-func waitForLockedBackend(t *testing.T, ctx context.Context, observer *pgx.Conn, pid int32) {
-	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		var waiting bool
-		err := observer.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')", pid).Scan(&waiting)
-		if err != nil {
-			t.Fatal(database.SafeError("read lock wait", err))
-		}
-		if waiting {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("backend %d never waited on a lock", pid)
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal(database.SafeError("wait for lock", ctx.Err()))
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-}
-
 // seedUser inserts one synthetic account and returns its id.
 func seedUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, email string) ID {
 	t.Helper()
@@ -246,11 +222,12 @@ func seedUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, email strin
 	return id
 }
 
-// seedWorkspace inserts one synthetic workspace and returns its id.
-func seedWorkspace(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name string) ID {
+// seedWorkspace inserts one synthetic workspace with its required creator and
+// returns its id.
+func seedWorkspace(t *testing.T, ctx context.Context, pool *pgxpool.Pool, createdBy ID, name string) ID {
 	t.Helper()
 	var id ID
-	if err := pool.QueryRow(ctx, "INSERT INTO workspaces (name) VALUES ($1) RETURNING id", name).Scan(&id); err != nil {
+	if err := pool.QueryRow(ctx, "INSERT INTO workspaces (created_by_user_id, name) VALUES ($1,$2) RETURNING id", createdBy, name).Scan(&id); err != nil {
 		t.Fatal(database.SafeError("seed workspace", err))
 	}
 	return id
@@ -264,15 +241,15 @@ func seedMembership(t *testing.T, ctx context.Context, pool *pgxpool.Pool, works
 	}
 }
 
-// createInTx runs CreatePersonal inside one explicit READ COMMITTED transaction
-// on an independent connection, which is the isolation level T-017 must use.
-func createInTx(t *testing.T, ctx context.Context, conn *pgx.Conn, userID ID) (Workspace, error) {
+// createOnConn runs creation inside one explicit READ COMMITTED transaction on an
+// independent connection, which is the isolation level the quota relies on.
+func createOnConn(t *testing.T, ctx context.Context, conn *pgx.Conn, userID ID, name string) (Workspace, error) {
 	t.Helper()
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return Workspace{}, database.SafeError("begin", err)
 	}
-	workspace, err := NewTx(tx).CreatePersonal(ctx, userID)
+	workspace, err := createWorkspace(ctx, &txStore{q: tx}, userID, name)
 	if err != nil {
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 		return Workspace{}, err
@@ -291,150 +268,207 @@ func rowCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (workspace
 	return workspaces, memberships
 }
 
-// TestCreatePersonalAgainstPostgres proves the first call writes exactly one
-// workspace named Personal with one owner membership, and that the id comes from
-// the database as a UUID v7.
-func TestCreatePersonalAgainstPostgres(t *testing.T) {
-	_, pool, appURL := newWorkspaces(t)
+// createdBy returns the stored creator of one workspace.
+func createdBy(t *testing.T, ctx context.Context, pool *pgxpool.Pool, workspaceID ID) ID {
+	t.Helper()
+	var owner ID
+	if err := pool.QueryRow(ctx, "SELECT created_by_user_id FROM workspaces WHERE id=$1", workspaceID).Scan(&owner); err != nil {
+		t.Fatal(database.SafeError("load creator", err))
+	}
+	return owner
+}
+
+// TestLatestSchemaShape proves a fresh schema built only from the released
+// migrations has the columns, collation and unique index the domain code relies
+// on, and no new foreign key, CHECK, trigger or row level security on its own
+// tables. Other domains may declare their own constraints in the same schema.
+func TestLatestSchemaShape(t *testing.T) {
+	_, pool, _ := newWorkspaces(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	userID := seedUser(t, ctx, pool, "personal@example.com")
 
-	conn := openAppConn(t, ctx, appURL)
-	workspace, err := createInTx(t, ctx, conn, userID)
+	var collation string
+	if err := pool.QueryRow(ctx, `SELECT collation_name FROM information_schema.columns
+WHERE table_schema = current_schema() AND table_name = 'workspaces' AND column_name = 'name'`).Scan(&collation); err != nil {
+		t.Fatal(database.SafeError("workspaces name collation", err))
+	}
+	if collation != "C" {
+		t.Fatalf("workspaces.name collation=%q want C", collation)
+	}
+	var nullable string
+	if err := pool.QueryRow(ctx, `SELECT is_nullable FROM information_schema.columns
+WHERE table_schema = current_schema() AND table_name = 'workspaces' AND column_name = 'created_by_user_id'`).Scan(&nullable); err != nil {
+		t.Fatal(database.SafeError("workspaces creator nullability", err))
+	}
+	if nullable != "NO" {
+		t.Fatalf("created_by_user_id nullable=%q want NO", nullable)
+	}
+	var indexdef string
+	if err := pool.QueryRow(ctx, `SELECT indexdef FROM pg_indexes
+WHERE schemaname = current_schema() AND indexname = 'uk_workspaces_created_by_user_id_name'`).Scan(&indexdef); err != nil {
+		t.Fatal(database.SafeError("workspaces name index", err))
+	}
+	if !strings.Contains(indexdef, "UNIQUE") || !strings.Contains(indexdef, "(created_by_user_id, name)") {
+		t.Fatalf("indexdef=%q want a unique index on (created_by_user_id, name)", indexdef)
+	}
+	var constraints, triggers, rls int
+	if err := pool.QueryRow(ctx, `SELECT
+ (SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
+   JOIN pg_namespace n ON n.oid = r.relnamespace
+   WHERE n.nspname = current_schema()
+   AND r.relname IN ('workspaces', 'workspace_memberships') AND c.contype IN ('f', 'c')),
+ (SELECT count(*) FROM pg_trigger g JOIN pg_class r ON r.oid = g.tgrelid
+   JOIN pg_namespace n ON n.oid = r.relnamespace
+   WHERE n.nspname = current_schema()
+   AND r.relname IN ('workspaces', 'workspace_memberships') AND NOT g.tgisinternal),
+ (SELECT count(*) FROM pg_class r JOIN pg_namespace n ON n.oid = r.relnamespace
+   WHERE n.nspname = current_schema()
+   AND r.relname IN ('workspaces', 'workspace_memberships') AND r.relrowsecurity)`).Scan(&constraints, &triggers, &rls); err != nil {
+		t.Fatal(database.SafeError("schema shape", err))
+	}
+	if constraints != 0 || triggers != 0 || rls != 0 {
+		t.Fatalf("foreign keys/checks=%d triggers=%d rls=%d want 0", constraints, triggers, rls)
+	}
+}
+
+// TestCreateWorkspaceAgainstPostgres proves the first call stores the trimmed
+// name with its creator, writes exactly one owner membership, and that the id
+// comes from the database as a UUID v7. The new workspace is visible in the
+// creator's list immediately and counts toward the quota.
+func TestCreateWorkspaceAgainstPostgres(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	userID := seedUser(t, ctx, pool, "create@example.com")
+
+	workspace, err := service.Create(ctx, userID, "  Alpha  ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if workspace.Name != "Personal" {
-		t.Fatalf("name=%q want Personal", workspace.Name)
+	if workspace.Name != "Alpha" {
+		t.Fatalf("name=%q want the trimmed name Alpha", workspace.Name)
 	}
 	var name string
 	var version int
 	if err := pool.QueryRow(ctx, "SELECT name, uuid_extract_version(id) FROM workspaces WHERE id=$1", workspace.ID).Scan(&name, &version); err != nil {
 		t.Fatal(database.SafeError("load workspace", err))
 	}
-	if name != "Personal" || version != 7 {
-		t.Fatalf("stored name=%q uuid version=%d want Personal and 7", name, version)
+	if name != "Alpha" || version != 7 {
+		t.Fatalf("stored name=%q uuid version=%d want Alpha and 7", name, version)
+	}
+	if owner := createdBy(t, ctx, pool, workspace.ID); owner != userID {
+		t.Fatal("stored creator does not match the creating account")
 	}
 	var role string
 	if err := pool.QueryRow(ctx, "SELECT role FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2", workspace.ID, userID).Scan(&role); err != nil {
 		t.Fatal(database.SafeError("load membership", err))
 	}
-	var memberships int
-	if err := pool.QueryRow(ctx, "SELECT count(*)::int FROM workspace_memberships WHERE user_id=$1", userID).Scan(&memberships); err != nil {
-		t.Fatal(database.SafeError("count memberships", err))
+	if role != "owner" {
+		t.Fatalf("role=%q want owner", role)
 	}
-	if role != "owner" || memberships != 1 {
-		t.Fatalf("role=%q memberships=%d want owner and 1", role, memberships)
+	workspaces, memberships := rowCounts(t, ctx, pool)
+	if workspaces != 1 || memberships != 1 {
+		t.Fatalf("workspaces=%d memberships=%d want 1 and 1", workspaces, memberships)
 	}
-	// The role query T-010/T-021 will use returns the owner result directly.
-	foundRole, found, err := New(NewPostgres(pool)).MembershipRole(ctx, userID, workspace.ID)
+	// The role query the workspace-scoped routes use returns the owner directly.
+	foundRole, found, err := service.MembershipRole(ctx, userID, workspace.ID)
 	if err != nil || !found || foundRole != RoleOwner {
 		t.Fatalf("role=%q found=%t err=%v want owner and found", foundRole, found, err)
 	}
+	list, err := service.List(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0] != workspace {
+		t.Fatalf("list=%v want the created workspace", list)
+	}
 }
 
-// TestCreatePersonalRepeatedReturnsSameWorkspace covers the sequential repeat:
-// the second call returns the same workspace and writes nothing.
-func TestCreatePersonalRepeatedReturnsSameWorkspace(t *testing.T) {
-	_, pool, appURL := newWorkspaces(t)
+// TestCreateWorkspaceRejectsInvalidName proves the domain rule runs before any
+// SQL: nothing is written and no error is reported as a name conflict.
+func TestCreateWorkspaceRejectsInvalidName(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	userID := seedUser(t, ctx, pool, "repeat@example.com")
-	conn := openAppConn(t, ctx, appURL)
+	userID := seedUser(t, ctx, pool, "invalid@example.com")
 
-	first, err := createInTx(t, ctx, conn, userID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := createInTx(t, ctx, conn, userID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.ID != second.ID || first.Name != second.Name {
-		t.Fatal("the repeated call returned a different workspace")
+	for _, name := range []string{"", "   ", "Al\x00pha", strings.Repeat("a", nameMaxRunes+1), strings.Repeat("\U0001F600", 65)} {
+		if _, err := service.Create(ctx, userID, name); !errors.Is(err, ErrInvalidName) {
+			t.Fatalf("name=%q error=%v want ErrInvalidName", name, err)
+		}
 	}
 	workspaces, memberships := rowCounts(t, ctx, pool)
-	if workspaces != 1 || memberships != 1 {
-		t.Fatalf("workspaces=%d memberships=%d want 1 and 1", workspaces, memberships)
+	if workspaces != 0 || memberships != 0 {
+		t.Fatalf("workspaces=%d memberships=%d want 0 and 0", workspaces, memberships)
 	}
 }
 
-// TestCreatePersonalConcurrencyCreatesOneWorkspace drives two explicit READ
-// COMMITTED transactions for the same user and asserts the documented order from
-// observable server state: the second waits on the users row lock, the first
-// commits, and the second then returns the same workspace. No workspace or
-// membership is duplicated.
-func TestCreatePersonalConcurrencyCreatesOneWorkspace(t *testing.T) {
-	_, pool, appURL := newWorkspaces(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+// TestCreateWorkspaceUnknownUserWritesNothing proves the users row lock doubles
+// as the existence check: a missing account fails before any insert.
+func TestCreateWorkspaceUnknownUserWritesNothing(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	userID := seedUser(t, ctx, pool, "concurrent@example.com")
 
-	firstConn := openAppConn(t, ctx, appURL)
-	secondConn := openAppConn(t, ctx, appURL)
-	observer := openAppConn(t, ctx, appURL)
-
-	// The first transaction creates the workspace and holds the users row lock
-	// until it commits.
-	firstTx, err := firstConn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		t.Fatal(database.SafeError("begin first", err))
-	}
-	first, err := NewTx(firstTx).CreatePersonal(ctx, userID)
-	if err != nil {
-		_ = firstTx.Rollback(context.WithoutCancel(ctx))
-		t.Fatal(err)
-	}
-
-	// Pin the backend id of the second connection before it runs anything, so the
-	// wait is observed on that exact backend rather than on any lock waiter.
-	var secondPID int32
-	if err := secondConn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&secondPID); err != nil {
-		t.Fatal(database.SafeError("read second backend pid", err))
-	}
-
-	// The second transaction starts while the lock is held and must wait.
-	type result struct {
-		workspace Workspace
-		err       error
-	}
-	second := make(chan result, 1)
-	go func() {
-		workspace, err := createInTx(t, ctx, secondConn, userID)
-		second <- result{workspace: workspace, err: err}
-	}()
-	waitForLockedBackend(t, ctx, observer, secondPID)
-
-	if err := firstTx.Commit(ctx); err != nil {
-		t.Fatal(database.SafeError("commit first", err))
-	}
-	got := <-second
-	if got.err != nil {
-		t.Fatal(got.err)
-	}
-	if got.workspace.ID != first.ID || got.workspace.Name != first.Name {
-		t.Fatal("the waiting transaction did not return the first committed workspace")
+	if _, err := service.Create(ctx, ID{Bytes: [16]byte{0x01}, Valid: true}, "Alpha"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("error=%v want ErrUserNotFound", err)
 	}
 	workspaces, memberships := rowCounts(t, ctx, pool)
-	if workspaces != 1 || memberships != 1 {
-		t.Fatalf("workspaces=%d memberships=%d want 1 and 1", workspaces, memberships)
+	if workspaces != 0 || memberships != 0 {
+		t.Fatalf("workspaces=%d memberships=%d want 0 and 0", workspaces, memberships)
 	}
 }
 
-// TestCreatePersonalConcurrencyDistinctUsersCreateDistinctWorkspaces proves the
-// users row lock is per user: two different users never share a workspace.
-func TestCreatePersonalConcurrencyDistinctUsersCreateDistinctWorkspaces(t *testing.T) {
+// TestCreateWorkspaceAtLimit proves the third creation fails with the quota
+// error and leaves the stored rows untouched. It also covers the sequential
+// duplicate name: the second attempt with the same name is a name conflict from
+// the unique index, not a second workspace.
+func TestCreateWorkspaceAtLimit(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	userID := seedUser(t, ctx, pool, "limit@example.com")
+
+	if _, err := service.Create(ctx, userID, "Alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, userID, "Alpha"); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("duplicate error=%v want ErrNameConflict", err)
+	}
+	if _, err := service.Create(ctx, userID, "Beta"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, userID, "Gamma"); !errors.Is(err, ErrLimitReached) {
+		t.Fatalf("error=%v want ErrLimitReached", err)
+	}
+	workspaces, memberships := rowCounts(t, ctx, pool)
+	if workspaces != 2 || memberships != 2 {
+		t.Fatalf("workspaces=%d memberships=%d want 2 and 2", workspaces, memberships)
+	}
+	var stored int
+	if err := pool.QueryRow(ctx, "SELECT count(*)::int FROM workspaces WHERE name='Gamma'").Scan(&stored); err != nil {
+		t.Fatal(database.SafeError("count rejected name", err))
+	}
+	if stored != 0 {
+		t.Fatal("a rejected creation left a workspace row")
+	}
+}
+
+// TestCreateWorkspaceConcurrencyDistinctNames drives eight independent READ
+// COMMITTED transactions for the same account and distinct names: the users row
+// lock serialises them, so exactly two creations succeed and the other six see
+// the quota error. No partial workspace or membership is left behind.
+func TestCreateWorkspaceConcurrencyDistinctNames(t *testing.T) {
 	_, pool, appURL := newWorkspaces(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	firstUser := seedUser(t, ctx, pool, "distinct-a@example.com")
-	secondUser := seedUser(t, ctx, pool, "distinct-b@example.com")
+	userID := seedUser(t, ctx, pool, "race-limit@example.com")
 
-	results := make([]Workspace, 2)
-	errs := make([]error, 2)
+	names := []string{"Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta"}
+	errs := make([]error, len(names))
+	results := make([]Workspace, len(names))
 	var wg sync.WaitGroup
-	for i, userID := range []ID{firstUser, secondUser} {
+	for i, name := range names {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -446,21 +480,112 @@ func TestCreatePersonalConcurrencyDistinctUsersCreateDistinctWorkspaces(t *testi
 			defer func() {
 				_ = conn.Close(context.Background())
 			}()
-			results[i], errs[i] = createInTx(t, ctx, conn, userID)
+			results[i], errs[i] = createOnConn(t, ctx, conn, userID, name)
 		}()
 	}
 	wg.Wait()
-	for _, err := range errs {
-		if err != nil {
-			t.Fatal(err)
+
+	succeeded := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+			if results[i].Name != names[i] {
+				t.Fatalf("result %d name=%q want %q", i, results[i].Name, names[i])
+			}
+		case errors.Is(err, ErrLimitReached):
+		default:
+			t.Fatalf("name=%q error=%v want success or ErrLimitReached", names[i], err)
 		}
 	}
-	if results[0].ID == results[1].ID {
-		t.Fatal("two users share one personal workspace")
+	if succeeded != freeWorkspaceLimit {
+		t.Fatalf("succeeded=%d want exactly %d", succeeded, freeWorkspaceLimit)
 	}
 	workspaces, memberships := rowCounts(t, ctx, pool)
-	if workspaces != 2 || memberships != 2 {
-		t.Fatalf("workspaces=%d memberships=%d want 2 and 2", workspaces, memberships)
+	if workspaces != freeWorkspaceLimit || memberships != freeWorkspaceLimit {
+		t.Fatalf("workspaces=%d memberships=%d want %d and %d", workspaces, memberships, freeWorkspaceLimit, freeWorkspaceLimit)
+	}
+	var owners int
+	if err := pool.QueryRow(ctx, "SELECT count(*)::int FROM workspace_memberships WHERE user_id=$1 AND role='owner'", userID).Scan(&owners); err != nil {
+		t.Fatal(database.SafeError("count owners", err))
+	}
+	if owners != freeWorkspaceLimit {
+		t.Fatalf("owner memberships=%d want %d", owners, freeWorkspaceLimit)
+	}
+}
+
+// TestCreateWorkspaceConcurrencySameName drives four independent transactions
+// with the same name: the unique index, not a prior lookup, decides, so exactly
+// one succeeds and the rest are name conflicts.
+func TestCreateWorkspaceConcurrencySameName(t *testing.T) {
+	_, pool, appURL := newWorkspaces(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	userID := seedUser(t, ctx, pool, "race-name@example.com")
+
+	const attempts = 4
+	errs := make([]error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := pgx.Connect(ctx, appURL)
+			if err != nil {
+				errs[i] = database.SafeError("connect", err)
+				return
+			}
+			defer func() {
+				_ = conn.Close(context.Background())
+			}()
+			_, errs[i] = createOnConn(t, ctx, conn, userID, "Alpha")
+		}()
+	}
+	wg.Wait()
+
+	succeeded := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrNameConflict):
+		default:
+			t.Fatalf("attempt %d error=%v want success or ErrNameConflict", i, err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("succeeded=%d want exactly 1", succeeded)
+	}
+	workspaces, memberships := rowCounts(t, ctx, pool)
+	if workspaces != 1 || memberships != 1 {
+		t.Fatalf("workspaces=%d memberships=%d want 1 and 1", workspaces, memberships)
+	}
+}
+
+// TestCreateWorkspaceQuotaIsPerAccount proves different accounts never share the
+// quota: each one may create its two workspaces, and each third call fails.
+func TestCreateWorkspaceQuotaIsPerAccount(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	first := seedUser(t, ctx, pool, "quota-a@example.com")
+	second := seedUser(t, ctx, pool, "quota-b@example.com")
+
+	for _, userID := range []ID{first, second} {
+		for _, name := range []string{"Alpha", "Beta"} {
+			if _, err := service.Create(ctx, userID, name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, userID := range []ID{first, second} {
+		if _, err := service.Create(ctx, userID, "Gamma"); !errors.Is(err, ErrLimitReached) {
+			t.Fatalf("error=%v want ErrLimitReached for a second account", err)
+		}
+	}
+	workspaces, memberships := rowCounts(t, ctx, pool)
+	if workspaces != 4 || memberships != 4 {
+		t.Fatalf("workspaces=%d memberships=%d want 4 and 4", workspaces, memberships)
 	}
 }
 
@@ -472,24 +597,24 @@ type injectedStore struct {
 	failMembership bool
 }
 
-func (s injectedStore) insertWorkspace(ctx context.Context, name string) (Workspace, error) {
+func (s injectedStore) insertWorkspace(ctx context.Context, userID ID, name string) (Workspace, error) {
 	if s.failWorkspace {
-		return Workspace{}, database.SafeError("workspaces insert", errors.New("synthetic-workspace-failure"))
+		return Workspace{}, database.SafeStoreError("workspaces insert", errors.New("synthetic-workspace-failure"))
 	}
-	return s.createStore.insertWorkspace(ctx, name)
+	return s.createStore.insertWorkspace(ctx, userID, name)
 }
 
 func (s injectedStore) insertOwnerMembership(ctx context.Context, workspaceID, userID ID) error {
 	if s.failMembership {
-		return database.SafeError("workspaces membership insert", errors.New("synthetic-membership-failure"))
+		return database.SafeStoreError("workspaces membership insert", errors.New("synthetic-membership-failure"))
 	}
 	return s.createStore.insertOwnerMembership(ctx, workspaceID, userID)
 }
 
-// TestCreatePersonalFailureRollsBackEverything injects a workspace insert
+// TestCreateWorkspaceFailureRollsBackEverything injects a workspace insert
 // failure and a membership insert failure in turn. Neither may leave a committed
-// workspace or membership behind, and the error must stay safe text.
-func TestCreatePersonalFailureRollsBackEverything(t *testing.T) {
+// workspace or membership behind, and the error must stay safe fixed text.
+func TestCreateWorkspaceFailureRollsBackEverything(t *testing.T) {
 	_, pool, appURL := newWorkspaces(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -510,8 +635,8 @@ func TestCreatePersonalFailureRollsBackEverything(t *testing.T) {
 				t.Fatal(database.SafeError("begin", err))
 			}
 			store := tc.store
-			store.createStore = NewTx(tx)
-			_, err = createPersonal(ctx, store, userID)
+			store.createStore = &txStore{q: tx}
+			_, err = createWorkspace(ctx, store, userID, "Alpha")
 			if err == nil {
 				t.Fatal("the injected failure was reported as success")
 			}
@@ -532,26 +657,100 @@ func TestCreatePersonalFailureRollsBackEverything(t *testing.T) {
 	}
 }
 
-// TestCreatePersonalUnknownUserWritesNothing proves the users row lock doubles as
-// the existence check: a missing user fails before any insert.
-func TestCreatePersonalUnknownUserWritesNothingAgainstPostgres(t *testing.T) {
-	_, pool, appURL := newWorkspaces(t)
+// TestListWorkspacesOrderAndIsolation runs the real SQL: an account without
+// memberships gets an empty non-nil slice, the C collation orders names
+// bytewise, equal names fall back to the workspace id, and workspaces the
+// account is not a member of are never returned.
+func TestListWorkspacesOrderAndIsolation(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn := openAppConn(t, ctx, appURL)
+	userID := seedUser(t, ctx, pool, "list@example.com")
+	creator := seedUser(t, ctx, pool, "list-creator@example.com")
+	stranger := seedUser(t, ctx, pool, "list-stranger@example.com")
 
-	_, err := createInTx(t, ctx, conn, ID{Bytes: [16]byte{0x01}, Valid: true})
-	if !errors.Is(err, ErrUserNotFound) {
-		t.Fatalf("error=%v want ErrUserNotFound", err)
+	empty, err := service.List(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	workspaces, memberships := rowCounts(t, ctx, pool)
-	if workspaces != 0 || memberships != 0 {
-		t.Fatalf("workspaces=%d memberships=%d want 0 and 0", workspaces, memberships)
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("empty list=%v want a non-nil empty slice", empty)
+	}
+
+	// C collation is bytewise: upper case sorts before lower case regardless of
+	// the database locale.
+	seeded := []struct {
+		name string
+		id   ID
+	}{
+		{"Beta", seedWorkspace(t, ctx, pool, creator, "Beta")},
+		{"alpha", seedWorkspace(t, ctx, pool, creator, "alpha")},
+		{"Alpha", seedWorkspace(t, ctx, pool, creator, "Alpha")},
+		{"Same", seedWorkspace(t, ctx, pool, creator, "Same")},
+		{"Same", seedWorkspace(t, ctx, pool, stranger, "Same")},
+	}
+	for _, row := range seeded {
+		seedMembership(t, ctx, pool, row.id, userID, "member")
+	}
+	foreign := seedWorkspace(t, ctx, pool, stranger, "Private")
+	seedMembership(t, ctx, pool, foreign, stranger, "owner")
+
+	list, err := service.List(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != len(seeded) {
+		t.Fatalf("list=%v want %d rows", list, len(seeded))
+	}
+	for i := 1; i < len(list); i++ {
+		previous, current := list[i-1], list[i]
+		byName := bytes.Compare([]byte(previous.Name), []byte(current.Name))
+		if byName > 0 || (byName == 0 && bytes.Compare(previous.ID.Bytes[:], current.ID.Bytes[:]) > 0) {
+			t.Fatalf("list=%v is not ordered by name then id", list)
+		}
+	}
+	if list[0].Name != "Alpha" || list[1].Name != "Beta" || list[2].Name != "Same" || list[3].Name != "Same" || list[4].Name != "alpha" {
+		t.Fatalf("list names=%q want C collation order", names(list))
+	}
+	for _, workspace := range list {
+		if workspace.ID == foreign {
+			t.Fatal("the list returned a workspace the account is not a member of")
+		}
 	}
 }
 
-// TestMembershipRoleAgainstPostgres covers the authorisation input: owner,
-// a directly seeded member row, a non-member, another user's workspace and an
+// names returns the display names of a list for failure messages.
+func names(list []Workspace) []string {
+	out := make([]string, len(list))
+	for i, workspace := range list {
+		out[i] = workspace.Name
+	}
+	return out
+}
+
+// TestWorkspaceLookupAgainstPostgres covers the detail read used after the
+// membership gate: a stored id is found, an unknown id is not.
+func TestWorkspaceLookupAgainstPostgres(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	userID := seedUser(t, ctx, pool, "lookup@example.com")
+	created, err := service.Create(ctx, userID, "Alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, found, err := service.Workspace(ctx, created.ID)
+	if err != nil || !found || got != created {
+		t.Fatalf("got=%+v found=%t err=%v want the created workspace", got, found, err)
+	}
+	if _, found, err := service.Workspace(ctx, ID{Bytes: [16]byte{0x0f}, Valid: true}); err != nil || found {
+		t.Fatalf("unknown id found=%t err=%v want not found", found, err)
+	}
+}
+
+// TestMembershipRoleAgainstPostgres covers the authorisation input: owner, a
+// directly seeded member row, a non-member, another user's workspace and an
 // unknown stored role.
 func TestMembershipRoleAgainstPostgres(t *testing.T) {
 	service, pool, _ := newWorkspaces(t)
@@ -560,8 +759,8 @@ func TestMembershipRoleAgainstPostgres(t *testing.T) {
 	owner := seedUser(t, ctx, pool, "role-owner@example.com")
 	member := seedUser(t, ctx, pool, "role-member@example.com")
 	other := seedUser(t, ctx, pool, "role-other@example.com")
-	workspace := seedWorkspace(t, ctx, pool, "synthetic-role-workspace")
-	foreign := seedWorkspace(t, ctx, pool, "synthetic-foreign-workspace")
+	workspace := seedWorkspace(t, ctx, pool, owner, "synthetic-role-workspace")
+	foreign := seedWorkspace(t, ctx, pool, other, "synthetic-foreign-workspace")
 	seedMembership(t, ctx, pool, workspace, owner, "owner")
 	seedMembership(t, ctx, pool, workspace, member, "member")
 
@@ -575,8 +774,8 @@ func TestMembershipRoleAgainstPostgres(t *testing.T) {
 	if role, found, err := service.MembershipRole(ctx, owner, foreign); err != nil || found || role != "" {
 		t.Fatalf("foreign role=%q found=%t err=%v want empty and false", role, found, err)
 	}
-	// A user asking about somebody else's personal workspace is a non-member.
-	personal := seedWorkspace(t, ctx, pool, "synthetic-personal")
+	// A user asking about somebody else's workspace is a non-member.
+	personal := seedWorkspace(t, ctx, pool, other, "synthetic-personal")
 	seedMembership(t, ctx, pool, personal, other, "owner")
 	if role, found, err := service.MembershipRole(ctx, owner, personal); err != nil || found || role != "" {
 		t.Fatalf("cross-user role=%q found=%t err=%v want empty and false", role, found, err)
@@ -607,7 +806,8 @@ func TestMembershipRoleDatabaseFailureIsNotANonMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	broken.Close()
-	role, found, err := New(NewPostgres(broken)).MembershipRole(ctx, ID{Bytes: [16]byte{0x02}, Valid: true}, ID{Bytes: [16]byte{0x03}, Valid: true})
+	brokenStore := NewPostgres(broken)
+	role, found, err := New(brokenStore, brokenStore).MembershipRole(ctx, ID{Bytes: [16]byte{0x02}, Valid: true}, ID{Bytes: [16]byte{0x03}, Valid: true})
 	if err == nil {
 		t.Fatal("a closed pool reported a membership result")
 	}
@@ -620,52 +820,38 @@ func TestMembershipRoleDatabaseFailureIsNotANonMember(t *testing.T) {
 	}
 }
 
-// TestPersonalHistoryIsNotShared proves an existing personal workspace keeps its
-// business rows when the user later joins another workspace: no row is copied or
-// moved, and the role query never touches business attribution.
-func TestPersonalHistoryIsNotShared(t *testing.T) {
-	service, pool, appURL := newWorkspaces(t)
+// TestWorkspaceHistoryStaysInItsWorkspace proves a second workspace never
+// re-homes the business rows of the first one: creation writes only the
+// workspace row and its owner membership.
+func TestWorkspaceHistoryStaysInItsWorkspace(t *testing.T) {
+	service, pool, _ := newWorkspaces(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	userID := seedUser(t, ctx, pool, "history@example.com")
-	conn := openAppConn(t, ctx, appURL)
-	personal, err := createInTx(t, ctx, conn, userID)
+	first, err := service.Create(ctx, userID, "Alpha")
 	if err != nil {
 		t.Fatal(err)
 	}
+	second, err := service.Create(ctx, userID, "Beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == second.ID {
+		t.Fatal("two creations returned the same workspace")
+	}
 
 	var projectID, sourceID ID
-	if err := pool.QueryRow(ctx, "INSERT INTO projects (workspace_id, project_key, name) VALUES ($1,$2,$3) RETURNING id", personal.ID, "synthetic-project", "Synthetic Project").Scan(&projectID); err != nil {
+	if err := pool.QueryRow(ctx, "INSERT INTO projects (workspace_id, project_key, name) VALUES ($1,$2,$3) RETURNING id", first.ID, "synthetic-project", "Synthetic Project").Scan(&projectID); err != nil {
 		t.Fatal(database.SafeError("seed project", err))
 	}
-	if err := pool.QueryRow(ctx, "INSERT INTO sources (workspace_id, platform, instance_key) VALUES ($1,$2,$3) RETURNING id", personal.ID, "synthetic-platform", "synthetic-instance").Scan(&sourceID); err != nil {
+	if err := pool.QueryRow(ctx, "INSERT INTO sources (workspace_id, platform, instance_key) VALUES ($1,$2,$3) RETURNING id", first.ID, "synthetic-platform", "synthetic-instance").Scan(&sourceID); err != nil {
 		t.Fatal(database.SafeError("seed source", err))
 	}
-	// Each seeded row keeps its own identity, so the assertions below can prove
-	// that specific row still exists and still belongs to the personal workspace
-	// instead of only counting rows that could have been re-created.
-	var credentialID, eventID ID
-	if err := pool.QueryRow(ctx, "INSERT INTO ingest_credentials (workspace_id, source_id, secret_hash) VALUES ($1,$2,$3) RETURNING id", personal.ID, sourceID, []byte("synthetic-digest-32-bytes-........")).Scan(&credentialID); err != nil {
+	var credentialID ID
+	if err := pool.QueryRow(ctx, "INSERT INTO ingest_credentials (workspace_id, source_id, secret_hash) VALUES ($1,$2,$3) RETURNING id", first.ID, sourceID, []byte("synthetic-digest-32-bytes-........")).Scan(&credentialID); err != nil {
 		t.Fatal(database.SafeError("seed credential", err))
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO usage_events (workspace_id, source_id, source_event_id, project_id, provider, model, occurred_at, received_at, normalization_version, payload_hash,
-input_tokens, input_tokens_quality, output_tokens, output_tokens_quality, total_tokens, total_tokens_quality,
-cache_read_tokens, cache_read_tokens_quality, cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality)
-VALUES ($1,$2,$3,$4,'synthetic-provider','synthetic-model',now(),now(),'v1','\x00',10,'known',20,'known',30,'known',0,'known',0,'known',0,'known') RETURNING id`,
-		personal.ID, sourceID, "synthetic-event", projectID).Scan(&eventID); err != nil {
-		t.Fatal(database.SafeError("seed usage event", err))
-	}
 
-	// Simulate a future team membership: the same user joins another workspace.
-	team := seedWorkspace(t, ctx, pool, "synthetic-team")
-	seedMembership(t, ctx, pool, team, userID, "member")
-	if role, found, err := service.MembershipRole(ctx, userID, team); err != nil || !found || role != RoleMember {
-		t.Fatalf("team role=%q found=%t err=%v", role, found, err)
-	}
-
-	// Every seeded row must still exist under its own id and still point at the
-	// personal workspace: joining another workspace neither moves nor re-creates
-	// the history.
 	for _, row := range []struct {
 		name  string
 		query string
@@ -674,87 +860,29 @@ VALUES ($1,$2,$3,$4,'synthetic-provider','synthetic-model',now(),now(),'v1','\x0
 		{"project", "SELECT workspace_id FROM projects WHERE id=$1", projectID},
 		{"source", "SELECT workspace_id FROM sources WHERE id=$1", sourceID},
 		{"ingest credential", "SELECT workspace_id FROM ingest_credentials WHERE id=$1", credentialID},
-		{"usage event", "SELECT workspace_id FROM usage_events WHERE id=$1", eventID},
 	} {
 		var workspaceID ID
 		if err := pool.QueryRow(ctx, row.query, row.id).Scan(&workspaceID); err != nil {
-			t.Fatalf("%s row is gone after the team membership: %v", row.name, database.SafeError("load "+row.name, err))
+			t.Fatalf("%s row is gone after the second creation: %v", row.name, database.SafeError("load "+row.name, err))
 		}
-		if workspaceID != personal.ID {
-			t.Fatalf("%s row workspace_id changed away from the personal workspace", row.name)
+		if workspaceID != first.ID {
+			t.Fatalf("%s row moved away from its workspace", row.name)
 		}
 	}
-	var inTeam int
+	var inSecond int
 	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM projects WHERE workspace_id=$1)
 + (SELECT count(*) FROM sources WHERE workspace_id=$1)
-+ (SELECT count(*) FROM ingest_credentials WHERE workspace_id=$1)
-+ (SELECT count(*) FROM usage_events WHERE workspace_id=$1)`, team).Scan(&inTeam); err != nil {
-		t.Fatal(database.SafeError("count team rows", err))
++ (SELECT count(*) FROM ingest_credentials WHERE workspace_id=$1)`, second.ID).Scan(&inSecond); err != nil {
+		t.Fatal(database.SafeError("count second rows", err))
 	}
-	if inTeam != 0 {
-		t.Fatalf("team workspace has %d copied business rows, want 0", inTeam)
+	if inSecond != 0 {
+		t.Fatalf("the new workspace has %d copied business rows, want 0", inSecond)
 	}
-
-	// Creating a personal space for another user never reuses this one.
-	otherUser := seedUser(t, ctx, pool, "history-other@example.com")
-	otherPersonal, err := createInTx(t, ctx, conn, otherUser)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if otherPersonal.ID == personal.ID {
-		t.Fatal("another user reused an existing personal workspace")
-	}
-}
-
-// seedMembershipAt inserts a membership with an explicit joined_at so the
-// "earliest owner workspace" order is deterministic.
-func seedMembershipAt(t *testing.T, ctx context.Context, pool *pgxpool.Pool, workspaceID, userID ID, role string, joined time.Time) {
-	t.Helper()
-	if _, err := pool.Exec(ctx, "INSERT INTO workspace_memberships (workspace_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)", workspaceID, userID, role, joined); err != nil {
-		t.Fatal(database.SafeError("seed membership", err))
-	}
-}
-
-// TestCurrentWorkspaceAgainstPostgres runs the real SQL: the earliest owner
-// workspace wins, a member-only workspace and another user's workspace are never
-// returned, and a user without an owner workspace is found=false.
-func TestCurrentWorkspaceAgainstPostgres(t *testing.T) {
-	service, pool, _ := newWorkspaces(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	user := seedUser(t, ctx, pool, "current@example.com")
-	other := seedUser(t, ctx, pool, "other-current@example.com")
-	loner := seedUser(t, ctx, pool, "loner@example.com")
-	now := time.Now().UTC().Truncate(time.Second)
-
-	late := seedWorkspace(t, ctx, pool, "Late")
-	early := seedWorkspace(t, ctx, pool, "Early")
-	memberOnly := seedWorkspace(t, ctx, pool, "MemberOnly")
-	foreign := seedWorkspace(t, ctx, pool, "Foreign")
-	seedMembershipAt(t, ctx, pool, late, user, "owner", now.Add(-time.Hour))
-	seedMembershipAt(t, ctx, pool, early, user, "owner", now.Add(-2*time.Hour))
-	// A member role, even the earliest, is not an owned workspace.
-	seedMembershipAt(t, ctx, pool, memberOnly, user, "member", now.Add(-3*time.Hour))
-	seedMembershipAt(t, ctx, pool, foreign, other, "owner", now.Add(-4*time.Hour))
-	seedMembershipAt(t, ctx, pool, memberOnly, loner, "member", now.Add(-time.Hour))
-
-	got, found, err := service.CurrentWorkspace(ctx, user)
-	if err != nil || !found || got.ID != early || got.Name != "Early" {
-		t.Fatalf("got %+v found=%t err=%v want earliest owner workspace %v", got, found, err, early)
-	}
-	got, found, err = service.CurrentWorkspace(ctx, other)
-	if err != nil || !found || got.ID != foreign {
-		t.Fatalf("other got %+v found=%t err=%v", got, found, err)
-	}
-	if _, found, err = service.CurrentWorkspace(ctx, loner); err != nil || found {
-		t.Fatalf("member-only user found=%t err=%v want not found", found, err)
-	}
-	if _, found, err = service.CurrentWorkspace(ctx, ID{Bytes: [16]byte{9}, Valid: true}); err != nil || found {
-		t.Fatalf("unknown user found=%t err=%v want not found", found, err)
-	}
-	rows, memberships := rowCounts(t, ctx, pool)
-	if rows != 4 || memberships != 5 {
-		t.Fatalf("read created rows: workspaces=%d memberships=%d", rows, memberships)
+	// Both workspaces belong to the same account through separate owner rows.
+	for _, workspaceID := range []ID{first.ID, second.ID} {
+		if role, found, err := service.MembershipRole(ctx, userID, workspaceID); err != nil || !found || role != RoleOwner {
+			t.Fatalf("workspace %v role=%q found=%t err=%v", workspaceID, role, found, err)
+		}
 	}
 }
 

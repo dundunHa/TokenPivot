@@ -1,0 +1,13 @@
+{
+  "name": "@tokenpivot/pi-usage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TokenPivot usage collector for Pi (pi-coding-agent extension; local SQLite queue, no npm dependencies)",
+  "type": "module",
+  "main": "./index.js",
+  "exports": { ".": "./index.js" },
+  "files": ["index.js", "lib/*.js", "README.md"],
+  "engines": { "node": ">=22.19" },
+  "scripts": { "test": "node --test test/" },
+  "pi": { "extensions": ["./index.js"] }
+}

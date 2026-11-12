@@ -1,18 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import {
-  useCurrentWorkspace,
-  useUsageOptions,
-} from "@/features/workspace/queries";
-import { RequestLogPanel } from "@/features/requests/RequestLogPanel";
+import { useUsageOptions } from "@/features/workspace/queries";
 import { OverviewFilterBar } from "./OverviewFilterBar";
-import { OverviewMetrics } from "./OverviewMetrics";
 import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
-import { OverviewTrendChart } from "./OverviewTrendChart";
-import { describeError, type RankingDimension } from "./overviewApi";
+import { GeekComposition } from "./geek/GeekComposition";
+import { GeekHeatmap } from "./geek/GeekHeatmap";
+import { GeekKpis } from "./geek/GeekKpis";
+import { GeekTrend } from "./geek/GeekTrend";
+import { ModelSpeedList } from "@/features/requests/ModelSpeedList";
+import { SpeedTrend } from "@/features/requests/SpeedTrend";
+import { SpeedKpi } from "@/features/requests/SpeedKpi";
 import {
   browserTimezone,
   DEFAULT_OVERVIEW_FILTERS,
@@ -23,8 +23,15 @@ import {
   toSearchParams,
   type OverviewFilters,
 } from "./overviewFilters";
-import { useAggregate, useProjects, type QueryScope } from "./overviewQueries";
-import { buildTrend, formatInstant } from "./overviewView";
+import {
+  useAggregate,
+  usePreviousTotals,
+  useWeekActivity,
+  useProjects,
+  type QueryScope,
+} from "./overviewQueries";
+import { useRefreshMs } from "./refreshInterval";
+import { buildTrend } from "./overviewView";
 
 const TICK_MS = 10_000;
 
@@ -53,48 +60,28 @@ function toggle(list: string[], value: string): string[] {
     : [...list, value];
 }
 
-export function OverviewPage({ userId }: { userId: string }) {
-  const workspace = useCurrentWorkspace(userId);
-  if (workspace.isPending) {
-    return (
-      <p role="status" className="text-muted-foreground text-sm">
-        正在加载空间…
-      </p>
-    );
-  }
-  if (workspace.isError) {
-    const { kind, message } = describeError(workspace.error);
-    return (
-      <div className="flex flex-col gap-2">
-        <Alert variant="destructive">
-          <AlertDescription>{message}</AlertDescription>
-        </Alert>
-        {kind === "forbidden" ? null : (
-          <Button
-            variant="outline"
-            className="self-start"
-            onClick={() => void workspace.refetch()}
-          >
-            重试
-          </Button>
-        )}
-      </div>
-    );
-  }
-  return (
-    <OverviewBody
-      scope={{ userId, workspaceId: workspace.data.workspaceId }}
-      workspaceName={workspace.data.name}
-    />
-  );
+/** 当前空间由工作区容器决定；本页只消费明确的 userId/workspaceId，不再查询 /current。 */
+export function OverviewPage({
+  userId,
+  workspaceId,
+}: {
+  userId: string;
+  workspaceId: string;
+}) {
+  return <OverviewBody scope={{ userId, workspaceId }} />;
 }
 
-function OverviewBody({
-  scope,
-  workspaceName,
+/**
+ * 解析 URL 筛选：缺时区时写回、非法时给出重置入口；合法时把筛选和更新函数交给子树。
+ * 总览与请求明细页共用，保证两页的筛选语义一致。
+ */
+export function FiltersGate({
+  children,
 }: {
-  scope: QueryScope;
-  workspaceName: string;
+  children: (
+    filters: OverviewFilters,
+    update: (next: OverviewFilters) => void,
+  ) => ReactNode;
 }) {
   const [params, setParams] = useSearchParams();
   const fallbackTz = useMemo(() => browserTimezone(), []);
@@ -139,13 +126,16 @@ function OverviewBody({
       </div>
     );
   }
+  return <>{children(filters, update)}</>;
+}
+
+function OverviewBody({ scope }: { scope: QueryScope }) {
   return (
-    <OverviewContent
-      scope={scope}
-      workspaceName={workspaceName}
-      filters={filters}
-      update={update}
-    />
+    <FiltersGate>
+      {(filters, update) => (
+        <OverviewContent scope={scope} filters={filters} update={update} />
+      )}
+    </FiltersGate>
   );
 }
 
@@ -171,20 +161,19 @@ function stripOwn(base: URLSearchParams): URLSearchParams {
 
 function OverviewContent({
   scope,
-  workspaceName,
   filters,
   update,
 }: {
   scope: QueryScope;
-  workspaceName: string;
   filters: OverviewFilters;
   update: (next: OverviewFilters) => void;
 }) {
   const now = useMinuteNow();
+  const refreshMs = useRefreshMs();
   const range = useMemo(() => resolveRange(filters, now), [filters, now]);
   const aggregate = useAggregate(scope, filters, range);
   const options = useUsageOptions(scope.userId, scope.workspaceId);
-  const projects = useProjects(scope);
+  const projects = useProjects(scope, refreshMs);
 
   const projectNames = useMemo(
     () => new Map((projects.data ?? []).map((p) => [p.projectId, p.name])),
@@ -206,19 +195,12 @@ function OverviewContent({
   const tz = filters.timezone;
   const identity = filterIdentity(filters);
 
-  const onRankingToggle = (dimension: RankingDimension, value: string) => {
-    if (dimension === "project") {
-      update({ ...filters, projects: toggle(filters.projects, value) });
-    } else if (dimension === "provider") {
-      update({ ...filters, providers: toggle(filters.providers, value) });
-    } else {
-      update({ ...filters, models: toggle(filters.models, value) });
-    }
-  };
-
   const data = aggregate.data;
+  const previous = usePreviousTotals(scope, filters, range, now);
+  const week = useWeekActivity(scope, filters, now);
+
   return (
-    <div className="flex flex-col gap-6">
+    <div className="geek-main">
       <OverviewFilterBar
         filters={filters}
         providerOptions={(options.data?.providers ?? []).map(asOption)}
@@ -232,48 +214,81 @@ function OverviewContent({
         }
         onChange={update}
       />
-      <p className="text-subtle text-xs">
-        空间 {workspaceName} · 时区 {tz}
+
+      {data ? (
+        <GeekKpis
+          data={data}
+          previous={previous.data?.totals}
+          rate={
+            <SpeedKpi scope={scope} filters={filters} intervalMs={refreshMs}>
+              <ModelSpeedList
+                scope={scope}
+                filters={filters}
+                range={range}
+                intervalMs={refreshMs}
+              />
+            </SpeedKpi>
+          }
+        />
+      ) : null}
+
+      <div className="geek-split">
+        <Section title="趋势" query={aggregate} timezone={tz}>
+          {data && trend ? (
+            <GeekTrend
+              scope={scope}
+              filters={filters}
+              range={range}
+              data={data}
+              trend={trend}
+              timezone={tz}
+            />
+          ) : null}
+        </Section>
+
+        {/* 排名 — 复用现有 OverviewRanking 保持查询/交互逻辑 */}
+        <OverviewRanking
+          identity={identity}
+          scope={scope}
+          filters={filters}
+          range={range}
+          projectNames={projectNames}
+          onToggle={(dim, val) => {
+            if (dim === "provider") {
+              update({
+                ...filters,
+                providers: toggle(filters.providers, val),
+              });
+            } else if (dim === "model") {
+              update({ ...filters, models: toggle(filters.models, val) });
+            } else if (dim === "project") {
+              update({
+                ...filters,
+                projects: toggle(filters.projects, val),
+              });
+            }
+          }}
+        />
+      </div>
+
+      <div className="geek-split">
+        <SpeedTrend
+          scope={scope}
+          filters={filters}
+          range={range}
+          intervalMs={refreshMs}
+        />
         {data ? (
-          <>
-            {" "}
-            · 统计范围 {formatInstant(data.range.start, tz)} →{" "}
-            {formatInstant(data.range.end, tz)} · 统计截点{" "}
-            {formatInstant(data.range.asOf, tz, true)} · 保留截点{" "}
-            {formatInstant(data.range.retentionCutoff, tz)} · 页面更新{" "}
-            {formatInstant(
-              new Date(aggregate.dataUpdatedAt).toISOString(),
-              tz,
-              true,
-            )}
-          </>
+          <GeekComposition
+            data={data}
+            scope={scope}
+            filters={filters}
+            range={range}
+          />
         ) : null}
-      </p>
-      <Section title="指标" query={aggregate} timezone={tz}>
-        {data ? <OverviewMetrics totals={data.totals} /> : null}
-      </Section>
-      <Section title="趋势" query={aggregate} timezone={tz}>
-        {data && trend ? (
-          trend.points.length === 0 ? (
-            <p className="text-muted-foreground text-sm">
-              {data.totals.requestCount === "0"
-                ? "所选范围与筛选下没有用量。"
-                : "没有可展示的趋势点。"}
-            </p>
-          ) : (
-            <OverviewTrendChart trend={trend} />
-          )
-        ) : null}
-      </Section>
-      <OverviewRanking
-        identity={identity}
-        scope={scope}
-        filters={filters}
-        range={range}
-        projectNames={projectNames}
-        onToggle={onRankingToggle}
-      />
-      <RequestLogPanel scope={scope} filters={filters} />
+      </div>
+
+      {week.data ? <GeekHeatmap data={week.data} timezone={tz} /> : null}
     </div>
   );
 }
