@@ -1,10 +1,11 @@
-import { queryOptions, useQuery } from "@tanstack/react-query";
+import { queryOptions, useQueries, useQuery } from "@tanstack/react-query";
 import type { OverviewFilters } from "@/features/overview/overviewFilters";
 import type { QueryScope } from "@/features/overview/overviewQueries";
 import {
   eventsQueryString,
   type RequestRange,
   fetchRate,
+  fetchSpeed,
   fetchRequests,
   filterParams,
 } from "./api";
@@ -27,7 +28,22 @@ export function eventsQuery(
       query,
     ] as const,
     queryFn: ({ signal }) => fetchRequests(scope.workspaceId, query, signal),
-    meta: { userId: scope.userId },
+    meta: { userId: scope.userId, workspaceId: scope.workspaceId },
+  });
+}
+
+export function speedQuery(scope: QueryScope, filters: OverviewFilters) {
+  const query = filterParams(filters).toString();
+  return queryOptions({
+    queryKey: [
+      "requests",
+      "speed",
+      scope.userId,
+      scope.workspaceId,
+      query,
+    ] as const,
+    queryFn: ({ signal }) => fetchSpeed(scope.workspaceId, query, signal),
+    meta: { userId: scope.userId, workspaceId: scope.workspaceId },
   });
 }
 
@@ -42,7 +58,7 @@ export function rateQuery(scope: QueryScope, filters: OverviewFilters) {
       query,
     ] as const,
     queryFn: ({ signal }) => fetchRate(scope.workspaceId, query, signal),
-    meta: { userId: scope.userId },
+    meta: { userId: scope.userId, workspaceId: scope.workspaceId },
   });
 }
 
@@ -58,11 +74,43 @@ export function useRequestEvents(
   });
 }
 
+/** 生成速度始终轮询（滚动 60 秒窗口 + 最近 60 分钟序列），与明细翻页无关；隐藏页由 Query 默认暂停。 */
+export function useSpeed(
+  scope: QueryScope,
+  filters: OverviewFilters,
+  intervalMs: number = POLL_MS,
+) {
+  return useQuery({
+    ...speedQuery(scope, filters),
+    refetchInterval: intervalMs,
+    refetchOnWindowFocus: "always",
+  });
+}
+
 /** 速率始终轮询当前 60 秒窗口，与明细翻页无关；隐藏页由 Query 默认暂停。 */
 export function useRate(scope: QueryScope, filters: OverviewFilters) {
   return useQuery({
     ...rateQuery(scope, filters),
     refetchInterval: POLL_MS,
     refetchOnWindowFocus: "always",
+  });
+}
+
+/**
+ * 按模型的生成速度：每个模型各取一条带单值模型筛选的结果，请求数等于模型数。
+ * 指标卡里的分模型列表与速度趋势共用这些查询（同键同缓存）。
+ */
+export function useModelSpeeds(
+  scope: QueryScope,
+  filters: OverviewFilters,
+  models: string[],
+  intervalMs: number = POLL_MS,
+) {
+  return useQueries({
+    queries: models.map((model) => ({
+      ...speedQuery(scope, { ...filters, models: [model] }),
+      refetchInterval: intervalMs,
+      refetchOnWindowFocus: "always" as const,
+    })),
   });
 }

@@ -1,5 +1,9 @@
 import { ApiError, getJson } from "@/lib/api";
-import { type OverviewFilters, type ResolvedRange } from "./overviewFilters";
+import {
+  effectiveGranularity,
+  type OverviewFilters,
+  type ResolvedRange,
+} from "./overviewFilters";
 
 /** 唯一读取聚合 / 排名 / 项目列表响应结构的位置：unknown 在此收窄，形状不对按数据错误抛出。 */
 
@@ -16,6 +20,12 @@ export interface UsageStats {
   input: MetricStat;
   output: MetricStat;
   total: MetricStat;
+  /** 输入的子集（命中缓存读取的 token），不加到 total。 */
+  cacheRead: MetricStat;
+  /** 输入的子集（写入缓存的 token），不加到 total。 */
+  cacheWrite: MetricStat;
+  /** 输出的子集（推理 token），不加到 total。 */
+  reasoning: MetricStat;
 }
 
 export interface AggregatePoint {
@@ -103,6 +113,18 @@ function metric(value: unknown): MetricStat {
   };
 }
 
+const ABSENT_METRIC: MetricStat = {
+  value: null,
+  known: "0",
+  estimated: "0",
+  missing: "0",
+};
+
+/** 缓存 / 推理为后期加入的子集指标：缺字段按“无数据”处理，不让整页因此报数据错误。 */
+function optionalMetric(value: unknown): MetricStat {
+  return value === undefined ? ABSENT_METRIC : metric(value);
+}
+
 function stats(value: unknown): UsageStats {
   const r = record(value);
   return {
@@ -110,6 +132,9 @@ function stats(value: unknown): UsageStats {
     input: metric(r.input_tokens),
     output: metric(r.output_tokens),
     total: metric(r.total_tokens),
+    cacheRead: optionalMetric(r.cache_read_tokens),
+    cacheWrite: optionalMetric(r.cache_write_tokens),
+    reasoning: optionalMetric(r.reasoning_tokens),
   };
 }
 
@@ -219,7 +244,7 @@ export function aggregateParams(
 ): string {
   const params = rangeParams(filters, range);
   params.set("timezone", filters.timezone);
-  params.set("granularity", filters.granularity);
+  params.set("granularity", effectiveGranularity(filters.granularity, range));
   return params.toString();
 }
 

@@ -105,6 +105,11 @@ type store interface {
 	TouchSource(ctx context.Context, workspaceID, sourceID credentials.ID) error
 }
 
+// MaxAutoProjects bounds how many projects a workspace may have before an event with
+// an unknown project_key is rejected instead of creating another one. It protects the
+// project list from a misbehaving client; manual creation is not affected.
+const MaxAutoProjects = 1000
+
 // itemTx is the per-item transaction the service drives. Every method must run
 // inside that transaction; Commit is the only way an item becomes visible.
 type itemTx interface {
@@ -113,6 +118,11 @@ type itemTx interface {
 	Now(ctx context.Context) (time.Time, error)
 	// ProjectExists reports whether the project belongs to the workspace.
 	ProjectExists(ctx context.Context, workspaceID, projectID credentials.ID) (bool, error)
+	// EnsureProject returns the project of the workspace with this key, creating
+	// it (name = key) when it does not exist. The second result is false when the
+	// workspace already has MaxAutoProjects projects and the key is new. Archived
+	// projects keep their key reserved and are returned as they are.
+	EnsureProject(ctx context.Context, workspaceID credentials.ID, projectKey string) (credentials.ID, bool, error)
 	// InsertEvent inserts the detail row, reporting false when the identity
 	// already exists.
 	InsertEvent(ctx context.Context, event storedEvent) (bool, error)
@@ -141,7 +151,11 @@ type usage struct {
 type event struct {
 	SourceEventID string
 	// ProjectID is invalid when the event is not attributed to a project.
-	ProjectID  credentials.ID
+	ProjectID credentials.ID
+	// ProjectKey asks the server to attribute the event to the project with this key,
+	// creating it on first sight. It is mutually exclusive with ProjectID and is replaced
+	// by the resolved ProjectID before anything is stored or compared.
+	ProjectKey string
 	Provider   string
 	Model      string
 	OccurredAt time.Time // UTC, microsecond precision
@@ -352,6 +366,25 @@ func (s *Service) processItem(ctx context.Context, credential credentials.Creden
 	case verdictExpired:
 		// Expiry is decided before any duplicate or conflict lookup.
 		return result{status: statusExpired}
+	}
+
+	if e.ProjectKey != "" {
+		// Resolved after the window verdict (an expired event creates nothing) and inside
+		// the item transaction (a rolled-back item leaves no project behind). The event is
+		// copied so the decoded value stays reusable; its digest is recomputed over the
+		// resolved project, which makes a key and the id it names the same content.
+		id, ok, err := tx.EnsureProject(ctx, credential.WorkspaceID, e.ProjectKey)
+		if err != nil {
+			return retryableResult(ctx, err)
+		}
+		if !ok {
+			return rejectedResult(codeProjectInvalid, "project limit reached for this workspace")
+		}
+		resolved := *e
+		resolved.ProjectKey = ""
+		resolved.ProjectID = id
+		resolved.PayloadHash = sha256.Sum256(resolved.normalizedText())
+		e = &resolved
 	}
 
 	// An absent project is legitimate; an invalid, foreign or missing project is

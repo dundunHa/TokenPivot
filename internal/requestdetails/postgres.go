@@ -2,6 +2,7 @@ package requestdetails
 
 import (
 	"context"
+	"time"
 
 	"github.com/dundunHa/TokenPivot/internal/database"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -123,6 +124,83 @@ LEFT JOIN usage_events e
  AND e.occurred_at < p.as_of
  ` + filterSQL("$3", "$4", "$5", "$6") + `
 GROUP BY p.as_of`
+
+// speedQuery measures generation speed from the events that can be measured: a known
+// or estimated output_tokens and a positive duration_ms. As in rateQuery the database
+// statement start is sampled once as as_of.
+//
+// It returns one row per UTC minute (grouping(bucket)=0) from the minute that contains
+// as_of-60min up to as_of, so the first bucket is whole, and one overall row
+// (grouping(bucket)=1). The overall row's win_* columns cover only the rolling 60 seconds
+// [as_of-60s, as_of); the per-minute rows' sums are the minute series. Empty minutes have
+// no row. $1 workspace, $2 optional fixed as_of, $3..$6 filter.
+var speedQuery = `WITH p AS (SELECT COALESCE($2::timestamptz, statement_timestamp()) AS as_of),
+m AS (
+  SELECT p.as_of, e.occurred_at, e.output_tokens_quality, e.output_tokens, e.duration_ms,
+    (e.output_tokens_quality IN ('known','estimated') AND e.duration_ms IS NOT NULL AND e.duration_ms > 0) AS usable
+  FROM p
+  LEFT JOIN usage_events e
+    ON e.workspace_id = $1
+   AND e.occurred_at >= date_bin('1 minute', p.as_of - interval '60 minutes', TIMESTAMPTZ '2000-01-01 00:00:00+00')
+   AND e.occurred_at < p.as_of
+   ` + filterSQL("$3", "$4", "$5", "$6") + `
+)
+SELECT as_of,
+  date_bin('1 minute', occurred_at, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket,
+  grouping(date_bin('1 minute', occurred_at, TIMESTAMPTZ '2000-01-01 00:00:00+00')) AS is_total,
+  (sum(output_tokens::numeric) FILTER (WHERE usable))::text,
+  (sum(duration_ms::numeric) FILTER (WHERE usable))::text,
+  count(occurred_at), count(*) FILTER (WHERE usable),
+  count(*) FILTER (WHERE usable AND output_tokens_quality = 'estimated'),
+  (sum(output_tokens::numeric) FILTER (WHERE usable AND occurred_at >= as_of - interval '60 seconds'))::text,
+  (sum(duration_ms::numeric) FILTER (WHERE usable AND occurred_at >= as_of - interval '60 seconds'))::text,
+  count(*) FILTER (WHERE occurred_at >= as_of - interval '60 seconds'),
+  count(*) FILTER (WHERE usable AND occurred_at >= as_of - interval '60 seconds'),
+  count(*) FILTER (WHERE usable AND output_tokens_quality = 'estimated' AND occurred_at >= as_of - interval '60 seconds')
+FROM m
+GROUP BY GROUPING SETS ((as_of, date_bin('1 minute', occurred_at, TIMESTAMPTZ '2000-01-01 00:00:00+00')), (as_of))
+ORDER BY is_total, bucket`
+
+// Speed returns the current window and the minute series.
+func (s *Postgres) Speed(ctx context.Context, params SpeedParams) (SpeedRow, error) {
+	var asOf any
+	if params.AsOf != nil {
+		asOf = *params.AsOf
+	}
+	args := append([]any{params.WorkspaceID, asOf}, filterArgs(params.Filter)...)
+	rows, err := s.pool.Query(ctx, speedQuery, args...)
+	if err != nil {
+		return SpeedRow{}, database.SafeStoreError("request speed", err)
+	}
+	defer rows.Close()
+	var out SpeedRow
+	for rows.Next() {
+		var (
+			at                  time.Time
+			bucket              *time.Time
+			isTotal             int32
+			allOut, allDur      *string
+			events, meas, estim int64
+			winOut, winDur      *string
+			wEvents, wMeas, wEs int64
+		)
+		if err := rows.Scan(&at, &bucket, &isTotal, &allOut, &allDur, &events, &meas, &estim, &winOut, &winDur, &wEvents, &wMeas, &wEs); err != nil {
+			return SpeedRow{}, database.SafeStoreError("scan request speed", err)
+		}
+		out.AsOf = at
+		if isTotal == 1 {
+			out.Current = SpeedSums{OutputTokens: winOut, DurationMS: winDur, Events: wEvents, Measured: wMeas, Estimated: wEs}
+			continue
+		}
+		if bucket != nil && meas > 0 {
+			out.Points = append(out.Points, SpeedPoint{BucketStart: *bucket, SpeedSums: SpeedSums{OutputTokens: allOut, DurationMS: allDur, Events: events, Measured: meas, Estimated: estim}})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return SpeedRow{}, database.SafeStoreError("request speed", err)
+	}
+	return out, nil
+}
 
 // Rate aggregates the rolling 60 second window.
 func (s *Postgres) Rate(ctx context.Context, params RateParams) (RateRow, error) {

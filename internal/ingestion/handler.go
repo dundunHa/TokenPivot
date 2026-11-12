@@ -448,6 +448,18 @@ func decodeEvent(node *jsonNode) (*event, *rejection) {
 			default:
 				return nil, invalidItem("project_id must be a UUID string or null")
 			}
+		case "project_key":
+			switch member.value.kind {
+			case jsonNull:
+				decoded.ProjectKey = ""
+			case jsonString:
+				if !validLabel(member.value.text) {
+					return nil, invalidItem("project_key must be 1-128 UTF-8 bytes without control characters or surrounding whitespace")
+				}
+				decoded.ProjectKey = member.value.text
+			default:
+				return nil, invalidItem("project_key must be a string or null")
+			}
 		case "provider":
 			if member.value.kind != jsonString {
 				return nil, invalidItem("provider must be a string")
@@ -534,12 +546,17 @@ func decodeEvent(node *jsonNode) (*event, *rejection) {
 	if !haveSourceID || !haveProvider || !haveModel || !haveOccurredAt || !haveUsage {
 		return nil, invalidItem("event is missing a required field")
 	}
+	if decoded.ProjectKey != "" && decoded.ProjectID.Valid {
+		return nil, invalidItem("project_id and project_key are mutually exclusive")
+	}
 	occurredAt, ok := parseOccurredAt(occurredText)
 	if !ok {
 		return nil, invalidItem("occurred_at must be RFC 3339 with an offset and at most 6 fractional digits")
 	}
 	decoded.OccurredAt = occurredAt
 	decoded.TimingFieldsPresent = haveTiming
+	// With a project_key the project is not known yet: processItem resolves it and recomputes
+	// the digest over the resolved project, so a key and the id it resolves to hash the same.
 	decoded.PayloadHash = sha256.Sum256(decoded.normalizedText())
 	return &decoded, nil
 }

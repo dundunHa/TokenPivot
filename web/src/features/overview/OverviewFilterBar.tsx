@@ -8,15 +8,23 @@ import {
   type OverviewFilters,
   type RangePreset,
 } from "./overviewFilters";
+import {
+  REFRESH_CHOICES,
+  refreshLabel,
+  setRefreshMs,
+  useRefreshMs,
+} from "./refreshInterval";
 
 const PRESETS: { id: RangePreset; label: string }[] = [
   { id: "1h", label: "最近一小时" },
+  { id: "24h", label: "近 24 小时" },
   { id: "today", label: "今天" },
   { id: "yesterday", label: "昨天" },
   { id: "7d", label: "最近七天" },
   { id: "custom", label: "自定义" },
 ];
 const GRAN_LABEL: Record<Granularity, string> = {
+  auto: "自动",
   minute: "分钟",
   hour: "小时",
   day: "天",
@@ -49,12 +57,12 @@ function MultiSelect({
       .map((v) => ({ value: v, label: v })),
   ];
   return (
-    <details className="border-border rounded-md border">
-      <summary className="cursor-pointer px-3 py-1 text-sm">
+    <details className="geek-ms">
+      <summary>
         {label}
         {selected.length > 0 ? `（${selected.length}）` : "（全部）"}
       </summary>
-      <div className="flex max-h-56 flex-col gap-1 overflow-auto px-3 py-2">
+      <div className="geek-ms-panel">
         {disabledHint ? (
           <p role="alert" className="text-destructive text-xs">
             {disabledHint}
@@ -92,8 +100,11 @@ export function OverviewFilterBar({
   projectOptions,
   optionsError,
   projectsError,
+  dimensionsOnly = false,
   onChange,
 }: {
+  /** 只显示供应商/模型/项目（请求明细页不使用时间范围与粒度）。 */
+  dimensionsOnly?: boolean;
   filters: OverviewFilters;
   providerOptions: Option[];
   modelOptions: Option[];
@@ -106,6 +117,7 @@ export function OverviewFilterBar({
   const [draftStart, setDraftStart] = useState(filters.start ?? "");
   const [draftEnd, setDraftEnd] = useState(filters.end ?? "");
   const [customError, setCustomError] = useState<string | null>(null);
+  const refreshMs = useRefreshMs();
 
   const names = new Map(projectOptions.map((o) => [o.value, o.label]));
   const chips: { key: string; text: string; remove: () => void }[] = [
@@ -153,39 +165,96 @@ export function OverviewFilterBar({
   }
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap items-start gap-2">
-        <MultiSelect
-          label="供应商"
-          options={providerOptions}
-          selected={filters.providers}
-          disabledHint={optionsError}
-          onChange={(providers) => onChange({ ...filters, providers })}
-        />
-        <MultiSelect
-          label="模型"
-          options={modelOptions}
-          selected={filters.models}
-          disabledHint={optionsError}
-          onChange={(models) => onChange({ ...filters, models })}
-        />
-        <MultiSelect
-          label="项目"
-          options={projectOptions}
-          selected={filters.projects}
-          disabledHint={projectsError}
-          onChange={(projects) => onChange({ ...filters, projects })}
-        />
+    <div className="geek-filters">
+      <div className="geek-toolbar">
+        {dimensionsOnly ? null : (
+          <>
+            <div role="group" aria-label="时间范围" className="geek-segmented">
+              {PRESETS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className="geek-ranking-tab"
+                  aria-pressed={
+                    p.id === "custom"
+                      ? customOpen
+                      : !customOpen && filters.range === p.id
+                  }
+                  onClick={() => pickPreset(p.id)}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <div role="group" aria-label="粒度" className="geek-segmented">
+              {GRANULARITIES.map((g) => (
+                <button
+                  key={g}
+                  type="button"
+                  className="geek-ranking-tab"
+                  aria-pressed={filters.granularity === g}
+                  onClick={() => onChange({ ...filters, granularity: g })}
+                >
+                  {GRAN_LABEL[g]}
+                </button>
+              ))}
+            </div>
+            <div
+              role="group"
+              aria-label="刷新间隔"
+              className="geek-segmented geek-segmented-labeled"
+            >
+              <span className="geek-segmented-label" aria-hidden="true">
+                刷新
+              </span>
+              {REFRESH_CHOICES.map((ms) => (
+                <button
+                  key={ms}
+                  type="button"
+                  className="geek-ranking-tab"
+                  aria-pressed={refreshMs === ms}
+                  onClick={() => setRefreshMs(ms)}
+                >
+                  {refreshLabel(ms)}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+        <div
+          className={`geek-toolbar-end ${dimensionsOnly ? "geek-toolbar-start" : ""}`}
+        >
+          <MultiSelect
+            label="供应商"
+            options={providerOptions}
+            selected={filters.providers}
+            disabledHint={optionsError}
+            onChange={(providers) => onChange({ ...filters, providers })}
+          />
+          <MultiSelect
+            label="模型"
+            options={modelOptions}
+            selected={filters.models}
+            disabledHint={optionsError}
+            onChange={(models) => onChange({ ...filters, models })}
+          />
+          <MultiSelect
+            label="项目"
+            options={projectOptions}
+            selected={filters.projects}
+            disabledHint={projectsError}
+            onChange={(projects) => onChange({ ...filters, projects })}
+          />
+        </div>
       </div>
       {chips.length > 0 ? (
-        <ul aria-label="已选筛选" className="flex flex-wrap gap-2">
+        <ul aria-label="已选筛选" className="geek-chips">
           {chips.map((c) => (
             <li key={c.key}>
               <button
                 type="button"
                 aria-label={`移除 ${c.text}`}
                 onClick={c.remove}
-                className="border-border rounded-md border px-2 py-0.5 text-xs"
               >
                 {c.text} ×
               </button>
@@ -193,57 +262,33 @@ export function OverviewFilterBar({
           ))}
         </ul>
       ) : null}
-      <div role="group" aria-label="时间范围" className="flex flex-wrap gap-2">
-        {PRESETS.map((p) => (
-          <button
-            key={p.id}
-            type="button"
-            aria-pressed={
-              p.id === "custom"
-                ? customOpen
-                : !customOpen && filters.range === p.id
-            }
-            onClick={() => pickPreset(p.id)}
-            className="border-border aria-pressed:border-primary aria-pressed:text-primary rounded-md border px-3 py-1 text-sm"
-          >
-            {p.label}
-          </button>
-        ))}
-        <span className="mx-1" />
-        <div role="group" aria-label="粒度" className="flex gap-2">
-          {GRANULARITIES.map((g) => (
-            <button
-              key={g}
-              type="button"
-              aria-pressed={filters.granularity === g}
-              onClick={() => onChange({ ...filters, granularity: g })}
-              className="border-border aria-pressed:border-primary aria-pressed:text-primary rounded-md border px-3 py-1 text-sm"
-            >
-              {GRAN_LABEL[g]}
-            </button>
-          ))}
-        </div>
-      </div>
-      {customOpen ? (
+      {customOpen && !dimensionsOnly ? (
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-end gap-2">
-            <label className="flex flex-col gap-1 text-xs">
+            <label className="text-muted-foreground flex flex-col gap-1 text-xs">
               起点
               <Input
+                className="h-8 w-64 text-xs"
                 value={draftStart}
                 placeholder="2026-10-28T09:00:00+08:00"
                 onChange={(e) => setDraftStart(e.target.value)}
               />
             </label>
-            <label className="flex flex-col gap-1 text-xs">
+            <label className="text-muted-foreground flex flex-col gap-1 text-xs">
               终点
               <Input
+                className="h-8 w-64 text-xs"
                 value={draftEnd}
                 placeholder="2026-10-28T18:00:00+08:00"
                 onChange={(e) => setDraftEnd(e.target.value)}
               />
             </label>
-            <Button variant="outline" onClick={applyCustom}>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8"
+              onClick={applyCustom}
+            >
               应用
             </Button>
           </div>

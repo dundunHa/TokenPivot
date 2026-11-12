@@ -1,0 +1,80 @@
+/* J 极客重奏 F++ — 专属设计 token */
+/* 琥珀暖黑 · 等宽字体 · 终端气质 */
+
+:root {
+  /* 背景层级 */
+  --geek-bg: #0b0a08;
+  --geek-bg-panel: #0e0e10;
+  --geek-bg-raised: #14120f;
+  --geek-bg-hover: rgba(224, 166, 75, 0.06);
+  --geek-bg-active: rgba(224, 166, 75, 0.1);
+
+  /* 文字 */
+  --geek-text: #f4f1ea;
+  --geek-text-dim: #a09a8c;
+  --geek-text-muted: #857f70;
+  --geek-text-faint: #6a655a;
+
+  /* 琥珀 */
+  --geek-amber: #e0a64b;
+  --geek-amber-dim: #b8853a;
+  --geek-amber-faint: #8a6a2e;
+  --geek-amber-glow: rgba(224, 166, 75, 0.15);
+
+  /* 语义色 */
+  --geek-success: #7fb069;
+  --geek-warning: #d4a574;
+  --geek-error: #c17c5b;
+  --geek-info: #7aa2ff;
+
+  /* 边线 */
+  --geek-border: #26231e;
+  --geek-border-light: #34302a;
+
+  /* 字体 */
+  --geek-mono:
+    ui-monospace, "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+
+  /* 间距 */
+  --geek-gap: 16px;
+  --geek-pad: 16px;
+  --geek-radius: 6px;
+}
+
+/* 等宽数字 */
+.geek-num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* 琥珀文字 */
+.geek-amber {
+  color: var(--geek-amber);
+}
+.geek-dim {
+  color: var(--geek-text-dim);
+}
+.geek-muted {
+  color: var(--geek-text-muted);
+}
+.geek-faint {
+  color: var(--geek-text-faint);
+}
+
+/* 状态色 */
+.geek-ok {
+  color: var(--geek-success);
+}
+.geek-warn {
+  color: var(--geek-warning);
+}
+.geek-err {
+  color: var(--geek-error);
+}
+
+/* 减少动效 */
+@media (prefers-reduced-motion: reduce) {
+  .geek-skeleton {
+    animation: none;
+  }
+}
