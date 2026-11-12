@@ -223,11 +223,14 @@ type ev struct {
 	total    *int64
 	quality  string
 	id       pgtype.UUID
-	// out is the final output token count; outputQuality defaults to known and
-	// must be set to estimated/missing with out nil for those rows. gen and ttft
-	// are the raw client timings, nil when unknown.
+	// out is the final output token count; outputQuality defaults to known when
+	// out is set and missing otherwise, and must be set to estimated/missing
+	// explicitly for those rows. duration is the request span the legacy speed
+	// endpoint measures. gen and ttft are the raw client timings, nil when
+	// unknown.
 	out           *int64
 	outputQuality string
+	duration      *int64
 	gen           *int64
 	ttft          *int64
 }
@@ -268,10 +271,10 @@ func (f *fixture) add(t *testing.T, e ev) pgtype.UUID {
 	}
 	f.exec(t, `INSERT INTO usage_events (id,workspace_id,source_id,source_event_id,project_id,provider,model,occurred_at,received_at,normalization_version,payload_hash,
 input_tokens,input_tokens_quality,output_tokens,output_tokens_quality,total_tokens,total_tokens_quality,
-cache_read_tokens_quality,cache_write_tokens_quality,reasoning_tokens_quality,generation_duration_ms,ttft_ms)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'v1','\x00',NULL,'missing',$12,$13,$10,$11,'missing','missing','missing',$14,$15)`,
+cache_read_tokens_quality,cache_write_tokens_quality,reasoning_tokens_quality,duration_ms,generation_duration_ms,ttft_ms)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'v1','\x00',NULL,'missing',$12,$13,$10,$11,'missing','missing','missing',$14,$15,$16)`,
 		e.id, e.ws, srcFor(e.ws), fmt.Sprint("e", nextID), project, e.provider, e.model, e.at, e.received, e.total, e.quality,
-		e.out, e.outputQuality, e.gen, e.ttft)
+		e.out, e.outputQuality, e.duration, e.gen, e.ttft)
 	return e.id
 }
 
@@ -857,5 +860,136 @@ func TestRateGenerationMetricsFilters(t *testing.T) {
 		} else if r.TTFT.Value == nil || *r.TTFT.Value != c.ttftValue {
 			t.Fatalf("%v ttft = %v want %s", c.q, r.TTFT.Value, c.ttftValue)
 		}
+	}
+}
+
+func (f *fixture) speed(t *testing.T, w pgtype.UUID, q url.Values) *SpeedResponse {
+	t.Helper()
+	r, err := f.svc.SpeedAt(f.ctx, w, q, asOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func sp(out, dur int64, quality string) ev {
+	return ev{out: n(out), outputQuality: quality, duration: n(dur), total: n(out), quality: "known"}
+}
+
+// Only events with a usable output and a positive duration are measured, the rolling
+// window is exactly [as_of-60s, as_of), and the series groups by UTC minute.
+func TestSpeedWindowMeasuredEventsAndSeries(t *testing.T) {
+	f := newFixture(t)
+	at := func(d time.Duration, e ev) ev { e.at = asOf.Add(d); return e }
+	// In the 60 second window: 100 tokens/2s known, 50 tokens/1s estimated.
+	f.add(t, at(-10*time.Second, sp(100, 2000, "known")))
+	f.add(t, at(-20*time.Second, sp(50, 1000, "estimated")))
+	// In the window but not measurable: unknown duration, zero duration, missing output.
+	f.add(t, at(-30*time.Second, ev{out: n(500), outputQuality: "known", total: n(500)}))
+	f.add(t, at(-31*time.Second, ev{out: n(500), outputQuality: "known", duration: n(0), total: n(500)}))
+	f.add(t, at(-32*time.Second, ev{duration: n(900), total: n(900)}))
+	// Window boundaries: start is included, as_of and just before start are not.
+	f.add(t, at(-time.Minute, sp(7, 700, "known")))
+	f.add(t, at(-time.Minute-time.Microsecond, sp(1000, 1000, "known")))
+	f.add(t, at(0, sp(1000, 1000, "known")))
+	// The first series minute is whole: 11:00:10 is before as_of-60min (11:00:30) but in the 11:00 bucket.
+	f.add(t, at(-60*time.Minute-20*time.Second, sp(40, 400, "known")))
+	// Earlier in the hour, and outside the hour.
+	f.add(t, at(-10*time.Minute, sp(300, 3000, "known")))
+	f.add(t, at(-61*time.Minute, sp(9000, 9000, "known")))
+	// Another workspace must not leak in.
+	f.add(t, ev{ws: otherWS, at: asOf.Add(-5 * time.Second), out: n(9999), outputQuality: "known", duration: n(1), total: n(9999)})
+
+	r := f.speed(t, ws, nil)
+	c := r.Current
+	if c.OutputTokens == nil || *c.OutputTokens != "157" || c.DurationMS == nil || *c.DurationMS != "3700" {
+		t.Fatalf("current sums = %+v", c)
+	}
+	// 6 events completed in the window (the one exactly at as_of-60s included, the one at as_of
+	// excluded); 3 are measurable, 1 of them estimated.
+	if c.EventCount != 6 || c.MeasuredCount != 3 || c.EstimatedCount != 1 {
+		t.Fatalf("current counts = %+v", c)
+	}
+	if r.WindowSeconds != 60 || r.Unit != "tokens/s" || r.AsOf != formatTime(asOf) {
+		t.Fatalf("shape = %+v", r)
+	}
+	if r.SeriesStart != formatTime(asOf.Add(-60*time.Minute).Truncate(time.Minute)) {
+		t.Fatalf("series start = %s", r.SeriesStart)
+	}
+	// The series groups by UTC calendar minute over the last 60 minutes, so unlike the rolling
+	// window it keeps the event at as_of-60s-1µs (11:59:29.999999): 11:59 = 7 + 1000 tokens.
+	// 12:00 holds the two measurable events at -10s and -20s; the event at as_of is excluded.
+	got := map[string]SpeedMinute{}
+	for _, p := range r.Points {
+		got[p.BucketStart] = p
+	}
+	m := func(h, min int) string { return formatTime(time.Date(2026, 10, 28, h, min, 0, 0, time.UTC)) }
+	val := func(p *string) string {
+		if p == nil {
+			return "<nil>"
+		}
+		return *p
+	}
+	for _, want := range []struct {
+		at             string
+		out, dur       string
+		measured, estd int64
+	}{
+		{m(11, 0), "40", "400", 1, 0},
+		{m(11, 50), "300", "3000", 1, 0},
+		{m(11, 59), "1007", "1700", 2, 0},
+		{m(12, 0), "150", "3000", 2, 1},
+	} {
+		p, ok := got[want.at]
+		if !ok || val(p.OutputTokens) != want.out || val(p.DurationMS) != want.dur || p.MeasuredCount != want.measured || p.EstimatedCount != want.estd {
+			t.Fatalf("%s = out %s dur %s measured %d estimated %d (present=%v), want %s/%s/%d/%d",
+				want.at, val(p.OutputTokens), val(p.DurationMS), p.MeasuredCount, p.EstimatedCount, ok, want.out, want.dur, want.measured, want.estd)
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("expected exactly the 11:00, 11:50, 11:59 and 12:00 minutes, got %d: %+v", len(got), got)
+	}
+	// Minutes with no measurable event are absent, never zero rows.
+	for _, p := range r.Points {
+		if p.MeasuredCount == 0 {
+			t.Fatalf("empty minute returned: %+v", p)
+		}
+	}
+}
+
+func TestSpeedEmptyAndFilters(t *testing.T) {
+	f := newFixture(t)
+	r := f.speed(t, ws, nil)
+	if r.Current.OutputTokens != nil || r.Current.DurationMS != nil || r.Current.EventCount != 0 || len(r.Points) != 0 {
+		t.Fatalf("empty = %+v", r)
+	}
+	at := asOf.Add(-5 * time.Second)
+	a := sp(100, 1000, "known")
+	a.at, a.model, a.provider, a.project = at, "m1", "p1", projA
+	b := sp(200, 4000, "known")
+	b.at, b.model, b.provider = at.Add(-time.Second), "m2", "p2"
+	f.add(t, a)
+	f.add(t, b)
+	cases := []struct {
+		q        url.Values
+		out, dur string
+	}{
+		{nil, "300", "5000"},
+		{url.Values{"model": {"m1"}}, "100", "1000"},
+		{url.Values{"provider": {"p2"}}, "200", "4000"},
+		{url.Values{"project": {"unattributed"}}, "200", "4000"},
+		{url.Values{"project": {projA.String()}}, "100", "1000"},
+	}
+	for _, c := range cases {
+		got := f.speed(t, ws, c.q).Current
+		if got.OutputTokens == nil || *got.OutputTokens != c.out || *got.DurationMS != c.dur {
+			t.Fatalf("%v: %+v, want %s/%s", c.q, got, c.out, c.dur)
+		}
+	}
+	if _, err := f.svc.SpeedAt(f.ctx, ws, url.Values{"project": {projX.String()}}, asOf); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("foreign project err = %v", err)
+	}
+	if _, err := f.svc.SpeedAt(f.ctx, ws, url.Values{"limit": {"5"}}, asOf); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("unknown parameter err = %v", err)
 	}
 }

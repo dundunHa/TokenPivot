@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mapSessionEvent, mapUsage, mapGenerationTiming, resolveProject, formatTime } from '../lib/mapper.js'
+import {
+  mapSessionEvent, mapUsage, mapGenerationTiming, resolveProject, formatTime, requestDuration, MAX_DURATION_MS,
+} from '../lib/mapper.js'
 
 const PID = '018f3c5e-2b3c-7d4e-9f0a-1b2c3d4e5f60'
 const session = { id: 's-1', header: { id: 's-1', cwd: '/work/app/sub' } }
@@ -419,4 +421,28 @@ test('partial usage: a malformed total still leaves the no-cache input exact, to
   assert.deepEqual(e.usage.input_tokens, { value: 10, quality: 'known' })
   assert.deepEqual(e.usage.output_tokens, { value: 100, quality: 'known' })
   assert.deepEqual(e.usage.total_tokens, { value: null, quality: 'missing' })
+})
+
+test('requestDuration: step start to completion, unknown when absent or implausible', () => {
+  assert.equal(requestDuration(1000, 3500), 2500)
+  assert.equal(requestDuration(1000, 1000), 0) // a real zero is not unknown
+  assert.equal(requestDuration(undefined, 3500), null)
+  assert.equal(requestDuration(Number.NaN, 3500), null)
+  assert.equal(requestDuration(5000, 4000), null) // clock went backwards
+  assert.equal(requestDuration(0, MAX_DURATION_MS), MAX_DURATION_MS)
+  assert.equal(requestDuration(0, MAX_DURATION_MS + 1), null)
+  assert.equal(requestDuration(0.4, 10.6), 10)
+})
+
+test('duration_ms comes from options.startedAt for assistant/message only', () => {
+  const event = msg({ inputTokens: 1, outputTokens: 2 })
+  const startedAt = event.time - 1800
+  assert.equal(mapSessionEvent(session, event, { startedAt }).duration_ms, 1800)
+  assert.equal(mapSessionEvent(session, event, {}).duration_ms, null)
+  const compaction = {
+    type: 'compaction/summary',
+    time: event.time,
+    data: { compactionId: 'c-1', provider: 'p', model: 'm', usage: { inputTokens: 1, outputTokens: 1 } },
+  }
+  assert.equal(mapSessionEvent(session, compaction, { startedAt }).duration_ms, null)
 })

@@ -44,9 +44,10 @@ type Options struct {
 	// RequestDetails enables the read-only request detail and 60 second rate
 	// routes; nil leaves them absent. They also need Options.Auth.
 	RequestDetails *RequestDetails
-	// CurrentWorkspace enables GET /api/v1/workspaces/current; nil leaves it
-	// absent. It also needs Options.Auth for the session gate.
-	CurrentWorkspace *CurrentWorkspace
+	// Workspaces enables the browser workspace list, create and detail routes;
+	// nil leaves them absent. They also need Options.Auth for the session and
+	// Origin gates.
+	Workspaces *Workspaces
 	// Projects enables the project management routes; nil leaves them absent.
 	// They also need Options.Auth for the session and Origin gates.
 	Projects *Projects
@@ -61,10 +62,10 @@ type Options struct {
 // NewHandler exposes liveness and bounded, uncached readiness, keeping API and
 // probe paths on the backend while optionally serving a frontend. Browser
 // authentication routes are registered only when Options.Auth is set, the
-// owner-only credential routes, project routes and source routes only when
-// Options.Auth and the matching resource option are both set, the aggregate query
-// routes only when both Options.Auth and Options.Usage are set, and the batch ingestion route only when
-// Options.Ingestion is set.
+// owner-only credential routes, workspace routes, project routes and source routes
+// only when Options.Auth and the matching resource option are both set, the
+// aggregate query routes only when both Options.Auth and Options.Usage are set, and
+// the batch ingestion route only when Options.Ingestion is set.
 func NewHandler(options Options) http.Handler {
 	checkReady := options.CheckReady
 	if checkReady == nil {
@@ -97,7 +98,7 @@ func NewHandler(options Options) http.Handler {
 	options.Credentials.routes(mux, options.Auth)
 	options.Usage.routes(mux, options.Auth)
 	options.RequestDetails.routes(mux, options.Auth)
-	options.CurrentWorkspace.routes(mux, options.Auth)
+	options.Workspaces.routes(mux, options.Auth)
 	options.Projects.routes(mux, options.Auth)
 	options.Sources.routes(mux, options.Auth)
 	options.Ingestion.Register(mux)

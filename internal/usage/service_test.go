@@ -402,18 +402,29 @@ func TestPartialEdgesAndTotalsIndependentOfGranularity(t *testing.T) {
 func TestExactlyMaxPointsAllowedAndNextBucketStopsEnumeration(t *testing.T) {
 	utc := time.UTC
 	start := at("2026-10-01T00:00:00Z")
-	got, tooMany, err := enumerateBuckets(start, start.Add(1000*time.Minute), Minute, utc, MaxPoints, nil)
-	if err != nil || tooMany || len(got) != 1000 {
-		t.Fatalf("1000 buckets: len=%d tooMany=%v err=%v", len(got), tooMany, err)
+	got, tooMany, err := enumerateBuckets(start, start.Add(MaxPoints*time.Minute), Minute, utc, MaxPoints, nil)
+	if err != nil || tooMany || len(got) != MaxPoints {
+		t.Fatalf("%d buckets: len=%d tooMany=%v err=%v", MaxPoints, len(got), tooMany, err)
 	}
-	if _, tooMany, _ = enumerateBuckets(start, start.Add(1001*time.Minute), Minute, utc, MaxPoints, nil); !tooMany {
-		t.Fatal("1001 buckets must be too many")
+	if _, tooMany, _ = enumerateBuckets(start, start.Add((MaxPoints+1)*time.Minute), Minute, utc, MaxPoints, nil); !tooMany {
+		t.Fatal("MaxPoints+1 buckets must be too many")
 	}
-	if _, tooMany, _ = enumerateBuckets(start, start.Add(1000*time.Hour), Hour, utc, MaxPoints, nil); tooMany {
-		t.Fatal("1000 hour buckets must be allowed")
+	if _, tooMany, _ = enumerateBuckets(start, start.Add(MaxPoints*time.Hour), Hour, utc, MaxPoints, nil); tooMany {
+		t.Fatal("MaxPoints hour buckets must be allowed")
 	}
-	if _, tooMany, _ = enumerateBuckets(start, start.Add(1001*time.Hour), Hour, utc, MaxPoints, nil); !tooMany {
-		t.Fatal("1001 hour buckets must be too many")
+	if _, tooMany, _ = enumerateBuckets(start, start.Add((MaxPoints+1)*time.Hour), Hour, utc, MaxPoints, nil); !tooMany {
+		t.Fatal("MaxPoints+1 hour buckets must be too many")
+	}
+}
+
+// A 24-hour minute-level trend (the dashboard default) must fit in one request,
+// even when the range end is not minute-aligned (1441 intersecting buckets).
+func TestTwentyFourHourMinuteTrendFitsMaxPoints(t *testing.T) {
+	start := at("2026-10-01T00:00:00Z")
+	end := start.Add(24*time.Hour + 30*time.Second)
+	got, tooMany, err := enumerateBuckets(start, end, Minute, time.UTC, MaxPoints, nil)
+	if err != nil || tooMany || len(got) != 1441 {
+		t.Fatalf("24h minute: len=%d tooMany=%v err=%v", len(got), tooMany, err)
 	}
 }
 
@@ -428,22 +439,22 @@ func TestEnumerationStopsEarlyOnVeryLongRanges(t *testing.T) {
 			t.Fatalf("%s: tooMany=%v err=%v", g, tooMany, err)
 		}
 		// A full scan would need millions of key probes; early exit stays near
-		// 1001 buckets times the per-bucket search.
-		if probes > 120000 {
-			t.Fatalf("%s: %d probes, enumeration did not stop at the 1001st bucket", g, probes)
+		// MaxPoints+1 buckets times the per-bucket search (scales with MaxPoints).
+		if probes > 40*(MaxPoints+1)*3 {
+			t.Fatalf("%s: %d probes, enumeration did not stop at bucket MaxPoints+1", g, probes)
 		}
 	}
 }
 
 func TestTooManyPointsSuggestsFinestCoarserGranularity(t *testing.T) {
-	// Real limits: 1001 minutes -> hour fits.
+	// Real limits: MaxPoints+1 minutes (1501 = 25h01m) -> hour fits.
 	store := &fakeStore{}
 	s, _, _ := newTestService(store)
-	values := set(set(set(aggValues(), "granularity", "minute"), "start", "2026-10-27T00:00:00Z"), "end", "2026-10-27T16:41:00Z") // 1001 minutes
+	values := set(set(set(aggValues(), "granularity", "minute"), "start", "2026-10-27T00:00:00Z"), "end", "2026-10-28T01:01:00Z")
 	_, err := s.Aggregate(context.Background(), testWorkspace, values)
 	assertSuggestion(t, err, MaxPoints, Hour)
-	// 1001 hours -> day fits.
-	values = set(set(aggValues(), "start", "2026-09-01T00:00:00Z"), "end", "2026-10-12T17:00:00Z")
+	// MaxPoints+1 hours (1501 = 62d13h) -> day fits.
+	values = set(set(aggValues(), "start", "2026-08-20T00:00:00Z"), "end", "2026-10-21T13:00:00Z")
 	_, err = s.Aggregate(context.Background(), testWorkspace, values)
 	assertSuggestion(t, err, MaxPoints, Day)
 	if store.aggregateCalls != 0 {
@@ -1033,5 +1044,64 @@ func TestOptionsStoreErrorPassesThrough(t *testing.T) {
 	s, _, _ := newTestService(&fakeStore{err: boom})
 	if _, err := s.Options(context.Background(), testWorkspace); !errors.Is(err, boom) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAutoGranularityPicksFinestWithinTarget(t *testing.T) {
+	cases := []struct {
+		name       string
+		start, end string
+		want       Granularity
+	}{
+		{"1 hour -> minute", "2026-10-27T00:00:00Z", "2026-10-27T01:00:00Z", Minute},
+		{"exactly 200 minutes -> minute", "2026-10-27T00:00:00Z", "2026-10-27T03:20:00Z", Minute},
+		{"201 minutes -> hour", "2026-10-27T00:00:00Z", "2026-10-27T03:21:00Z", Hour},
+		{"one day -> hour", "2026-10-27T00:00:00Z", "2026-10-28T00:00:00Z", Hour},
+		{"7 days -> hour", "2026-10-21T00:00:00Z", "2026-10-28T00:00:00Z", Hour},
+		{"30 days -> day", "2026-09-28T00:00:00Z", "2026-10-28T00:00:00Z", Day},
+		{"1 year -> day", "2025-10-28T00:00:00Z", "2026-10-28T00:00:00Z", Day},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store := &fakeStore{}
+			s, _, _ := newTestService(store)
+			values := set(set(set(aggValues(), "granularity", "auto"), "start", c.start), "end", c.end)
+			resp, err := s.Aggregate(context.Background(), testWorkspace, values)
+			if err != nil {
+				t.Fatalf("auto: %v", err)
+			}
+			if resp.Range.Granularity != c.want {
+				t.Fatalf("granularity = %s, want %s", resp.Range.Granularity, c.want)
+			}
+		})
+	}
+}
+
+func TestAutoGranularityRespectsMaxPointsAndKeepsExplicitStrict(t *testing.T) {
+	store := &fakeStore{}
+	s, _, _ := newTestService(store)
+	// Explicit minute over MaxPoints+1 minutes (1501 min = 25h01m) is still rejected: no silent change.
+	values := set(set(set(aggValues(), "granularity", "minute"), "start", "2026-10-27T00:00:00Z"), "end", "2026-10-28T01:01:00Z")
+	_, err := s.Aggregate(context.Background(), testWorkspace, values)
+	assertSuggestion(t, err, MaxPoints, Hour)
+	// The same range with auto succeeds.
+	resp, err := s.Aggregate(context.Background(), testWorkspace, set(values, "granularity", "auto"))
+	if err != nil || resp.Range.Granularity != Hour {
+		t.Fatalf("auto resp=%v err=%v, want hour", resp, err)
+	}
+	// When even day exceeds the hard limit, auto fails like an explicit day request.
+	s.maxPoints = 5
+	s.autoPoints = 3
+	values = set(set(set(aggValues(), "granularity", "auto"), "start", "2026-10-01T00:00:00Z"), "end", "2026-10-28T00:00:00Z")
+	_, err = s.Aggregate(context.Background(), testWorkspace, values)
+	assertSuggestion(t, err, 5, "")
+}
+
+func TestAutoGranularityIsCaseSensitive(t *testing.T) {
+	s, _, _ := newTestService(&fakeStore{})
+	for _, v := range []string{"AUTO", "Auto", ""} {
+		if _, err := s.Aggregate(context.Background(), testWorkspace, set(aggValues(), "granularity", v)); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("granularity=%q err=%v, want ErrInvalidArgument", v, err)
+		}
 	}
 }

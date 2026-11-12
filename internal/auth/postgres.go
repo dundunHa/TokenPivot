@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/dundunHa/TokenPivot/internal/database"
-	"github.com/dundunHa/TokenPivot/internal/workspaces"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,8 +16,27 @@ import (
 // database, so application and database clock differences never decide session
 // validity.
 const (
-	userCredentialQuery      = `SELECT id, email, password_hash FROM users WHERE email = $1`
-	createUserQuery          = `INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email`
+	userCredentialQuery = `SELECT id, email, password_hash FROM users WHERE email = $1`
+	createUserQuery     = `INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email`
+	// createFeishuUserQuery creates an account that has no local password, so only
+	// the Feishu callback can authenticate it until a password is set.
+	createFeishuUserQuery = `INSERT INTO users (email, password_hash) VALUES ($1, NULL) RETURNING id, email`
+	// userByFeishuOpenIDQuery resolves the binding by (provider, provider_user_id),
+	// which is the unique key the schema guarantees.
+	userByFeishuOpenIDQuery = `SELECT u.id, u.email
+FROM user_identities ui
+JOIN users u ON u.id = ui.user_id
+WHERE ui.provider = 'feishu' AND ui.provider_user_id = $1`
+	// upsertFeishuIdentityQuery writes the binding once per (user, provider). The
+	// update only fires when the stored provider_user_id is the same one, so
+	// repeating a bind is idempotent and a second open_id for the same account is
+	// reported as zero affected rows instead of being silently dropped. Empty
+	// optional values are stored as NULL.
+	upsertFeishuIdentityQuery = `INSERT INTO user_identities (user_id, provider, provider_user_id, union_id, tenant_key, email, display_name)
+VALUES ($1, 'feishu', $2, NULLIF($3, ''), NULLIF($4, ''), $5, NULLIF($6, ''))
+ON CONFLICT (user_id, provider) DO UPDATE
+SET provider_user_id = user_identities.provider_user_id
+WHERE user_identities.provider_user_id = EXCLUDED.provider_user_id`
 	createSessionQuery       = `INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '30 days') RETURNING expires_at`
 	authenticateSessionQuery = `UPDATE sessions
 SET expires_at = now() + interval '30 days'
@@ -70,12 +88,12 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 }
 
 // InTx runs fn inside one explicit READ COMMITTED transaction. The store passed
-// to fn is bound to that transaction, so the account, personal workspace, owner
-// membership and first session it writes commit or roll back as one unit. The
-// isolation level is spelled out because the closed-registration path relies on
-// READ COMMITTED: the statements after a lock wait take a fresh snapshot and see
-// the user that the previous lock holder committed. A nil function result
-// commits; any error rolls back and is returned as the caller supplied it.
+// to fn is bound to that transaction, so the account and its first session it
+// writes commit or roll back as one unit. The isolation level is spelled out
+// because the closed-registration path relies on READ COMMITTED: the statements
+// after a lock wait take a fresh snapshot and see the user that the previous lock
+// holder committed. A nil function result commits; any error rolls back and is
+// returned as the caller supplied it.
 func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, RegistrationStore) error) error {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
@@ -86,7 +104,7 @@ func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, Registrati
 		// is expected and deliberately ignored.
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
-	if err := fn(ctx, &registrationTxStore{sqlStore: &sqlStore{q: tx}, workspaces: workspaces.NewTx(tx)}); err != nil {
+	if err := fn(ctx, &registrationTxStore{sqlStore: &sqlStore{q: tx}}); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -96,12 +114,11 @@ func (p *Postgres) InTx(ctx context.Context, fn func(context.Context, Registrati
 }
 
 // registrationTxStore is the transaction-bound registration store. It answers the
-// account and session statements through the shared sqlStore on this transaction
-// and reaches personal workspace creation through the workspaces transaction
-// adapter, so the order and the SQL of that step stay owned by internal/workspaces.
+// account and session statements through the shared sqlStore on this transaction;
+// it writes nothing else, so registration cannot create a workspace or a
+// membership.
 type registrationTxStore struct {
 	*sqlStore
-	workspaces *workspaces.Tx
 }
 
 // CreateUser inserts the account and returns the identity the database assigned.
@@ -115,12 +132,30 @@ func (s *registrationTxStore) CreateUser(ctx context.Context, email, passwordHas
 	return user, nil
 }
 
-// CreatePersonal creates the user's initial personal workspace and owner
-// membership in this same transaction. The returned workspace is not part of the
-// registration response, so it is dropped here instead of being exposed.
-func (s *registrationTxStore) CreatePersonal(ctx context.Context, userID ID) error {
-	if _, err := s.workspaces.CreatePersonal(ctx, workspaces.ID{Bytes: userID, Valid: true}); err != nil {
-		return err
+// CreateFeishuUser inserts an account with no local password. Only the email
+// unique index conflict becomes ErrEmailUnavailable.
+func (s *registrationTxStore) CreateFeishuUser(ctx context.Context, email string) (User, error) {
+	var user User
+	var id ID
+	if err := s.q.QueryRow(ctx, createFeishuUserQuery, email).Scan(&id, &user.Email); err != nil {
+		return User{}, mapUserConflict(err)
+	}
+	user.ID = id
+	return user, nil
+}
+
+// UpsertFeishuIdentity writes the provider binding and keeps an existing row for
+// the same (user, provider) pair only when it holds the same open_id. A conflict
+// on the open_id unique index means the identity already belongs to another
+// account; zero affected rows means this account is already bound to a different
+// open_id. Both are refused writes.
+func (s *registrationTxStore) UpsertFeishuIdentity(ctx context.Context, userID ID, identity FeishuIdentity) error {
+	tag, err := s.q.Exec(ctx, upsertFeishuIdentityQuery, userID, identity.OpenID, identity.UnionID, identity.TenantKey, identity.Email, identity.DisplayName)
+	if err != nil {
+		return mapFeishuIdentityConflict(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrFeishuIdentityConflict
 	}
 	return nil
 }
@@ -146,11 +181,15 @@ func (s *registrationTxStore) HasUsers(ctx context.Context) (bool, error) {
 }
 
 // UserCredential returns the account of a normalized email. A miss is not an
-// error, so the service can run the dummy verification instead.
+// error, so the service can run the dummy verification instead. An account
+// created by Feishu stores NULL in password_hash, which is reported as an empty
+// encoding; the service then fails the password check exactly like a wrong
+// password.
 func (s *sqlStore) UserCredential(ctx context.Context, email string) (Credential, bool, error) {
 	var credential Credential
 	var id ID
-	err := s.q.QueryRow(ctx, userCredentialQuery, email).Scan(&id, &credential.User.Email, &credential.PasswordHash)
+	var passwordHash *string
+	err := s.q.QueryRow(ctx, userCredentialQuery, email).Scan(&id, &credential.User.Email, &passwordHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Credential{}, false, nil
 	}
@@ -158,7 +197,26 @@ func (s *sqlStore) UserCredential(ctx context.Context, email string) (Credential
 		return Credential{}, false, safeStoreError("auth account lookup", err)
 	}
 	credential.User.ID = id
+	if passwordHash != nil {
+		credential.PasswordHash = *passwordHash
+	}
 	return credential, true, nil
+}
+
+// UserByFeishuOpenID returns the account already bound to a Feishu open_id. A
+// miss is not an error: the callback then looks at the email.
+func (s *sqlStore) UserByFeishuOpenID(ctx context.Context, openID string) (User, bool, error) {
+	var user User
+	var id ID
+	err := s.q.QueryRow(ctx, userByFeishuOpenIDQuery, openID).Scan(&id, &user.Email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, false, nil
+	}
+	if err != nil {
+		return User{}, false, safeStoreError("auth feishu identity lookup", err)
+	}
+	user.ID = id
+	return user, true, nil
 }
 
 // CreateSession issues one additional session for an existing account.
@@ -208,6 +266,17 @@ func mapUserConflict(err error) error {
 		return ErrEmailUnavailable
 	}
 	return safeStoreError("auth registration", err)
+}
+
+// mapFeishuIdentityConflict translates only the open_id unique index conflict
+// into the business error; every other database failure keeps its safe generic
+// form. That conflict means another account already owns the identity.
+func mapFeishuIdentityConflict(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uk_user_identities_provider_uid" {
+		return ErrFeishuIdentityConflict
+	}
+	return safeStoreError("auth feishu identity", err)
 }
 
 // safeStoreError keeps the fixed stage text of database.SafeError and adds

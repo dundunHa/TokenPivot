@@ -22,6 +22,7 @@ type RequestDetails struct {
 const (
 	usageEventsPath = "/api/v1/workspaces/{workspaceID}/usage-events"
 	usageRatePath   = "/api/v1/workspaces/{workspaceID}/usage-rate"
+	usageSpeedPath  = "/api/v1/workspaces/{workspaceID}/usage-speed"
 )
 
 // NewRequestDetails returns the adapter; both dependencies are required.
@@ -37,6 +38,7 @@ func (d *RequestDetails) routes(mux *http.ServeMux, sessions *Auth) {
 	}
 	mux.Handle("GET "+usageEventsPath, sessions.readRoute(http.HandlerFunc(d.handleEvents)))
 	mux.Handle("GET "+usageRatePath, sessions.readRoute(http.HandlerFunc(d.handleRate)))
+	mux.Handle("GET "+usageSpeedPath, sessions.readRoute(http.HandlerFunc(d.handleSpeed)))
 }
 
 func (d *RequestDetails) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +68,23 @@ func (d *RequestDetails) handleRate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response, err := d.Service.Rate(r.Context(), workspaceID, values)
+	if err != nil {
+		writeRequestDetailsError(r, w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (d *RequestDetails) handleSpeed(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := requireMemberAvailable(w, r, d.Workspaces)
+	if !ok {
+		return
+	}
+	values, ok := requestDetailsQuery(w, r)
+	if !ok {
+		return
+	}
+	response, err := d.Service.Speed(r.Context(), workspaceID, values)
 	if err != nil {
 		writeRequestDetailsError(r, w, err)
 		return

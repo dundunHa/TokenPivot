@@ -2,7 +2,20 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 
 export { http, HttpResponse };
-export const server = setupServer();
+
+/**
+ * 默认 handlers：未显式 mock 的测试也拿到真实的默认响应。
+ * 飞书授权默认按“本实例未配置飞书应用凭证”返回，测试要用飞书入口时再 `server.use` 覆盖。
+ */
+export const server = setupServer(
+  http.get("/api/v1/auth/feishu/authorize", () =>
+    HttpResponse.json({
+      enabled: false,
+      authorize_url: null,
+      expires_in_seconds: 0,
+    }),
+  ),
+);
 
 export function deferred<T = void>() {
   let resolve!: (value: T) => void;

@@ -18,6 +18,16 @@ export interface CredentialErrors {
   password?: string;
 }
 
+/**
+ * 飞书授权会话（`GET /api/v1/auth/feishu/authorize`）。
+ * 未配置飞书应用凭证时服务端仍返回 200，用 `enabled: false` 区分。
+ */
+export interface FeishuAuthorizeInfo {
+  enabled: boolean;
+  authorizeUrl: string | null;
+  expiresInSeconds: number;
+}
+
 export type CredentialsValidation =
   | { ok: true; credentials: AuthCredentials }
   | { ok: false; errors: CredentialErrors };
@@ -47,6 +57,24 @@ export function parseAuthSession(value: unknown): AuthSession | undefined {
   return { user: { id: user.id, email: user.email }, expires_at };
 }
 
+/** 把未知响应体收窄为 FeishuAuthorizeInfo；形状不合法返回 undefined。 */
+export function parseFeishuAuthorize(
+  value: unknown,
+): FeishuAuthorizeInfo | undefined {
+  if (!isRecord(value)) return undefined;
+  const { enabled, authorize_url, expires_in_seconds } = value;
+  if (typeof enabled !== "boolean") return undefined;
+  if (authorize_url !== null && typeof authorize_url !== "string") {
+    return undefined;
+  }
+  const seconds =
+    typeof expires_in_seconds === "number" &&
+    Number.isFinite(expires_in_seconds)
+      ? Math.max(0, Math.floor(expires_in_seconds))
+      : 0;
+  return { enabled, authorizeUrl: authorize_url, expiresInSeconds: seconds };
+}
+
 /** 从未知错误体取出字符串 error.code；形状不对返回 undefined。 */
 export function parseAuthErrorCode(value: unknown): string | undefined {
   if (!isRecord(value) || !isRecord(value.error)) return undefined;
@@ -65,6 +93,28 @@ export class AuthApiError extends Error {
     this.code = code;
     this.retryAfter = retryAfter;
   }
+}
+
+/** 密码长度的实时读数：Unicode 码点数与 UTF-8 字节数。 */
+export function passwordMetrics(password: string): {
+  codePoints: number;
+  bytes: number;
+} {
+  return {
+    codePoints: Array.from(password).length,
+    bytes: new TextEncoder().encode(password).length,
+  };
+}
+
+/** 429 RATE_LIMITED 的秒级退避读数；无合法 Retry-After 时为 undefined。 */
+export function rateLimitSeconds(error: unknown): number | undefined {
+  if (!(error instanceof AuthApiError) || error.code !== "RATE_LIMITED") {
+    return undefined;
+  }
+  if (error.retryAfter === undefined || !/^\d+$/.test(error.retryAfter)) {
+    return undefined;
+  }
+  return Number(error.retryAfter);
 }
 
 /**
@@ -119,6 +169,14 @@ export function authErrorMessage(error: unknown): string {
       return "请检查邮箱和密码是否符合要求。";
     case "NETWORK":
       return "无法连接服务，请检查网络后重试。";
+    // 以下 CODE 只出现在飞书回调的重定向查询参数里，不属于 AuthError.code 枚举。
+    case "UNAUTHENTICATED":
+    case "FEISHU_STATE_INVALID":
+      return "飞书授权已失效，请重新扫码。";
+    case "FEISHU_EMAIL_REQUIRED":
+      return "飞书账号没有返回企业邮箱，请改用邮箱密码登录。";
+    case "FEISHU_AUTH_FAILED":
+      return "飞书授权未完成，请重新尝试。";
     default:
       return "服务暂时不可用，请稍后重试。";
   }

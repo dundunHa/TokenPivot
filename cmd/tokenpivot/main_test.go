@@ -163,3 +163,36 @@ func TestWebOriginFailureIsRedacted(t *testing.T) {
 		})
 	}
 }
+
+// TestFeishuHalfConfigurationStopsStartup proves a single Feishu credential stops
+// startup before listening and that neither the configured value nor the missing
+// secret appears in the log.
+func TestFeishuHalfConfigurationStopsStartup(t *testing.T) {
+	l := testListener(t)
+	defer func() {
+		if err := l.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	for name, extra := range map[string]string{
+		"app id only":     "TOKENPIVOT_FEISHU_APP_ID=synthetic-sensitive-marker",
+		"app secret only": "TOKENPIVOT_FEISHU_APP_SECRET=synthetic-sensitive-marker",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cmd, logs := child(t, l.Addr().String())
+			cmd.Env = append(cmd.Env, "TOKENPIVOT_DATABASE_URL=synthetic-sensitive-marker", extra)
+			err := cmd.Run()
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+				t.Fatalf("exit = %v, want code 1", err)
+			}
+			checkLogs(t, logs.text(), false, false)
+			if strings.Count(logs.text(), `"msg":"failed"`) != 1 {
+				t.Errorf("expected exactly one failure log: %s", logs.text())
+			}
+			if !strings.Contains(logs.text(), "TOKENPIVOT_FEISHU_APP_ID and TOKENPIVOT_FEISHU_APP_SECRET must be set together") {
+				t.Errorf("failure did not come from the Feishu pair check: %s", logs.text())
+			}
+		})
+	}
+}

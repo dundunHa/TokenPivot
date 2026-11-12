@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { sessionKey } from "./queries";
@@ -16,7 +16,14 @@ const SESSION = "/api/v1/auth/session";
 const LOGIN = "/api/v1/auth/login";
 const REGISTER = "/api/v1/auth/register";
 const LOGOUT = "/api/v1/auth/logout";
+const AUTHORIZE = "/api/v1/auth/feishu/authorize";
 const FUTURE = "2999-01-01T00:00:00Z";
+
+// 飞书授权地址是公开登录页的初始化请求：这里直接让它在服务端失败，
+// 页面必须进入“二维码已过期”的可刷新状态，不产生未捕获异常，也不打断认证流程。
+beforeEach(() => {
+  server.use(http.get(AUTHORIZE, () => errorResponse(500, "INTERNAL")));
+});
 
 function countSessionGets() {
   const counter = { count: 0 };
@@ -131,6 +138,8 @@ describe.each([
         sessionGets += 1;
         return errorResponse(401, "UNAUTHENTICATED");
       }),
+      // 注册/登录后都是零空间状态：由强制创建 modal 接住，不挂载业务页面。
+      http.get("/api/v1/workspaces", () => HttpResponse.json([])),
     );
     const user = userEvent.setup();
     renderApp(path);
@@ -138,7 +147,7 @@ describe.each([
     await user.click(screen.getByRole("button", { name: button }));
     await screen.findByText("normalised@example.com");
     expect(bodies).toEqual([{ email, password }]);
-    expect(screen.getByText("Personal")).toBeTruthy();
+    expect(await screen.findByRole("dialog")).toBeTruthy();
     expect(screen.getByRole("button", { name: "登出" })).toBeTruthy();
     expect(location()).toBe("/|REPLACE");
     expect(sessionGets).toBe(0);
@@ -156,6 +165,7 @@ describe("submit state", () => {
         await gate.promise;
         return HttpResponse.json(sessionBody("a@example.com", FUTURE));
       }),
+      http.get("/api/v1/workspaces", () => HttpResponse.json([])),
     );
     const user = userEvent.setup();
     renderApp("/login");
@@ -328,6 +338,7 @@ describe("logout", () => {
         HttpResponse.json(sessionBody("a@example.com", FUTURE)),
       ),
       http.post(LOGOUT, () => new HttpResponse(null, { status: 204 })),
+      http.get("/api/v1/workspaces", () => HttpResponse.json([])),
     );
     const user = userEvent.setup();
     renderApp("/");
@@ -344,8 +355,8 @@ describe("logout", () => {
         HttpResponse.json(sessionBody("a@example.com", FUTURE)),
       ),
       http.post(LOGOUT, () => errorResponse(500, "INTERNAL")),
-      // 总览的空间请求保持挂起，本用例只关注退出失败提示。
-      http.get("/api/v1/workspaces/current", () => new Promise(() => {})),
+      // 工作区列表保持挂起，本用例只关注退出失败提示。
+      http.get("/api/v1/workspaces", () => new Promise(() => {})),
     );
     const user = userEvent.setup();
     renderApp("/");

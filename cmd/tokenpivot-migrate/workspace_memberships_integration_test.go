@@ -206,8 +206,8 @@ func TestWorkspaceMemberships(t *testing.T) {
 		if err := db.QueryRowContext(ctx, query).Scan(&table, &role); err != nil {
 			t.Fatal(database.SafeError("comments", err))
 		}
-		if !strings.Contains(table, "owner rows for personal workspaces") {
-			t.Fatalf("table comment=%q does not state the personal-only write boundary", table)
+		if !strings.Contains(table, "owner membership in the same transaction") {
+			t.Fatalf("table comment=%q does not state the owner write boundary", table)
 		}
 		if !strings.Contains(role, "owner or member") {
 			t.Fatalf("role comment=%q does not list the accepted roles", role)
@@ -253,7 +253,7 @@ func TestWorkspaceMemberships(t *testing.T) {
 	t.Run("defaults and uniqueness", func(t *testing.T) {
 		first := seedUser(t, ctx, app, "membership-first@example.com")
 		second := seedUser(t, ctx, app, "membership-second@example.com")
-		workspace := seedWorkspace(t, ctx, app, "synthetic-membership")
+		workspace := seedWorkspace(t, ctx, app, first, "synthetic-membership")
 
 		var joinedAt time.Time
 		if err := app.QueryRow(ctx, "INSERT INTO workspace_memberships (workspace_id, user_id, role) VALUES ($1,$2,$3) RETURNING joined_at", workspace, first, "owner").Scan(&joinedAt); err != nil {
@@ -269,7 +269,7 @@ func TestWorkspaceMemberships(t *testing.T) {
 			t.Fatal("a second user could not join the same workspace")
 		}
 		// The same user may own another workspace: no user_id unique index.
-		other := seedWorkspace(t, ctx, app, "synthetic-membership-other")
+		other := seedWorkspace(t, ctx, app, first, "synthetic-membership-other")
 		if _, err := app.Exec(ctx, "INSERT INTO workspace_memberships (workspace_id, user_id, role) VALUES ($1,$2,$3)", other, first, "owner"); err != nil {
 			t.Fatal("a user could not hold a membership in a second workspace")
 		}
@@ -377,11 +377,11 @@ func seedUser(t *testing.T, ctx context.Context, app *pgx.Conn, email string) st
 	return userID
 }
 
-// seedWorkspace inserts one synthetic workspace as the service role.
-func seedWorkspace(t *testing.T, ctx context.Context, app *pgx.Conn, name string) string {
+// seedWorkspace inserts one synthetic workspace owned by creatorID.
+func seedWorkspace(t *testing.T, ctx context.Context, app *pgx.Conn, creatorID, name string) string {
 	t.Helper()
 	var workspaceID string
-	if err := app.QueryRow(ctx, "INSERT INTO workspaces (name) VALUES ($1) RETURNING id", name).Scan(&workspaceID); err != nil {
+	if err := app.QueryRow(ctx, "INSERT INTO workspaces (created_by_user_id, name) VALUES ($1,$2) RETURNING id", creatorID, name).Scan(&workspaceID); err != nil {
 		t.Fatal(database.SafeError("seed workspace", err))
 	}
 	return workspaceID

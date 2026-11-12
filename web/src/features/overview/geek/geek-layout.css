@@ -1,0 +1,736 @@
+/* 仪表盘布局与组件样式（暖黑底 + 琥珀强调） */
+
+.geek-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--geek-gap);
+}
+
+/* ===== 栅格：主区 3fr / 辅区 2fr，窄屏单列 ===== */
+.geek-split {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: var(--geek-gap);
+  align-items: stretch;
+}
+@media (max-width: 1099px) {
+  .geek-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ===== 卡片 ===== */
+.geek-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: var(--geek-pad);
+  background: var(--geek-bg-panel);
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+}
+.geek-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  min-height: 26px;
+}
+.geek-card-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--geek-text);
+}
+
+/* ===== 分段控件 ===== */
+.geek-segmented {
+  display: inline-flex;
+}
+.geek-segmented-labeled {
+  align-items: center;
+}
+.geek-segmented-label {
+  margin-right: 8px;
+  font-family: var(--geek-mono);
+  font-size: 12px;
+  color: var(--geek-text-dim);
+}
+.geek-ranking-tab {
+  background: transparent;
+  border: 1px solid var(--geek-border-light);
+  margin-left: -1px;
+  color: var(--geek-text-dim);
+  padding: 3px 12px;
+  font-family: var(--geek-mono);
+  font-size: 12px;
+  line-height: 18px;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+.geek-ranking-tab:first-child {
+  margin-left: 0;
+  border-radius: 5px 0 0 5px;
+}
+.geek-ranking-tab:last-child {
+  border-radius: 0 5px 5px 0;
+}
+.geek-ranking-tab:hover {
+  color: var(--geek-text);
+  background: var(--geek-bg-hover);
+}
+.geek-tab-active,
+.geek-ranking-tab[aria-selected="true"],
+.geek-ranking-tab[aria-pressed="true"] {
+  background: var(--geek-amber);
+  color: var(--geek-bg);
+  border-color: var(--geek-amber);
+  position: relative;
+}
+.geek-tab-active:hover,
+.geek-ranking-tab[aria-selected="true"]:hover,
+.geek-ranking-tab[aria-pressed="true"]:hover {
+  background: var(--geek-amber);
+  color: var(--geek-bg);
+}
+
+/* ===== 筛选工具栏 ===== */
+.geek-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.geek-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+}
+.geek-toolbar-end {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+.geek-ms {
+  position: relative;
+}
+.geek-ms > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  list-style: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--geek-text-dim);
+  border: 1px solid var(--geek-border-light);
+  border-radius: 5px;
+  transition:
+    color 0.12s,
+    background 0.12s;
+}
+.geek-ms > summary::-webkit-details-marker {
+  display: none;
+}
+.geek-ms > summary::after {
+  content: "▾";
+  font-size: 10px;
+}
+.geek-ms > summary:hover,
+.geek-ms[open] > summary {
+  color: var(--geek-text);
+  background: var(--geek-bg-hover);
+}
+.geek-ms-panel {
+  position: absolute;
+  z-index: 20;
+  right: 0;
+  top: calc(100% + 6px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 200px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 10px 12px;
+  font-size: 12px;
+  background: var(--geek-bg-raised);
+  border: 1px solid var(--geek-border-light);
+  border-radius: var(--geek-radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+.geek-ms-panel label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.geek-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.geek-chips button {
+  padding: 2px 10px;
+  font-size: 11px;
+  color: var(--geek-amber);
+  background: var(--geek-bg-active);
+  border: 1px solid var(--geek-amber-faint);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.geek-chips button:hover {
+  background: var(--geek-amber-glow);
+}
+
+/* ===== 指标卡 ===== */
+.geek-kpis {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) repeat(3, minmax(0, 1fr));
+  gap: var(--geek-gap);
+}
+@media (max-width: 1099px) {
+  .geek-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .geek-kpi-hero {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 599px) {
+  .geek-kpis {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.geek-kpi {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 16px 18px;
+  background: linear-gradient(
+    180deg,
+    var(--geek-bg-raised),
+    var(--geek-bg-panel) 60%
+  );
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+  overflow: hidden;
+}
+.geek-kpi::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--geek-amber-faint),
+    transparent
+  );
+}
+.geek-kpi-hero {
+  background:
+    radial-gradient(
+      120% 90% at 0% 0%,
+      rgba(224, 166, 75, 0.14),
+      transparent 60%
+    ),
+    var(--geek-bg-panel);
+  border-color: var(--geek-border-light);
+}
+.geek-kpi-label {
+  font-size: 12px;
+  color: var(--geek-text-dim);
+}
+.geek-kpi-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+.geek-kpi-number {
+  font-size: 30px;
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: -0.5px;
+}
+.geek-kpi-hero .geek-kpi-number {
+  font-size: 44px;
+  font-weight: 300;
+  color: var(--geek-amber);
+  text-shadow: 0 0 28px rgba(224, 166, 75, 0.35);
+}
+.geek-kpi-unit {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--geek-text-muted);
+  text-shadow: none;
+}
+.geek-kpi-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--geek-text-muted);
+}
+.geek-kpi-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+}
+.geek-live {
+  position: relative;
+}
+.geek-delta {
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.geek-delta-up {
+  color: var(--geek-success);
+  background: rgba(127, 176, 105, 0.12);
+}
+.geek-delta-down {
+  color: var(--geek-error);
+  background: rgba(193, 124, 91, 0.14);
+}
+.geek-spark {
+  width: 100%;
+  height: 32px;
+  margin-top: auto;
+}
+.geek-split-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--geek-bg-raised);
+}
+.geek-split-in {
+  background: var(--geek-amber);
+}
+.geek-split-out {
+  background: var(--geek-info);
+}
+.geek-split-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  font-size: 12px;
+  color: var(--geek-text-dim);
+}
+.geek-split-legend i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+}
+.geek-dot-in {
+  background: var(--geek-amber);
+}
+.geek-dot-out {
+  background: var(--geek-info);
+}
+
+/* ===== 趋势 ===== */
+.geek-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: var(--geek-text-dim);
+}
+.geek-legend i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 2px;
+}
+.geek-trend-note {
+  margin: 0;
+  font-size: 11px;
+}
+.geek-skeleton {
+  height: 300px;
+  border-radius: var(--geek-radius);
+  background: var(--geek-bg-raised);
+  animation: geek-pulse 1.4s ease-in-out infinite;
+}
+.geek-skeleton-sm {
+  height: 40px;
+}
+@keyframes geek-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+.geek-tooltip {
+  min-width: 160px;
+  padding: 10px 12px;
+  font-size: 12px;
+  background: rgba(20, 18, 15, 0.96);
+  border: 1px solid var(--geek-border-light);
+  border-radius: var(--geek-radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+}
+.geek-tooltip-time {
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--geek-text-muted);
+}
+.geek-tooltip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 0;
+}
+.geek-tooltip-row i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+.geek-tooltip-row b {
+  margin-left: auto;
+  padding-left: 16px;
+  font-weight: 500;
+}
+.geek-tooltip-sum {
+  margin-top: 4px;
+  padding-top: 5px;
+  border-top: 1px solid var(--geek-border-light);
+  color: var(--geek-text-dim);
+}
+
+/* ===== 排名 ===== */
+.geek-rank-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.geek-rank-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 12px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.geek-rank-row:hover {
+  background: var(--geek-bg-hover);
+}
+.geek-rank-row[aria-pressed="true"] {
+  background: var(--geek-bg-active);
+  border-color: var(--geek-amber-dim);
+}
+.geek-rank-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geek-rank-value {
+  text-align: right;
+  white-space: nowrap;
+}
+.geek-rank-track {
+  grid-column: 1 / -1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--geek-bg-raised);
+  overflow: hidden;
+}
+.geek-rank-track > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--geek-amber-dim), var(--geek-amber));
+  border-radius: 2px;
+}
+.geek-rank-note {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--geek-text-muted);
+}
+.geek-link {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 2px 10px;
+  font-size: 12px;
+  color: var(--geek-amber);
+  cursor: pointer;
+}
+.geek-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ===== 请求明细 ===== */
+.geek-table-wrap {
+  max-height: min(70vh, 720px);
+  overflow: auto;
+  border: 1px solid var(--geek-border);
+  border-radius: var(--geek-radius);
+}
+.geek-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  text-align: left;
+}
+.geek-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 12px;
+  background: var(--geek-bg-raised);
+  border-bottom: 1px solid var(--geek-border-light);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--geek-text-muted);
+  white-space: nowrap;
+}
+.geek-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--geek-border);
+  white-space: nowrap;
+}
+.geek-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.geek-table tbody tr:hover td {
+  background: var(--geek-bg-hover);
+}
+.geek-table .geek-th-num,
+.geek-table .geek-td-num {
+  text-align: right;
+}
+
+/* ===== 空态 ===== */
+.geek-empty {
+  padding: 32px;
+  text-align: center;
+  font-size: 13px;
+}
+
+.geek-ms-inline > summary {
+  display: inline-block;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  color: var(--geek-text-dim);
+}
+.geek-ms-inline > summary::-webkit-details-marker {
+  display: none;
+}
+.geek-ms-inline > summary::before {
+  content: "▸ ";
+  color: var(--geek-amber);
+}
+.geek-ms-inline[open] > summary::before {
+  content: "▾ ";
+}
+.geek-ms-inline > summary:hover {
+  color: var(--geek-text);
+}
+.geek-toolbar-start {
+  margin-left: 0;
+}
+
+/* ===== 顶部导航 ===== */
+.geek-nav {
+  display: flex;
+  gap: 4px;
+  margin-left: 12px;
+}
+.geek-nav a {
+  padding: 4px 12px;
+  font-size: 13px;
+  color: var(--geek-text-dim);
+  border-bottom: 2px solid transparent;
+  transition: color 0.12s;
+}
+.geek-nav a:hover {
+  color: var(--geek-text);
+}
+.geek-nav a[aria-current="page"] {
+  color: var(--geek-amber);
+  border-bottom-color: var(--geek-amber);
+}
+.geek-kpis-single {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 320px;
+}
+.geek-card-sub {
+  margin-left: 10px;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--geek-text-muted);
+}
+
+/* ===== 按模型速率（非交互行） ===== */
+.geek-rate-row {
+  cursor: default;
+}
+.geek-rate-row:hover {
+  background: transparent;
+}
+.geek-skeleton-md {
+  height: 120px;
+}
+.geek-rank-value em {
+  font-style: normal;
+  color: var(--geek-text-muted);
+}
+
+/* ===== 缓存与推理 ===== */
+.geek-comp-hero {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.geek-comp-label {
+  font-size: 12px;
+  color: var(--geek-text-dim);
+}
+.geek-comp-number {
+  font-size: 32px;
+  font-weight: 300;
+  color: var(--geek-amber);
+}
+/* 按模型命中率：与下方子集列表分开，避免与总量口径混淆 */
+.geek-comp-models {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.geek-comp-note {
+  margin: 0;
+  font-size: 12px;
+}
+.geek-comp-row b {
+  margin-right: 4px;
+  font-weight: 500;
+  color: var(--geek-amber);
+}
+.geek-comp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.geek-comp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.geek-comp-row em {
+  margin-left: 8px;
+  font-style: normal;
+  color: var(--geek-text-muted);
+}
+
+/* ===== 活跃时段热力图 ===== */
+.geek-heat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow-x: auto;
+}
+.geek-heat-axis,
+.geek-heat-row {
+  display: grid;
+  grid-template-columns: 88px repeat(24, minmax(14px, 1fr));
+  gap: 3px;
+  align-items: center;
+  min-width: 520px;
+}
+.geek-heat-axis span {
+  font-size: 10px;
+  text-align: left;
+  color: var(--geek-text-muted);
+}
+.geek-heat-day {
+  font-size: 11px;
+  color: var(--geek-text-dim);
+  white-space: nowrap;
+}
+.geek-heat-cell {
+  display: block;
+  height: 22px;
+  border-radius: 3px;
+  background: var(--geek-bg-raised);
+}
+.geek-heat-cell:hover {
+  outline: 1px solid var(--geek-text-dim);
+}
+
+/* ===== 实时速率卡内的分模型明细 ===== */
+.geek-model-rates {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.geek-model-rates li {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 6px;
+  font-size: 11px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.geek-model-rates li > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--w);
+  background: var(--c);
+  opacity: 0.16;
+  border-radius: 4px;
+}
+.geek-model-rates li > span {
+  position: relative;
+}
+.geek-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
