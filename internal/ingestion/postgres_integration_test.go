@@ -1272,7 +1272,11 @@ func TestProjectKeyCreatesOnceAndAttributes(t *testing.T) {
 		t.Fatalf("archived project was not reused: %v", again)
 	}
 
-	// Retransmission with the key, or with the id it resolved to, is a duplicate.
+	// Retransmission with the same key is a duplicate. The id based resend below is
+	// deliberately different content (acceptedEventJSON also carries status and
+	// duration_ms, which keyedEventJSON omits), so it is a conflict rather than a
+	// duplicate; the same-content key/id equivalence is proven in
+	// TestProjectKeyTimingsShareTheResolvedIdentity.
 	results = runBatch(t, service, credential, encodedBatch(t,
 		keyedEventJSON("k-1", "TokenPivot", occurredAt),
 		acceptedEventJSON("k-1", occurredAt, keys["TokenPivot"])))
@@ -1355,6 +1359,294 @@ SELECT $1, 'bulk-' || g, 'bulk' FROM generate_series(1, $2) g`, workspaceID, Max
 	if _, found := e.projectKeys(t, ctx, workspaceID)["brand-new"]; found {
 		t.Fatal("a rejected key still created a project")
 	}
+}
+
+// timedEventJSON renders one event whose project is given either as a raw
+// project_key fragment or as a project_id fragment, with the timing fragment
+// appended verbatim. Everything else stays byte identical between the two forms,
+// so key resolved and id given retransmissions compare as the same content.
+func timedEventJSON(sourceEventID, projectField string, occurredAt time.Time, timings string) string {
+	return fmt.Sprintf(`{"source_event_id":%q,%s,"provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}%s}`,
+		sourceEventID, projectField, occurredAt.UTC().Format(microLayout), timings)
+}
+
+// TestProjectKeyTimingsShareTheResolvedIdentity proves the real database path for
+// a keyed event that also carries timings: the key is resolved to a project id
+// before the content digest is computed, so the same content sent by key and by
+// the resolved id is one identity, v1 and v2 retransmissions meet in the common v1
+// projection, and duplicates or conflicts never rewrite the stored row, backfill
+// NULL timings or double count the minute aggregate.
+func TestProjectKeyTimingsShareTheResolvedIdentity(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	const bothTimings = `,"generation_duration_ms":1200,"ttft_ms":180`
+	keyField := func(key string) string { return fmt.Sprintf(`"project_key":%q`, key) }
+	idField := func(id pgtype.UUID) string { return fmt.Sprintf(`"project_id":%q`, uuidText(id)) }
+
+	// assertUnchanged proves no stored row and no minute row moved, which covers a
+	// rewritten timing, a backfilled NULL and a double counted aggregate alike.
+	assertUnchanged := func(t *testing.T, name string, beforeEvents, beforeMinutes []string) {
+		t.Helper()
+		afterEvents, afterMinutes := e.historySnapshot(t, ctx, workspaceID)
+		requireSubset(t, name+" events", beforeEvents, afterEvents, 0)
+		requireSubset(t, name+" minutes", beforeMinutes, afterMinutes, 0)
+	}
+
+	t.Run("a project_key resolves before a v2 event is accepted", func(t *testing.T) {
+		const key = "TimedKey"
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2", keyField(key), occurredAt, bothTimings)))
+		requireResultStatuses(t, results, statusAccepted)
+		projectID, found := e.projectKeys(t, ctx, workspaceID)[key]
+		if !found {
+			t.Fatalf("project_key %q was not created", key)
+		}
+		row := e.readRow(t, ctx, workspaceID, sourceID, "pk-v2")
+		if row.projectID != projectID {
+			t.Fatal("the stored row is not attributed to the resolved project")
+		}
+		if row.version != normalizationVersionV2 {
+			t.Fatalf("version=%q want=%q", row.version, normalizationVersionV2)
+		}
+		if row.generationDurationMS == nil || *row.generationDurationMS != 1200 || row.ttftMS == nil || *row.ttftMS != 180 {
+			t.Fatalf("timings=%v/%v want 1200/180", describeInteger(row.generationDurationMS), describeInteger(row.ttftMS))
+		}
+		// The minute aggregate is keyed by the resolved project, so exactly one bucket
+		// exists and it belongs to that project rather than to the unattributed slot.
+		if buckets := e.countBuckets(t, ctx, workspaceID, sourceID); buckets != 1 {
+			t.Fatalf("buckets=%d want exactly 1", buckets)
+		}
+		bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		if bucket.eventCount != 1 || bucket.sum[0] != 100 || bucket.sum[1] != 20 || bucket.sum[2] != 120 {
+			t.Fatalf("bucket=%+v want event_count=1 sums 100/20/120", bucket)
+		}
+	})
+
+	t.Run("the same v2 content by key and by the resolved id is one identity", func(t *testing.T) {
+		const key = "TimedKey"
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		beforeBucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2", keyField(key), occurredAt, bothTimings),
+			timedEventJSON("pk-v2", idField(projectID), occurredAt, bothTimings)))
+		requireResultStatuses(t, results, statusDuplicate, statusDuplicate)
+		assertUnchanged(t, "key and resolved id duplicate", beforeEvents, beforeMinutes)
+		if rows := e.countRows(t, ctx, workspaceID, sourceID, "pk-v2"); rows != 1 {
+			t.Fatalf("rows=%d want 1", rows)
+		}
+		if after := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", occurredAt); after != beforeBucket {
+			t.Fatalf("bucket changed %+v -> %+v", beforeBucket, after)
+		}
+	})
+
+	t.Run("a changed timing on the same key and id is a conflict", func(t *testing.T) {
+		const key = "TimedKey"
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2", keyField(key), occurredAt, `,"generation_duration_ms":1201,"ttft_ms":180`),
+			timedEventJSON("pk-v2", idField(projectID), occurredAt, `,"generation_duration_ms":1200,"ttft_ms":181`)))
+		requireResultStatuses(t, results, statusConflict, statusConflict)
+		assertUnchanged(t, "changed timing conflict", beforeEvents, beforeMinutes)
+		kept := e.readRow(t, ctx, workspaceID, sourceID, "pk-v2")
+		if kept.generationDurationMS == nil || *kept.generationDurationMS != 1200 || kept.ttftMS == nil || *kept.ttftMS != 180 {
+			t.Fatalf("kept timings=%v/%v want the original 1200/180", describeInteger(kept.generationDurationMS), describeInteger(kept.ttftMS))
+		}
+		if kept.projectID != projectID {
+			t.Fatal("a conflict re-attributed the stored row")
+		}
+	})
+
+	// A v1 row under a key accepts an identical v2 resend as a duplicate: both sides
+	// rebuild the common v1 projection from the resolved project id, and the row is
+	// never upgraded or backfilled.
+	t.Run("a stored v1 keyed row accepts a v2 resend without backfilling", func(t *testing.T) {
+		const key = "TimedKeyV1Stored"
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v1", keyField(key), occurredAt.Add(time.Second), "")))
+		requireResultStatuses(t, results, statusAccepted)
+		projectID, found := e.projectKeys(t, ctx, workspaceID)[key]
+		if !found {
+			t.Fatalf("project_key %q was not created", key)
+		}
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		results = runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v1", keyField(key), occurredAt.Add(time.Second), bothTimings)))
+		requireResultStatuses(t, results, statusDuplicate)
+		assertUnchanged(t, "v1 keyed row v2 resend", beforeEvents, beforeMinutes)
+		kept := e.readRow(t, ctx, workspaceID, sourceID, "pk-v1")
+		if kept.version != normalizationVersion || kept.generationDurationMS != nil || kept.ttftMS != nil {
+			t.Fatalf("kept version=%q timings=%v/%v want v1 with NULL timings", kept.version,
+				describeInteger(kept.generationDurationMS), describeInteger(kept.ttftMS))
+		}
+		if kept.projectID != projectID {
+			t.Fatal("the v1 row lost its resolved project")
+		}
+	})
+
+	// The other direction: a stored v2 keyed row accepts a v1 resend and keeps the
+	// timings it was accepted with.
+	t.Run("a stored v2 keyed row accepts a v1 resend and keeps its timings", func(t *testing.T) {
+		const key = "TimedKeyV2Stored"
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2stored", keyField(key), occurredAt.Add(2*time.Second), bothTimings)))
+		requireResultStatuses(t, results, statusAccepted)
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		results = runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-v2stored", keyField(key), occurredAt.Add(2*time.Second), "")))
+		requireResultStatuses(t, results, statusDuplicate)
+		assertUnchanged(t, "v2 keyed row v1 resend", beforeEvents, beforeMinutes)
+		kept := e.readRow(t, ctx, workspaceID, sourceID, "pk-v2stored")
+		if kept.version != normalizationVersionV2 || kept.generationDurationMS == nil || *kept.generationDurationMS != 1200 || kept.ttftMS == nil || *kept.ttftMS != 180 {
+			t.Fatalf("kept version=%q timings=%v/%v want v2 with 1200/180", kept.version,
+				describeInteger(kept.generationDurationMS), describeInteger(kept.ttftMS))
+		}
+		if kept.projectID != projectID {
+			t.Fatal("the v2 row lost its resolved project")
+		}
+	})
+
+	// A changed v1 element is a conflict in both directions even though the project
+	// arrives as a key, so the comparison must use the resolved id rather than the
+	// key text.
+	for _, direction := range []struct {
+		name     string
+		stored   string
+		resend   string
+		sourceID string
+		offset   time.Duration
+	}{
+		{name: "v1 stored v2 resend", stored: "", resend: bothTimings, sourceID: "pk-cv-v1", offset: 3 * time.Second},
+		{name: "v2 stored v1 resend", stored: bothTimings, resend: "", sourceID: "pk-cv-v2", offset: 4 * time.Second},
+	} {
+		t.Run("a changed provider conflicts when "+direction.name, func(t *testing.T) {
+			key := "TimedKeyConflict" + direction.sourceID
+			at := occurredAt.Add(direction.offset)
+			results := runBatch(t, service, credential, encodedBatch(t,
+				timedEventJSON(direction.sourceID, keyField(key), at, direction.stored)))
+			requireResultStatuses(t, results, statusAccepted)
+			beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+			changed := strings.Replace(
+				timedEventJSON(direction.sourceID, keyField(key), at, direction.resend),
+				`"provider":"example-provider"`, `"provider":"other-provider"`, 1)
+			results = runBatch(t, service, credential, encodedBatch(t, changed))
+			requireResultStatuses(t, results, statusConflict)
+			assertUnchanged(t, "changed provider conflict "+direction.name, beforeEvents, beforeMinutes)
+			kept := e.readRow(t, ctx, workspaceID, sourceID, direction.sourceID)
+			if kept.provider != "example-provider" {
+				t.Fatalf("stored provider=%q want the original", kept.provider)
+			}
+		})
+	}
+
+	// One batch mixes a valid keyed v2 item, an expired keyed v2 item and an invalid
+	// keyed item: each item keeps its own transaction, so timings never widen the
+	// expired window or the rejected item into a project creation.
+	t.Run("each keyed item keeps its own transaction", func(t *testing.T) {
+		const (
+			okKey      = "TimedTxnKey"
+			expiredKey = "TimedExpiredKey"
+			badKey     = "TimedRejectedKey"
+		)
+		expiredAt := time.Now().UTC().Add(-181 * 24 * time.Hour).Truncate(time.Microsecond)
+		badEvent := strings.Replace(
+			timedEventJSON("pk-bad", keyField(badKey), occurredAt, bothTimings),
+			`"provider":"example-provider"`, `"provider":""`, 1)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-txn-ok", keyField(okKey), occurredAt.Add(5*time.Second), bothTimings),
+			timedEventJSON("pk-txn-expired", keyField(expiredKey), expiredAt, bothTimings),
+			badEvent,
+		))
+		requireResultStatuses(t, results, statusAccepted, statusExpired, statusRejected)
+		if results[2].code != codeInvalidArgument {
+			t.Fatalf("invalid item code=%q want %s", results[2].code, codeInvalidArgument)
+		}
+		keys := e.projectKeys(t, ctx, workspaceID)
+		okProject, found := keys[okKey]
+		if !found {
+			t.Fatalf("accepted item did not create %q", okKey)
+		}
+		if _, found := keys[expiredKey]; found {
+			t.Fatal("an expired item created a project")
+		}
+		if _, found := keys[badKey]; found {
+			t.Fatal("a rejected item created a project")
+		}
+		row := e.readRow(t, ctx, workspaceID, sourceID, "pk-txn-ok")
+		if row.projectID != okProject || row.generationDurationMS == nil || *row.generationDurationMS != 1200 {
+			t.Fatalf("accepted item project=%v generation=%v want %v/1200", row.projectID.Valid, describeInteger(row.generationDurationMS), okProject.Valid)
+		}
+		if rows := e.countRows(t, ctx, workspaceID, sourceID, "pk-txn-expired"); rows != 0 {
+			t.Fatalf("expired rows=%d want 0", rows)
+		}
+		if rows := e.countRows(t, ctx, workspaceID, sourceID, "pk-bad"); rows != 0 {
+			t.Fatalf("rejected rows=%d want 0", rows)
+		}
+	})
+
+	// Archiving the project does not release its key, and a keyed v2 event with
+	// timings is still accepted against that archived project.
+	t.Run("an archived keyed project still accepts a v2 event", func(t *testing.T) {
+		const key = "TimedKey"
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		if _, err := e.owner.Exec(ctx, "UPDATE projects SET archived_at = now() WHERE id = $1", projectID); err != nil {
+			t.Fatal(database.SafeError("archive project", err))
+		}
+		// A separate minute keeps this bucket independent of the earlier events.
+		archivedAt := occurredAt.Add(2 * time.Minute)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-archived", keyField(key), archivedAt, bothTimings)))
+		requireResultStatuses(t, results, statusAccepted)
+		if again := e.projectKeys(t, ctx, workspaceID); again[key] != projectID {
+			t.Fatal("the archived key was recreated instead of reused")
+		}
+		row := e.readRow(t, ctx, workspaceID, sourceID, "pk-archived")
+		if row.projectID != projectID || row.generationDurationMS == nil || *row.generationDurationMS != 1200 || row.ttftMS == nil || *row.ttftMS != 180 {
+			t.Fatalf("archived row project=%v timings=%v/%v want the reused project with 1200/180", row.projectID.Valid,
+				describeInteger(row.generationDurationMS), describeInteger(row.ttftMS))
+		}
+		bucket := e.readBucket(t, ctx, workspaceID, sourceID, projectID, "example-provider", "example-model", archivedAt)
+		if bucket.eventCount != 1 {
+			t.Fatalf("archived bucket event_count=%d want 1", bucket.eventCount)
+		}
+	})
+
+	// Filling the workspace to the auto-creation limit rejects only a new key: an
+	// existing key still accepts a v2 event with timings and still creates nothing.
+	t.Run("the project limit applies to a new key only", func(t *testing.T) {
+		const key = "TimedKey"
+		projectID := e.projectKeys(t, ctx, workspaceID)[key]
+		existing := len(e.projectKeys(t, ctx, workspaceID))
+		if existing >= MaxAutoProjects {
+			t.Fatalf("workspace already holds %d projects", existing)
+		}
+		if _, err := e.owner.Exec(ctx, `INSERT INTO projects (workspace_id, project_key, name)
+SELECT $1, 'timed-bulk-' || g, 'bulk' FROM generate_series(1, $2) g`, workspaceID, MaxAutoProjects-existing); err != nil {
+			t.Fatal(database.SafeError("fill projects", err))
+		}
+		limitAt := occurredAt.Add(7 * time.Second)
+		results := runBatch(t, service, credential, encodedBatch(t,
+			timedEventJSON("pk-limit-new", keyField("timed-brand-new"), limitAt, bothTimings),
+			timedEventJSON("pk-limit-existing", keyField(key), limitAt, bothTimings)))
+		requireResultStatuses(t, results, statusRejected, statusAccepted)
+		if results[0].code != codeProjectInvalid {
+			t.Fatalf("limit rejection code=%q want %s", results[0].code, codeProjectInvalid)
+		}
+		if _, found := e.projectKeys(t, ctx, workspaceID)["timed-brand-new"]; found {
+			t.Fatal("a rejected key still created a project")
+		}
+		row := e.readRow(t, ctx, workspaceID, sourceID, "pk-limit-existing")
+		if row.projectID != projectID || row.generationDurationMS == nil || *row.generationDurationMS != 1200 {
+			t.Fatalf("existing key row project=%v generation=%v want the resolved project with 1200", row.projectID.Valid, describeInteger(row.generationDurationMS))
+		}
+	})
 }
 
 func TestSourceStampMovesForwardOnly(t *testing.T) {
