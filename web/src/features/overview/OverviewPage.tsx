@@ -278,7 +278,14 @@ function OverviewContent({
           range={range}
           intervalMs={refreshMs}
         />
-        {data ? <GeekComposition data={data} /> : null}
+        {data ? (
+          <GeekComposition
+            data={data}
+            scope={scope}
+            filters={filters}
+            range={range}
+          />
+        ) : null}
       </div>
 
       {week.data ? <GeekHeatmap data={week.data} timezone={tz} /> : null}
