@@ -465,3 +465,35 @@ test('partially broken usage with valid timing keeps the known output in the rea
   assert.deepEqual(summary.usage.cache_read_tokens, { value: null, quality: 'missing' })
   await collector.stop()
 })
+
+test('a confirmed reasoning count survives an unusable output in the real upload body', async () => {
+  const sent = []
+  const { collector, drain } = await collectorWithMicrotasks({
+    endpoint: 'http://127.0.0.1:9/api/v1/ingestion/events',
+    getToken: () => 'tpk_x',
+    fetch: async (url, init) => {
+      sent.push(JSON.parse(init.body))
+      return new Response(JSON.stringify({ request_id: 'r', results: [{ index: 0, status: 'accepted' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+  const session = { id: 's-1', header: { id: 's-1' } }
+  // input and output are unusable, but the reasoning count is a real provider observation
+  const done = collector.handle(session, assistantMessage('m-r', 7, NOW, { inputTokens: -1, outputTokens: -1, reasoningTokens: 30 }))
+  collector.receive({ agent: agentOf(session), notice: { seq: 7, timing: { requestStartedAt: 0, firstOutputAt: 8000, lastOutputAt: 10000 } } })
+  await drain()
+  await done
+  assert.equal((await collector.flush()).state, 'idle')
+  const events = sent.flatMap((body) => body.events)
+  assert.equal(events.length, 1)
+  const [event] = events
+  assert.equal(event.source_event_id, 'dsh:msg:m-r')
+  assert.equal(event.ttft_ms, 8000)
+  assert.equal(event.generation_duration_ms, 2000)
+  assert.deepEqual(event.usage.reasoning_tokens, { value: 30, quality: 'known' })
+  assert.deepEqual(event.usage.output_tokens, { value: null, quality: 'missing' })
+  assert.deepEqual(event.usage.input_tokens, { value: null, quality: 'missing' })
+  await collector.stop()
+})

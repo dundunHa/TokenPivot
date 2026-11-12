@@ -189,8 +189,10 @@ export function recoverUsage(u) {
     total_tokens: total === null ? MISSING : known(total),
     cache_read_tokens: cacheRead === null ? MISSING : known(cacheRead),
     cache_write_tokens: cacheWrite === null ? MISSING : known(cacheWrite),
-    // reasoning is a subset of output: only a confirmed subset is reported.
-    reasoning_tokens: reasoning !== null && output !== null && reasoning <= output ? known(reasoning) : MISSING,
+    // reasoning is a subset of output, but the server only applies that check when both are known
+    // (internal/ingestion/handler.go normalizeUsage). A confirmed reasoning count therefore stands
+    // on its own when the output is unknown; only a known output can rule it out.
+    reasoning_tokens: reasoning !== null && (output === null || reasoning <= output) ? known(reasoning) : MISSING,
   }
   return Object.values(usage).some((m) => m.quality === 'known') ? usage : null
 }
