@@ -308,17 +308,19 @@ func credentialFor(workspaceID, sourceID pgtype.UUID) credentials.Credential {
 
 // storedRow is one usage_events row as the tests read it back.
 type storedRow struct {
-	projectID   pgtype.UUID
-	provider    string
-	model       string
-	occurredAt  time.Time
-	receivedAt  time.Time
-	version     string
-	payloadHash []byte
-	values      [6]*int64
-	qualities   [6]string
-	status      *string
-	durationMS  *int64
+	projectID            pgtype.UUID
+	provider             string
+	model                string
+	occurredAt           time.Time
+	receivedAt           time.Time
+	version              string
+	payloadHash          []byte
+	values               [6]*int64
+	qualities            [6]string
+	status               *string
+	durationMS           *int64
+	generationDurationMS *int64
+	ttftMS               *int64
 }
 
 // eventRowSQL reads one detail row by its identity with every frozen column.
@@ -326,7 +328,7 @@ const eventRowSQL = `SELECT project_id, provider, model, occurred_at, received_a
     input_tokens, input_tokens_quality, output_tokens, output_tokens_quality,
     total_tokens, total_tokens_quality, cache_read_tokens, cache_read_tokens_quality,
     cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality,
-    status, duration_ms
+    status, duration_ms, generation_duration_ms, ttft_ms
 FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3`
 
 // readRow reads one stored detail row, failing when it is absent.
@@ -338,7 +340,7 @@ func (e *integrationEnv) readRow(t *testing.T, ctx context.Context, workspaceID,
 		&row.values[0], &row.qualities[0], &row.values[1], &row.qualities[1],
 		&row.values[2], &row.qualities[2], &row.values[3], &row.qualities[3],
 		&row.values[4], &row.qualities[4], &row.values[5], &row.qualities[5],
-		&row.status, &row.durationMS,
+		&row.status, &row.durationMS, &row.generationDurationMS, &row.ttftMS,
 	)
 	if err != nil {
 		t.Fatal(database.SafeError("read event row", err))
@@ -512,6 +514,327 @@ func TestBatchAcceptsNewEvents(t *testing.T) {
 	}
 	if logs.String() != "" {
 		t.Fatalf("unexpected log output: %s", logs.String())
+	}
+}
+
+func TestGenerationTimingsStoreOnlyWhatTheClientSent(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	both := strings.TrimSuffix(acceptedEventJSON("evt-v2", occurredAt, pgtype.UUID{}), "}") + `,"generation_duration_ms":1200,"ttft_ms":180}`
+	nulls := strings.TrimSuffix(acceptedEventJSON("evt-v2-null", occurredAt.Add(time.Second), pgtype.UUID{}), "}") + `,"generation_duration_ms":null,"ttft_ms":null}`
+	results := runBatch(t, service, credential, encodedBatch(t,
+		acceptedEventJSON("evt-v1", occurredAt, pgtype.UUID{}),
+		both,
+		nulls,
+	))
+	requireResultStatuses(t, results, statusAccepted, statusAccepted, statusAccepted)
+
+	// A client that never sent a timing keeps the v1 version and two NULL columns.
+	v1Row := e.readRow(t, ctx, workspaceID, sourceID, "evt-v1")
+	if v1Row.version != normalizationVersion {
+		t.Fatalf("v1 row version=%q want=%q", v1Row.version, normalizationVersion)
+	}
+	if v1Row.generationDurationMS != nil || v1Row.ttftMS != nil {
+		t.Fatalf("v1 row timings=%v/%v want NULL/NULL", describeInteger(v1Row.generationDurationMS), describeInteger(v1Row.ttftMS))
+	}
+	// A v2 row stores the raw client integers unchanged.
+	v2Row := e.readRow(t, ctx, workspaceID, sourceID, "evt-v2")
+	if v2Row.version != normalizationVersionV2 {
+		t.Fatalf("v2 row version=%q want=%q", v2Row.version, normalizationVersionV2)
+	}
+	if v2Row.generationDurationMS == nil || *v2Row.generationDurationMS != 1200 || v2Row.ttftMS == nil || *v2Row.ttftMS != 180 {
+		t.Fatalf("v2 row timings=%v/%v want 1200/180", describeInteger(v2Row.generationDurationMS), describeInteger(v2Row.ttftMS))
+	}
+	// An explicit null is stored as NULL under the v2 version, not as zero.
+	nullRow := e.readRow(t, ctx, workspaceID, sourceID, "evt-v2-null")
+	if nullRow.version != normalizationVersionV2 {
+		t.Fatalf("null row version=%q want=%q", nullRow.version, normalizationVersionV2)
+	}
+	if nullRow.generationDurationMS != nil || nullRow.ttftMS != nil {
+		t.Fatalf("null row timings=%v/%v want NULL/NULL", describeInteger(nullRow.generationDurationMS), describeInteger(nullRow.ttftMS))
+	}
+
+	// The two new columns never reach the minute aggregation: the bucket is exactly
+	// the v1 coin count for the three accepted events.
+	bucket := e.readBucket(t, ctx, workspaceID, sourceID, pgtype.UUID{}, "example-provider", "example-model", occurredAt)
+	if bucket.eventCount != 3 || bucket.sum[0] != 300 || bucket.sum[1] != 60 || bucket.sum[2] != 360 {
+		t.Fatalf("bucket=%+v want event_count=3 sums 300/60/360", bucket)
+	}
+
+	// A row written before the columns existed reads back NULL and still compares:
+	// the v1 identity accepts a v1 resend unchanged and never backfills the row.
+	legacyEvent := acceptedEventJSON("evt-legacy", occurredAt.Add(2*time.Second), pgtype.UUID{})
+	if _, err := e.owner.Exec(ctx, `INSERT INTO usage_events (
+    workspace_id, source_id, source_event_id, project_id, provider, model, occurred_at, received_at,
+    normalization_version, payload_hash,
+    input_tokens, input_tokens_quality, output_tokens, output_tokens_quality,
+    total_tokens, total_tokens_quality, cache_read_tokens, cache_read_tokens_quality,
+    cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality,
+    status, duration_ms
+) VALUES ($1,$2,$3,NULL,'example-provider','example-model',$4,$5,$6,$7,
+    100,'known',20,'known',120,'known',NULL,'missing',NULL,'missing',NULL,'missing','success',1250)`,
+		workspaceID, sourceID, "evt-legacy", occurredAt.Add(2*time.Second), time.Now().UTC(),
+		normalizationVersion, hashOf(t, legacyEvent)); err != nil {
+		t.Fatal(database.SafeError("insert legacy row", err))
+	}
+	legacyRow := e.readRow(t, ctx, workspaceID, sourceID, "evt-legacy")
+	if legacyRow.generationDurationMS != nil || legacyRow.ttftMS != nil {
+		t.Fatal("a migrated legacy row must read back NULL timings")
+	}
+	snapshotEvents, snapshotMinutes := e.historySnapshot(t, ctx, workspaceID)
+	results = runBatch(t, service, credential, encodedBatch(t, legacyEvent))
+	requireResultStatuses(t, results, statusDuplicate)
+	afterEvents, afterMinutes := e.historySnapshot(t, ctx, workspaceID)
+	requireSubset(t, "legacy duplicate", snapshotEvents, afterEvents, 0)
+	requireSubset(t, "legacy duplicate minutes", snapshotMinutes, afterMinutes, 0)
+
+	// Same v2 identity with a changed timing is a conflict, and the row is untouched.
+	changed := strings.TrimSuffix(acceptedEventJSON("evt-v2", occurredAt, pgtype.UUID{}), "}") + `,"generation_duration_ms":1200,"ttft_ms":181}`
+	beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+	results = runBatch(t, service, credential, encodedBatch(t, changed))
+	requireResultStatuses(t, results, statusConflict)
+	finalEvents, finalMinutes := e.historySnapshot(t, ctx, workspaceID)
+	requireSubset(t, "v2 conflict", beforeEvents, finalEvents, 0)
+	requireSubset(t, "v2 conflict minutes", beforeMinutes, finalMinutes, 0)
+
+	// Both columns are nullable with no default, so a client that did not send a
+	// timing leaves NULL and an old row keeps NULL.
+	rows, err := e.owner.Query(ctx, `SELECT column_name, is_nullable, column_default FROM information_schema.columns
+WHERE table_schema = current_schema() AND table_name='usage_events'
+    AND column_name IN ('generation_duration_ms','ttft_ms') ORDER BY column_name`)
+	if err != nil {
+		t.Fatal(database.SafeError("read new column shape", err))
+	}
+	defer rows.Close()
+	nullable := map[string]bool{}
+	for rows.Next() {
+		var name string
+		var isNullable string
+		var defaultValue *string
+		if err := rows.Scan(&name, &isNullable, &defaultValue); err != nil {
+			t.Fatal(database.SafeError("scan new column shape", err))
+		}
+		if isNullable != "YES" || defaultValue != nil {
+			t.Fatalf("column %s nullable=%q default=%v want YES/NULL", name, isNullable, defaultValue)
+		}
+		nullable[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(database.SafeError("read new column shape rows", err))
+	}
+	if !nullable["generation_duration_ms"] || !nullable["ttft_ms"] {
+		t.Fatalf("new columns=%v want both", nullable)
+	}
+
+	// The two new columns add no grant of their own: the existing table level
+	// SELECT and INSERT still cover them, and nothing was widened to UPDATE or
+	// DELETE.
+	var canSelect, canInsert, canUpdate, canDelete bool
+	if err := e.owner.QueryRow(ctx, `SELECT has_table_privilege($1,'usage_events','SELECT'),
+    has_table_privilege($1,'usage_events','INSERT'),
+    has_table_privilege($1,'usage_events','UPDATE'),
+    has_table_privilege($1,'usage_events','DELETE')`, e.appRole).Scan(&canSelect, &canInsert, &canUpdate, &canDelete); err != nil {
+		t.Fatal(database.SafeError("read usage_events privileges", err))
+	}
+	if !canSelect || !canInsert || canUpdate || canDelete {
+		t.Fatalf("privileges select=%t insert=%t update=%t delete=%t want true/true/false/false", canSelect, canInsert, canUpdate, canDelete)
+	}
+}
+
+// crossVersionEvent renders one ingestion event whose v1 comparison elements can
+// each be overridden, so a cross-version resend can change exactly one of them.
+// The raw fragment fields keep the override table free of JSON assembly.
+type crossVersionEvent struct {
+	sourceEventID string
+	occurredAt    time.Time
+	projectJSON   string
+	provider      string
+	model         string
+	inputTokens   int64
+	outputTokens  int64
+	statusJSON    string
+	durationJSON  string
+}
+
+// json renders the event, appending the given timing fragment verbatim. An empty
+// fragment yields the v1 shape, so version() picks v1 for it.
+func (c crossVersionEvent) json(timings string) string {
+	return fmt.Sprintf(`{"source_event_id":%q,"project_id":%s,"provider":%q,"model":%q,"occurred_at":%q,"usage":{"input_tokens":{"value":%d,"quality":"known"},"output_tokens":{"value":%d,"quality":"known"}},"status":%s,"duration_ms":%s%s}`,
+		c.sourceEventID, c.projectJSON, c.provider, c.model, c.occurredAt.UTC().Format(microLayout),
+		c.inputTokens, c.outputTokens, c.statusJSON, c.durationJSON, timings)
+}
+
+// crossVersionBaseline is the frozen content every cross-version case starts from.
+func crossVersionBaseline(sourceEventID string, occurredAt time.Time) crossVersionEvent {
+	return crossVersionEvent{
+		sourceEventID: sourceEventID,
+		occurredAt:    occurredAt,
+		projectJSON:   "null",
+		provider:      "example-provider",
+		model:         "example-model",
+		inputTokens:   100,
+		outputTokens:  20,
+		statusJSON:    `"success"`,
+		durationJSON:  "1250",
+	}
+}
+
+// TestCrossVersionRetransmissionRebuildsTheCommonVersion proves the real database
+// path, not the fake store: a stored v2 row keeps a v2 digest that is not
+// comparable with a v1 projection, so the duplicate verdict below can only be
+// reached by rebuilding the v1 digest from the retained columns through
+// ExistingEvent. Every resend also has to leave both the stored row and the
+// minute aggregate untouched.
+func TestCrossVersionRetransmissionRebuildsTheCommonVersion(t *testing.T) {
+	e := newIntegrationEnv(t)
+	ctx := context.Background()
+	workspaceID, sourceID := e.seedSource(t, ctx)
+	projectID := e.seedProject(t, ctx, workspaceID, nil)
+	pool := e.pool(t)
+	service := e.service(t, pool, &syncBuffer{})
+	credential := credentialFor(workspaceID, sourceID)
+	occurredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	const bothTimings = `,"generation_duration_ms":1200,"ttft_ms":180`
+
+	// assertUnchanged proves no stored row and no minute row moved, which covers a
+	// rewritten column, a backfilled timing and a double counted aggregate alike.
+	assertUnchanged := func(t *testing.T, name string, beforeEvents, beforeMinutes []string) {
+		t.Helper()
+		afterEvents, afterMinutes := e.historySnapshot(t, ctx, workspaceID)
+		requireSubset(t, name+" events", beforeEvents, afterEvents, 0)
+		requireSubset(t, name+" minutes", beforeMinutes, afterMinutes, 0)
+	}
+
+	t.Run("a stored v1 row accepts a v2 resend as a duplicate", func(t *testing.T) {
+		baseline := crossVersionBaseline("cv-v1-to-v2", occurredAt)
+		results := runBatch(t, service, credential, encodedBatch(t, baseline.json("")))
+		requireResultStatuses(t, results, statusAccepted)
+		row := e.readRow(t, ctx, workspaceID, sourceID, baseline.sourceEventID)
+		if row.version != normalizationVersion {
+			t.Fatalf("stored version=%q want=%q", row.version, normalizationVersion)
+		}
+		if got, want := hex.EncodeToString(row.payloadHash), hex.EncodeToString(hashOf(t, baseline.json(""))); got != want {
+			t.Fatalf("stored v1 digest=%s want=%s", got, want)
+		}
+		beforeBucket := e.readBucket(t, ctx, workspaceID, sourceID, pgtype.UUID{}, "example-provider", "example-model", occurredAt)
+		if beforeBucket.eventCount != 1 || beforeBucket.sum[0] != 100 || beforeBucket.sum[1] != 20 || beforeBucket.sum[2] != 120 {
+			t.Fatalf("bucket=%+v want event_count=1 sums 100/20/120", beforeBucket)
+		}
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		// The same seven v1 elements with both timings added: the shared v1 projection
+		// is byte identical, so this is a duplicate and the row keeps NULL timings.
+		results = runBatch(t, service, credential, encodedBatch(t, baseline.json(bothTimings)))
+		requireResultStatuses(t, results, statusDuplicate)
+		assertUnchanged(t, "v1 stored v2 resend", beforeEvents, beforeMinutes)
+		afterBucket := e.readBucket(t, ctx, workspaceID, sourceID, pgtype.UUID{}, "example-provider", "example-model", occurredAt)
+		if afterBucket != beforeBucket {
+			t.Fatalf("bucket changed %+v -> %+v", beforeBucket, afterBucket)
+		}
+		kept := e.readRow(t, ctx, workspaceID, sourceID, baseline.sourceEventID)
+		if kept.version != normalizationVersion || kept.generationDurationMS != nil || kept.ttftMS != nil {
+			t.Fatalf("row version=%q timings=%v/%v want v1 with NULL timings", kept.version,
+				describeInteger(kept.generationDurationMS), describeInteger(kept.ttftMS))
+		}
+	})
+
+	t.Run("a stored v2 row accepts a v1 resend as a duplicate", func(t *testing.T) {
+		baseline := crossVersionBaseline("cv-v2-to-v1", occurredAt.Add(time.Second))
+		results := runBatch(t, service, credential, encodedBatch(t, baseline.json(bothTimings)))
+		requireResultStatuses(t, results, statusAccepted)
+		row := e.readRow(t, ctx, workspaceID, sourceID, baseline.sourceEventID)
+		if row.version != normalizationVersionV2 {
+			t.Fatalf("stored version=%q want=%q", row.version, normalizationVersionV2)
+		}
+		storedDigest := hex.EncodeToString(row.payloadHash)
+		if want := hex.EncodeToString(hashOf(t, baseline.json(bothTimings))); storedDigest != want {
+			t.Fatalf("stored digest=%s want the v2 digest %s", storedDigest, want)
+		}
+		// The v2 digest must differ from the v1 projection, otherwise the duplicate
+		// below could be reached without rebuilding anything and prove nothing.
+		if v1Digest := hex.EncodeToString(hashOf(t, baseline.json(""))); storedDigest == v1Digest {
+			t.Fatal("a v2 row must not store the v1 digest")
+		}
+		beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+		results = runBatch(t, service, credential, encodedBatch(t, baseline.json("")))
+		requireResultStatuses(t, results, statusDuplicate)
+		assertUnchanged(t, "v2 stored v1 resend", beforeEvents, beforeMinutes)
+		kept := e.readRow(t, ctx, workspaceID, sourceID, baseline.sourceEventID)
+		if kept.version != normalizationVersionV2 || kept.generationDurationMS == nil || *kept.generationDurationMS != 1200 {
+			t.Fatalf("row version=%q generation=%v want v2 with 1200", kept.version, describeInteger(kept.generationDurationMS))
+		}
+	})
+
+	// One changed v1 element is a conflict in both directions: the comparison has to
+	// see the request's own content, not just the stored row's own digest.
+	changes := []struct {
+		name   string
+		change func(*crossVersionEvent)
+	}{
+		{"occurred_at", func(c *crossVersionEvent) { c.occurredAt = c.occurredAt.Add(time.Millisecond) }},
+		{"project_id", func(c *crossVersionEvent) { c.projectJSON = `"` + uuidText(projectID) + `"` }},
+		{"provider", func(c *crossVersionEvent) { c.provider = "other-provider" }},
+		{"model", func(c *crossVersionEvent) { c.model = "other-model" }},
+		{"input_tokens", func(c *crossVersionEvent) { c.inputTokens = 101 }},
+		{"output_tokens", func(c *crossVersionEvent) { c.outputTokens = 21 }},
+		{"status", func(c *crossVersionEvent) { c.statusJSON = `"error"` }},
+		{"duration_ms", func(c *crossVersionEvent) { c.durationJSON = "1251" }},
+	}
+	for _, change := range changes {
+		t.Run("a changed "+change.name+" conflicts against a stored v2 row", func(t *testing.T) {
+			baseline := crossVersionBaseline("cv-v2-conflict-"+change.name, occurredAt.Add(2*time.Second))
+			results := runBatch(t, service, credential, encodedBatch(t, baseline.json(bothTimings)))
+			requireResultStatuses(t, results, statusAccepted)
+			beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+			changed := baseline
+			change.change(&changed)
+			results = runBatch(t, service, credential, encodedBatch(t, changed.json("")))
+			requireResultStatuses(t, results, statusConflict)
+			assertUnchanged(t, "v2 row v1 conflict "+change.name, beforeEvents, beforeMinutes)
+		})
+		t.Run("a changed "+change.name+" conflicts against a stored v1 row", func(t *testing.T) {
+			baseline := crossVersionBaseline("cv-v1-conflict-"+change.name, occurredAt.Add(3*time.Second))
+			results := runBatch(t, service, credential, encodedBatch(t, baseline.json("")))
+			requireResultStatuses(t, results, statusAccepted)
+			beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+			changed := baseline
+			change.change(&changed)
+			results = runBatch(t, service, credential, encodedBatch(t, changed.json(bothTimings)))
+			requireResultStatuses(t, results, statusConflict)
+			assertUnchanged(t, "v1 row v2 conflict "+change.name, beforeEvents, beforeMinutes)
+		})
+	}
+
+	// A same-version resend only has to compare digests; each raw timing is still
+	// part of the comparison content, so either change is a conflict.
+	for _, timings := range []struct {
+		name     string
+		fragment string
+	}{
+		{"generation_duration_ms", `,"generation_duration_ms":1201,"ttft_ms":180`},
+		{"ttft_ms", `,"generation_duration_ms":1200,"ttft_ms":181`},
+	} {
+		t.Run("a changed "+timings.name+" conflicts on the same v2 identity", func(t *testing.T) {
+			baseline := crossVersionBaseline("cv-v2-timing-"+timings.name, occurredAt.Add(4*time.Second))
+			results := runBatch(t, service, credential, encodedBatch(t, baseline.json(bothTimings)))
+			requireResultStatuses(t, results, statusAccepted)
+			beforeEvents, beforeMinutes := e.historySnapshot(t, ctx, workspaceID)
+			results = runBatch(t, service, credential, encodedBatch(t, baseline.json(timings.fragment)))
+			requireResultStatuses(t, results, statusConflict)
+			assertUnchanged(t, "v2 timing conflict "+timings.name, beforeEvents, beforeMinutes)
+			kept := e.readRow(t, ctx, workspaceID, sourceID, baseline.sourceEventID)
+			if kept.generationDurationMS == nil || *kept.generationDurationMS != 1200 {
+				t.Fatalf("generation=%v want the original 1200", describeInteger(kept.generationDurationMS))
+			}
+			if kept.ttftMS == nil || *kept.ttftMS != 180 {
+				t.Fatalf("ttft=%v want the original 180", describeInteger(kept.ttftMS))
+			}
+		})
 	}
 }
 

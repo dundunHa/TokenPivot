@@ -35,6 +35,8 @@ const item = (id: string, over: Record<string, unknown> = {}) => ({
   total_tokens: tok(0),
   status: null,
   duration_ms: null,
+  generation_speed_tps: "49.500000",
+  ttft_ms: 8000,
   ...over,
 });
 const page = (
@@ -62,6 +64,8 @@ const rateBody = (over: Record<string, unknown> = {}) => ({
     missing_count: 1,
   },
   window_last_received_at: "2026-10-28T11:59:59Z",
+  generation_speed: { unit: "tokens/s", value: "49.500000", sample_count: 2 },
+  ttft: { unit: "ms", value: "8000.000000", sample_count: 3 },
   ...over,
 });
 
@@ -157,7 +161,7 @@ afterEach(() => {
 });
 
 describe("request log panel", () => {
-  it("renders rows with unavailable, zero and missing fields apart and rate text", async () => {
+  it("renders rows with unavailable, zero and missing fields apart and the rolling averages", async () => {
     useBackend();
     renderApp("/?tz=UTC");
     const row = await screen.findByTestId("request-row");
@@ -167,19 +171,35 @@ describe("request log panel", () => {
     expect(within(row).getByText("状态不可用")).toBeTruthy();
     expect(within(row).getByText("耗时不详")).toBeTruthy();
     expect(within(row).getByText("未归属")).toBeTruthy();
-    expect((await screen.findByTestId("rate-value")).textContent).toBe(
-      "12,000",
+    // 明细每请求两列：后端十进制字符串只做尾零裁剪，不重算。
+    expect(within(row).getByText("49.5 tokens/s")).toBeTruthy();
+    expect(within(row).getByText("8000 ms")).toBeTruthy();
+
+    expect((await screen.findByTestId("rate-speed")).textContent).toBe(
+      "49.5 tokens/s",
     );
-    expect(screen.getByTestId("rate-notes").textContent).toContain(
-      "含估算 1 条",
+    expect(screen.getByTestId("rate-speed-samples").textContent).toBe(
+      "2 个有效样本",
     );
-    expect(screen.getByTestId("rate-notes").textContent).toContain("部分覆盖");
+    expect(screen.getByTestId("rate-ttft").textContent).toBe("8000 ms");
+    expect(screen.getByTestId("rate-ttft-samples").textContent).toBe(
+      "3 个有效样本",
+    );
+    expect(screen.getByTestId("rate-events").textContent).toBe(
+      "窗口内 5 条事件",
+    );
+    expect(screen.getByTestId("rate-estimate-note").textContent).toContain(
+      "chunk 估算",
+    );
+    expect(screen.getByTestId("rate-estimate-note").textContent).toContain(
+      "非逐 token 精确测量",
+    );
     expect(screen.getByTestId("rate-fresh").textContent).toContain(
       "窗口内最后接收",
     );
   });
 
-  it("distinguishes no events and unavailable usage in the rate", async () => {
+  it("distinguishes no events and a window without valid samples", async () => {
     useBackend({
       rate: () =>
         HttpResponse.json(
@@ -192,18 +212,96 @@ describe("request log panel", () => {
               missing_count: 0,
             },
             window_last_received_at: null,
+            generation_speed: {
+              unit: "tokens/s",
+              value: null,
+              sample_count: 0,
+            },
+            ttft: { unit: "ms", value: null, sample_count: 0 },
           }),
         ),
       events: () => HttpResponse.json(page([])),
     });
     renderApp("/?tz=UTC");
-    expect((await screen.findByTestId("rate-value")).textContent).toBe(
-      "窗口内无事件",
+    expect((await screen.findByTestId("rate-speed")).textContent).toBe(
+      "不可用",
     );
+    expect(screen.getByTestId("rate-speed-samples").textContent).toBe(
+      "0 个有效样本",
+    );
+    expect(screen.getByTestId("rate-ttft").textContent).toBe("不可用");
+    expect(screen.getByTestId("rate-events").textContent).toBe("窗口内无事件");
     expect(screen.getByTestId("rate-fresh").textContent).toContain(
       "接收新鲜度未知",
     );
     await screen.findByText("当前保留明细中没有匹配的请求。");
+  });
+
+  it("accepts an old backend that omits both rolling objects as unknown", async () => {
+    const legacy = rateBody();
+    delete (legacy as Record<string, unknown>).generation_speed;
+    delete (legacy as Record<string, unknown>).ttft;
+    useBackend({ rate: () => HttpResponse.json(legacy) });
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    expect((await screen.findByTestId("rate-speed")).textContent).toBe(
+      "不可用",
+    );
+    expect(screen.getByTestId("rate-speed-samples").textContent).toBe(
+      "0 个有效样本",
+    );
+    expect(screen.getByTestId("rate-ttft").textContent).toBe("不可用");
+    expect(screen.getByTestId("rate-ttft-samples").textContent).toBe(
+      "0 个有效样本",
+    );
+  });
+
+  it("shows each rolling metric's own sample count independently", async () => {
+    useBackend({
+      rate: () =>
+        HttpResponse.json(
+          rateBody({
+            generation_speed: {
+              unit: "tokens/s",
+              value: null,
+              sample_count: 0,
+            },
+            ttft: { unit: "ms", value: "8000.000000", sample_count: 3 },
+          }),
+        ),
+    });
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("request-row");
+    expect((await screen.findByTestId("rate-speed")).textContent).toBe(
+      "不可用",
+    );
+    expect(screen.getByTestId("rate-speed-samples").textContent).toBe(
+      "0 个有效样本",
+    );
+    expect(screen.getByTestId("rate-ttft").textContent).toBe("8000 ms");
+    expect(screen.getByTestId("rate-ttft-samples").textContent).toBe(
+      "3 个有效样本",
+    );
+  });
+
+  it("shows a missing per request metric as unknown rather than zero", async () => {
+    useBackend({
+      events: () =>
+        HttpResponse.json(
+          page([
+            item("e1", {
+              generation_speed_tps: null,
+              ttft_ms: 0,
+            }),
+          ]),
+        ),
+    });
+    renderApp("/?tz=UTC");
+    const row = await screen.findByTestId("request-row");
+    // 速度缺失，TTFT 是真实 0：不可用出现两次（输出 Token 也缺失），绝不出现 "0 tokens/s"。
+    expect(within(row).getAllByText("不可用")).toHaveLength(2);
+    expect(within(row).queryByText("0 tokens/s")).toBeNull();
+    expect(within(row).getByText("0 ms")).toBeTruthy();
   });
 
   it("sends filters with unattributed mapping and no range, and pages by cursor", async () => {
@@ -288,7 +386,7 @@ describe("request log panel", () => {
     await user.click(within(list).getByRole("button", { name: "重试" }));
     await screen.findByTestId("request-row");
     await user.click(screen.getByRole("button", { name: "重试速率" }));
-    await screen.findByTestId("rate-value");
+    await screen.findByTestId("rate-speed");
   });
 
   it("keeps the previous rows and says so when a poll fails", async () => {
@@ -304,7 +402,7 @@ describe("request log panel", () => {
     });
     renderApp("/?tz=UTC");
     await screen.findByTestId("request-row");
-    await screen.findByTestId("rate-value");
+    await screen.findByTestId("rate-speed");
     fail = true;
     const before = seen.events.length;
     await tick(5_000);
@@ -312,7 +410,7 @@ describe("request log panel", () => {
     await screen.findByText(/^更新失败，展示截至/);
     await screen.findByText(/速率更新失败，展示截至/);
     expect(screen.getByTestId("request-row")).toBeTruthy();
-    expect(screen.getByTestId("rate-value").textContent).toBe("12,000");
+    expect(screen.getByTestId("rate-speed").textContent).toBe("49.5 tokens/s");
   });
 
   it("polls both every 5 seconds on the latest page and only the rate on an older page", async () => {
@@ -327,7 +425,7 @@ describe("request log panel", () => {
     });
     renderApp("/?tz=UTC");
     await screen.findByTestId("request-row");
-    await screen.findByTestId("rate-value");
+    await screen.findByTestId("rate-speed");
     const e0 = seen.events.length;
     const r0 = seen.rates.length;
     await tick(5_000);
@@ -353,7 +451,7 @@ describe("request log panel", () => {
     const seen = useBackend();
     renderApp("/?tz=UTC");
     await screen.findByTestId("request-row");
-    await screen.findByTestId("rate-value");
+    await screen.findByTestId("rate-speed");
     act(() => setVisibility("hidden"));
     const e = seen.events.length;
     const r = seen.rates.length;
@@ -634,7 +732,7 @@ describe("request log panel", () => {
     });
     renderApp("/?tz=UTC");
     await screen.findByTestId("request-row");
-    await screen.findByTestId("rate-value");
+    await screen.findByTestId("rate-speed");
     await act(async () => {
       screen.getByRole("button", { name: "下一页" }).click();
     });
@@ -649,7 +747,7 @@ describe("request log panel", () => {
     });
     await tick(5_000);
     await waitFor(() => expect(screen.queryByText(/速率更新失败/)).toBeNull());
-    expect(screen.getByTestId("rate-value").textContent).toBe("12,000");
+    expect(screen.getByTestId("rate-speed").textContent).toBe("49.5 tokens/s");
     expect(screen.getAllByTestId("request-row")).toHaveLength(1);
     expect(seen.events.length).toBe(e);
   });

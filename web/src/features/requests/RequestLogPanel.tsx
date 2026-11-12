@@ -12,8 +12,10 @@ import type { QueryScope } from "@/features/overview/overviewQueries";
 import { formatInstant } from "@/features/overview/overviewView";
 import type { RateData, RequestRange, RequestRow } from "./api";
 import {
-  describeRate,
+  describeGenerationMetrics,
   formatDuration,
+  formatMilliseconds,
+  formatSpeedTps,
   formatStatus,
   formatTokenField,
   parseRequestRange,
@@ -278,18 +280,42 @@ function RateView({
   stale: boolean;
   timezone: string;
 }) {
-  const view = describeRate(data);
+  const view = describeGenerationMetrics(data);
   return (
     <div className="flex flex-col gap-1" data-testid="rate">
-      <p className="text-subtle text-xs">近 60 秒速率（tokens/min）</p>
-      <p className="text-2xl font-semibold" data-testid="rate-value">
-        {view.headline}
+      <p className="text-subtle text-xs">近 60 秒平均</p>
+      <div className="flex flex-wrap gap-6">
+        <div className="flex flex-col gap-0.5">
+          <p className="text-subtle text-xs">生成速度</p>
+          <p className="text-2xl font-semibold" data-testid="rate-speed">
+            {view.speed.headline}
+          </p>
+          <p
+            className="text-muted-foreground text-xs"
+            data-testid="rate-speed-samples"
+          >
+            {view.speed.samples}
+          </p>
+        </div>
+        <div className="flex flex-col gap-0.5">
+          <p className="text-subtle text-xs">首 token 延迟（TTFT）</p>
+          <p className="text-2xl font-semibold" data-testid="rate-ttft">
+            {view.ttft.headline}
+          </p>
+          <p
+            className="text-muted-foreground text-xs"
+            data-testid="rate-ttft-samples"
+          >
+            {view.ttft.samples}
+          </p>
+        </div>
+      </div>
+      <p className="text-muted-foreground text-xs" data-testid="rate-events">
+        {view.eventCount}
       </p>
-      {view.notes.length > 0 ? (
-        <p className="text-muted-foreground text-xs" data-testid="rate-notes">
-          {view.notes.join(" · ")}
-        </p>
-      ) : null}
+      <p className="text-subtle text-xs" data-testid="rate-estimate-note">
+        客户端观测的 chunk 估算，非逐 token 精确测量；两项各自只统计有效样本。
+      </p>
       <p className="text-subtle text-xs" data-testid="rate-fresh">
         窗口截至 {formatInstant(data.end, timezone, true)} ·{" "}
         {data.windowLastReceivedAt
@@ -325,6 +351,8 @@ function RequestTable({
             <th scope="col">输入</th>
             <th scope="col">输出</th>
             <th scope="col">总计</th>
+            <th scope="col">生成速度 (tokens/s)</th>
+            <th scope="col">TTFT (ms)</th>
             <th scope="col">状态</th>
             <th scope="col">耗时</th>
           </tr>
@@ -343,6 +371,8 @@ function RequestTable({
               <td>{formatTokenField(r.input)}</td>
               <td>{formatTokenField(r.output)}</td>
               <td>{formatTokenField(r.total)}</td>
+              <td>{formatSpeedTps(r.generationSpeedTps)}</td>
+              <td>{formatMilliseconds(r.ttftMs)}</td>
               <td>{formatStatus(r.status)}</td>
               <td>{formatDuration(r.durationMs)}</td>
             </tr>

@@ -80,6 +80,11 @@ type EventRow struct {
 	Input, Output, Total  TokenRow
 	Status                *string
 	DurationMS            *int64
+	// GenerationSpeedTPS is the derived tokens/s as an exact decimal string, nil
+	// when the row has no valid speed sample. TTFTMS is the raw first token
+	// latency, nil when unknown; its validity is independent of the speed.
+	GenerationSpeedTPS *string
+	TTFTMS             *int64
 }
 
 // RateRow is the window aggregate. Sum is an exact decimal string, nil when no
@@ -90,6 +95,11 @@ type RateRow struct {
 	Events, Known, Estimated int64
 	Missing                  int64
 	LastReceived             *time.Time
+	// SpeedAvg and TTFTAvg are decimal strings rounded to six places, nil when
+	// their own sample count is zero. The two sample sets are independent: each
+	// request counts once in the metric it has, never weighted by tokens or time.
+	SpeedAvg, TTFTAvg         *string
+	SpeedSamples, TTFTSamples int64
 }
 
 // Store is the parameterised read surface over usage_events.
@@ -144,6 +154,11 @@ type Event struct {
 	TotalTokens  Token       `json:"total_tokens"`
 	Status       *string     `json:"status"`
 	DurationMS   *int64      `json:"duration_ms"`
+	// GenerationSpeedTPS and TTFTMS are always present; nil means unknown, never
+	// zero. They are the client observed chunk estimate, not exact per token
+	// timing, and are never inferred from the stored usage or duration.
+	GenerationSpeedTPS *string `json:"generation_speed_tps"`
+	TTFTMS             *int64  `json:"ttft_ms"`
 }
 
 // EventsResponse is the body of the detail list.
@@ -166,15 +181,26 @@ type RateTotal struct {
 	MissingCount   int64   `json:"missing_count"`
 }
 
+// RateMetric is one average over the window with its own unit and valid sample
+// count. Value is a decimal string, nil when no valid sample exists; a zero
+// sample count never becomes a zero average.
+type RateMetric struct {
+	Unit        string  `json:"unit"`
+	Value       *string `json:"value"`
+	SampleCount int64   `json:"sample_count"`
+}
+
 // RateResponse is the body of the rate endpoint.
 type RateResponse struct {
-	Start              string    `json:"start"`
-	End                string    `json:"end"`
-	AsOf               string    `json:"as_of"`
-	WindowSeconds      int       `json:"window_seconds"`
-	Unit               string    `json:"unit"`
-	TotalTokens        RateTotal `json:"total_tokens"`
-	WindowLastReceived *string   `json:"window_last_received_at"`
+	Start              string     `json:"start"`
+	End                string     `json:"end"`
+	AsOf               string     `json:"as_of"`
+	WindowSeconds      int        `json:"window_seconds"`
+	Unit               string     `json:"unit"`
+	TotalTokens        RateTotal  `json:"total_tokens"`
+	GenerationSpeed    RateMetric `json:"generation_speed"`
+	TTFT               RateMetric `json:"ttft"`
+	WindowLastReceived *string    `json:"window_last_received_at"`
 }
 
 type cursorPayload struct {
@@ -321,7 +347,9 @@ func (s *Service) rateAt(ctx context.Context, workspaceID pgtype.UUID, values ur
 	response := &RateResponse{
 		Start: formatTime(end.Add(-RateWindow)), End: formatTime(end), AsOf: formatTime(end),
 		WindowSeconds: int(RateWindow / time.Second), Unit: "tokens/min",
-		TotalTokens: RateTotal{Value: row.Sum, EventCount: row.Events, KnownCount: row.Known, EstimatedCount: row.Estimated, MissingCount: row.Missing},
+		TotalTokens:     RateTotal{Value: row.Sum, EventCount: row.Events, KnownCount: row.Known, EstimatedCount: row.Estimated, MissingCount: row.Missing},
+		GenerationSpeed: RateMetric{Unit: "tokens/s", Value: row.SpeedAvg, SampleCount: row.SpeedSamples},
+		TTFT:            RateMetric{Unit: "ms", Value: row.TTFTAvg, SampleCount: row.TTFTSamples},
 	}
 	if row.LastReceived != nil {
 		text := formatTime(*row.LastReceived)
@@ -337,6 +365,7 @@ func newEvent(row EventRow) Event {
 		Source:      SourceRef{ID: row.SourceID.String(), Platform: row.Platform, InstanceKey: row.InstanceKey},
 		InputTokens: Token(row.Input), OutputTokens: Token(row.Output), TotalTokens: Token(row.Total),
 		Status: row.Status, DurationMS: row.DurationMS,
+		GenerationSpeedTPS: row.GenerationSpeedTPS, TTFTMS: row.TTFTMS,
 	}
 	if row.ProjectID.Valid && row.ProjectKey != nil && row.ProjectName != nil {
 		event.Project = &ProjectRef{ID: row.ProjectID.String(), Key: *row.ProjectKey, Name: *row.ProjectName}

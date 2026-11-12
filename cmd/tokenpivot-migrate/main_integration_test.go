@@ -172,7 +172,7 @@ func TestSingleConnectionMatrix(t *testing.T) {
 			}
 			latest := sources[len(sources)-1].Version
 			previous := sources[len(sources)-2].Version
-			if latest != 7 || previous != 6 {
+			if latest != 8 || previous != 7 {
 				t.Fatalf("latest=%d previous=%d: update the per-migration assertions below for the new latest migration", latest, previous)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -202,28 +202,36 @@ func TestSingleConnectionMatrix(t *testing.T) {
 				if version != want {
 					t.Fatalf("version=%d want=%d", version, want)
 				}
-				// The latest migration (00007) only adds sources.archived_at, so down-one
-				// must drop that column and leave every table, including
+				// The latest migration (00008) only adds usage_events.generation_duration_ms
+				// and usage_events.ttft_ms, so down-one must drop exactly those two columns
+				// and leave sources.archived_at (00007) together with every table, including
 				// workspace_memberships (00006), in place.
 				var memberships, authTables, usageMinuteStats, usageEvents, foundation, archivedAt bool
 				if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.workspace_memberships') IS NOT NULL, to_regclass(current_schema()||'.users') IS NOT NULL, to_regclass(current_schema()||'.usage_minute_stats') IS NOT NULL, to_regclass(current_schema()||'.usage_events') IS NOT NULL, to_regclass(current_schema()||'.workspaces') IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'archived_at')").Scan(&memberships, &authTables, &usageMinuteStats, &usageEvents, &foundation, &archivedAt); err != nil {
 					t.Fatal(database.SafeError("table set", err))
 				}
+				var generationColumns int
+				if err := db.QueryRowContext(ctx, "SELECT count(*)::int FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'usage_events' AND column_name IN ('generation_duration_ms','ttft_ms')").Scan(&generationColumns); err != nil {
+					t.Fatal(database.SafeError("generation columns", err))
+				}
 				switch command {
 				case "status":
-					if memberships || authTables || usageMinuteStats || usageEvents || foundation || archivedAt {
-						t.Fatal("business tables exist before up")
+					if memberships || authTables || usageMinuteStats || usageEvents || foundation || archivedAt || generationColumns != 0 {
+						t.Fatal("business tables or latest columns exist before up")
 					}
 				case "down-one":
-					if archivedAt {
-						t.Fatal("down-one did not drop sources.archived_at of the latest migration")
+					if generationColumns != 0 {
+						t.Fatal("down-one did not drop the generation metric columns of the latest migration")
+					}
+					if !archivedAt {
+						t.Fatal("down-one removed sources.archived_at of an earlier migration")
 					}
 					if !memberships || !authTables || !usageMinuteStats || !usageEvents || !foundation {
 						t.Fatal("down-one removed a table of an earlier migration")
 					}
 				default:
-					if !memberships || !authTables || !usageMinuteStats || !usageEvents || !foundation || !archivedAt {
-						t.Fatal("up did not create the membership, auth, minute stats, usage event, foundation tables and sources.archived_at")
+					if !memberships || !authTables || !usageMinuteStats || !usageEvents || !foundation || !archivedAt || generationColumns != 2 {
+						t.Fatal("up did not create the membership, auth, minute stats, usage event, foundation tables, sources.archived_at and the two generation metric columns")
 					}
 				}
 				t.Logf("command=%s exit=0 duration=%s version=%d", command, time.Since(start), version)

@@ -413,3 +413,101 @@ test('collector: session events → queue → upload; restart replays leftovers'
   await c2.stop()
   await s.close()
 })
+
+// ---- generation timing in the uploaded body (T-061 D) ----
+
+test('v1 shape when no timing was observed: neither timing key is sent', async () => {
+  const s = await server(allAs('accepted'))
+  const { up } = await uploader(s.endpoint, [ev(1)])
+  assert.equal((await up.flush()).state, 'idle')
+  const body = s.calls[0].body.events[0]
+  assert.ok(!('generation_duration_ms' in body) && !('ttft_ms' in body))
+  assert.deepEqual(Object.keys(body).sort(), ['duration_ms', 'model', 'occurred_at', 'project_id', 'provider', 'source_event_id', 'status', 'usage'])
+  await s.close()
+})
+
+test('v2 shape sends both keys with real values, and null for an unknown one', async () => {
+  const s = await server(allAs('accepted'))
+  const timed = [
+    { ...ev(1), generation_duration_ms: 2000, ttft_ms: 8000 },
+    { ...ev(2), generation_duration_ms: 0, ttft_ms: null },
+    { ...ev(3), generation_duration_ms: null, ttft_ms: 0 },
+  ]
+  const { up } = await uploader(s.endpoint, timed)
+  assert.equal((await up.flush()).state, 'idle')
+  const bodies = s.calls[0].body.events
+  assert.deepEqual(bodies.map((b) => [b.generation_duration_ms, b.ttft_ms]), [[2000, 8000], [0, null], [null, 0]])
+  // the two timings never turn into a speed field
+  assert.ok(bodies.every((b) => !Object.keys(b).some((k) => /speed|tps/.test(k))))
+  await s.close()
+})
+
+test('mapper → collector → upload keeps TTFT for a usage-less request and a usage-less compaction', async () => {
+  const s = await server(allAs('accepted'))
+  const dir = await tmp()
+  const tasks = []
+  const c = new Collector({
+    stateDir: dir, endpoint: s.endpoint, getToken: () => TOKEN, logger: logs(),
+    setTimer: () => 1, clearTimer: () => {},
+    microtask: (fn) => { tasks.push(fn) },
+  })
+  await c.start()
+  const session = { id: 'sess', header: { id: 'sess' } }
+  const agent = { session }
+  const drain = async () => {
+    while (tasks.length > 0) {
+      for (const fn of tasks.splice(0)) fn()
+      await new Promise((r) => setImmediate(r))
+    }
+  }
+
+  const msgDone = c.handle(session, { type: 'assistant/message', seq: 7, time: Date.now(), data: {
+    message: { role: 'assistant', id: 'no-usage', source: { provider: 'p', model: 'm' } },
+  } })
+  c.receive({ agent, notice: { seq: 7, timing: { requestStartedAt: 0, firstOutputAt: 8000, lastOutputAt: 10000 } } })
+
+  const compDone = c.handle(session, { type: 'compaction/summary', seq: 8, time: Date.now(), data: {
+    compactionId: 'c-1', provider: 'p', model: 'm',
+  } })
+  c.receive({ agent, notice: { seq: 8, timing: { requestStartedAt: 100, firstOutputAt: 500, lastOutputAt: 1500 } } })
+
+  await drain()
+  await Promise.all([msgDone, compDone])
+  assert.equal((await c.flush()).state, 'idle')
+  const bodies = s.calls[0].body.events
+  assert.deepEqual(bodies.map((b) => [b.source_event_id, b.ttft_ms, b.generation_duration_ms]), [
+    ['dsh:msg:no-usage', 8000, 2000],
+    ['dsh:compaction:sess:c-1', 400, 1000],
+  ])
+  for (const body of bodies) {
+    // unknown counts stay missing, never 0
+    assert.deepEqual(body.usage.output_tokens, { value: null, quality: 'missing' })
+    assert.deepEqual(body.usage.input_tokens, { value: null, quality: 'missing' })
+  }
+  await c.stop()
+  await s.close()
+})
+
+test('old host through the collector: unchanged v1 body end to end', async () => {
+  const s = await server(allAs('accepted'))
+  const dir = await tmp()
+  const tasks = []
+  const c = new Collector({
+    stateDir: dir, endpoint: s.endpoint, getToken: () => TOKEN, logger: logs(),
+    setTimer: () => 1, clearTimer: () => {},
+    microtask: (fn) => { tasks.push(fn) },
+  })
+  await c.start()
+  const done = c.handle({ id: 'sess', header: { id: 'sess' } }, { type: 'assistant/message', seq: 3, time: Date.now(), data: {
+    message: { role: 'assistant', id: 'old-host', source: { provider: 'p', model: 'm' } },
+    usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 },
+  } })
+  for (const fn of tasks.splice(0)) fn()
+  await done
+  assert.equal((await c.flush()).state, 'idle')
+  const body = s.calls[0].body.events[0]
+  assert.ok(!('generation_duration_ms' in body) && !('ttft_ms' in body))
+  assert.deepEqual(body.usage.output_tokens, { value: 1, quality: 'known' })
+  await c.stop()
+  await s.close()
+})

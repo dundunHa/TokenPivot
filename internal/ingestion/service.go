@@ -28,9 +28,15 @@ import (
 
 // Frozen contract limits and versions.
 const (
-	// normalizationVersion is the only comparison algorithm this release writes
-	// and understands.
+	// normalizationVersion is the v1 comparison algorithm: the seven element array
+	// every event without generation timings is compared under. It stays the
+	// version written for a request that carries neither timing attribute, so an
+	// old client's retransmission keeps its original identity.
 	normalizationVersion = "tokenpivot-usage-event/v1"
+	// normalizationVersionV2 is v1 plus the two client observed timings appended
+	// as elements 8 and 9. It is chosen by the request shape, never by the client,
+	// and both known versions project onto v1 for a cross-version comparison.
+	normalizationVersionV2 = "tokenpivot-usage-event/v2"
 	// retainedWindow is the accepted occurred_at age; both ends are inclusive.
 	retainedWindow = 180 * 24 * time.Hour
 	// maxSafeInteger is the largest value a JSON integer may carry (2^53-1).
@@ -142,8 +148,26 @@ type event struct {
 	Usage      usage
 	Status     *string
 	DurationMS *int64
-	// PayloadHash is the raw SHA-256 digest of the normalized comparison text.
+	// GenerationDurationMS and TTFTMS are the client observed raw timings. A nil
+	// pointer means unknown: omitted, explicit null, or an earlier client.
+	GenerationDurationMS *int64
+	TTFTMS               *int64
+	// TimingFieldsPresent records that at least one timing attribute appeared in
+	// the request, even as null. It selects the comparison version and is never
+	// stored, because a stored row is compared by its retained columns instead.
+	TimingFieldsPresent bool
+	// PayloadHash is the raw SHA-256 digest of the normalized comparison text of
+	// this request's own version.
 	PayloadHash [sha256.Size]byte
+}
+
+// version reports the comparison version this request is normalized under. The
+// request shape decides it: two attributes absent is v1, any appearance is v2.
+func (e *event) version() string {
+	if e.TimingFieldsPresent {
+		return normalizationVersionV2
+	}
+	return normalizationVersion
 }
 
 // storedEvent is one immutable detail row: the identity, the first-receive stamp
@@ -162,6 +186,8 @@ type storedEvent struct {
 	Usage                usage
 	Status               *string
 	DurationMS           *int64
+	GenerationDurationMS *int64
+	TTFTMS               *int64
 }
 
 // rejection is one permanent per-item refusal decided before any database write.
@@ -437,17 +463,53 @@ func checkWindow(occurredAt, now time.Time) verdict {
 	return verdictValid
 }
 
-// compareContent classifies an existing identity. Only a stored version this
-// release can reproduce is comparable; an unknown version cannot be projected
-// losslessly and is reported as permanently incompatible instead of guessed.
+// compareContent classifies an existing identity. Only a common version both
+// sides can form losslessly is compared; an unknown stored version cannot be
+// projected and is reported as permanently incompatible instead of guessed.
+//
+// Both known versions retain the whole v1 comparison content, so v1 is always a
+// lossless common projection. When the stored row and this request were
+// normalized under different versions, the stored digest is rebuilt from the
+// retained columns: a stored v2 digest is not comparable with a v1 projection.
 func compareContent(existing storedEvent, e *event) result {
-	if existing.NormalizationVersion != normalizationVersion {
+	version, ok := commonVersion(existing.NormalizationVersion, e.version())
+	if !ok {
 		return rejectedResult(codeNormalizationIncompatible, "no common normalization version can be formed")
 	}
-	if bytes.Equal(existing.PayloadHash, e.PayloadHash[:]) {
+	stored := existing.PayloadHash
+	if existing.NormalizationVersion != version {
+		digest := sha256.Sum256(existing.comparison().textFor(version))
+		stored = digest[:]
+	}
+	requested := e.PayloadHash[:]
+	if e.version() != version {
+		digest := sha256.Sum256(e.comparison().textFor(version))
+		requested = digest[:]
+	}
+	if bytes.Equal(stored, requested) {
 		return result{status: statusDuplicate}
 	}
 	return result{status: statusConflict}
+}
+
+// commonVersion returns the comparison version two versions share. Equal known
+// versions are compared directly; two different known versions both project onto
+// v1, because v2 only appends fields and every v1 comparison column is retained.
+// Anything involving an unknown version has no common version this release can
+// form, so the identity is permanently incompatible.
+func commonVersion(stored, request string) (string, bool) {
+	if !isKnownVersion(stored) || !isKnownVersion(request) {
+		return "", false
+	}
+	if stored == request {
+		return stored, true
+	}
+	return normalizationVersion, true
+}
+
+// isKnownVersion reports a comparison version this release can render.
+func isKnownVersion(version string) bool {
+	return version == normalizationVersion || version == normalizationVersionV2
 }
 
 // rejectedResult builds a permanent per-item refusal.
@@ -511,11 +573,13 @@ func storedEventFor(credential credentials.Credential, e *event, receivedAt time
 		Model:                e.Model,
 		OccurredAt:           e.OccurredAt,
 		ReceivedAt:           receivedAt,
-		NormalizationVersion: normalizationVersion,
+		NormalizationVersion: e.version(),
 		PayloadHash:          e.PayloadHash[:],
 		Usage:                e.Usage,
 		Status:               e.Status,
 		DurationMS:           e.DurationMS,
+		GenerationDurationMS: e.GenerationDurationMS,
+		TTFTMS:               e.TTFTMS,
 	}
 }
 
@@ -539,38 +603,103 @@ func minuteInputFor(credential credentials.Credential, e *event) aggregation.Min
 	}
 }
 
-// normalizedText is the frozen v1 comparison text: one JSON array with exactly
-// seven elements, no insignificant whitespace and no localization.
+// comparison is the typed content the normalized text is rendered from. Both the
+// decoded request and a stored row project into it, so one renderer covers every
+// version instead of two serializers drifting apart.
+type comparison struct {
+	OccurredAt           time.Time
+	ProjectID            credentials.ID
+	Provider             string
+	Model                string
+	Usage                usage
+	Status               *string
+	DurationMS           *int64
+	GenerationDurationMS *int64
+	TTFTMS               *int64
+}
+
+// comparison projects a decoded request onto the comparison content.
+func (e *event) comparison() comparison {
+	return comparison{
+		OccurredAt:           e.OccurredAt,
+		ProjectID:            e.ProjectID,
+		Provider:             e.Provider,
+		Model:                e.Model,
+		Usage:                e.Usage,
+		Status:               e.Status,
+		DurationMS:           e.DurationMS,
+		GenerationDurationMS: e.GenerationDurationMS,
+		TTFTMS:               e.TTFTMS,
+	}
+}
+
+// comparison projects a stored row back onto the comparison content. Every v1
+// field is a retained column at its frozen precision and both v2 timings are
+// retained too, so this projection never guesses a value.
+func (s storedEvent) comparison() comparison {
+	return comparison{
+		OccurredAt:           s.OccurredAt,
+		ProjectID:            s.ProjectID,
+		Provider:             s.Provider,
+		Model:                s.Model,
+		Usage:                s.Usage,
+		Status:               s.Status,
+		DurationMS:           s.DurationMS,
+		GenerationDurationMS: s.GenerationDurationMS,
+		TTFTMS:               s.TTFTMS,
+	}
+}
+
+// normalizedText is the comparison text of this request's own version: the seven
+// v1 elements, or nine when either timing attribute appeared.
 func (e *event) normalizedText() []byte {
+	return e.comparison().textFor(e.version())
+}
+
+// textFor renders the frozen comparison text of one version: a JSON array with
+// seven elements for v1, and the two raw client timings appended for v2. No
+// insignificant whitespace, no localization, no floating point.
+func (c comparison) textFor(version string) []byte {
 	buffer := make([]byte, 0, 512)
 	buffer = append(buffer, '[')
-	buffer = appendJSONString(buffer, e.OccurredAt.UTC().Format(microLayout))
+	buffer = appendJSONString(buffer, c.OccurredAt.UTC().Format(microLayout))
 	buffer = append(buffer, ',')
-	if e.ProjectID.Valid {
-		buffer = appendJSONString(buffer, projectText(e.ProjectID))
+	if c.ProjectID.Valid {
+		buffer = appendJSONString(buffer, projectText(c.ProjectID))
 	} else {
 		buffer = append(buffer, "null"...)
 	}
 	buffer = append(buffer, ',')
-	buffer = appendJSONString(buffer, e.Provider)
+	buffer = appendJSONString(buffer, c.Provider)
 	buffer = append(buffer, ',')
-	buffer = appendJSONString(buffer, e.Model)
+	buffer = appendJSONString(buffer, c.Model)
 	buffer = append(buffer, ',')
-	buffer = appendUsage(buffer, e.Usage)
+	buffer = appendUsage(buffer, c.Usage)
 	buffer = append(buffer, ',')
-	if e.Status != nil {
-		buffer = appendJSONString(buffer, *e.Status)
+	if c.Status != nil {
+		buffer = appendJSONString(buffer, *c.Status)
 	} else {
 		buffer = append(buffer, "null"...)
 	}
 	buffer = append(buffer, ',')
-	if e.DurationMS != nil {
-		buffer = strconv.AppendInt(buffer, *e.DurationMS, 10)
-	} else {
-		buffer = append(buffer, "null"...)
+	buffer = appendOptionalInteger(buffer, c.DurationMS)
+	if version == normalizationVersionV2 {
+		buffer = append(buffer, ',')
+		buffer = appendOptionalInteger(buffer, c.GenerationDurationMS)
+		buffer = append(buffer, ',')
+		buffer = appendOptionalInteger(buffer, c.TTFTMS)
 	}
 	buffer = append(buffer, ']')
 	return buffer
+}
+
+// appendOptionalInteger writes a decimal integer or the null literal, so an
+// unknown timing can never be confused with a real zero.
+func appendOptionalInteger(buffer []byte, value *int64) []byte {
+	if value == nil {
+		return append(buffer, "null"...)
+	}
+	return strconv.AppendInt(buffer, *value, 10)
 }
 
 // microLayout is the normalized occurred_at representation: UTC with exactly six

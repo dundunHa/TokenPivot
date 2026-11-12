@@ -32,6 +32,51 @@ const isCount = (v) => Number.isSafeInteger(v) && v >= 0
 const known = (value) => ({ value, quality: 'known' })
 const MISSING = Object.freeze({ value: null, quality: 'missing' })
 
+/** An event whose request finished without usable usage: all six metrics missing, never zero. */
+const missingUsage = () => ({
+  input_tokens: MISSING,
+  output_tokens: MISSING,
+  total_tokens: MISSING,
+  cache_read_tokens: MISSING,
+  cache_write_tokens: MISSING,
+  reasoning_tokens: MISSING,
+})
+
+/**
+ * One generation boundary → a non-negative safe integer, or null. A missing, negative,
+ * fractional or out-of-range boundary is unknown, not zero.
+ */
+const boundary = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : null)
+
+/** A difference that is still a non-negative safe integer, else null. */
+function difference(later, earlier) {
+  const value = later - earlier
+  return Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+/**
+ * Host `GenerationTiming` → the two optional ingestion fields.
+ *
+ * Both are independent observations: `generation_duration_ms = lastOutputAt-firstOutputAt`
+ * and `ttft_ms = firstOutputAt-requestStartedAt`. A missing boundary, a clock going backwards
+ * and a non-safe difference are unknown (null); `0` is a real observation. When both are
+ * unknown the fields are omitted entirely, so a host without timing keeps sending the v1
+ * shape; when at least one is valid both keys appear and the other is null. This never derives
+ * or uploads a speed — the server does that from final known output tokens.
+ * @param {{requestStartedAt?: number, firstOutputAt?: number|null, lastOutputAt?: number|null}|null|undefined} timing
+ * @returns {{generation_duration_ms?: number|null, ttft_ms?: number|null}}
+ */
+export function mapGenerationTiming(timing) {
+  if (!timing || typeof timing !== 'object') return {}
+  const startedAt = boundary(timing.requestStartedAt)
+  const firstAt = boundary(timing.firstOutputAt)
+  const lastAt = boundary(timing.lastOutputAt)
+  const duration = firstAt === null || lastAt === null ? null : difference(lastAt, firstAt)
+  const ttft = startedAt === null || firstAt === null ? null : difference(firstAt, startedAt)
+  if (duration === null && ttft === null) return {}
+  return { generation_duration_ms: duration, ttft_ms: ttft }
+}
+
 /**
  * DSH TokenUsage → TokenPivot usage (TokenPivot input_tokens INCLUDES cache reads/writes).
  *
@@ -81,6 +126,74 @@ export function mapUsage(u) {
   }
 }
 
+/**
+ * Partial recovery for a final event that carries a valid timing but whose usage `mapUsage`
+ * rejected (one required or optional count was unusable).
+ *
+ * Only counts that are independently confirmed survive; anything unconfirmed stays `missing`,
+ * never `0`, so a known output (and the speed the server derives from it) is not thrown away
+ * together with one unrelated broken field. The input reading reuses `mapUsage`'s rule: the cache
+ * sum counts only when every present cache field is itself usable, and an absent cache field still
+ * means "none reported". A cache-free input needs no other field (both readings coincide), while a
+ * cache-bearing one is only confirmed when the total pins down which reading applies. When that
+ * reading cannot be pinned down (unusable cache, ambiguous inclusive/exclusive, unsafe sum, a
+ * total that disagrees) the field is missing instead of an asserted shape the server would reject.
+ * @returns {object|null} usage, or null when no count can be confirmed
+ */
+export function recoverUsage(u) {
+  if (!u || typeof u !== 'object') return null
+  const has = (k) => u[k] !== undefined && u[k] !== null
+  const count = (k) => (isCount(u[k]) ? u[k] : null)
+  const inputTokens = count('inputTokens')
+  const output = count('outputTokens')
+  const cacheRead = count('cacheReadTokens')
+  const cacheWrite = count('cacheWriteTokens')
+  const dshTotal = count('totalTokens')
+  // A present but unusable cache field hides an unknown part of the input; assuming 0 there would
+  // assert a known input that can be too small.
+  const cacheUsable = !(has('cacheReadTokens') && cacheRead === null)
+    && !(has('cacheWriteTokens') && cacheWrite === null)
+  const cache = cacheUsable ? (cacheRead ?? 0) + (cacheWrite ?? 0) : null
+  const fits = (...parts) => Number.isSafeInteger(parts.reduce((sum, part) => sum + part, 0))
+
+  let input = null
+  if (inputTokens !== null && cache !== null) {
+    const inclusive = inputTokens
+    const exclusive = inclusive + cache
+    if (cache === 0) {
+      // No cache reported: inclusive and exclusive coincide, so neither the output nor a total can
+      // change the reading — this input is confirmed on its own.
+      input = exclusive
+    } else if (output !== null && Number.isSafeInteger(exclusive)) {
+      if (dshTotal !== null && fits(exclusive, output) && dshTotal === exclusive + output) {
+        input = exclusive // DSH's total says the input excludes the cache
+      } else if (dshTotal !== null && fits(inclusive, output) && dshTotal === inclusive + output && cache <= inclusive) {
+        input = inclusive // DSH's total says the input already includes the cache
+      }
+    }
+  }
+
+  let total = dshTotal
+  // The host's own total stands on its own when the input reading stayed unconfirmed; only a total
+  // that contradicts two known counts would be rejected, so that one is reported as unknown.
+  if (input !== null && output !== null && total !== null && total !== input + output) total = null
+  // Without a total the server derives input+output from two known counts; a sum outside the safe
+  // range would make it reject the event, so the input gives way and the output survives.
+  if (input !== null && output !== null && total === null && !fits(input, output)) input = null
+
+  const reasoning = count('reasoningTokens')
+  const usage = {
+    input_tokens: input === null ? MISSING : known(input),
+    output_tokens: output === null ? MISSING : known(output),
+    total_tokens: total === null ? MISSING : known(total),
+    cache_read_tokens: cacheRead === null ? MISSING : known(cacheRead),
+    cache_write_tokens: cacheWrite === null ? MISSING : known(cacheWrite),
+    // reasoning is a subset of output: only a confirmed subset is reported.
+    reasoning_tokens: reasoning !== null && output !== null && reasoning <= output ? known(reasoning) : MISSING,
+  }
+  return Object.values(usage).some((m) => m.quality === 'known') ? usage : null
+}
+
 /** RFC 3339 UTC with millisecond precision (≤ 6 fractional digits as required). */
 export function formatTime(ms) {
   if (!Number.isFinite(ms)) return null
@@ -122,9 +235,10 @@ export function resolveProject(cwd, mappings) {
  * @param {{ id?: string, header?: { id?: string, cwd?: string } }} session
  * @param {{ type: string, time: number, data: any }} event
  * @param {{ cwd?: string, projects?: {path: string, projectId: string}[] }} options
- * @returns {object|null} UsageEvent, or null when the event carries no reportable usage
+ * @param {object} [timing] the host's `GenerationTiming` for this final event, when it published one
+ * @returns {object|null} UsageEvent, or null when the event carries no reportable usage or timing
  */
-export function mapSessionEvent(session, event, options = {}) {
+export function mapSessionEvent(session, event, options = {}, timing) {
   if (!event || typeof event !== 'object') return null
   const data = event.data
   if (!data || typeof data !== 'object') return null
@@ -151,7 +265,13 @@ export function mapSessionEvent(session, event, options = {}) {
 
   if (!validEventId(sourceEventId) || !validName(provider) || !validName(model)) return null
   const usage = mapUsage(data.usage)
-  if (!usage) return null
+  const generation = mapGenerationTiming(timing)
+  const timed = Object.keys(generation).length > 0
+  // A request with a published timing is still worth reporting without usage: the count stays
+  // unknown (missing), never zero, so TTFT survives on its own. A usage that only broke on one
+  // field is partially recovered (the known output keeps its speed sample); without timing the
+  // event is skipped exactly as before.
+  if (!usage && !timed) return null
   const occurredAt = formatTime(event.time)
   if (!occurredAt) return null
 
@@ -161,7 +281,8 @@ export function mapSessionEvent(session, event, options = {}) {
     provider,
     model,
     occurred_at: occurredAt,
-    usage,
+    usage: usage ?? (timed ? recoverUsage(data.usage) : null) ?? missingUsage(),
+    ...generation,
     // DSH records neither a request status nor a request duration for successful calls.
     status: null,
     duration_ms: null,

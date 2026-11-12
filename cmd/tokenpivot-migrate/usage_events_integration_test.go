@@ -48,6 +48,8 @@ type usageEventRow struct {
 	reasoning            usageMetric
 	status               *string
 	durationMS           *int64
+	generationDurationMS *int64
+	ttftMS               *int64
 }
 
 const insertUsageEventSQL = `INSERT INTO usage_events (
@@ -56,8 +58,8 @@ const insertUsageEventSQL = `INSERT INTO usage_events (
     input_tokens, input_tokens_quality, output_tokens, output_tokens_quality,
     total_tokens, total_tokens_quality, cache_read_tokens, cache_read_tokens_quality,
     cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality,
-    status, duration_ms
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+    status, duration_ms, generation_duration_ms, ttft_ms
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
 ON CONFLICT (workspace_id, source_id, source_event_id) DO NOTHING
 RETURNING id`
 
@@ -71,7 +73,8 @@ const usageEventSnapshotSQL = `SELECT concat_ws('|',
     coalesce(cache_read_tokens::text, '<null>'), cache_read_tokens_quality,
     coalesce(cache_write_tokens::text, '<null>'), cache_write_tokens_quality,
     coalesce(reasoning_tokens::text, '<null>'), reasoning_tokens_quality,
-    coalesce(status, '<null>'), coalesce(duration_ms::text, '<null>'))
+    coalesce(status, '<null>'), coalesce(duration_ms::text, '<null>'),
+    coalesce(generation_duration_ms::text, '<null>'), coalesce(ttft_ms::text, '<null>'))
 FROM usage_events
 WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3`
 
@@ -111,6 +114,8 @@ func syntheticUsageEvent(t *testing.T) usageEventRow {
 		reasoning:            usageMetric{quality: "missing"},
 		status:               pointerTo("success"),
 		durationMS:           pointerTo(int64(1250)),
+		generationDurationMS: pointerTo(int64(2000)),
+		ttftMS:               pointerTo(int64(8000)),
 	}
 }
 
@@ -121,7 +126,7 @@ func usageEventArgs(row usageEventRow) []any {
 		row.input.value, row.input.quality, row.output.value, row.output.quality,
 		row.total.value, row.total.quality, row.cacheRead.value, row.cacheRead.quality,
 		row.cacheWrite.value, row.cacheWrite.quality, row.reasoning.value, row.reasoning.quality,
-		row.status, row.durationMS,
+		row.status, row.durationMS, row.generationDurationMS, row.ttftMS,
 	}
 }
 
@@ -189,19 +194,21 @@ func TestUsageEvents(t *testing.T) {
 			defaultText string
 		}
 		expected := map[string]column{
-			"id":                    {dataType: "uuid", nullable: "NO", defaultText: "uuidv7()"},
-			"workspace_id":          {dataType: "uuid", nullable: "NO"},
-			"source_id":             {dataType: "uuid", nullable: "NO"},
-			"source_event_id":       {dataType: "text", nullable: "NO"},
-			"project_id":            {dataType: "uuid", nullable: "YES"},
-			"provider":              {dataType: "text", nullable: "NO"},
-			"model":                 {dataType: "text", nullable: "NO"},
-			"occurred_at":           {dataType: "timestamp with time zone", nullable: "NO"},
-			"received_at":           {dataType: "timestamp with time zone", nullable: "NO"},
-			"normalization_version": {dataType: "text", nullable: "NO"},
-			"payload_hash":          {dataType: "bytea", nullable: "NO"},
-			"status":                {dataType: "text", nullable: "YES"},
-			"duration_ms":           {dataType: "bigint", nullable: "YES"},
+			"id":                     {dataType: "uuid", nullable: "NO", defaultText: "uuidv7()"},
+			"workspace_id":           {dataType: "uuid", nullable: "NO"},
+			"source_id":              {dataType: "uuid", nullable: "NO"},
+			"source_event_id":        {dataType: "text", nullable: "NO"},
+			"project_id":             {dataType: "uuid", nullable: "YES"},
+			"provider":               {dataType: "text", nullable: "NO"},
+			"model":                  {dataType: "text", nullable: "NO"},
+			"occurred_at":            {dataType: "timestamp with time zone", nullable: "NO"},
+			"received_at":            {dataType: "timestamp with time zone", nullable: "NO"},
+			"normalization_version":  {dataType: "text", nullable: "NO"},
+			"payload_hash":           {dataType: "bytea", nullable: "NO"},
+			"status":                 {dataType: "text", nullable: "YES"},
+			"duration_ms":            {dataType: "bigint", nullable: "YES"},
+			"generation_duration_ms": {dataType: "bigint", nullable: "YES"},
+			"ttft_ms":                {dataType: "bigint", nullable: "YES"},
 		}
 		for _, metric := range []string{"input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"} {
 			expected[metric] = column{dataType: "bigint", nullable: "YES"}
@@ -452,6 +459,8 @@ func TestUsageEvents(t *testing.T) {
 		changed.input = usageMetric{value: pointerTo(int64(999)), quality: "estimated"}
 		changed.status = pointerTo("error")
 		changed.durationMS = pointerTo(int64(1))
+		changed.generationDurationMS = pointerTo(int64(3))
+		changed.ttftMS = pointerTo(int64(4))
 		changed.receivedAt = original.receivedAt.Add(24 * time.Hour)
 		if _, inserted := insertUsageEvent(t, ctx, app, changed); inserted {
 			t.Fatal("conflicting retransmission was inserted")
@@ -648,12 +657,15 @@ func TestUsageEvents(t *testing.T) {
 		row.projectID = nil
 		row.status = nil
 		row.durationMS = nil
+		row.generationDurationMS = nil
+		row.ttftMS = nil
 		if _, inserted := insertUsageEvent(t, ctx, app, row); !inserted {
 			t.Fatal("insert was not inserted")
 		}
 		var input, output *int64
+		var generationDuration, ttft *int64
 		var inputQuality, outputQuality, totalQuality string
-		err := app.QueryRow(ctx, "SELECT input_tokens, output_tokens, input_tokens_quality, output_tokens_quality, total_tokens_quality FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", row.workspaceID, row.sourceID, row.sourceEventID).Scan(&input, &output, &inputQuality, &outputQuality, &totalQuality)
+		err := app.QueryRow(ctx, "SELECT input_tokens, output_tokens, input_tokens_quality, output_tokens_quality, total_tokens_quality, generation_duration_ms, ttft_ms FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", row.workspaceID, row.sourceID, row.sourceEventID).Scan(&input, &output, &inputQuality, &outputQuality, &totalQuality, &generationDuration, &ttft)
 		if err != nil {
 			t.Fatal(database.SafeError("read metrics", err))
 		}
@@ -666,18 +678,55 @@ func TestUsageEvents(t *testing.T) {
 		if inputQuality != "missing" || outputQuality != "known" || totalQuality != "missing" {
 			t.Fatalf("qualities input=%q output=%q total=%q", inputQuality, outputQuality, totalQuality)
 		}
+		if generationDuration != nil || ttft != nil {
+			t.Fatalf("missing generation timings read back as duration=%v ttft=%v", generationDuration, ttft)
+		}
 		omitted := syntheticUsageEvent(t)
 		_, err = app.Exec(ctx, "INSERT INTO usage_events (workspace_id, source_id, source_event_id, provider, model, occurred_at, received_at, normalization_version, payload_hash, input_tokens_quality, output_tokens_quality, total_tokens_quality, cache_read_tokens_quality, cache_write_tokens_quality, reasoning_tokens_quality) VALUES ($1,$2,$3,'synthetic-provider','synthetic-model',now(),now(),'tokenpivot-usage-event/v1','\\x01','missing','missing','missing','missing','missing','missing')", omitted.workspaceID, omitted.sourceID, omitted.sourceEventID)
 		if err != nil {
 			t.Fatal(database.SafeError("insert omitted metrics", err))
 		}
 		var nonNull int
-		err = app.QueryRow(ctx, "SELECT count(*)::int FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3 AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR total_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL)", omitted.workspaceID, omitted.sourceID, omitted.sourceEventID).Scan(&nonNull)
+		err = app.QueryRow(ctx, "SELECT count(*)::int FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3 AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR total_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL OR generation_duration_ms IS NOT NULL OR ttft_ms IS NOT NULL)", omitted.workspaceID, omitted.sourceID, omitted.sourceEventID).Scan(&nonNull)
 		if err != nil {
 			t.Fatal(database.SafeError("check omitted metrics", err))
 		}
 		if nonNull != 0 {
 			t.Fatalf("omitted metric columns were defaulted for %d rows", nonNull)
+		}
+	})
+
+	// 9a. Generation metrics: both raw millisecond columns keep a real zero (a single
+	// chunk output) distinct from NULL (unknown), store the raw integer without a
+	// stored ratio, and accept an independently missing counterpart.
+	t.Run("generation metrics", func(t *testing.T) {
+		single := syntheticUsageEvent(t)
+		single.generationDurationMS = pointerTo(int64(0))
+		single.ttftMS = nil
+		if _, inserted := insertUsageEvent(t, ctx, app, single); !inserted {
+			t.Fatal("insert was not inserted")
+		}
+		var duration, ttft *int64
+		if err := app.QueryRow(ctx, "SELECT generation_duration_ms, ttft_ms FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", single.workspaceID, single.sourceID, single.sourceEventID).Scan(&duration, &ttft); err != nil {
+			t.Fatal(database.SafeError("read single chunk metrics", err))
+		}
+		if duration == nil || *duration != 0 {
+			t.Fatalf("real zero generation_duration_ms lost: %v", duration)
+		}
+		if ttft != nil {
+			t.Fatalf("missing ttft_ms read back as %d", *ttft)
+		}
+		both := syntheticUsageEvent(t)
+		both.generationDurationMS = pointerTo(int64(1234))
+		both.ttftMS = pointerTo(int64(5678))
+		if _, inserted := insertUsageEvent(t, ctx, app, both); !inserted {
+			t.Fatal("insert was not inserted")
+		}
+		if err := app.QueryRow(ctx, "SELECT generation_duration_ms, ttft_ms FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", both.workspaceID, both.sourceID, both.sourceEventID).Scan(&duration, &ttft); err != nil {
+			t.Fatal(database.SafeError("read generation metrics", err))
+		}
+		if duration == nil || *duration != 1234 || ttft == nil || *ttft != 5678 {
+			t.Fatalf("generation metrics duration=%v ttft=%v want the stored raw 1234 5678 ms", duration, ttft)
 		}
 	})
 
@@ -745,6 +794,93 @@ func TestUsageEvents(t *testing.T) {
 		}
 		t.Logf("samples=%d at 256 byte identity", len(samples))
 	})
+}
+
+const (
+	generationMetricsVersion = 8
+	beforeGenerationMetrics  = sourceArchivalVersion
+)
+
+// TestGenerationMetricsMigration pins the 00008 upgrade and rollback so later
+// migrations cannot silently change them: the two nullable raw millisecond columns
+// arrive with no default, existing rows keep NULL instead of a backfill, no index or
+// grant changes, and down removes only those two columns.
+func TestGenerationMetricsMigration(t *testing.T) {
+	migrationURL, _ := integrationSchema(t)
+	p, db := testProvider(t, migrationURL, migrations.Files)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := p.UpTo(ctx, beforeGenerationMetrics); err != nil {
+		t.Fatal(database.SafeError("up to 7", err))
+	}
+	// Seed a row with the column set that existed before 00008, so the upgrade has real
+	// history to leave alone.
+	old := syntheticUsageEvent(t)
+	if _, err := db.ExecContext(ctx, "INSERT INTO usage_events (workspace_id, source_id, source_event_id, provider, model, occurred_at, received_at, normalization_version, payload_hash, input_tokens, input_tokens_quality, output_tokens, output_tokens_quality, total_tokens, total_tokens_quality, cache_read_tokens_quality, cache_write_tokens_quality, reasoning_tokens_quality, status, duration_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)", old.workspaceID, old.sourceID, old.sourceEventID, old.provider, old.model, old.occurredAt, old.receivedAt, old.normalizationVersion, old.payloadHash, old.input.value, old.input.quality, old.output.value, old.output.quality, old.total.value, old.total.quality, old.cacheRead.quality, old.cacheWrite.quality, old.reasoning.quality, old.status, old.durationMS); err != nil {
+		t.Fatal(database.SafeError("seed pre-00008 row", err))
+	}
+	if _, err := p.UpTo(ctx, generationMetricsVersion); err != nil {
+		t.Fatal(database.SafeError("up to 8", err))
+	}
+	version, err := p.GetDBVersion(ctx)
+	if err != nil || version != generationMetricsVersion {
+		t.Fatalf("version=%d err=%v want %d", version, err, generationMetricsVersion)
+	}
+	rows, err := db.QueryContext(ctx, "SELECT column_name::text, data_type::text, is_nullable::text, coalesce(column_default::text,'') FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='usage_events' AND column_name IN ('generation_duration_ms','ttft_ms') ORDER BY column_name")
+	if err != nil {
+		t.Fatal(database.SafeError("generation columns", err))
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Error("close generation column rows failed")
+		}
+	}()
+	shapes := make(map[string]string)
+	for rows.Next() {
+		var name, dataType, nullable, defaultText string
+		if err := rows.Scan(&name, &dataType, &nullable, &defaultText); err != nil {
+			t.Fatal(database.SafeError("scan generation column", err))
+		}
+		shapes[name] = dataType + "/" + nullable + "/" + defaultText
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(database.SafeError("generation column rows", err))
+	}
+	if len(shapes) != 2 || shapes["generation_duration_ms"] != "bigint/YES/" || shapes["ttft_ms"] != "bigint/YES/" {
+		t.Fatalf("generation columns=%v want both nullable bigint without default", shapes)
+	}
+	var duration, ttft *int64
+	if err := db.QueryRowContext(ctx, "SELECT generation_duration_ms, ttft_ms FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", old.workspaceID, old.sourceID, old.sourceEventID).Scan(&duration, &ttft); err != nil {
+		t.Fatal(database.SafeError("read pre-00008 row", err))
+	}
+	if duration != nil || ttft != nil {
+		t.Fatalf("upgrade backfilled duration=%v ttft=%v for an existing row", duration, ttft)
+	}
+	var indexes, privileges string
+	if err := db.QueryRowContext(ctx, "SELECT (SELECT string_agg(indexname::text, ',' ORDER BY indexname) FROM pg_indexes WHERE schemaname=current_schema() AND tablename='usage_events'), (SELECT string_agg(privilege_type::text, ',' ORDER BY privilege_type)::text FROM information_schema.role_table_grants WHERE grantee='tokenpivot_app' AND table_schema=current_schema() AND table_name='usage_events')").Scan(&indexes, &privileges); err != nil {
+		t.Fatal(database.SafeError("indexes and grants", err))
+	}
+	if indexes != "idx_usage_events_received_at,idx_usage_events_workspace_id_occurred_at_id,uk_usage_events_workspace_id_source_id_source_event_id,usage_events_pkey" {
+		t.Fatalf("indexes=%q changed with the generation metric columns", indexes)
+	}
+	if privileges != "INSERT,SELECT" {
+		t.Fatalf("grants=%q want=INSERT,SELECT", privileges)
+	}
+	if _, err := p.DownTo(ctx, beforeGenerationMetrics); err != nil {
+		t.Fatal(database.SafeError("down to 7", err))
+	}
+	var columns int
+	var usageEvents, archivedAt bool
+	if err := db.QueryRowContext(ctx, "SELECT count(*)::int FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='usage_events' AND column_name IN ('generation_duration_ms','ttft_ms')").Scan(&columns); err != nil || columns != 0 {
+		t.Fatalf("down left %d generation metric columns: err=%v", columns, err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT to_regclass(current_schema()||'.usage_events') IS NOT NULL, EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='sources' AND column_name='archived_at')").Scan(&usageEvents, &archivedAt); err != nil || !usageEvents || !archivedAt {
+		t.Fatalf("down removed an object of an earlier migration: table=%t archived_at=%t err=%v", usageEvents, archivedAt, err)
+	}
+	var provider string
+	if err := db.QueryRowContext(ctx, "SELECT provider FROM usage_events WHERE workspace_id=$1 AND source_id=$2 AND source_event_id=$3", old.workspaceID, old.sourceID, old.sourceEventID).Scan(&provider); err != nil || provider != old.provider {
+		t.Fatalf("down removed the stored row: provider=%q err=%v", provider, err)
+	}
 }
 
 // connectTestConn opens a dedicated connection and closes it when the subtest ends;
