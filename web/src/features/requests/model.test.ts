@@ -3,13 +3,17 @@ import type { RateData } from "./api";
 import { eventsQueryString } from "./api";
 import { DEFAULT_OVERVIEW_FILTERS } from "@/features/overview/overviewFilters";
 import {
-  describeRate,
+  describeGenerationMetrics,
   eventsPollOptions,
   formatDuration,
+  formatMilliseconds,
+  formatSpeedTps,
   formatStatus,
   formatTokenField,
   parseRequestRange,
   POLL_MS,
+  trimDecimal,
+  UNAVAILABLE,
 } from "./model";
 
 const rate = (over: Partial<RateData>): RateData => ({
@@ -22,6 +26,8 @@ const rate = (over: Partial<RateData>): RateData => ({
   estimatedCount: 0,
   missingCount: 0,
   windowLastReceivedAt: null,
+  generationSpeed: { unit: "tokens/s", value: null, sampleCount: 0 },
+  ttft: { unit: "ms", value: null, sampleCount: 0 },
   ...over,
 });
 
@@ -39,25 +45,98 @@ describe("request model", () => {
     expect(formatStatus(null)).toBe("状态不可用");
   });
 
-  it("describes no events, unavailable, zero, estimated and partial coverage apart", () => {
-    expect(describeRate(rate({})).headline).toBe("窗口内无事件");
-    expect(
-      describeRate(rate({ eventCount: 2, missingCount: 2 })).headline,
-    ).toBe("用量不可用");
-    expect(
-      describeRate(rate({ value: "0", eventCount: 1, knownCount: 1 })),
-    ).toEqual({ headline: "0", notes: [] });
-    const mixed = describeRate(
+  it("trims only the backend decimals without changing the value", () => {
+    expect(trimDecimal("49.500000")).toBe("49.5");
+    expect(trimDecimal("0.000000")).toBe("0");
+    expect(trimDecimal("100")).toBe("100");
+    expect(trimDecimal("0.250000")).toBe("0.25");
+    expect(trimDecimal("123456.123456")).toBe("123456.123456");
+  });
+
+  it("formats per request speed and TTFT, keeping missing apart from zero", () => {
+    expect(formatSpeedTps("49.500000")).toBe("49.5 tokens/s");
+    expect(formatSpeedTps("0")).toBe("0 tokens/s");
+    expect(formatSpeedTps(null)).toBe(UNAVAILABLE);
+    expect(formatMilliseconds(8000)).toBe("8000 ms");
+    expect(formatMilliseconds(0)).toBe("0 ms");
+    expect(formatMilliseconds("8000.000000")).toBe("8000 ms");
+    expect(formatMilliseconds(null)).toBe(UNAVAILABLE);
+  });
+
+  it("describes the rolling averages with their own sample counts", () => {
+    const view = describeGenerationMetrics(
       rate({
-        value: "12000",
-        eventCount: 5,
-        knownCount: 3,
-        estimatedCount: 1,
-        missingCount: 1,
+        eventCount: 3,
+        generationSpeed: {
+          unit: "tokens/s",
+          value: "49.500000",
+          sampleCount: 1,
+        },
+        ttft: { unit: "ms", value: "8000.000000", sampleCount: 2 },
       }),
     );
-    expect(mixed.headline).toBe("12,000");
-    expect(mixed.notes).toEqual(["含估算 1 条", "部分覆盖：缺失 1 条"]);
+    expect(view.speed).toEqual({
+      headline: "49.5 tokens/s",
+      samples: "1 个有效样本",
+    });
+    expect(view.ttft).toEqual({
+      headline: "8000 ms",
+      samples: "2 个有效样本",
+    });
+    expect(view.eventCount).toBe("窗口内 3 条事件");
+  });
+
+  it("reports no events apart from a window without valid samples", () => {
+    const empty = describeGenerationMetrics(rate({}));
+    expect(empty.speed.headline).toBe(UNAVAILABLE);
+    expect(empty.speed.samples).toBe("0 个有效样本");
+    expect(empty.eventCount).toBe("窗口内无事件");
+
+    const sampled = describeGenerationMetrics(
+      rate({
+        eventCount: 5,
+        generationSpeed: {
+          unit: "tokens/s",
+          value: "0",
+          sampleCount: 2,
+        },
+      }),
+    );
+    expect(sampled.speed.headline).toBe("0 tokens/s");
+    expect(sampled.ttft.headline).toBe(UNAVAILABLE);
+  });
+
+  it("never turns zero samples or a null average into zero", () => {
+    const view = describeGenerationMetrics(
+      rate({
+        eventCount: 4,
+        generationSpeed: {
+          unit: "tokens/s",
+          value: "49.500000",
+          sampleCount: 0,
+        },
+        ttft: { unit: "ms", value: null, sampleCount: 3 },
+      }),
+    );
+    expect(view.speed.headline).toBe(UNAVAILABLE);
+    expect(view.ttft.headline).toBe(UNAVAILABLE);
+  });
+
+  it("keeps the two sample counts independent when only one metric has samples", () => {
+    const view = describeGenerationMetrics(
+      rate({
+        eventCount: 2,
+        generationSpeed: {
+          unit: "tokens/s",
+          value: null,
+          sampleCount: 0,
+        },
+        ttft: { unit: "ms", value: "8000.000000", sampleCount: 1 },
+      }),
+    );
+    expect(view.speed.samples).toBe("0 个有效样本");
+    expect(view.ttft.samples).toBe("1 个有效样本");
+    expect(view.ttft.headline).toBe("8000 ms");
   });
 
   it("polls events only on the latest page", () => {

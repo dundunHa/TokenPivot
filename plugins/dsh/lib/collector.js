@@ -44,7 +44,7 @@ export class Collector {
    *   projects?: {path: string, projectId: string}[], resolveCwd?: (session) => string|undefined,
    *   maxQueueItems?: number, flushDelayMs?: number, logger?: any, fetch?: Function,
    *   setTimer?: (fn: Function, ms: number) => any, clearTimer?: (handle: any) => void,
-   *   uploaderOptions?: object,
+   *   microtask?: (fn: Function) => void, uploaderOptions?: object,
    * }} options
    */
   constructor(options) {
@@ -61,11 +61,19 @@ export class Collector {
     })
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
     this.clearTimer = options.clearTimer ?? ((h) => clearTimeout(h))
+    this.microtask = options.microtask ?? ((fn) => queueMicrotask(fn))
     this.flushDelayMs = options.flushDelayMs ?? 2000
     this.timer = null
     this.timerDue = Infinity
     this.stopped = false
     this.ready = null
+    /** Final events waiting for their timing notice, in arrival order. */
+    this.waiting = []
+    /** session object → Map(final event seq → waiting entry); identity, never a string id. */
+    this.pendingBySession = new WeakMap()
+    /** Batches being mapped and written; `stop()` waits for every one of them. */
+    this.batches = new Set()
+    this.flushScheduled = false
   }
 
   /**
@@ -81,26 +89,142 @@ export class Collector {
     return this.ready
   }
 
-  /** session/event listener body. Must not throw into DSH. */
-  async handle(session, event) {
-    if (this.stopped) return
-    if (event?.type !== 'assistant/message' && event?.type !== 'compaction/summary') return
-    let usageEvent
-    try {
-      usageEvent = mapSessionEvent(session, event, {
-        cwd: this.options.resolveCwd?.(session),
-        projects: this.options.projects,
-      })
-    } catch (error) {
-      this.logger?.warn?.(`skipped ${event.type}: ${error?.message ?? error}`)
-      return
+  /**
+   * session/event listener body. Must not throw into DSH; the returned promise settles once this
+   * event is queued (or skipped), never rejects.
+   *
+   * The host commits the final `session/event` first and then publishes `agent/generation-timing`
+   * synchronously on the same stack, so this method stages the event synchronously — before its
+   * first `await` — and settles the whole batch in one microtask. A host that never publishes the
+   * notice therefore costs no wait: the staged event is reported without timing as before.
+   */
+  handle(session, event) {
+    if (this.stopped) return Promise.resolve()
+    if (event?.type !== 'assistant/message' && event?.type !== 'compaction/summary') return Promise.resolve()
+    let done
+    const settled = new Promise((resolve) => { done = resolve })
+    const entry = { session, event, timing: null, seq: event.seq, done }
+    // Staged synchronously: the notice for this event may arrive on this very stack.
+    this.waiting.push(entry)
+    this.link(entry)
+    if (!this.flushScheduled) {
+      this.flushScheduled = true
+      this.microtask(() => { void this.drain() })
     }
-    if (!usageEvent) return
-    await this.ready
+    return settled
+  }
+
+  /**
+   * Make a staged entry reachable by a notice: keyed by the Session object and the final event seq.
+   * Only a real Session object can be a WeakMap key and only it can be matched by a notice.
+   */
+  link(entry) {
+    if (entry.session === null || typeof entry.session !== 'object' || !Number.isSafeInteger(entry.seq)) return
+    let bySeq = this.pendingBySession.get(entry.session)
+    if (!bySeq) {
+      bySeq = new Map()
+      this.pendingBySession.set(entry.session, bySeq)
+    }
+    bySeq.set(entry.seq, entry)
+  }
+
+  /**
+   * Close one entry's association so no later notice can attach to it. Idempotent, and it only
+   * removes the key when that key still names this entry (a duplicate seq may have replaced it).
+   */
+  close(entry) {
+    if (entry.session === null || typeof entry.session !== 'object' || !Number.isSafeInteger(entry.seq)) return
+    const bySeq = this.pendingBySession.get(entry.session)
+    if (!bySeq) return
+    if (bySeq.get(entry.seq) !== entry) return
+    bySeq.delete(entry.seq)
+    if (bySeq.size === 0) this.pendingBySession.delete(entry.session)
+  }
+
+  /**
+   * `agent/generation-timing` listener body: attach the notice to the staged event of the same
+   * agent session and seq. A notice that matches nothing (late, unknown, or a duplicate seq that
+   * already flushed) is ignored so it can never attach to a later request.
+   * @param {{agent?: {session?: object}, notice?: {seq?: number, timing?: object}}} payload
+   */
+  receive(payload) {
     if (this.stopped) return
-    if (this.queue.enqueue(usageEvent)) {
-      this.schedule(this.flushDelayMs)
-      await this.queue.persist() // may reject (disk); the event stays in memory and the next write retries
+    const session = payload?.agent?.session
+    const notice = payload?.notice
+    if (!session || typeof session !== 'object' || !notice) return
+    if (!Number.isSafeInteger(notice.seq)) return
+    const bySeq = this.pendingBySession.get(session)
+    const entry = bySeq?.get(notice.seq)
+    if (!entry) return
+    bySeq.delete(notice.seq)
+    if (bySeq.size === 0) this.pendingBySession.delete(session)
+    entry.timing = notice.timing ?? null
+  }
+
+  /**
+   * One microtask: freeze this batch's timing, then map and queue every staged event in one write.
+   *
+   * The cutoff is this method's synchronous prologue: the batch is taken and every association is
+   * closed BEFORE the first `await`, so a notice that arrives while the queue is still loading or
+   * while an earlier write is in flight can no longer reach a batched entry. The waits below only
+   * delay the write, never the timing decision.
+   */
+  async drain() {
+    this.flushScheduled = false
+    const entries = this.waiting
+    this.waiting = []
+    // Synchronous cutoff: close every association of this batch before any `await`.
+    for (const entry of entries) this.close(entry)
+    if (entries.length === 0) return
+    await this.track(this.write(entries))
+  }
+
+  /** Register one batch so `stop()` can wait for it to be written. */
+  track(batch) {
+    this.batches.add(batch)
+    void batch.then(() => this.batches.delete(batch), () => this.batches.delete(batch))
+    return batch
+  }
+
+  /**
+   * Map and queue one frozen batch, then write it once.
+   *
+   * Nothing here consults `stopped`: a batch that was received before the stop is still written,
+   * otherwise the queue on disk would miss events this instance had already accepted and the
+   * reloaded instance could never report them. Mapping and queueing are per entry, so one broken
+   * event never costs the rest of the batch.
+   */
+  async write(entries) {
+    let queued = 0
+    try {
+      try {
+        await this.ready
+      } catch {
+        // The queue load failed; enqueue in memory anyway (every later persist retries the load).
+      }
+      for (const entry of entries) {
+        try {
+          const usageEvent = mapSessionEvent(entry.session, entry.event, {
+            cwd: this.options.resolveCwd?.(entry.session),
+            projects: this.options.projects,
+          }, entry.timing ?? undefined)
+          if (usageEvent && this.queue.enqueue(usageEvent)) queued += 1
+        } catch (error) {
+          this.logger?.warn?.(`skipped ${entry.event?.type}: ${error?.message ?? error}`)
+        }
+      }
+      if (queued > 0) {
+        this.schedule(this.flushDelayMs) // no wake-up once stopping: the queue stays for 补报
+        try {
+          await this.queue.persist()
+        } catch (error) {
+          // Disk trouble is not fatal: the events stay in memory and the next write retries.
+          this.logger?.warn?.(`cannot write queue: ${error?.message ?? error}`)
+        }
+      }
+    } finally {
+      // Settle even when the write failed: handle() never rejects and never hangs on disk errors.
+      for (const entry of entries) entry.done()
     }
   }
 
@@ -131,11 +255,25 @@ export class Collector {
     return outcome
   }
 
-  /** Resolves once no request is in flight and the last write is on disk, so a reloaded instance can take over. */
+  /**
+   * Resolves once every batch received before the stop is queued and written, no request is in
+   * flight and the last write is on disk, so a reloaded instance can take over.
+   *
+   * A stop never drops what was already accepted: events staged before the stop (even ones whose
+   * microtask has not run yet, or whose batch is still waiting for the queue file to load or for an
+   * earlier write) are mapped and written here, and the batches already in flight are awaited.
+   * Only events arriving after the stop are ignored, by `handle()`/`receive()`.
+   */
   async stop() {
     this.stopped = true
     if (this.timer) this.clearTimer(this.timer)
     this.timer = null
+    this.timerDue = Infinity
+    const staged = this.waiting
+    this.waiting = []
+    for (const entry of staged) this.close(entry)
+    if (staged.length > 0) await this.track(this.write(staged)).catch(() => {})
+    await Promise.all([...this.batches].map((batch) => batch.catch(() => {})))
     await this.ready?.catch(() => {})
     await this.uploader.stop()
     await this.queue.writing.catch(() => {})

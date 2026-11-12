@@ -38,12 +38,24 @@ func filterArgs(f Filter) []any {
 	return []any{providers, models, projects, f.Unattributed}
 }
 
+// speedExpr is the unrounded per request generation speed in tokens/s: the
+// decode span covers every output token but the first one, so N-1 tokens are
+// spread over generation_duration_ms. It is numeric, never a stored float.
+const speedExpr = `((e.output_tokens - 1)::numeric * 1000) / e.generation_duration_ms`
+
+// speedValid is the only condition under which speedExpr has a value. The final
+// known output tokens must exceed one, and a single chunk output (zero decode
+// span) yields no speed rather than a zero or an infinity.
+const speedValid = `e.output_tokens_quality = 'known' AND e.output_tokens > 1 AND e.generation_duration_ms > 0`
+
 // eventsQuery pages newest first by (occurred_at, id). $1 workspace, $2 start,
 // $3 end, $4..$7 filter, $8 has cursor, $9 cursor time, $10 cursor id, $11 limit+1.
 var eventsQuery = `SELECT e.id, e.source_id, e.occurred_at, e.received_at, e.provider, e.model,
   e.project_id, p.project_key, p.name, s.platform, s.instance_key,
   e.input_tokens, e.input_tokens_quality, e.output_tokens, e.output_tokens_quality,
-  e.total_tokens, e.total_tokens_quality, e.status, e.duration_ms
+  e.total_tokens, e.total_tokens_quality, e.status, e.duration_ms,
+  CASE WHEN ` + speedValid + ` THEN round(` + speedExpr + `, 6)::text END,
+  e.ttft_ms
 FROM usage_events e
 JOIN sources s ON s.workspace_id = e.workspace_id AND s.id = e.source_id
 LEFT JOIN projects p ON p.workspace_id = e.workspace_id AND p.id = e.project_id
@@ -74,7 +86,8 @@ func (s *Postgres) Events(ctx context.Context, params EventsParams) ([]EventRow,
 		if err := rows.Scan(&r.ID, &r.SourceID, &r.OccurredAt, &r.ReceivedAt, &r.Provider, &r.Model,
 			&r.ProjectID, &r.ProjectKey, &r.ProjectName, &r.Platform, &r.InstanceKey,
 			&r.Input.Value, &r.Input.Quality, &r.Output.Value, &r.Output.Quality,
-			&r.Total.Value, &r.Total.Quality, &r.Status, &r.DurationMS); err != nil {
+			&r.Total.Value, &r.Total.Quality, &r.Status, &r.DurationMS,
+			&r.GenerationSpeedTPS, &r.TTFTMS); err != nil {
 			return nil, database.SafeStoreError("scan request event", err)
 		}
 		out = append(out, r)
@@ -87,7 +100,10 @@ func (s *Postgres) Events(ctx context.Context, params EventsParams) ([]EventRow,
 
 // rateQuery samples the database statement start once and aggregates the
 // half-open window [as_of-60s, as_of) in the same statement. $1 workspace,
-// $2 optional fixed as_of, $3..$6 filter.
+// $2 optional fixed as_of, $3..$6 filter. The two generation metrics are
+// arithmetic means over their own valid samples, never token or duration
+// weighted: each request counts once. The average is taken over the unrounded
+// per request speed and rounded only once, at the end.
 var rateQuery = `WITH p AS (SELECT COALESCE($2::timestamptz, statement_timestamp()) AS as_of)
 SELECT p.as_of,
   (sum(e.total_tokens::numeric) FILTER (WHERE e.total_tokens_quality IN ('known','estimated')))::text,
@@ -95,7 +111,11 @@ SELECT p.as_of,
   count(*) FILTER (WHERE e.total_tokens_quality = 'known'),
   count(*) FILTER (WHERE e.total_tokens_quality = 'estimated'),
   count(*) FILTER (WHERE e.total_tokens_quality = 'missing'),
-  max(e.received_at)
+  max(e.received_at),
+  round(avg(` + speedExpr + `) FILTER (WHERE ` + speedValid + `), 6)::text,
+  count(*) FILTER (WHERE ` + speedValid + `),
+  round(avg(e.ttft_ms) FILTER (WHERE e.ttft_ms IS NOT NULL), 6)::text,
+  count(e.ttft_ms)
 FROM p
 LEFT JOIN usage_events e
   ON e.workspace_id = $1
@@ -112,7 +132,8 @@ func (s *Postgres) Rate(ctx context.Context, params RateParams) (RateRow, error)
 	}
 	args := append([]any{params.WorkspaceID, asOf}, filterArgs(params.Filter)...)
 	var r RateRow
-	if err := s.pool.QueryRow(ctx, rateQuery, args...).Scan(&r.AsOf, &r.Sum, &r.Events, &r.Known, &r.Estimated, &r.Missing, &r.LastReceived); err != nil {
+	if err := s.pool.QueryRow(ctx, rateQuery, args...).Scan(&r.AsOf, &r.Sum, &r.Events, &r.Known, &r.Estimated, &r.Missing, &r.LastReceived,
+		&r.SpeedAvg, &r.SpeedSamples, &r.TTFTAvg, &r.TTFTSamples); err != nil {
 		return RateRow{}, database.SafeStoreError("request rate", err)
 	}
 	return r, nil

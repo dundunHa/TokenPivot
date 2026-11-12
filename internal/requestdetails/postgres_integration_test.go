@@ -5,6 +5,7 @@ package requestdetails
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -222,6 +223,13 @@ type ev struct {
 	total    *int64
 	quality  string
 	id       pgtype.UUID
+	// out is the final output token count; outputQuality defaults to known and
+	// must be set to estimated/missing with out nil for those rows. gen and ttft
+	// are the raw client timings, nil when unknown.
+	out           *int64
+	outputQuality string
+	gen           *int64
+	ttft          *int64
 }
 
 func n(v int64) *int64 { return &v }
@@ -241,6 +249,13 @@ func (f *fixture) add(t *testing.T, e ev) pgtype.UUID {
 	if e.quality == "" {
 		e.quality = "known"
 	}
+	if e.outputQuality == "" {
+		if e.out != nil {
+			e.outputQuality = "known"
+		} else {
+			e.outputQuality = "missing"
+		}
+	}
 	if e.received.IsZero() {
 		e.received = e.at
 	}
@@ -253,9 +268,10 @@ func (f *fixture) add(t *testing.T, e ev) pgtype.UUID {
 	}
 	f.exec(t, `INSERT INTO usage_events (id,workspace_id,source_id,source_event_id,project_id,provider,model,occurred_at,received_at,normalization_version,payload_hash,
 input_tokens,input_tokens_quality,output_tokens,output_tokens_quality,total_tokens,total_tokens_quality,
-cache_read_tokens_quality,cache_write_tokens_quality,reasoning_tokens_quality)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'v1','\x00',NULL,'missing',NULL,'missing',$10,$11,'missing','missing','missing')`,
-		e.id, e.ws, srcFor(e.ws), fmt.Sprint("e", nextID), project, e.provider, e.model, e.at, e.received, e.total, e.quality)
+cache_read_tokens_quality,cache_write_tokens_quality,reasoning_tokens_quality,generation_duration_ms,ttft_ms)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'v1','\x00',NULL,'missing',$12,$13,$10,$11,'missing','missing','missing',$14,$15)`,
+		e.id, e.ws, srcFor(e.ws), fmt.Sprint("e", nextID), project, e.provider, e.model, e.at, e.received, e.total, e.quality,
+		e.out, e.outputQuality, e.gen, e.ttft)
 	return e.id
 }
 
@@ -608,5 +624,238 @@ func TestQueriesOnTerminatedConnectionAreUnavailable(t *testing.T) {
 	}
 	if _, err := f.pool.Exec(f.ctx, `SELECT * FROM no_such_table`); err == nil || errors.Is(database.SafeStoreError("x", err), database.ErrUnavailable) {
 		t.Fatalf("statement err = %v", err)
+	}
+}
+
+// detailByID returns the request detail of one event, failing when it is absent.
+func (f *fixture) detailByID(t *testing.T, id pgtype.UUID) Event {
+	t.Helper()
+	list, err := f.svc.Events(f.ctx, ws, withRange(url.Values{"limit": {"100"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range list.Items {
+		if item.ID == id.String() {
+			return item
+		}
+	}
+	t.Fatalf("event %s not in detail list", id.String())
+	return Event{}
+}
+
+// TestEventGenerationMetrics: only a known final output above one token over a
+// positive decode span yields a speed; every other shape stays unknown while an
+// independent valid TTFT is still returned. Historic rows keep both NULL.
+func TestEventGenerationMetrics(t *testing.T) {
+	f := newFixture(t)
+	at := asOf.Add(-10 * time.Second)
+	standard := f.add(t, ev{at: at, total: n(120), out: n(100), gen: n(2000), ttft: n(8000)})
+	singleChunk := f.add(t, ev{at: at, total: n(5), out: n(5), gen: n(0), ttft: n(300)})
+	oneToken := f.add(t, ev{at: at, total: n(1), out: n(1), gen: n(1500), ttft: n(50)})
+	estimated := f.add(t, ev{at: at, total: n(20), out: n(20), outputQuality: "estimated", gen: n(1000), ttft: n(70)})
+	missingOut := f.add(t, ev{at: at, quality: "missing", outputQuality: "missing", gen: n(1000), ttft: n(90)})
+	historic := f.add(t, ev{at: at, total: n(7)})
+	ttftOnly := f.add(t, ev{at: at, total: n(50), out: n(50), ttft: n(120)})
+
+	cases := []struct {
+		name   string
+		id     pgtype.UUID
+		speed  *string
+		hasTTF bool
+		ttft   int64
+	}{
+		{"standard", standard, ptrString("49.500000"), true, 8000},
+		{"single chunk", singleChunk, nil, true, 300},
+		{"one token", oneToken, nil, true, 50},
+		{"estimated output", estimated, nil, true, 70},
+		{"missing output", missingOut, nil, true, 90},
+		{"historic nulls", historic, nil, false, 0},
+		{"valid ttft only", ttftOnly, nil, true, 120},
+	}
+	for _, c := range cases {
+		item := f.detailByID(t, c.id)
+		if (c.speed == nil) != (item.GenerationSpeedTPS == nil) || (c.speed != nil && *item.GenerationSpeedTPS != *c.speed) {
+			t.Fatalf("%s speed = %v want %v", c.name, item.GenerationSpeedTPS, c.speed)
+		}
+		if (item.TTFTMS != nil) != c.hasTTF || (c.hasTTF && *item.TTFTMS != c.ttft) {
+			t.Fatalf("%s ttft = %v want %d (present %v)", c.name, item.TTFTMS, c.ttft, c.hasTTF)
+		}
+	}
+}
+
+func ptrString(v string) *string { return &v }
+
+// TestRateGenerationMetricsAverages: the two metrics average their own valid
+// samples arithmetically, rounded once at the end. Two valid speeds with
+// different token counts and decode spans separate the arithmetic mean (29.75)
+// from the duration weighted (36.333333) and token weighted (45.585586) forms.
+func TestRateGenerationMetricsAverages(t *testing.T) {
+	f := newFixture(t)
+	at := asOf.Add(-time.Second)
+	// A: only a TTFT sample.
+	f.add(t, ev{at: at, total: n(1), out: n(1), gen: n(1500), ttft: n(400)})
+	// Two valid speed and TTFT rows, deliberately different token counts and spans.
+	f.add(t, ev{at: at, total: n(120), out: n(100), gen: n(2000), ttft: n(1000)})
+	f.add(t, ev{at: at, total: n(11), out: n(11), gen: n(1000), ttft: n(3000)})
+	// C: nothing usable.
+	f.add(t, ev{at: at})
+	r := f.rate(t, ws, nil)
+	if r.GenerationSpeed.Unit != "tokens/s" || r.GenerationSpeed.SampleCount != 2 || r.GenerationSpeed.Value == nil || *r.GenerationSpeed.Value != "29.750000" {
+		t.Fatalf("speed = %+v", r.GenerationSpeed)
+	}
+	if r.TTFT.Unit != "ms" || r.TTFT.SampleCount != 3 || r.TTFT.Value == nil || *r.TTFT.Value != "1466.666667" {
+		t.Fatalf("ttft = %+v", r.TTFT)
+	}
+	// The legacy tokens/min fields survive unchanged next to the new objects.
+	if r.Unit != "tokens/min" || r.TotalTokens.Value == nil || *r.TotalTokens.Value != "132" {
+		t.Fatalf("legacy = %+v %+v", r.Unit, r.TotalTokens)
+	}
+	// Averages over non terminating per request values round only once.
+	f2 := newFixture(t)
+	f2.add(t, ev{at: at, out: n(2), gen: n(3000), ttft: n(1)})
+	f2.add(t, ev{at: at, out: n(2), gen: n(3000), ttft: n(2)})
+	r2 := f2.rate(t, ws, nil)
+	if r2.GenerationSpeed.Value == nil || *r2.GenerationSpeed.Value != "0.333333" {
+		t.Fatalf("repeating speed = %+v", r2.GenerationSpeed)
+	}
+	if r2.TTFT.Value == nil || *r2.TTFT.Value != "1.500000" {
+		t.Fatalf("repeating ttft = %+v", r2.TTFT)
+	}
+	// Rounding once at the end is observable. These two speeds are exactly
+	// 0.9999996 and 1.0000011; their mean is 1.00000035 and rounds to 1.000000,
+	// while averaging the already rounded 1.000000 and 1.000001 gives 1.0000005
+	// and would round to 1.000001. The spans are large only so the ratio lands on
+	// the boundary exactly, not because such timings are expected in traffic.
+	f3 := newFixture(t)
+	f3.add(t, ev{at: at, out: n(2500000), gen: n(2500000000)})
+	f3.add(t, ev{at: at, out: n(10000012), gen: n(10000000000)})
+	r3 := f3.rate(t, ws, nil)
+	if r3.GenerationSpeed.SampleCount != 2 || r3.GenerationSpeed.Value == nil || *r3.GenerationSpeed.Value != "1.000000" {
+		t.Fatalf("round once speed = %+v", r3.GenerationSpeed)
+	}
+}
+
+// TestRateGenerationMetricsSamplesAndWindow: no event, unusable rows mixed with
+// valid ones, the exact half-open boundary and a backfill outside the window
+// each keep the sample counts honest, and received_at never stands in for
+// occurred_at.
+func TestRateGenerationMetricsSamplesAndWindow(t *testing.T) {
+	f := newFixture(t)
+	r := f.rate(t, ws, nil)
+	if r.GenerationSpeed.Value != nil || r.GenerationSpeed.SampleCount != 0 || r.TTFT.Value != nil || r.TTFT.SampleCount != 0 {
+		t.Fatalf("empty = %+v %+v", r.GenerationSpeed, r.TTFT)
+	}
+	start := asOf.Add(-time.Minute)
+	// Left edge is inclusive, the right edge exclusive.
+	f.add(t, ev{at: start, out: n(11), gen: n(1000), ttft: n(0)})
+	f.add(t, ev{at: asOf, out: n(21), gen: n(1000), ttft: n(9999)})
+	// Unusable rows only: single chunk, N=1 and estimated output.
+	f.add(t, ev{at: start.Add(time.Second), out: n(9), gen: n(0), ttft: n(100)})
+	f.add(t, ev{at: start.Add(time.Second), out: n(1), gen: n(500)})
+	f.add(t, ev{at: start.Add(time.Second), out: n(9), outputQuality: "estimated", gen: n(500)})
+	r = f.rate(t, ws, nil)
+	if r.GenerationSpeed.SampleCount != 1 || r.GenerationSpeed.Value == nil || *r.GenerationSpeed.Value != "10.000000" {
+		t.Fatalf("speed = %+v", r.GenerationSpeed)
+	}
+	if r.TTFT.SampleCount != 2 || r.TTFT.Value == nil || *r.TTFT.Value != "50.000000" {
+		t.Fatalf("ttft = %+v", r.TTFT)
+	}
+	// A report whose occurred_at precedes the window must not move either average,
+	// whichever way received_at points.
+	f.add(t, ev{at: start.Add(-time.Microsecond), out: n(101), gen: n(1000), ttft: n(50000), received: asOf.Add(-time.Second)})
+	f.add(t, ev{at: start.Add(-time.Hour), out: n(201), gen: n(1000), ttft: n(60000), received: asOf.Add(-2 * time.Second)})
+	// A backfill inside the window counts at its original occurred_at.
+	f.add(t, ev{at: start.Add(2 * time.Second), out: n(101), gen: n(1000), ttft: n(300), received: asOf.Add(-3 * time.Second)})
+	r = f.rate(t, ws, nil)
+	if r.GenerationSpeed.SampleCount != 2 || r.GenerationSpeed.Value == nil || *r.GenerationSpeed.Value != "55.000000" {
+		t.Fatalf("backfill speed = %+v", r.GenerationSpeed)
+	}
+	if r.TTFT.SampleCount != 3 || r.TTFT.Value == nil || *r.TTFT.Value != "133.333333" {
+		t.Fatalf("backfill ttft = %+v", r.TTFT)
+	}
+}
+
+// TestRateGenerationMetricsAllSamplesInvalid: the window holds events, so the
+// legacy counters stay non zero, yet none of them is a valid sample of either
+// new metric. Both objects must then be value null with sample count zero,
+// never a zero average, and the single LEFT JOIN row of an empty window must not
+// be miscounted as an event.
+func TestRateGenerationMetricsAllSamplesInvalid(t *testing.T) {
+	f := newFixture(t)
+	at := asOf.Add(-time.Second)
+	// Single chunk: usable output size but a zero decode span.
+	f.add(t, ev{at: at, total: n(9), out: n(9), gen: n(0)})
+	// One output token: nothing to spread over the span.
+	f.add(t, ev{at: at, total: n(1), out: n(1), gen: n(500)})
+	// Estimated final output is not a known sample.
+	f.add(t, ev{at: at, total: n(9), out: n(9), outputQuality: "estimated", gen: n(500)})
+	// Missing output: no final count at all.
+	f.add(t, ev{at: at, total: n(4), quality: "missing", outputQuality: "missing", gen: n(500)})
+	// Known output but no decode timing at all.
+	f.add(t, ev{at: at, total: n(2), out: n(2)})
+	// No row carries a TTFT, so that sample set is empty for a second reason.
+	r := f.rate(t, ws, nil)
+	// The missing row still counts as an event but contributes no total.
+	if r.TotalTokens.EventCount != 5 || r.TotalTokens.Value == nil || *r.TotalTokens.Value != "21" {
+		t.Fatalf("legacy = %+v", r.TotalTokens)
+	}
+	if r.GenerationSpeed.Unit != "tokens/s" || r.GenerationSpeed.Value != nil || r.GenerationSpeed.SampleCount != 0 {
+		t.Fatalf("speed = %+v", r.GenerationSpeed)
+	}
+	if r.TTFT.Unit != "ms" || r.TTFT.Value != nil || r.TTFT.SampleCount != 0 {
+		t.Fatalf("ttft = %+v", r.TTFT)
+	}
+	body, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"generation_speed":{"unit":"tokens/s","value":null,"sample_count":0}`, `"ttft":{"unit":"ms","value":null,"sample_count":0}`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("body misses %s: %s", want, body)
+		}
+	}
+}
+
+// TestRateGenerationMetricsFilters: provider, model and project narrowing apply
+// the same way to both new objects and to the legacy total.
+func TestRateGenerationMetricsFilters(t *testing.T) {
+	f := newFixture(t)
+	at := asOf.Add(-time.Second)
+	f.add(t, ev{at: at, project: projA, provider: "p1", model: "m1", total: n(10), out: n(11), gen: n(1000), ttft: n(100)})
+	f.add(t, ev{at: at, project: projB, provider: "p2", model: "m1", total: n(20), out: n(21), gen: n(1000), ttft: n(300)})
+	f.add(t, ev{at: at, provider: "p1", model: "m2", total: n(30), out: n(31), gen: n(1000)})
+	cases := []struct {
+		q          url.Values
+		speedValue string
+		speedCount int64
+		ttftValue  string
+		ttftCount  int64
+	}{
+		{nil, "20.000000", 3, "200.000000", 2},
+		{url.Values{"provider": {"p1"}}, "20.000000", 2, "100.000000", 1},
+		{url.Values{"model": {"m1"}}, "15.000000", 2, "200.000000", 2},
+		{url.Values{"project": {"unattributed"}}, "30.000000", 1, "", 0},
+		{url.Values{"project": {projA.String()}}, "10.000000", 1, "100.000000", 1},
+		{url.Values{"project": {projB.String()}, "provider": {"p1"}}, "", 0, "", 0},
+	}
+	for _, c := range cases {
+		r := f.rate(t, ws, c.q)
+		if r.GenerationSpeed.SampleCount != c.speedCount || r.TTFT.SampleCount != c.ttftCount {
+			t.Fatalf("%v counts = %+v %+v", c.q, r.GenerationSpeed, r.TTFT)
+		}
+		if c.speedValue == "" {
+			if r.GenerationSpeed.Value != nil {
+				t.Fatalf("%v speed = %v want null", c.q, *r.GenerationSpeed.Value)
+			}
+		} else if r.GenerationSpeed.Value == nil || *r.GenerationSpeed.Value != c.speedValue {
+			t.Fatalf("%v speed = %v want %s", c.q, r.GenerationSpeed.Value, c.speedValue)
+		}
+		if c.ttftValue == "" {
+			if r.TTFT.Value != nil {
+				t.Fatalf("%v ttft = %v want null", c.q, *r.TTFT.Value)
+			}
+		} else if r.TTFT.Value == nil || *r.TTFT.Value != c.ttftValue {
+			t.Fatalf("%v ttft = %v want %s", c.q, r.TTFT.Value, c.ttftValue)
+		}
 	}
 }

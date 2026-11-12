@@ -55,6 +55,17 @@ export function apply(ctx, config) {
     })
   })
 
+  // Process-local timing of a finalized request, published after its Session event on the same
+  // stack. The collector stages the event synchronously, so a host without this event (旧宿主)
+  // still reports exactly as before. Must not throw into DSH.
+  ctx.on('agent/generation-timing', (payload) => {
+    try {
+      collector.receive(payload)
+    } catch (error) {
+      ctx.logger.warn(`tokenpivot-usage: cannot read generation timing: ${error?.message ?? error}`)
+    }
+  })
+
   // Returning the promise lets the host wait (if it does) before a reloaded instance starts writing.
   ctx.effect(() => () => collector.stop())
 }

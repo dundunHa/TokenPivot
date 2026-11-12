@@ -422,6 +422,7 @@ func decodeEvent(node *jsonNode) (*event, *rejection) {
 		haveModel      bool
 		haveOccurredAt bool
 		haveUsage      bool
+		haveTiming     bool
 	)
 	for _, member := range node.object {
 		switch member.key {
@@ -508,6 +509,23 @@ func decodeEvent(node *jsonNode) (*event, *rejection) {
 			default:
 				return nil, invalidItem("duration_ms must be a decimal integer or null")
 			}
+		case "generation_duration_ms":
+			// The attribute appearing at all — even as null — selects the v2
+			// comparison version: reporting an unknown timing is not the same as a
+			// client that has no concept of the field.
+			timing, rejection := decodeTiming(member.value, "generation_duration_ms")
+			if rejection != nil {
+				return nil, rejection
+			}
+			decoded.GenerationDurationMS = timing
+			haveTiming = true
+		case "ttft_ms":
+			timing, rejection := decodeTiming(member.value, "ttft_ms")
+			if rejection != nil {
+				return nil, rejection
+			}
+			decoded.TTFTMS = timing
+			haveTiming = true
 		default:
 			// An unknown event field rejects only this position.
 			return nil, invalidItem("event contains an unknown field")
@@ -521,8 +539,30 @@ func decodeEvent(node *jsonNode) (*event, *rejection) {
 		return nil, invalidItem("occurred_at must be RFC 3339 with an offset and at most 6 fractional digits")
 	}
 	decoded.OccurredAt = occurredAt
+	decoded.TimingFieldsPresent = haveTiming
 	decoded.PayloadHash = sha256.Sum256(decoded.normalizedText())
 	return &decoded, nil
+}
+
+// decodeTiming decodes one optional client timing. An omitted attribute leaves
+// an unknown timing behind and is reported by the caller through its own flag; an
+// explicit null is the same unknown value but still counts as the attribute
+// appearing. A negative value or a value above the safe integer range is
+// permanent, exactly like the other decimal integer fields.
+func decodeTiming(node *jsonNode, field string) (*int64, *rejection) {
+	switch node.kind {
+	case jsonNull:
+		return nil, nil
+	case jsonNumber:
+		value, ok := parseInteger(node.number)
+		if !ok {
+			return nil, invalidItem(field + " must be a decimal integer within the safe range")
+		}
+		timing := value
+		return &timing, nil
+	default:
+		return nil, invalidItem(field + " must be a decimal integer or null")
+	}
 }
 
 // decodeUsage decodes the six optional metrics, then applies the five cross-field

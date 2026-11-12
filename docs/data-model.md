@@ -1,6 +1,6 @@
 # TokenPivot 数据模型设计
 
-> T-001 技术设计草案；核心边界已确认，字段与索引须经接口样例及压测后定稿。`workspaces`、`projects`、`sources`、`ingest_credentials` 四张基础表已由迁移 00002 实现，`usage_events` 由 00003、`usage_minute_stats` 由 00004、`users` 与 `sessions` 由 00005、`workspace_memberships` 由 00006 实现；其余表仍只是设计，不是数据库已实现的说明。
+> T-001 技术设计草案；核心边界已确认，字段与索引须经接口样例及压测后定稿。`workspaces`、`projects`、`sources`、`ingest_credentials` 四张基础表已由迁移 00002 实现，`usage_events` 由 00003（00008 追加两个可空计时列）、`usage_minute_stats` 由 00004、`users` 与 `sessions` 由 00005、`workspace_memberships` 由 00006 实现；其余表仍只是设计，不是数据库已实现的说明。
 
 ## 1. 关系
 
@@ -59,6 +59,7 @@ ID 用 UUID v7，由数据库默认值 `uuidv7()` 生成，写入后用 `RETURNI
 | cache_read_tokens/cache_write_tokens/reasoning_tokens | bigint，可空 | 来源可获取的子集，不额外加到 total |
 | `<metric>_quality`（每个指标一列） | text，必填 | known/estimated/missing，禁止只用一个全局完整标记掩盖分字段差异；指标值为 NULL 当且仅当质量为 missing，由入口校验，迁移不加 CHECK |
 | status/duration_ms | text / bigint，可空 | 来源不可得时为空；不用这些字段虚构延迟分位数 |
+| generation_duration_ms/ttft_ms | bigint，可空，无默认值 | 迁移 00008 新增；客户端观测的 decode 时长与首 token 延迟（毫秒），只用原始整数，不存派生速度。来源不可得时为空，**不回填历史行**；`0` 是真实观测，NULL 才是未知 |
 
 不加 created_at/updated_at：received_at 已是写入时间，行不可变；也不存原始报文或 jsonb，比较集合已落成列。
 
@@ -69,6 +70,8 @@ ID 用 UUID v7，由数据库默认值 `uuidv7()` 生成，写入后用 `RETURNI
 权限与不可变：服务角色 `tokenpivot_app` 在本表上只有 SELECT、INSERT，不授予 UPDATE、DELETE、TRUNCATE、REFERENCES、TRIGGER。因此 `UPDATE`、`ON CONFLICT DO UPDATE`、`SELECT … FOR SHARE` 对服务角色都因权限不足失败，即使 SQL 写错也无法覆盖内容或续期 received_at；清理所需的 DELETE 由保留清理任务在自己的迁移里另行授权。无 RLS 时租户隔离靠每条 SQL 都带认证得到的 workspace_id，由写入与读查询任务各自实现并测试。
 
 比较依据与校验边界：持久化 normalization_version、payload_hash 和比较集合的每个字段（按冻结精度成列）；跨版本比较须基于实际留存信息，类型化列不保证能按新规则无损重建。数据库不校验摘要与列是否一致、不校验非负与取值范围、不建外键与 CHECK；这些都由入口校验一次，存储层不重复。
+
+规范化版本与新增计时列：`normalization_version` 目前有两个已知值，`tokenpivot-usage-event/v1`（比较集合 7 个元素）与 `tokenpivot-usage-event/v2`（在 v1 之后追加 `generation_duration_ms`、`ttft_ms`，共 9 个元素）。请求里两个计时属性都未出现时按 v1 落库，出现任一个时按 v2 落库（显式 `null` 也算出现）。已知 v1 与 v2 的共同比较版本固定为 v1：v2 是纯追加，v1 的每列都保留，因此 v2 旧行能用留存列重建 v1 摘要，v1 请求也能投影到 v1。两端任一是未知版本时返回 `NORMALIZATION_INCOMPATIBLE`。两列不参与分钟聚合，也不改动事件身份与既有用量。
 
 保留按首次 received_at 180 天。时间有效性校验先于查重：过期返回 expired，不要求继续识别 duplicate/conflict。清理与有效写入边界使用一致服务端截点；未来事件不进入表。修改 occurred_at 是修改业务内容，不是合法重试；超出防重期限后不承诺识别被篡改身份。
 

@@ -24,24 +24,32 @@ const (
 
 	// insertEventQuery relies on the identity unique constraint as the only
 	// duplicate arbiter: no read-before-write and no overwrite. RETURNING tells the
-	// caller whether a row was actually inserted.
+	// caller whether a row was actually inserted. The two client observed timings
+	// are nullable and carry no default, so an unknown timing stays NULL.
 	insertEventQuery = `INSERT INTO usage_events (
     workspace_id, source_id, source_event_id, project_id, provider, model, occurred_at, received_at,
     normalization_version, payload_hash,
     input_tokens, input_tokens_quality, output_tokens, output_tokens_quality,
     total_tokens, total_tokens_quality, cache_read_tokens, cache_read_tokens_quality,
     cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality,
-    status, duration_ms
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+    status, duration_ms, generation_duration_ms, ttft_ms
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
 ON CONFLICT ON CONSTRAINT uk_usage_events_workspace_id_source_id_source_event_id DO NOTHING
 RETURNING 1` //nolint:lll // the SQL is written out column by column on purpose
 
 	// existingEventQuery reads the stored comparison basis by its identity in its
 	// own statement. Under Read Committed the INSERT snapshot cannot be assumed to
-	// see a row another transaction just committed. Only the two comparison columns
-	// are read: the stored normalization version decides comparability, and the
-	// stored digest decides duplicate versus conflict.
-	existingEventQuery = `SELECT normalization_version, payload_hash
+	// see a row another transaction just committed.
+	//
+	// It reads every retained comparison column, not just the stored version and
+	// digest: a v2 row's digest is not comparable with a v1 projection, so the
+	// common version's digest has to be rebuilt from these columns.
+	existingEventQuery = `SELECT normalization_version, payload_hash,
+    occurred_at, project_id, provider, model,
+    input_tokens, input_tokens_quality, output_tokens, output_tokens_quality,
+    total_tokens, total_tokens_quality, cache_read_tokens, cache_read_tokens_quality,
+    cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality,
+    status, duration_ms, generation_duration_ms, ttft_ms
 FROM usage_events WHERE workspace_id = $1 AND source_id = $2 AND source_event_id = $3`
 
 	// touchSourceQuery moves the source stamp forward only. GREATEST keeps an older
@@ -127,11 +135,26 @@ func (t *postgresTx) InsertEvent(ctx context.Context, event storedEvent) (bool, 
 	return true, nil
 }
 
-// ExistingEvent reads the stored comparison basis of one identity, if any.
+// ExistingEvent reads the stored comparison basis of one identity, if any. The
+// whole retained comparison content is loaded so a cross-version comparison can
+// rebuild the common version's digest without a second statement.
 func (t *postgresTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
-	var existing storedEvent
+	var (
+		existing                            storedEvent
+		inputValue, outputValue             *int64
+		totalValue, cacheReadValue          *int64
+		cacheWriteValue, reasoningValue     *int64
+		inputQuality, outputQuality         string
+		totalQuality, cacheReadQuality      string
+		cacheWriteQuality, reasoningQuality string
+	)
 	err := t.tx.QueryRow(ctx, existingEventQuery, workspaceID, sourceID, sourceEventID).Scan(
 		&existing.NormalizationVersion, &existing.PayloadHash,
+		&existing.OccurredAt, &existing.ProjectID, &existing.Provider, &existing.Model,
+		&inputValue, &inputQuality, &outputValue, &outputQuality,
+		&totalValue, &totalQuality, &cacheReadValue, &cacheReadQuality,
+		&cacheWriteValue, &cacheWriteQuality, &reasoningValue, &reasoningQuality,
+		&existing.Status, &existing.DurationMS, &existing.GenerationDurationMS, &existing.TTFTMS,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return storedEvent{}, false, nil
@@ -139,7 +162,21 @@ func (t *postgresTx) ExistingEvent(ctx context.Context, workspaceID, sourceID cr
 	if err != nil {
 		return storedEvent{}, false, database.SafeError("ingestion existing event", err)
 	}
+	existing.Usage = usage{
+		Input:      metricFrom(inputValue, inputQuality),
+		Output:     metricFrom(outputValue, outputQuality),
+		Total:      metricFrom(totalValue, totalQuality),
+		CacheRead:  metricFrom(cacheReadValue, cacheReadQuality),
+		CacheWrite: metricFrom(cacheWriteValue, cacheWriteQuality),
+		Reasoning:  metricFrom(reasoningValue, reasoningQuality),
+	}
 	return existing, true, nil
+}
+
+// metricFrom rebuilds one stored metric from its retained value and quality
+// columns. A NULL value is the missing quality's value, never a real zero.
+func metricFrom(value *int64, quality string) aggregation.Metric {
+	return aggregation.Metric{Value: value, Quality: aggregation.Quality(quality)}
 }
 
 // ApplyMinute writes the minute increment through the aggregation package, inside
@@ -180,7 +217,7 @@ func eventArgs(event storedEvent) []any {
 		metricValue(event.Usage.CacheRead), string(event.Usage.CacheRead.Quality),
 		metricValue(event.Usage.CacheWrite), string(event.Usage.CacheWrite.Quality),
 		metricValue(event.Usage.Reasoning), string(event.Usage.Reasoning.Quality),
-		event.Status, event.DurationMS,
+		event.Status, event.DurationMS, event.GenerationDurationMS, event.TTFTMS,
 	}
 }
 
