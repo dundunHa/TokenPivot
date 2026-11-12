@@ -49,8 +49,3 @@
 ## 前端与认证
 
 ## 请求指标
-
-- [ ] T-069 {running} {P1} **请求生成速度与 TTFT：生产集成与发布** 已保留生产基线并通过复审及完整回归；使用迁移00009，正在发布。
-  - plan: openspec/changes/generation-speed-and-ttft/design.md
-  - 分支: generation-speed-production-integration
-  - 提交: 740f7f11c12071e6aa51165b99edf66cee5063ff
