@@ -101,17 +101,15 @@ func (s *Postgres) Events(ctx context.Context, params EventsParams) ([]EventRow,
 
 // rateQuery samples the database statement start once and aggregates the
 // half-open window [as_of-60s, as_of) in the same statement. $1 workspace,
-// $2 optional fixed as_of, $3..$6 filter. The two generation metrics are
-// arithmetic means over their own valid samples, never token or duration
+// $2 optional fixed as_of, $3..$6 filter. It returns the raw event count of the
+// window, the last received stamp and the two generation metrics. Those metrics
+// are arithmetic means over their own valid samples, never token or duration
 // weighted: each request counts once. The average is taken over the unrounded
-// per request speed and rounded only once, at the end.
+// per request speed and rounded only once, at the end. There is no token sum: the
+// window reports how many requests ended, not a tokens/min total.
 var rateQuery = `WITH p AS (SELECT COALESCE($2::timestamptz, statement_timestamp()) AS as_of)
 SELECT p.as_of,
-  (sum(e.total_tokens::numeric) FILTER (WHERE e.total_tokens_quality IN ('known','estimated')))::text,
   count(e.id),
-  count(*) FILTER (WHERE e.total_tokens_quality = 'known'),
-  count(*) FILTER (WHERE e.total_tokens_quality = 'estimated'),
-  count(*) FILTER (WHERE e.total_tokens_quality = 'missing'),
   max(e.received_at),
   round(avg(` + speedExpr + `) FILTER (WHERE ` + speedValid + `), 6)::text,
   count(*) FILTER (WHERE ` + speedValid + `),
@@ -210,7 +208,7 @@ func (s *Postgres) Rate(ctx context.Context, params RateParams) (RateRow, error)
 	}
 	args := append([]any{params.WorkspaceID, asOf}, filterArgs(params.Filter)...)
 	var r RateRow
-	if err := s.pool.QueryRow(ctx, rateQuery, args...).Scan(&r.AsOf, &r.Sum, &r.Events, &r.Known, &r.Estimated, &r.Missing, &r.LastReceived,
+	if err := s.pool.QueryRow(ctx, rateQuery, args...).Scan(&r.AsOf, &r.EventCount, &r.LastReceived,
 		&r.SpeedAvg, &r.SpeedSamples, &r.TTFTAvg, &r.TTFTSamples); err != nil {
 		return RateRow{}, database.SafeStoreError("request rate", err)
 	}

@@ -83,16 +83,12 @@ export interface RateData {
   start: string;
   end: string;
   asOf: string;
-  /** 旧 tokens/min 字段：仅保留给旧前端，页面不再展示。 */
-  value: string | null;
+  /** 窗口内的原始事件数；不是 token 数，也不是任一项的样本数。 */
   eventCount: number;
-  knownCount: number;
-  estimatedCount: number;
-  missingCount: number;
   windowLastReceivedAt: string | null;
-  /** 近 60 秒平均生成速度；旧后端省略时为 null 值、0 样本。 */
+  /** 近 60 秒平均生成速度；无样本时为 null 值、0 样本，对象本身必有。 */
   generationSpeed: RateSample<"tokens/s">;
-  /** 近 60 秒平均 TTFT；旧后端省略时为 null 值、0 样本。 */
+  /** 近 60 秒平均 TTFT；无样本时为 null 值、0 样本，对象本身必有。 */
   ttft: RateSample<"ms">;
 }
 
@@ -144,15 +140,6 @@ function metricDecimal(value: unknown): string {
   return value;
 }
 
-/** 明细行的可选新字段：旧后端省略该键、新后端给 null 都按缺失处理。 */
-function optionalMetricDecimal(value: unknown): string | null {
-  return value === undefined || value === null ? null : metricDecimal(value);
-}
-
-function optionalSafeInteger(value: unknown): number | null {
-  return value === undefined ? null : nullableSafeInteger(value);
-}
-
 /** 必填的非负安全整数：指标对象必带样本数，null 与缺失都是畸形响应。 */
 function safeCount(value: unknown): number {
   const parsed = nullableSafeInteger(value);
@@ -161,11 +148,10 @@ function safeCount(value: unknown): number {
 }
 
 /**
- * 旧后端会整块省略新增对象：省略按「无有效样本」处理（值 null、样本数 0），
- * 而不是报错或当成 0。显式 null 对象不是约定的形状，按畸形响应拒绝。
+ * 指标对象必有：省略整个对象、显式 null 或单位不符都是畸形响应。无有效样本的
+ * 合法形状是 value:null 加 sample_count:0，不是缺键。
  */
 function rateSample<U extends string>(value: unknown, unit: U): RateSample<U> {
-  if (value === undefined) return { unit, value: null, sampleCount: 0 };
   const r = record(value);
   if (text(r.unit) !== unit) throw badResponse();
   return {
@@ -214,8 +200,11 @@ function row(value: unknown): RequestRow {
     total: token(r.total_tokens),
     status: nullableText(r.status),
     durationMs: r.duration_ms === null ? null : count(r.duration_ms),
-    generationSpeedTps: optionalMetricDecimal(r.generation_speed_tps),
-    ttftMs: optionalSafeInteger(r.ttft_ms),
+    generationSpeedTps:
+      r.generation_speed_tps === null
+        ? null
+        : metricDecimal(r.generation_speed_tps),
+    ttftMs: nullableSafeInteger(r.ttft_ms),
   };
 }
 
@@ -272,20 +261,11 @@ function parseSpeed(body: unknown): SpeedData {
 
 function parseRate(body: unknown): RateData {
   const r = record(body);
-  const total = record(r.total_tokens);
-  const value = total.value;
-  if (value !== null && (typeof value !== "string" || !DECIMAL.test(value))) {
-    throw badResponse();
-  }
   return {
     start: text(r.start),
     end: text(r.end),
     asOf: text(r.as_of),
-    value,
-    eventCount: count(total.event_count),
-    knownCount: count(total.known_count),
-    estimatedCount: count(total.estimated_count),
-    missingCount: count(total.missing_count),
+    eventCount: count(r.event_count),
     windowLastReceivedAt: nullableText(r.window_last_received_at),
     generationSpeed: rateSample(r.generation_speed, "tokens/s"),
     ttft: rateSample(r.ttft, "ms"),

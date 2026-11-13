@@ -53,17 +53,10 @@ RETURNING 1` //nolint:lll // the SQL is written out column by column on purpose
 
 	// existingEventQuery reads the stored comparison basis by its identity in its
 	// own statement. Under Read Committed the INSERT snapshot cannot be assumed to
-	// see a row another transaction just committed.
-	//
-	// It reads every retained comparison column, not just the stored version and
-	// digest: a v2 row's digest is not comparable with a v1 projection, so the
-	// common version's digest has to be rebuilt from these columns.
-	existingEventQuery = `SELECT normalization_version, payload_hash,
-    occurred_at, project_id, provider, model,
-    input_tokens, input_tokens_quality, output_tokens, output_tokens_quality,
-    total_tokens, total_tokens_quality, cache_read_tokens, cache_read_tokens_quality,
-    cache_write_tokens, cache_write_tokens_quality, reasoning_tokens, reasoning_tokens_quality,
-    status, duration_ms, generation_duration_ms, ttft_ms
+	// see a row another transaction just committed. Only the stored version and
+	// digest are needed: a v2 row is compared bytewise and any other version is
+	// refused, so no other column is projected or re-rendered.
+	existingEventQuery = `SELECT normalization_version, payload_hash
 FROM usage_events WHERE workspace_id = $1 AND source_id = $2 AND source_event_id = $3`
 
 	// touchSourceQuery moves the source stamp forward only. GREATEST keeps an older
@@ -309,64 +302,33 @@ func (t *postgresTx) InsertEvent(ctx context.Context, event storedEvent) (bool, 
 	return inserted, nil
 }
 
-// ExistingEvent reads the stored comparison basis of one identity, if any. The
-// whole retained comparison content is loaded so a cross-version comparison can
-// rebuild the common version's digest without a second statement. The clock
-// sample of the same round trip feeds the window re-check that follows the read.
-func (t *postgresTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
+// ExistingEvent reads the stored comparison basis of one identity, if any. Only the
+// version and digest are loaded, because that is all a duplicate check needs. The
+// clock sample of the same round trip feeds the window re-check that follows the
+// read.
+func (t *postgresTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (existingEvent, bool, error) {
 	t.sampledNow = nil
 	batch := newPipelinedBatch(t.tx)
 	if err := batch.add(existingEventQuery, workspaceID, sourceID, sourceEventID); err != nil {
-		return storedEvent{}, false, database.SafeError("ingestion existing event", err)
+		return existingEvent{}, false, database.SafeError("ingestion existing event", err)
 	}
 	if err := batch.add(nowQuery); err != nil {
-		return storedEvent{}, false, database.SafeError("ingestion server time", err)
+		return existingEvent{}, false, database.SafeError("ingestion server time", err)
 	}
 	mrr := batch.exec(ctx)
 	defer func() { _ = mrr.Close() }()
 
-	var (
-		existing                            storedEvent
-		inputValue, outputValue             *int64
-		totalValue, cacheReadValue          *int64
-		cacheWriteValue, reasoningValue     *int64
-		inputQuality, outputQuality         string
-		totalQuality, cacheReadQuality      string
-		cacheWriteQuality, reasoningQuality string
-	)
+	var existing existingEvent
 	found := true
-	err := readBatchRow(mrr, batch.typeMap,
-		&existing.NormalizationVersion, &existing.PayloadHash,
-		&existing.OccurredAt, &existing.ProjectID, &existing.Provider, &existing.Model,
-		&inputValue, &inputQuality, &outputValue, &outputQuality,
-		&totalValue, &totalQuality, &cacheReadValue, &cacheReadQuality,
-		&cacheWriteValue, &cacheWriteQuality, &reasoningValue, &reasoningQuality,
-		&existing.Status, &existing.DurationMS, &existing.GenerationDurationMS, &existing.TTFTMS,
-	)
+	err := readBatchRow(mrr, batch.typeMap, &existing.NormalizationVersion, &existing.PayloadHash)
 	if errors.Is(err, pgx.ErrNoRows) {
-		existing = storedEvent{}
+		existing = existingEvent{}
 		found = false
 	} else if err != nil {
-		return storedEvent{}, false, database.SafeError("ingestion existing event", err)
-	}
-	if found {
-		existing.Usage = usage{
-			Input:      metricFrom(inputValue, inputQuality),
-			Output:     metricFrom(outputValue, outputQuality),
-			Total:      metricFrom(totalValue, totalQuality),
-			CacheRead:  metricFrom(cacheReadValue, cacheReadQuality),
-			CacheWrite: metricFrom(cacheWriteValue, cacheWriteQuality),
-			Reasoning:  metricFrom(reasoningValue, reasoningQuality),
-		}
+		return existingEvent{}, false, database.SafeError("ingestion existing event", err)
 	}
 	t.captureSampledNow(mrr, batch.typeMap)
 	return existing, found, nil
-}
-
-// metricFrom rebuilds one stored metric from its retained value and quality
-// columns. A NULL value is the missing quality's value, never a real zero.
-func metricFrom(value *int64, quality string) aggregation.Metric {
-	return aggregation.Metric{Value: value, Quality: aggregation.Quality(quality)}
 }
 
 // ApplyMinute writes the minute increment through the aggregation package, inside

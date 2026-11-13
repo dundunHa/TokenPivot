@@ -59,15 +59,7 @@ const rateBody = (over: Record<string, unknown> = {}) => ({
   start: "2026-10-28T11:59:00Z",
   end: "2026-10-28T12:00:00Z",
   as_of: "2026-10-28T12:00:00Z",
-  window_seconds: 60,
-  unit: "tokens/min",
-  total_tokens: {
-    value: "12000",
-    event_count: 5,
-    known_count: 3,
-    estimated_count: 1,
-    missing_count: 1,
-  },
+  event_count: 5,
   window_last_received_at: "2026-10-28T11:59:59Z",
   generation_speed: metric("tokens/s", "49.500000", 2),
   ttft: metric("ms", "8000.000000", 3),
@@ -99,17 +91,16 @@ describe("request detail generation metrics", () => {
     expect(body.items[0]?.ttftMs).toBe(8000);
   });
 
-  it("treats explicit null and an old backend that omits the keys as missing", async () => {
-    const legacy = item({ id: "e2" });
-    delete (legacy as Record<string, unknown>).generation_speed_tps;
-    delete (legacy as Record<string, unknown>).ttft_ms;
+  it("treats an explicit null as missing and a missing key as a bad response", async () => {
     const body = await events([
       item({ generation_speed_tps: null, ttft_ms: null }),
-      legacy,
     ]);
-    for (const row of body.items) {
-      expect(row.generationSpeedTps).toBeNull();
-      expect(row.ttftMs).toBeNull();
+    expect(body.items[0]?.generationSpeedTps).toBeNull();
+    expect(body.items[0]?.ttftMs).toBeNull();
+    for (const field of ["generation_speed_tps", "ttft_ms"]) {
+      const incomplete = item({ id: "e2" });
+      delete (incomplete as Record<string, unknown>)[field];
+      await failure(events([incomplete]));
     }
   });
 
@@ -164,20 +155,18 @@ describe("current usage rate generation metrics", () => {
       value: "8000.000000",
       sampleCount: 3,
     });
-    // 旧 tokens/min 字段仍解析，供旧前端读取。
-    expect(body.value).toBe("12000");
+    expect(body.eventCount).toBe(5);
   });
 
-  it("reads an old backend that omits both objects as unknown with zero samples", async () => {
-    const body = await rate(
-      rateBody({ generation_speed: undefined, ttft: undefined }),
-    );
-    expect(body.generationSpeed).toEqual({
-      unit: "tokens/s",
-      value: null,
-      sampleCount: 0,
-    });
-    expect(body.ttft).toEqual({ unit: "ms", value: null, sampleCount: 0 });
+  it("rejects a body that omits either metric object or the event count", async () => {
+    for (const over of [
+      { generation_speed: undefined },
+      { ttft: undefined },
+      { event_count: undefined },
+      { event_count: -1 },
+    ]) {
+      await failure(rate(rateBody(over)));
+    }
   });
 
   it("keeps a null average distinct from a zero average", async () => {

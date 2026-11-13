@@ -155,7 +155,8 @@ test('old host (no notice at all): reports the original v1 shape, no extra keys'
   await drain()
   await done
   const [event] = collector.queue.peek(1)
-  assert.ok(!('generation_duration_ms' in event) && !('ttft_ms' in event))
+  assert.equal(event.generation_duration_ms, null)
+  assert.equal(event.ttft_ms, null)
   assert.deepEqual(event.usage.input_tokens, { value: 10, quality: 'known' })
   await collector.stop()
 })
@@ -171,8 +172,8 @@ test('late notice after the microtask is ignored and never attaches to a later r
   await drain()
   await second
   const [a, b] = collector.queue.peek(10)
-  assert.ok(!('ttft_ms' in a))
-  assert.ok(!('ttft_ms' in b))
+  assert.equal(a.ttft_ms, null)
+  assert.equal(b.ttft_ms, null)
   assert.equal(collector.queue.size, 2)
   await collector.stop()
 })
@@ -191,7 +192,7 @@ test('notice for an unknown seq, a foreign session or a malformed payload is ign
   await drain()
   await done
   const [event] = collector.queue.peek(1)
-  assert.ok(!('ttft_ms' in event))
+  assert.equal(event.ttft_ms, null)
   assert.equal(collector.queue.size, 1)
   await collector.stop()
 })
@@ -209,7 +210,7 @@ test('event without seq or without timing still reports; timing unknown stays om
   await Promise.all([doneA, doneB])
   const items = collector.queue.peek(10)
   assert.equal(items.length, 2)
-  assert.ok(items.every((e) => !('ttft_ms' in e) && !('generation_duration_ms' in e)))
+  assert.ok(items.every((e) => e.ttft_ms === null && e.generation_duration_ms === null))
   await collector.stop()
 })
 
@@ -275,7 +276,8 @@ test('notice arriving before the Session event has nothing to attach to: reporte
   await drain()
   await done
   const [event] = collector.queue.peek(1)
-  assert.ok(!('ttft_ms' in event) && !('generation_duration_ms' in event))
+  assert.equal(event.ttft_ms, null)
+  assert.equal(event.generation_duration_ms, null)
   assert.equal(collector.queue.size, 1)
   await collector.stop()
 })
@@ -330,7 +332,8 @@ test('delayed queue load: an event with no same-stack notice reports without tim
   await started
   await done
   const [event] = collector.queue.peek(1)
-  assert.ok(!('ttft_ms' in event) && !('generation_duration_ms' in event))
+  assert.equal(event.ttft_ms, null)
+  assert.equal(event.generation_duration_ms, null)
   await collector.stop()
 })
 
@@ -354,8 +357,8 @@ test('notice arriving while a persist is in flight cannot attach to another even
   await Promise.all([first, second])
   const byId = new Map(collector.queue.peek(10).map((e) => [e.source_event_id, e]))
   assert.equal(byId.get('dsh:msg:m-a').ttft_ms, 500)
-  assert.ok(!('ttft_ms' in byId.get('dsh:msg:m-b')), 'the late notice must not attach')
-  assert.ok(!('generation_duration_ms' in byId.get('dsh:msg:m-b')))
+  assert.equal(byId.get('dsh:msg:m-b').ttft_ms, null, 'the late notice must not attach')
+  assert.equal(byId.get('dsh:msg:m-b').generation_duration_ms, null)
   await collector.stop()
 })
 

@@ -6,7 +6,7 @@
   "type": "module",
   "main": "./index.js",
   "exports": { ".": "./index.js" },
-  "files": ["index.js", "lib/*.js", "README.md"],
+  "files": ["index.js", "lib/*.js", "scripts/*.js", "README.md"],
   "engines": { "node": ">=22.19" },
   "scripts": { "test": "node --test test/" },
   "pi": { "extensions": ["./index.js"] }

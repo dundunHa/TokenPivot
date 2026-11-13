@@ -15,10 +15,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
-	"strconv"
 	"time"
 
 	"github.com/dundunHa/TokenPivot/internal/aggregation"
@@ -26,17 +24,8 @@ import (
 	"github.com/dundunHa/TokenPivot/internal/database"
 )
 
-// Frozen contract limits and versions.
+// Frozen contract limits.
 const (
-	// normalizationVersion is the v1 comparison algorithm: the seven element array
-	// every event without generation timings is compared under. It stays the
-	// version written for a request that carries neither timing attribute, so an
-	// old client's retransmission keeps its original identity.
-	normalizationVersion = "tokenpivot-usage-event/v1"
-	// normalizationVersionV2 is v1 plus the two client observed timings appended
-	// as elements 8 and 9. It is chosen by the request shape, never by the client,
-	// and both known versions project onto v1 for a cross-version comparison.
-	normalizationVersionV2 = "tokenpivot-usage-event/v2"
 	// retainedWindow is the accepted occurred_at age; both ends are inclusive.
 	retainedWindow = 180 * 24 * time.Hour
 	// maxSafeInteger is the largest value a JSON integer may carry (2^53-1).
@@ -127,7 +116,7 @@ type itemTx interface {
 	// already exists.
 	InsertEvent(ctx context.Context, event storedEvent) (bool, error)
 	// ExistingEvent reads the stored comparison basis of one identity.
-	ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error)
+	ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (existingEvent, bool, error)
 	// ApplyMinute writes the minute increment inside this transaction.
 	ApplyMinute(ctx context.Context, input aggregation.MinuteInput) error
 	// Commit commits the detail row and the minute increment together.
@@ -162,26 +151,13 @@ type event struct {
 	Usage      usage
 	Status     *string
 	DurationMS *int64
-	// GenerationDurationMS and TTFTMS are the client observed raw timings. A nil
-	// pointer means unknown: omitted, explicit null, or an earlier client.
+	// GenerationDurationMS and TTFTMS are the client observed raw timings. Both
+	// attributes are required, so a nil pointer always means an explicit null: the
+	// client reported an unknown timing, never a real zero.
 	GenerationDurationMS *int64
 	TTFTMS               *int64
-	// TimingFieldsPresent records that at least one timing attribute appeared in
-	// the request, even as null. It selects the comparison version and is never
-	// stored, because a stored row is compared by its retained columns instead.
-	TimingFieldsPresent bool
-	// PayloadHash is the raw SHA-256 digest of the normalized comparison text of
-	// this request's own version.
+	// PayloadHash is the raw SHA-256 digest of the nine element normalization text.
 	PayloadHash [sha256.Size]byte
-}
-
-// version reports the comparison version this request is normalized under. The
-// request shape decides it: two attributes absent is v1, any appearance is v2.
-func (e *event) version() string {
-	if e.TimingFieldsPresent {
-		return normalizationVersionV2
-	}
-	return normalizationVersion
 }
 
 // storedEvent is one immutable detail row: the identity, the first-receive stamp
@@ -202,6 +178,14 @@ type storedEvent struct {
 	DurationMS           *int64
 	GenerationDurationMS *int64
 	TTFTMS               *int64
+}
+
+// existingEvent is the narrow comparison basis of an already stored identity. Only
+// the persisted version and digest are read: a v2 row is compared bytewise, and any
+// other version is refused instead of being projected or rebuilt.
+type existingEvent struct {
+	NormalizationVersion string
+	PayloadHash          []byte
 }
 
 // rejection is one permanent per-item refusal decided before any database write.
@@ -383,7 +367,7 @@ func (s *Service) processItem(ctx context.Context, credential credentials.Creden
 		resolved := *e
 		resolved.ProjectKey = ""
 		resolved.ProjectID = id
-		resolved.PayloadHash = sha256.Sum256(resolved.normalizedText())
+		resolved.PayloadHash = DigestV2(resolved.normalizationInput())
 		e = &resolved
 	}
 
@@ -496,53 +480,18 @@ func checkWindow(occurredAt, now time.Time) verdict {
 	return verdictValid
 }
 
-// compareContent classifies an existing identity. Only a common version both
-// sides can form losslessly is compared; an unknown stored version cannot be
-// projected and is reported as permanently incompatible instead of guessed.
-//
-// Both known versions retain the whole v1 comparison content, so v1 is always a
-// lossless common projection. When the stored row and this request were
-// normalized under different versions, the stored digest is rebuilt from the
-// retained columns: a stored v2 digest is not comparable with a v1 projection.
-func compareContent(existing storedEvent, e *event) result {
-	version, ok := commonVersion(existing.NormalizationVersion, e.version())
-	if !ok {
-		return rejectedResult(codeNormalizationIncompatible, "no common normalization version can be formed")
+// compareContent classifies an existing identity. Only the one persisted version is
+// comparable: a row written by an older release (including an unconverted v1 row) is
+// permanently incompatible instead of being projected onto a shared shape or
+// overwritten. Two v2 rows are compared by their digest alone.
+func compareContent(existing existingEvent, e *event) result {
+	if existing.NormalizationVersion != NormalizationVersionV2 {
+		return rejectedResult(codeNormalizationIncompatible, "the stored normalization version is not supported")
 	}
-	stored := existing.PayloadHash
-	if existing.NormalizationVersion != version {
-		digest := sha256.Sum256(existing.comparison().textFor(version))
-		stored = digest[:]
-	}
-	requested := e.PayloadHash[:]
-	if e.version() != version {
-		digest := sha256.Sum256(e.comparison().textFor(version))
-		requested = digest[:]
-	}
-	if bytes.Equal(stored, requested) {
+	if bytes.Equal(existing.PayloadHash, e.PayloadHash[:]) {
 		return result{status: statusDuplicate}
 	}
 	return result{status: statusConflict}
-}
-
-// commonVersion returns the comparison version two versions share. Equal known
-// versions are compared directly; two different known versions both project onto
-// v1, because v2 only appends fields and every v1 comparison column is retained.
-// Anything involving an unknown version has no common version this release can
-// form, so the identity is permanently incompatible.
-func commonVersion(stored, request string) (string, bool) {
-	if !isKnownVersion(stored) || !isKnownVersion(request) {
-		return "", false
-	}
-	if stored == request {
-		return stored, true
-	}
-	return normalizationVersion, true
-}
-
-// isKnownVersion reports a comparison version this release can render.
-func isKnownVersion(version string) bool {
-	return version == normalizationVersion || version == normalizationVersionV2
 }
 
 // rejectedResult builds a permanent per-item refusal.
@@ -606,7 +555,7 @@ func storedEventFor(credential credentials.Credential, e *event, receivedAt time
 		Model:                e.Model,
 		OccurredAt:           e.OccurredAt,
 		ReceivedAt:           receivedAt,
-		NormalizationVersion: e.version(),
+		NormalizationVersion: NormalizationVersionV2,
 		PayloadHash:          e.PayloadHash[:],
 		Usage:                e.Usage,
 		Status:               e.Status,
@@ -634,165 +583,4 @@ func minuteInputFor(credential credentials.Credential, e *event) aggregation.Min
 		CacheWrite:  e.Usage.CacheWrite,
 		Reasoning:   e.Usage.Reasoning,
 	}
-}
-
-// comparison is the typed content the normalized text is rendered from. Both the
-// decoded request and a stored row project into it, so one renderer covers every
-// version instead of two serializers drifting apart.
-type comparison struct {
-	OccurredAt           time.Time
-	ProjectID            credentials.ID
-	Provider             string
-	Model                string
-	Usage                usage
-	Status               *string
-	DurationMS           *int64
-	GenerationDurationMS *int64
-	TTFTMS               *int64
-}
-
-// comparison projects a decoded request onto the comparison content.
-func (e *event) comparison() comparison {
-	return comparison{
-		OccurredAt:           e.OccurredAt,
-		ProjectID:            e.ProjectID,
-		Provider:             e.Provider,
-		Model:                e.Model,
-		Usage:                e.Usage,
-		Status:               e.Status,
-		DurationMS:           e.DurationMS,
-		GenerationDurationMS: e.GenerationDurationMS,
-		TTFTMS:               e.TTFTMS,
-	}
-}
-
-// comparison projects a stored row back onto the comparison content. Every v1
-// field is a retained column at its frozen precision and both v2 timings are
-// retained too, so this projection never guesses a value.
-func (s storedEvent) comparison() comparison {
-	return comparison{
-		OccurredAt:           s.OccurredAt,
-		ProjectID:            s.ProjectID,
-		Provider:             s.Provider,
-		Model:                s.Model,
-		Usage:                s.Usage,
-		Status:               s.Status,
-		DurationMS:           s.DurationMS,
-		GenerationDurationMS: s.GenerationDurationMS,
-		TTFTMS:               s.TTFTMS,
-	}
-}
-
-// normalizedText is the comparison text of this request's own version: the seven
-// v1 elements, or nine when either timing attribute appeared.
-func (e *event) normalizedText() []byte {
-	return e.comparison().textFor(e.version())
-}
-
-// textFor renders the frozen comparison text of one version: a JSON array with
-// seven elements for v1, and the two raw client timings appended for v2. No
-// insignificant whitespace, no localization, no floating point.
-func (c comparison) textFor(version string) []byte {
-	buffer := make([]byte, 0, 512)
-	buffer = append(buffer, '[')
-	buffer = appendJSONString(buffer, c.OccurredAt.UTC().Format(microLayout))
-	buffer = append(buffer, ',')
-	if c.ProjectID.Valid {
-		buffer = appendJSONString(buffer, projectText(c.ProjectID))
-	} else {
-		buffer = append(buffer, "null"...)
-	}
-	buffer = append(buffer, ',')
-	buffer = appendJSONString(buffer, c.Provider)
-	buffer = append(buffer, ',')
-	buffer = appendJSONString(buffer, c.Model)
-	buffer = append(buffer, ',')
-	buffer = appendUsage(buffer, c.Usage)
-	buffer = append(buffer, ',')
-	if c.Status != nil {
-		buffer = appendJSONString(buffer, *c.Status)
-	} else {
-		buffer = append(buffer, "null"...)
-	}
-	buffer = append(buffer, ',')
-	buffer = appendOptionalInteger(buffer, c.DurationMS)
-	if version == normalizationVersionV2 {
-		buffer = append(buffer, ',')
-		buffer = appendOptionalInteger(buffer, c.GenerationDurationMS)
-		buffer = append(buffer, ',')
-		buffer = appendOptionalInteger(buffer, c.TTFTMS)
-	}
-	buffer = append(buffer, ']')
-	return buffer
-}
-
-// appendOptionalInteger writes a decimal integer or the null literal, so an
-// unknown timing can never be confused with a real zero.
-func appendOptionalInteger(buffer []byte, value *int64) []byte {
-	if value == nil {
-		return append(buffer, "null"...)
-	}
-	return strconv.AppendInt(buffer, *value, 10)
-}
-
-// microLayout is the normalized occurred_at representation: UTC with exactly six
-// fractional digits and a trailing Z.
-const microLayout = "2006-01-02T15:04:05.000000Z"
-
-// appendUsage writes the usage object in the frozen key order, with all six
-// metrics always present.
-func appendUsage(buffer []byte, u usage) []byte {
-	buffer = append(buffer, `{"input_tokens":`...)
-	buffer = appendMetric(buffer, u.Input)
-	buffer = append(buffer, `,"output_tokens":`...)
-	buffer = appendMetric(buffer, u.Output)
-	buffer = append(buffer, `,"total_tokens":`...)
-	buffer = appendMetric(buffer, u.Total)
-	buffer = append(buffer, `,"cache_read_tokens":`...)
-	buffer = appendMetric(buffer, u.CacheRead)
-	buffer = append(buffer, `,"cache_write_tokens":`...)
-	buffer = appendMetric(buffer, u.CacheWrite)
-	buffer = append(buffer, `,"reasoning_tokens":`...)
-	buffer = appendMetric(buffer, u.Reasoning)
-	return append(buffer, '}')
-}
-
-// appendMetric writes one metric as value then quality.
-func appendMetric(buffer []byte, metric aggregation.Metric) []byte {
-	if metric.Value == nil || metric.Quality == aggregation.QualityMissing {
-		return append(buffer, `{"value":null,"quality":"missing"}`...)
-	}
-	buffer = append(buffer, `{"value":`...)
-	buffer = strconv.AppendInt(buffer, *metric.Value, 10)
-	buffer = append(buffer, `,"quality":"`...)
-	buffer = append(buffer, string(metric.Quality)...)
-	return append(buffer, `"}`...)
-}
-
-// appendJSONString writes a JSON string with RFC 8259 minimal escaping: only the
-// quote and the reverse solidus are escaped here, non-ASCII is emitted as its UTF-8
-// bytes. Entry validation already rejects every control character that could
-// otherwise need an escape.
-func appendJSONString(buffer []byte, text string) []byte {
-	buffer = append(buffer, '"')
-	for i := 0; i < len(text); i++ {
-		switch character := text[i]; {
-		case character == '"':
-			buffer = append(buffer, '\\', '"')
-		case character == '\\':
-			buffer = append(buffer, '\\', '\\')
-		case character < 0x20:
-			const hexDigits = "0123456789abcdef"
-			buffer = append(buffer, '\\', 'u', '0', '0', hexDigits[character>>4], hexDigits[character&0x0f])
-		default:
-			buffer = append(buffer, character)
-		}
-	}
-	return append(buffer, '"')
-}
-
-// projectText renders the stored project identity as the frozen lower case UUID.
-func projectText(id credentials.ID) string {
-	raw := id.Bytes
-	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
 }

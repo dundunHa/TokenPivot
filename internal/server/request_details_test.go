@@ -135,9 +135,14 @@ func TestRequestDetailsMalformedWorkspaceAndRateBody(t *testing.T) {
 	}
 	w = f.get(t, detailsPath(f, "rate", ""), true)
 	body := w.Body.String()
-	for _, want := range []string{`"window_seconds":60`, `"unit":"tokens/min"`, `"value":null`, `"window_last_received_at":null`} {
+	for _, want := range []string{`"event_count":0`, `"window_last_received_at":null`, `"generation_speed":{"unit":"tokens/s","value":null,"sample_count":0}`, `"ttft":{"unit":"ms","value":null,"sample_count":0}`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("missing %s in %s", want, body)
+		}
+	}
+	for _, gone := range []string{`"window_seconds"`, `"tokens/min"`, `"total_tokens"`} {
+		if strings.Contains(body, gone) {
+			t.Fatalf("removed field %s still present in %s", gone, body)
 		}
 	}
 	w = f.get(t, detailsPath(f, "speed", ""), true)

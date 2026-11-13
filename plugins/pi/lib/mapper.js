@@ -234,6 +234,10 @@ export function mapTurnEnd({ sessionId, messageEntryId, message, cwd, projects }
       status: stopReason === 'error' ? 'error' : null,
       // durationMs 是单调时钟测得的耗时，接口只收整数毫秒。
       duration_ms: Math.round(durationMs),
+      // PI 没有生成阶段与首 token 时间的来源，两个必填计时键固定为 null：不从 duration_ms
+      // 反推，也不猜测 chunk 边界。
+      generation_duration_ms: null,
+      ttft_ms: null,
     },
     invalid: mapped.invalid ?? 0,
   }

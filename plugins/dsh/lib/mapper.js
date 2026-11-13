@@ -68,13 +68,16 @@ function difference(later, earlier) {
  * @returns {{generation_duration_ms?: number|null, ttft_ms?: number|null}}
  */
 export function mapGenerationTiming(timing) {
-  if (!timing || typeof timing !== 'object') return {}
+  if (!timing || typeof timing !== 'object') {
+    return { generation_duration_ms: null, ttft_ms: null }
+  }
   const startedAt = boundary(timing.requestStartedAt)
   const firstAt = boundary(timing.firstOutputAt)
   const lastAt = boundary(timing.lastOutputAt)
   const duration = firstAt === null || lastAt === null ? null : difference(lastAt, firstAt)
   const ttft = startedAt === null || firstAt === null ? null : difference(firstAt, startedAt)
-  if (duration === null && ttft === null) return {}
+  // Both keys always travel: an unknown timing is an explicit null, never an omitted key and
+  // never a derived zero. The server requires the pair on every event.
   return { generation_duration_ms: duration, ttft_ms: ttft }
 }
 
@@ -286,7 +289,7 @@ export function mapSessionEvent(session, event, options = {}, timing) {
   if (!validEventId(sourceEventId) || !validName(provider) || !validName(model)) return null
   const usage = mapUsage(data.usage)
   const generation = mapGenerationTiming(timing)
-  const timed = Object.keys(generation).length > 0
+  const timed = generation.generation_duration_ms !== null || generation.ttft_ms !== null
   // A request with a published timing is still worth reporting without usage: the count stays
   // unknown (missing), never zero, so TTFT survives on its own. A usage that only broke on one
   // field is partially recovered (the known output keeps its speed sample); without timing the

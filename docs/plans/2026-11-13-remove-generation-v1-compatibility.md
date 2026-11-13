@@ -1,6 +1,7 @@
 # T-070：移除请求计时 v1 兼容并显式转换 generation v2
 
-- 状态：可实施；本文件只记录已批准方案，不代表代码、转换或文档已经落地。
+- 当前交付：隔离工作区实现与复审通过；代码未提交、未合入，未执行真实数据转换或部署。证据见[交付与验证记录](#9-交付与验证记录2026-11-13)。
+- 规划时状态：可实施；下文保留原批准方案与授权历史。
 - 基线：`main@5dabc40ce498e026d6ab9e562e6f139c7b880ead`。
 - 执行切分：**单块，不拆**。规范化摘要、接口响应和队列格式由同一个 dev 串行修改，不并行写共享文件。
 - 用户决策：本地开发，不保留历史协议兼容；HTTP API 继续沿用 `/api/v1`，持久化摘要只使用 `tokenpivot-usage-event/v2`。
@@ -274,3 +275,41 @@ fnm exec --using 26.13.0 -- make test-integration
 | 误删仍有效的可靠性和 usage-speed 行为 | 保留逐项事务、首次行/分钟语义、队列状态机及独立 Speed 测试 |
 
 本计划没有待用户补充的设计决策；只有第 6.5 节所列实际 CLI 帮助、退出码和脚本命令需在实施运行后确认并写入文档。
+
+## 9. 交付与验证记录（2026-11-13）
+
+### 9.1 状态与实际范围
+
+- 实现位于 `/root/work/TokenPivot/.agents/worktrees/remove-generation-compatibility`，分支 `remove-generation-compatibility`；HEAD 为仅含规划提交的 `4393174db5ec84430d7ff6e958138f40e6483091`。全部业务改动尚未提交、合入或部署。
+- 保持 `/api/v1`，仅清理本计划指定的旧运行时兼容。无依赖、锁文件、历史 migration、根 AGENTS、TODO 或其他 running 任务的代码混入；服务端路由实现未修改，仅更新直接受响应变化影响的测试。
+- 实际范围与批准范围一致。审查期间补齐一次性工具的坏数据预检、完整行快照、零字节 journal、两种提交结果未知场景、队列字段白名单和项目字段互斥；这些均属于原有转换可靠性要求，不新增产品功能。
+- 根规则已经记录在主 checkout 的 AGENTS；本轮没有新增需要写入根规则的知识。一次性结果保留在本节，操作规则保留在[转换手册](../runbooks/generation-v2-conversion.md)。
+
+### 9.2 验收条件与证据
+
+| 批准验收条件 | 最终实现与验证证据 |
+|---|---|
+| 唯一 v2 九元素摘要；两个计时键必填且允许 null/真 0；未知已存版本明确报错 | [DigestV2](../../internal/ingestion/normalization.go#L47)、[必填校验](../../internal/ingestion/handler.go#L550)、[版本及同版本摘要比较](../../internal/ingestion/service.go#L487)；Go 单元及真实 PG 采集测试通过。 |
+| project_key 解析后摘要、首次行与分钟统计、逐项事务继续成立 | [解析后重算](../../internal/ingestion/service.go#L370)；真实 PG 的项目键/ID、重复、冲突、未转换版本、归档、数量限制、批内逐项结果测试通过。 |
+| 删除旧 tokens/min rate 字段及前端缺字段回退；保留独立 usage-speed、窗口与事件数、合法 null | [RateResponse](../../internal/requestdetails/service.go#L215)、[严格请求计时解析](../../web/src/features/requests/api.ts#L204)、[严格 rate 解析](../../web/src/features/requests/api.ts#L262)；前端 19 文件 287 项、requestdetails 真实 PG 的平均值/窗口/无有效样本/筛选测试通过。 |
+| 新 DSH/PI 事件统一带两个可空键；删除 DSH 的旧后端 project_key 重发兼容；队列可靠性不变 | 两插件 mapper 与 DSH uploader 的最终 diff；DSH 全套 114 项、PI 全套 109 项通过，包含上传、生命周期与转换测试。 |
+| PG 默认只读；显式 apply 仅改版本/hash，复用运行时 DigestV2；异常整体回滚，无待转换项不产生副作用 | [check 预检](../../cmd/tokenpivot-convert-generation-v2/main.go#L196)、[完整行加载](../../cmd/tokenpivot-convert-generation-v2/main.go#L366)、[指标配对校验](../../cmd/tokenpivot-convert-generation-v2/main.go#L450)、[完整行核对](../../cmd/tokenpivot-convert-generation-v2/main.go#L489)；真实 PG 测试覆盖非法质量和值、已有 v2 不变、分钟统计不变、触发器篡改三列回滚、二次转换为 0。 |
+| COMMIT 报错保持结果未知，用新连接 check 区分已提交/未提交，不自动重试或恢复 | [两种现场测试](../../cmd/tokenpivot-convert-generation-v2/main_integration_test.go#L720)、[完整行漂移回滚测试](../../cmd/tokenpivot-convert-generation-v2/main_integration_test.go#L794)均在父代理最终 PG 全套中通过；退出码与处置见[手册](../runbooks/generation-v2-conversion.md#L53)。 |
+| DSH/PI 只补缺失键为 null；坏数据整组零写入；合法已有值、ID、顺序、绑定与其他状态不变 | [DSH 转换测试](../../plugins/dsh/test/convert-generation-v2.test.js)、[PI 转换测试](../../plugins/pi/test/convert-generation-v2.test.js)覆盖 check/apply/no-op、未知字段、项目互斥与合法 null、坏/好混合事件、计时类型、保留字段与源文件组内容。 |
+| PI 只读检查先于可写打开，任何 journal 含空文件均停止；原库备份先于 apply，pending 单事务更新 | [PI 转换脚本](../../plugins/pi/scripts/convert-generation-v2.js)、[PI 转换测试](../../plugins/pi/test/convert-generation-v2.test.js#L306)；journal/WAL/未知 schema、pending 以外数据与 meta 不变、失败回滚、重复 apply 无备份等测试通过。 |
+| 文档与实际命令一致，不增加 API 主版本或运行时迁移 | 已同步批准的六份文档；父代理实际构建二进制并验证三个命令 `--help` 均退出 0、未知参数均退出 1；真实转换、no-op 与提交未知仅在隔离 fixture/schema 中验证。 |
+
+### 9.3 父代理最终检查与审查
+
+- `fnm exec --using 26.13.0 -- make test-plugin-dsh`：114/114；[日志](/tmp/t070-final-dsh.log)。
+- `fnm exec --using 26.13.0 -- make test-plugin-pi`：109/109；[日志](/tmp/t070-final-pi.log)。
+- `fnm exec --using 26.13.0 -- make check`：9 阶段通过，前端 287 项；[日志](/tmp/t070-final-check.log)。
+- 使用独立测试库凭据引用运行 `make test-integration`：全包真实 PG 集成通过；[日志](/tmp/t070-final-integration.log)。凭据内容未进入记录。
+- 三个命令的帮助及非法参数检查通过：[Go 帮助](/tmp/t070-final-go-help.log)、[DSH 帮助](/tmp/t070-final-dsh-help.log)、[PI 帮助](/tmp/t070-final-pi-help.log)。
+- 独立只读 review 在六项缺陷修复后最终 PASS（最后四文件复审代理 `25db5fd5-e3a5-402d-aabd-3c782d4a93a0`）；父代理另行核对最终 diff、范围和上述测试结果。必要输入、事务和队列检查保留，没有另做无关简化。
+
+### 9.4 尚未执行与交付边界
+
+- 未转换真实 PostgreSQL 业务库、真实 DSH/PI 队列，未停写、部署、重启、合入或提交业务代码。
+- 真实部署库备份/恢复命令与恢复演练尚待确认，已在手册标记 `TODO(待确认)`；未做 UI 自动化验收。
+- T-070 保持 running，待后续明确授权代码提交/合入及真实转换操作；本节的“验证通过”仅指隔离工作区代码与测试，不代表实际运行环境已更新。

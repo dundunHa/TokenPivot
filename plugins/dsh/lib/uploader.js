@@ -4,7 +4,6 @@
  * Result handling (docs/openapi/openapi.yaml):
  *   accepted / duplicate                  → dequeue
  *   conflict / expired / rejected         → dequeue + dead letter (resending the same body cannot change the outcome)
- *   rejected INVALID_ARGUMENT on an event with project_key → drop the key, keep, resend at once (older server)
  *   rejected + FUTURE_EVENT               → keep, back off: the server has zero clock-skew tolerance, so a
  *                                           local clock slightly ahead is fixed by simply waiting
  *   retryable, missing result             → keep, back off
@@ -203,16 +202,10 @@ export class Uploader {
     const remove = []
     const dead = []
     let retry = 0
-    let stripped = 0
     batch.forEach((item, index) => {
       const r = byIndex.get(index)
       if (r && DEQUEUE.has(r.status)) {
         remove.push(item.source_event_id)
-      } else if (r && r.status === 'rejected' && r.error?.code === 'INVALID_ARGUMENT' && 'project_key' in item) {
-        // A server that predates project_key refuses the whole item for the unknown field. The key is
-        // only a hint, so drop it and resend the event unattributed instead of losing the usage.
-        delete item.project_key
-        stripped += 1
       } else if (r && TERMINAL.has(r.status) && r.error?.code !== 'FUTURE_EVENT') {
         remove.push(item.source_event_id)
         dead.push({ source_event_id: item.source_event_id, outcome: r.status, code: r.error?.code ?? null, event: item })
@@ -221,7 +214,6 @@ export class Uploader {
       }
     })
     this.queue.remove(remove)
-    if (stripped > 0) this.logger?.warn?.(`${stripped} event(s) refused project_key; resending without it (is the server up to date?)`)
     await this.queue.persist()
     await this.queue.deadLetter(dead)
     if (dead.length > 0) this.logger?.warn?.(`${dead.length} event(s) not accepted (see dead-letter.jsonl)`)

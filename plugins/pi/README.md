@@ -90,6 +90,9 @@ PI 的扩展发现规则是「`extensions/*/package.json` 带 `pi.extensions` �
 `source_event_id` 是 `pi:msg:<sessionId>:<entryId>`：`entryId` 只在会话内唯一，
 两个会话即使 `entryId`、时间、用量都相同也是两条事件。
 
+事件体固定带 `generation_duration_ms` 与 `ttft_ms` 两个必填键，本插件一律上报 `null`：
+PI 的用量对象里没有 decode 时长与首 token 延迟，从 `durationMs` 反推会造出客户端没观测过的数字。
+
 跳过并计数的情形（`stderr` 里的 `count name=skip_*`）：
 
 | 原因码 | 含义 |
@@ -133,6 +136,27 @@ PI 的扩展发现规则是「`extensions/*/package.json` 带 `pi.extensions` �
   不迁移不合并）；换服务地址请同时换新目录，旧队列不会自动转投。
 - 队列目录打不开（软链、权限、临时 IO）时插件暂停，并在每次配置检查时重试同一目录；
   修好配置后自动重开，不要求重启 PI。损坏与旧格式不重试，保留现场等人处理。
+
+### 旧队列升级到 v2
+
+服务端只接受 `tokenpivot-usage-event/v2`，两个计时键必填（值可以是 `null`）。旧版本插件写进
+`queue.sqlite` 的 pending 事件没有这两个键，上报会得到 `INVALID_ARGUMENT` 并转 `dead`。升级前
+**先停掉所有共用该 `stateDir` 的 PI 进程**，再跑一次性脚本（在仓库根目录执行）：
+
+```sh
+node plugins/pi/scripts/convert-generation-v2.js            # 只读检查
+node plugins/pi/scripts/convert-generation-v2.js --apply    # 单事务补键并写回
+```
+
+- 状态目录默认取 `$TOKENPIVOT_PI_STATE_DIR`，否则 `~/.pi/agent/tokenpivot`；可用 `--dir <目录>` 指定。
+- 打开库之前先查恢复单元：`queue.sqlite-journal` 非空即报 `journal_present` 并停（不触发 SQLite
+  恢复、不删 journal）；存在 `-wal`/`-shm` 报 `unexpected_wal`。两种情况都不写库，交人工。
+- 用独立只读连接预检 `journal_mode=delete`、`user_version=1`、`meta` 与 `events` 表结构；不符即失败。
+- 只处理 `status='pending'` 的行，只给缺失的两键补 `null`。`dead`、`overflow`、`meta`、绑定、
+  `created_at`、`updated_at`、`rowid`、`user_version` 都不动。
+- `--apply` 先把整库备份成 `queue.sqlite.bak-<UTC 时间戳>`，再在 `BEGIN IMMEDIATE` 事务里按事件 ID
+  更新仍为 pending 的 payload；某行已被别人改状态就整体回滚（`concurrent_change`）。
+- 再跑一次 `--apply` 报 `converted: 0`，不产生新备份。退出码 0 表示成功（含 `no_queue`），1 表示失败。
 
 ## 5. 上报、暂停与恢复
 
@@ -217,7 +241,7 @@ PI 的扩展发现规则是「`extensions/*/package.json` 带 `pi.extensions` �
 - 已在本机核实：Node v26.11.1、darwin arm64、`node:sqlite` 的 `DatabaseSync` 同步 API 可用，
   `PRAGMA journal_mode=delete`、`PRAGMA synchronous=2`（FULL），
   `SQLITE_BUSY` 的错误形态是 `code=ERR_SQLITE_ERROR`、`errcode=5`、`errstr=database is locked`。
-- 本地测试覆盖（80 个）：映射三分支与三态、跳过原因、会话命名空间、路径边界、绑定与 CAS 轮换、
+- 本地测试覆盖（105 个，`make test-plugin-pi` 实测）：映射三分支与三态、跳过原因、会话命名空间、路径边界、绑定与 CAS 轮换、
   两进程 barrier 并发写、双 uploader 只删确认 ID、SIGSTOP 持锁仍 BUSY、提交前后 SIGKILL 恢复、
   数据库损坏保留、协议混合结果与严格逐项校验（禁止字段/白名单外错误码）、413/429/重定向、
   请求与响应体超时、在途凭证轮换、服务端已提交但响应丢失后的幂等重传、断网补报、

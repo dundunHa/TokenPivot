@@ -67,20 +67,12 @@ const speedBody = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-/** 近 60 秒窗口平均（usage-rate）：与 usage-speed 的 tokens/min 是两种口径，互不替代。 */
+/** 近 60 秒窗口平均（usage-rate）：事件数加两项独立平均，无 tokens/min 总量。 */
 const rateBody = (over: Record<string, unknown> = {}) => ({
   start: "2026-10-28T11:59:00Z",
   end: "2026-10-28T12:00:00Z",
   as_of: "2026-10-28T12:00:00Z",
-  window_seconds: 60,
-  unit: "tokens/min",
-  total_tokens: {
-    value: "12000",
-    event_count: 5,
-    known_count: 3,
-    estimated_count: 1,
-    missing_count: 1,
-  },
+  event_count: 5,
   window_last_received_at: "2026-10-28T11:59:59Z",
   generation_speed: { unit: "tokens/s", value: "49.500000", sample_count: 2 },
   ttft: { unit: "ms", value: "8000.000000", sample_count: 3 },
@@ -263,13 +255,7 @@ describe("request log panel", () => {
       rate: () =>
         HttpResponse.json(
           rateBody({
-            total_tokens: {
-              value: null,
-              event_count: 0,
-              known_count: 0,
-              estimated_count: 0,
-              missing_count: 0,
-            },
+            event_count: 0,
             window_last_received_at: null,
             generation_speed: {
               unit: "tokens/s",
@@ -300,23 +286,14 @@ describe("request log panel", () => {
     await screen.findByText("当前保留明细中没有匹配的请求。");
   });
 
-  it("accepts an old backend that omits both rolling objects as unknown", async () => {
-    const legacy = rateBody();
-    delete (legacy as Record<string, unknown>).generation_speed;
-    delete (legacy as Record<string, unknown>).ttft;
-    useBackend({ rate: () => HttpResponse.json(legacy) });
+  it("rejects a rate body that omits a required metric object", async () => {
+    const incomplete = rateBody();
+    delete (incomplete as Record<string, unknown>).generation_speed;
+    useBackend({ rate: () => HttpResponse.json(incomplete) });
     renderApp("/requests?tz=UTC");
     await screen.findByTestId("request-row");
-    expect((await screen.findByTestId("rate-speed")).textContent).toBe(
-      "不可用",
-    );
-    expect(screen.getByTestId("rate-speed-samples").textContent).toBe(
-      "0 个有效样本",
-    );
-    expect(screen.getByTestId("rate-ttft").textContent).toBe("不可用");
-    expect(screen.getByTestId("rate-ttft-samples").textContent).toBe(
-      "0 个有效样本",
-    );
+    await screen.findByText(/速率：响应数据格式不符合预期/);
+    expect(screen.queryByTestId("rate-speed")).toBeNull();
   });
 
   it("shows each rolling metric's own sample count independently", async () => {

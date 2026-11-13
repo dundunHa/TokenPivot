@@ -226,21 +226,21 @@ func (t *fakeTx) InsertEvent(ctx context.Context, event storedEvent) (bool, erro
 	return true, nil
 }
 
-func (t *fakeTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
+func (t *fakeTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (existingEvent, bool, error) {
 	t.store.record("existing")
 	if err := t.failure("existing"); err != nil {
-		return storedEvent{}, false, err
+		return existingEvent{}, false, err
 	}
 	if t.store.vanish {
-		return storedEvent{}, false, nil
+		return existingEvent{}, false, nil
 	}
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
 	row, ok := t.store.events[sourceEventID]
 	if !ok {
-		return storedEvent{}, false, nil
+		return existingEvent{}, false, nil
 	}
-	return row, true, nil
+	return existingEvent{NormalizationVersion: row.NormalizationVersion, PayloadHash: row.PayloadHash}, true, nil
 }
 
 func (t *fakeTx) ApplyMinute(ctx context.Context, input aggregation.MinuteInput) error {
@@ -343,7 +343,7 @@ func encodedBatch(t *testing.T, events ...string) string {
 
 // validEventJSON is one minimal valid event with the given identity and time.
 func validEventJSON(sourceEventID string, occurredAt time.Time) string {
-	return fmt.Sprintf(`{"source_event_id":%s,"provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`,
+	return fmt.Sprintf(`{"source_event_id":%s,"provider":"example-provider","model":"example-model","occurred_at":%q,"usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`,
 		strconv.Quote(sourceEventID), occurredAt.UTC().Format(microLayout))
 }
 
@@ -578,7 +578,7 @@ func TestBatchRejections(t *testing.T) {
 		},
 		{
 			name:   "shell boundary is not valid UTF-8",
-			body:   encodedBatch(t, `{"source_event_id":"a","provider":"\xff","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{}}`),
+			body:   encodedBatch(t, `{"source_event_id":"a","provider":"\xff","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`),
 			status: http.StatusBadRequest, code: "INVALID_ARGUMENT",
 		},
 		{
@@ -588,7 +588,7 @@ func TestBatchRejections(t *testing.T) {
 		},
 		{
 			name:   "duplicate nested key",
-			body:   `{"events":[{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":1,"quality":"known"},"input_tokens":{"value":2,"quality":"known"}}}]}`,
+			body:   `{"events":[{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":1,"quality":"known"},"input_tokens":{"value":2,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}]}`,
 			status: http.StatusBadRequest, code: "INVALID_ARGUMENT",
 		},
 		{
@@ -686,7 +686,7 @@ func TestAcceptedThenDuplicateKeepsInputOrder(t *testing.T) {
 	event := validEventJSON("req-dup", fixedNow)
 	// The same identity twice with different key order and a different offset
 	// spelling: the second must be duplicate, not a second accepted.
-	reordered := `{"usage":{"output_tokens":{"quality":"known","value":20},"input_tokens":{"quality":"known","value":100}},"occurred_at":"2026-10-27T07:00:00-07:00","model":"example-model","provider":"example-provider","source_event_id":"req-dup"}`
+	reordered := `{"usage":{"output_tokens":{"quality":"known","value":20},"input_tokens":{"quality":"known","value":100}},"occurred_at":"2026-10-27T07:00:00-07:00","model":"example-model","provider":"example-provider","source_event_id":"req-dup","generation_duration_ms":null,"ttft_ms":null}`
 	recorder := environment.send(t, encodedBatch(t, event, reordered, validEventJSON("req-other", fixedNow)))
 	body := decodeResults(t, recorder, 3)
 	requireStatuses(t, body, statusAccepted, statusDuplicate, statusAccepted)
@@ -709,112 +709,112 @@ func TestPerItemRejectionsDoNotAffectNeighbours(t *testing.T) {
 	}{
 		{
 			name: "unknown event field",
-			body: `{"source_event_id":"bad-unknown","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"workspace_id":"0199a0b0-0000-7000-8000-00000000000a"}`,
+			body: `{"source_event_id":"bad-unknown","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"workspace_id":"0199a0b0-0000-7000-8000-00000000000a","generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "unknown usage field",
-			body: `{"source_event_id":"bad-usage-unknown","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"billed_tokens":{"value":1,"quality":"known"}}}`,
+			body: `{"source_event_id":"bad-usage-unknown","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"billed_tokens":{"value":1,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "numeric literal is not an integer",
-			body: `{"source_event_id":"bad-total","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"total_tokens":{"value":1.0,"quality":"known"}}}`,
+			body: `{"source_event_id":"bad-total","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"total_tokens":{"value":1.0,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "exponent duration",
-			body: `{"source_event_id":"bad-duration","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"duration_ms":1e3}`,
+			body: `{"source_event_id":"bad-duration","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"duration_ms":1e3,"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "seven fractional digits",
-			body: `{"source_event_id":"bad-time","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00.1234567Z","usage":{}}`,
+			body: `{"source_event_id":"bad-time","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00.1234567Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "leap second",
-			body: `{"source_event_id":"bad-leap","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:60Z","usage":{}}`,
+			body: `{"source_event_id":"bad-leap","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:60Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "missing offset",
-			body: `{"source_event_id":"bad-offset","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00","usage":{}}`,
+			body: `{"source_event_id":"bad-offset","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "impossible date",
-			body: `{"source_event_id":"bad-date","provider":"p","model":"m","occurred_at":"2026-02-30T14:00:00Z","usage":{}}`,
+			body: `{"source_event_id":"bad-date","provider":"p","model":"m","occurred_at":"2026-02-30T14:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "offset out of range",
-			body: `{"source_event_id":"bad-range","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00+24:00","usage":{}}`,
+			body: `{"source_event_id":"bad-range","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00+24:00","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "unknown quality",
-			body: `{"source_event_id":"bad-quality","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":1,"quality":"exact"}}}`,
+			body: `{"source_event_id":"bad-quality","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":1,"quality":"exact"}},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "known without value",
-			body: `{"source_event_id":"bad-known","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":null,"quality":"known"}}}`,
+			body: `{"source_event_id":"bad-known","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":null,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "surrounding NBSP in provider",
-			body: `{"source_event_id":"bad-nbsp","provider":"\u00a0example","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{}}`,
+			body: `{"source_event_id":"bad-nbsp","provider":"\u00a0example","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "surrounding ideographic space in model",
-			body: `{"source_event_id":"bad-ideographic","provider":"p","model":"m\u3000","occurred_at":"2026-10-27T14:00:00Z","usage":{}}`,
+			body: `{"source_event_id":"bad-ideographic","provider":"p","model":"m\u3000","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "control character in status",
-			body: `{"source_event_id":"bad-status","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"status":"a\u0001"}`,
+			body: `{"source_event_id":"bad-status","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"status":"a\u0001","generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "source_event_id over 256 bytes",
-			body: `{"source_event_id":"` + strings.Repeat("汉", 100) + `","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{}}`,
+			body: `{"source_event_id":"` + strings.Repeat("汉", 100) + `","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "malformed project",
-			body: `{"source_event_id":"bad-project","project_id":"not-a-uuid","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{}}`,
+			body: `{"source_event_id":"bad-project","project_id":"not-a-uuid","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeInvalidArgument,
 		},
 		{
 			name: "known child exceeds known parent",
-			body: `{"source_event_id":"bad-subset","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":50,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"known"}}}`,
+			body: `{"source_event_id":"bad-subset","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":50,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeUsageUnsupported,
 		},
 		{
 			name: "known total equation fails",
-			body: `{"source_event_id":"bad-total-equation","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":130,"quality":"known"}}}`,
+			body: `{"source_event_id":"bad-total-equation","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":130,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeUsageUnsupported,
 		},
 		{
 			name: "derived total overflows",
-			body: `{"source_event_id":"bad-overflow","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":9007199254740991,"quality":"known"},"output_tokens":{"value":9007199254740991,"quality":"known"}}}`,
+			body: `{"source_event_id":"bad-overflow","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":9007199254740991,"quality":"known"},"output_tokens":{"value":9007199254740991,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeUsageOverflow,
 		},
 		{
 			name: "metric value over the safe range",
-			body: `{"source_event_id":"bad-metric-overflow","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":9007199254740992,"quality":"known"}}}`,
+			body: `{"source_event_id":"bad-metric-overflow","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":9007199254740992,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeUsageOverflow,
 		},
 		{
 			name: "future event",
-			body: `{"source_event_id":"bad-future","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00.000001Z","usage":{}}`,
+			body: `{"source_event_id":"bad-future","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00.000001Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: codeFutureEvent, decidedInTransaction: true,
 		},
 		{
 			name: "expired event",
-			body: `{"source_event_id":"bad-expired","provider":"p","model":"m","occurred_at":"2026-04-30T13:59:59.999999Z","usage":{}}`,
+			body: `{"source_event_id":"bad-expired","provider":"p","model":"m","occurred_at":"2026-04-30T13:59:59.999999Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			code: "", decidedInTransaction: true,
 		},
 	} {
@@ -850,11 +850,11 @@ func TestExpiryPrecedesAnyIdentityLookup(t *testing.T) {
 	environment := newTestEnvironment(t)
 	// Seed the identity exactly as an earlier accepted batch would have left it.
 	environment.store.events["known-identity"] = storedEvent{
-		NormalizationVersion: normalizationVersion,
+		NormalizationVersion: "tokenpivot-usage-event/v1",
 		PayloadHash:          make([]byte, sha256.Size),
 	}
 	body := decodeResults(t, environment.send(t, encodedBatch(t,
-		`{"source_event_id":"known-identity","provider":"p","model":"m","occurred_at":"2026-04-30T13:59:59.999999Z","usage":{}}`,
+		`{"source_event_id":"known-identity","provider":"p","model":"m","occurred_at":"2026-04-30T13:59:59.999999Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 	)), 1)
 	requireStatuses(t, body, statusExpired)
 	if lookups := environment.store.called("existing"); lookups != 0 {
@@ -882,7 +882,7 @@ func TestWindowIsResampledAfterInsertAndAfterMinute(t *testing.T) {
 			environment := newTestEnvironment(t)
 			environment.store.clock.times = tt.clock
 			body := decodeResults(t, environment.send(t, encodedBatch(t,
-				`{"source_event_id":"boundary-lower","provider":"p","model":"m","occurred_at":"2026-04-30T14:00:00.000000Z","usage":{}}`,
+				`{"source_event_id":"boundary-lower","provider":"p","model":"m","occurred_at":"2026-04-30T14:00:00.000000Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			)), 1)
 			requireStatuses(t, body, tt.want)
 			if tt.want != statusAccepted {
@@ -912,7 +912,7 @@ func TestWindowBoundariesAreInclusive(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			environment := newTestEnvironment(t)
 			body := decodeResults(t, environment.send(t, encodedBatch(t,
-				`{"source_event_id":"edge","provider":"p","model":"m","occurred_at":"`+tt.occurredAt+`","usage":{}}`,
+				`{"source_event_id":"edge","provider":"p","model":"m","occurred_at":"`+tt.occurredAt+`","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			)), 1)
 			requireStatuses(t, body, tt.want)
 			if tt.wantCode != "" {
@@ -946,7 +946,7 @@ func TestCommitAndDependencyFailuresAreRetryable(t *testing.T) {
 			environment.store.projects[syntheticID(0x44).Bytes] = struct{}{}
 			environment.store.insertResult = tt.insertResult
 			body := decodeResults(t, environment.send(t, encodedBatch(t,
-				`{"source_event_id":"failing","project_id":"44444444-4444-4444-4444-444444444445","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`,
+				`{"source_event_id":"failing","project_id":"44444444-4444-4444-4444-444444444445","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 			)), 1)
 			requireStatuses(t, body, statusRetryable)
 			requireCodes(t, body, tt.wantCode)
@@ -968,7 +968,7 @@ func TestVanishedIdentityIsRetryableNotAccepted(t *testing.T) {
 	environment.store.insertResult = 0
 	environment.store.vanish = true
 	body := decodeResults(t, environment.send(t, encodedBatch(t,
-		`{"source_event_id":"vanished","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`,
+		`{"source_event_id":"vanished","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 	)), 1)
 	requireStatuses(t, body, statusRetryable)
 	requireCodes(t, body, codeInternal)
@@ -977,18 +977,45 @@ func TestVanishedIdentityIsRetryableNotAccepted(t *testing.T) {
 	}
 }
 
-func TestConflictAndCrossVersionComparison(t *testing.T) {
+// TestConflictAndUnknownVersionComparison pins the whole duplicate decision:
+// exactly one stored version is comparable, two v2 digests are byte compared, and
+// an older stored row is never projected, rebuilt or backfilled.
+func TestConflictAndUnknownVersionComparison(t *testing.T) {
+	timed := func(sourceEventID string, generation, ttft string) string {
+		return `{"source_event_id":"` + sourceEventID + `","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}` +
+			`,"generation_duration_ms":` + generation + `,"ttft_ms":` + ttft + `}`
+	}
 	t.Run("same identity different content", func(t *testing.T) {
 		environment := newTestEnvironment(t)
 		first := validEventJSON("req-conflict", fixedNow)
-		second := `{"source_event_id":"req-conflict","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":101,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`
+		second := `{"source_event_id":"req-conflict","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":101,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`
 		body := decodeResults(t, environment.send(t, encodedBatch(t, first, second)), 2)
 		requireStatuses(t, body, statusAccepted, statusConflict)
 	})
-	t.Run("stored version cannot be projected", func(t *testing.T) {
+	t.Run("an unconverted v1 row is incompatible", func(t *testing.T) {
 		environment := newTestEnvironment(t)
-		// v1 and v2 are both projectable; a version this release cannot render has
-		// no common version and stays permanently incompatible.
+		// The row was written before this release; its seven element digest cannot
+		// be compared with a nine element one, so the request is refused instead of
+		// being treated as new or as a duplicate.
+		environment.store.events["req-v1"] = storedEvent{
+			NormalizationVersion: "tokenpivot-usage-event/v1",
+			PayloadHash:          make([]byte, sha256.Size),
+		}
+		body := decodeResults(t, environment.send(t, encodedBatch(t, timed("req-v1", "null", "null"))), 1)
+		requireStatuses(t, body, statusRejected)
+		requireCodes(t, body, codeNormalizationIncompatible)
+		// The refused request never reaches the minute increment, and the stored row
+		// keeps its own version and digest: nothing is overwritten or backfilled.
+		if minutes := environment.store.called("minute"); minutes != 0 {
+			t.Fatalf("minute increments=%d want=0", minutes)
+		}
+		row := environment.store.events["req-v1"]
+		if row.NormalizationVersion != "tokenpivot-usage-event/v1" || !bytes.Equal(row.PayloadHash, make([]byte, sha256.Size)) {
+			t.Fatalf("stored row changed: %+v", row)
+		}
+	})
+	t.Run("an unknown stored version is incompatible", func(t *testing.T) {
+		environment := newTestEnvironment(t)
 		environment.store.events["req-version"] = storedEvent{NormalizationVersion: "tokenpivot-usage-event/v3", PayloadHash: make([]byte, sha256.Size)}
 		body := decodeResults(t, environment.send(t, encodedBatch(t,
 			validEventJSON("req-version", fixedNow),
@@ -996,61 +1023,32 @@ func TestConflictAndCrossVersionComparison(t *testing.T) {
 		requireStatuses(t, body, statusRejected)
 		requireCodes(t, body, codeNormalizationIncompatible)
 	})
-	t.Run("v2 request against a stored v1 row is a duplicate", func(t *testing.T) {
+	t.Run("the same v2 row is a duplicate", func(t *testing.T) {
 		environment := newTestEnvironment(t)
-		// The stored v1 digest is comparable with the request's v1 projection, so
-		// the two timings only have to be absent from the stored row.
-		environment.store.events["req-cross"] = storedEvent{
-			NormalizationVersion: normalizationVersion,
-			PayloadHash:          hashOf(t, validEventJSON("req-cross", fixedNow)),
-		}
-		body := decodeResults(t, environment.send(t, encodedBatch(t,
-			strings.TrimSuffix(validEventJSON("req-cross", fixedNow), "}")+`,"generation_duration_ms":1200,"ttft_ms":180}`,
-		)), 1)
+		environment.store.events["req-cross"] = storedRowFor(t, timed("req-cross", "1200", "180"))
+		body := decodeResults(t, environment.send(t, encodedBatch(t, timed("req-cross", "1200", "180"))), 1)
 		requireStatuses(t, body, statusDuplicate)
-		if inserts := environment.store.called("insert"); inserts != 1 {
-			t.Fatalf("inserts=%d want=1", inserts)
-		}
 	})
-	t.Run("v1 request against a stored v2 row is a duplicate", func(t *testing.T) {
+	t.Run("an explicit null matches a stored null", func(t *testing.T) {
 		environment := newTestEnvironment(t)
-		// The stored v2 digest is not comparable with a v1 projection, so the row has
-		// to be seeded with the whole comparison content for the rebuild to work.
-		environment.store.events["req-cross"] = storedRowFor(t, strings.TrimSuffix(validEventJSON("req-cross", fixedNow), "}")+`,"generation_duration_ms":1200,"ttft_ms":180}`)
-		body := decodeResults(t, environment.send(t, encodedBatch(t, validEventJSON("req-cross", fixedNow))), 1)
+		environment.store.events["req-cross"] = storedRowFor(t, timed("req-cross", "null", "null"))
+		body := decodeResults(t, environment.send(t, encodedBatch(t, timed("req-cross", "null", "null"))), 1)
 		requireStatuses(t, body, statusDuplicate)
 	})
 	t.Run("a changed timing on the same v2 row is a conflict", func(t *testing.T) {
 		environment := newTestEnvironment(t)
-		environment.store.events["req-cross"] = storedRowFor(t, strings.TrimSuffix(validEventJSON("req-cross", fixedNow), "}")+`,"generation_duration_ms":1200,"ttft_ms":180}`)
-		body := decodeResults(t, environment.send(t, encodedBatch(t,
-			strings.TrimSuffix(validEventJSON("req-cross", fixedNow), "}")+`,"generation_duration_ms":1200,"ttft_ms":181}`,
-		)), 1)
+		environment.store.events["req-cross"] = storedRowFor(t, timed("req-cross", "1200", "180"))
+		body := decodeResults(t, environment.send(t, encodedBatch(t, timed("req-cross", "1200", "181"))), 1)
 		requireStatuses(t, body, statusConflict)
 		if inserts := environment.store.called("insert"); inserts != 1 {
 			t.Fatalf("inserts=%d want=1", inserts)
 		}
 	})
-	t.Run("a timing added to a row that had none is a duplicate", func(t *testing.T) {
+	t.Run("a null timing does not match a stored zero", func(t *testing.T) {
 		environment := newTestEnvironment(t)
-		// Cross-version retransmission only adds a timing: the seven v1 comparison
-		// elements are unchanged, so the shared v1 projection still matches and the
-		// stored row is never backfilled.
-		environment.store.events["req-cross"] = storedRowFor(t, validEventJSON("req-cross", fixedNow))
-		body := decodeResults(t, environment.send(t, encodedBatch(t,
-			strings.TrimSuffix(validEventJSON("req-cross", fixedNow), "}")+`,"ttft_ms":180}`,
-		)), 1)
-		requireStatuses(t, body, statusDuplicate)
-	})
-	t.Run("an explicit null timing matches one that was never sent", func(t *testing.T) {
-		environment := newTestEnvironment(t)
-		// Both spellings are the same unknown value, so the shared v1 projection is
-		// identical and the resend is a duplicate rather than a conflict.
-		environment.store.events["req-cross"] = storedRowFor(t, validEventJSON("req-cross", fixedNow))
-		body := decodeResults(t, environment.send(t, encodedBatch(t,
-			strings.TrimSuffix(validEventJSON("req-cross", fixedNow), "}")+`,"generation_duration_ms":null,"ttft_ms":null}`,
-		)), 1)
-		requireStatuses(t, body, statusDuplicate)
+		environment.store.events["req-cross"] = storedRowFor(t, timed("req-cross", "0", "0"))
+		body := decodeResults(t, environment.send(t, encodedBatch(t, timed("req-cross", "null", "null"))), 1)
+		requireStatuses(t, body, statusConflict)
 	})
 }
 
@@ -1071,7 +1069,7 @@ func TestProjectRules(t *testing.T) {
 	t.Run("unknown project is rejected and not stored as null", func(t *testing.T) {
 		environment := newTestEnvironment(t)
 		body := decodeResults(t, environment.send(t, encodedBatch(t,
-			`{"source_event_id":"req-project","project_id":"44444444-4444-4444-4444-444444444445","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`,
+			`{"source_event_id":"req-project","project_id":"44444444-4444-4444-4444-444444444445","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 		)), 1)
 		requireStatuses(t, body, statusRejected)
 		requireCodes(t, body, codeProjectInvalid)
@@ -1084,14 +1082,14 @@ func TestProjectRules(t *testing.T) {
 		// The store only answers ownership; an archived row still belongs here.
 		environment.store.projects[projectID.Bytes] = struct{}{}
 		body := decodeResults(t, environment.send(t, encodedBatch(t,
-			`{"source_event_id":"req-archived","project_id":"44444444-4444-4444-4444-444444444445","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`,
+			`{"source_event_id":"req-archived","project_id":"44444444-4444-4444-4444-444444444445","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 		)), 1)
 		requireStatuses(t, body, statusAccepted)
 	})
 	t.Run("absent project stays null", func(t *testing.T) {
 		environment := newTestEnvironment(t)
 		body := decodeResults(t, environment.send(t, encodedBatch(t,
-			`{"source_event_id":"req-null-project","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`,
+			`{"source_event_id":"req-null-project","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`,
 		)), 1)
 		requireStatuses(t, body, statusAccepted)
 		if lookups := environment.store.called("project"); lookups != 0 {
@@ -1102,7 +1100,7 @@ func TestProjectRules(t *testing.T) {
 
 func TestProjectKeyAutoCreatesAndResolves(t *testing.T) {
 	event := func(id, key string) string {
-		return `{"source_event_id":"` + id + `","project_key":"` + key + `","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+		return `{"source_event_id":"` + id + `","project_key":"` + key + `","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`
 	}
 	t.Run("first sight creates the project, later events reuse it", func(t *testing.T) {
 		environment := newTestEnvironment(t)
@@ -1117,7 +1115,7 @@ func TestProjectKeyAutoCreatesAndResolves(t *testing.T) {
 		body := decodeResults(t, environment.send(t, encodedBatch(t, event("same", "TokenPivot"))), 1)
 		requireStatuses(t, body, statusAccepted)
 		id := environment.store.byKey["TokenPivot"]
-		again := `{"source_event_id":"same","project_id":"` + projectText(id) + `","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+		again := `{"source_event_id":"same","project_id":"` + projectText(id) + `","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`
 		body = decodeResults(t, environment.send(t, encodedBatch(t, again)), 1)
 		requireStatuses(t, body, statusDuplicate)
 		body = decodeResults(t, environment.send(t, encodedBatch(t, event("same", "TokenPivot"))), 1)
@@ -1131,7 +1129,7 @@ func TestProjectKeyAutoCreatesAndResolves(t *testing.T) {
 	})
 	t.Run("project_id and project_key together are rejected before any lookup", func(t *testing.T) {
 		environment := newTestEnvironment(t)
-		both := `{"source_event_id":"both","project_id":"44444444-4444-4444-4444-444444444445","project_key":"x","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+		both := `{"source_event_id":"both","project_id":"44444444-4444-4444-4444-444444444445","project_key":"x","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`
 		body := decodeResults(t, environment.send(t, encodedBatch(t, both)), 1)
 		requireStatuses(t, body, statusRejected)
 		requireCodes(t, body, codeInvalidArgument)
@@ -1142,7 +1140,7 @@ func TestProjectKeyAutoCreatesAndResolves(t *testing.T) {
 	t.Run("invalid keys are rejected permanently", func(t *testing.T) {
 		for _, key := range []string{`""`, `" lead"`, `"trail "`, `"ctl\u0001"`, `1`, `["a"]`} {
 			environment := newTestEnvironment(t)
-			bad := `{"source_event_id":"bad","project_key":` + key + `,"provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+			bad := `{"source_event_id":"bad","project_key":` + key + `,"provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`
 			body := decodeResults(t, environment.send(t, encodedBatch(t, bad)), 1)
 			requireStatuses(t, body, statusRejected)
 			if environment.store.called("ensure-project") != 0 {
@@ -1152,7 +1150,7 @@ func TestProjectKeyAutoCreatesAndResolves(t *testing.T) {
 	})
 	t.Run("null project_key means unattributed", func(t *testing.T) {
 		environment := newTestEnvironment(t)
-		nullKey := `{"source_event_id":"nk","project_key":null,"provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{}}`
+		nullKey := `{"source_event_id":"nk","project_key":null,"provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`
 		body := decodeResults(t, environment.send(t, encodedBatch(t, nullKey)), 1)
 		requireStatuses(t, body, statusAccepted)
 		if environment.store.called("ensure-project") != 0 {
@@ -1161,7 +1159,7 @@ func TestProjectKeyAutoCreatesAndResolves(t *testing.T) {
 	})
 	t.Run("an expired event creates no project", func(t *testing.T) {
 		environment := newTestEnvironment(t)
-		old := `{"source_event_id":"old","project_key":"ghost","provider":"p","model":"m","occurred_at":"2020-01-01T00:00:00Z","usage":{}}`
+		old := `{"source_event_id":"old","project_key":"ghost","provider":"p","model":"m","occurred_at":"2020-01-01T00:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`
 		body := decodeResults(t, environment.send(t, encodedBatch(t, old)), 1)
 		requireStatuses(t, body, statusExpired)
 		if len(environment.store.byKey) != 0 {
@@ -1220,7 +1218,7 @@ func TestSourceStampOnlyMovesOnAcceptedAndFailureIsNotFatal(t *testing.T) {
 	t.Run("duplicate only leaves the stamp alone", func(t *testing.T) {
 		environment := newTestEnvironment(t)
 		environment.store.events["req-dup"] = storedEvent{
-			NormalizationVersion: normalizationVersion,
+			NormalizationVersion: NormalizationVersionV2,
 			PayloadHash:          hashOf(t, validEventJSON("req-dup", fixedNow)),
 		}
 		body := decodeResults(t, environment.send(t, encodedBatch(t, validEventJSON("req-dup", fixedNow))), 1)
@@ -1276,6 +1274,11 @@ func hashOf(t *testing.T, eventJSON string) []byte {
 	return decoded.PayloadHash[:]
 }
 
+// TestNormalizationVectors pins the nine element normalization text and its
+// SHA-256 digest. Every vector is the one persisted version, so the digest a
+// request computes, the digest written to usage_events and the digest the
+// offline converter recomputes are the same bytes. The two timing elements are
+// always last: a null means unknown and a 0 stays a real zero.
 func TestNormalizationVectors(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
@@ -1286,95 +1289,92 @@ func TestNormalizationVectors(t *testing.T) {
 	}{
 		{
 			name:    "vector A: offset equivalence with derived total",
-			event:   `{"source_event_id":"req-a1","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"status":"success","duration_ms":1250}`,
-			version: normalizationVersion,
-			text:    `["2026-10-27T14:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",1250]`,
-			hash:    "66311d0f0854f50184e40db98ea8bc0f086c470b1dd0817eb512fdb17cbdc121",
+			event:   `{"source_event_id":"req-a1","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"status":"success","duration_ms":1250,"generation_duration_ms":null,"ttft_ms":null}`,
+			version: NormalizationVersionV2,
+			text:    `["2026-10-27T14:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",1250,null,null]`,
+			hash:    "023170985f8fd1c54a0835b4da4ef56550d9ac7e5503f20ad9260f02908f6b30",
 		},
 		{
 			name:    "vector B: field order and UUID case equivalence",
-			event:   `{"source_event_id":"req-b1","duration_ms":null,"status":"success","usage":{"reasoning_tokens":{"quality":"known","value":50},"cache_read_tokens":{"value":400,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"input_tokens":{"value":1000,"quality":"known"}},"occurred_at":"2026-10-26T23:30:00.123456Z","model":"example-model","provider":"example-provider","project_id":"0199A0B0-0000-7000-8000-00000000000A"}`,
-			version: normalizationVersion,
-			text:    `["2026-10-26T23:30:00.123456Z","0199a0b0-0000-7000-8000-00000000000a","example-provider","example-model",{"input_tokens":{"value":1000,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"total_tokens":{"value":1250,"quality":"estimated"},"cache_read_tokens":{"value":400,"quality":"known"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":50,"quality":"known"}},"success",null]`,
-			hash:    "538702154d0bc75b274ecb4e70bfc7ec6241a2029d9c07dff6b68e0242ba3e3e",
+			event:   `{"source_event_id":"req-b1","duration_ms":null,"status":"success","usage":{"reasoning_tokens":{"quality":"known","value":50},"cache_read_tokens":{"value":400,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"input_tokens":{"value":1000,"quality":"known"}},"occurred_at":"2026-10-26T23:30:00.123456Z","model":"example-model","provider":"example-provider","project_id":"0199A0B0-0000-7000-8000-00000000000A","generation_duration_ms":null,"ttft_ms":null}`,
+			version: NormalizationVersionV2,
+			text:    `["2026-10-26T23:30:00.123456Z","0199a0b0-0000-7000-8000-00000000000a","example-provider","example-model",{"input_tokens":{"value":1000,"quality":"known"},"output_tokens":{"value":250,"quality":"estimated"},"total_tokens":{"value":1250,"quality":"estimated"},"cache_read_tokens":{"value":400,"quality":"known"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":50,"quality":"known"}},"success",null,null,null]`,
+			hash:    "7e432851433a3f3c97aa00a2a5b97e209c0e03c5dd5f3f312bbc8fe3a139270c",
 		},
 		{
 			name:    "vector C1: real zero",
-			event:   `{"source_event_id":"req-c1","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T00:00:00Z","usage":{"input_tokens":{"value":0,"quality":"known"}},"duration_ms":0}`,
-			version: normalizationVersion,
-			text:    `["2026-10-27T00:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":0,"quality":"known"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,0]`,
-			hash:    "fc31a256fba11fc95019164f220e4b47f6673d924c1135c0a57b3117ac841c89",
+			event:   `{"source_event_id":"req-c1","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T00:00:00Z","usage":{"input_tokens":{"value":0,"quality":"known"}},"duration_ms":0,"generation_duration_ms":null,"ttft_ms":null}`,
+			version: NormalizationVersionV2,
+			text:    `["2026-10-27T00:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":0,"quality":"known"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,0,null,null]`,
+			hash:    "5febc8de23b73d642ebc0c5771e7200a4d15a3f8032194734475b569e215fb44",
 		},
 		{
 			name:    "vector C2: all metrics missing",
-			event:   `{"source_event_id":"req-c2","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T00:00:00Z","usage":{},"duration_ms":0}`,
-			version: normalizationVersion,
-			text:    `["2026-10-27T00:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":null,"quality":"missing"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,0]`,
-			hash:    "48a0d3828e2b02476e0fb61998b81019821041d605f9f180aea49015a86ce816",
+			event:   `{"source_event_id":"req-c2","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T00:00:00Z","usage":{},"duration_ms":0,"generation_duration_ms":null,"ttft_ms":null}`,
+			version: NormalizationVersionV2,
+			text:    `["2026-10-27T00:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":null,"quality":"missing"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,0,null,null]`,
+			hash:    "72fdaad9794d239509e583e89ba1669fcef1437834afef04e51035be6c1dc8cb",
 		},
 		{
 			name:    "vector D1: cache read known",
-			event:   `{"source_event_id":"req-d1","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T12:00:00.500000Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"known"}},"status":"success","duration_ms":900}`,
-			version: normalizationVersion,
-			text:    `["2026-10-27T12:00:00.500000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"known"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",900]`,
-			hash:    "033249310b0dcc7b79b675f99fce10e320761e5ba84120a873ddaf9fab1229cf",
+			event:   `{"source_event_id":"req-d1","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T12:00:00.500000Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"known"}},"status":"success","duration_ms":900,"generation_duration_ms":null,"ttft_ms":null}`,
+			version: NormalizationVersionV2,
+			text:    `["2026-10-27T12:00:00.500000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"known"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",900,null,null]`,
+			hash:    "d03b6dc9d70332baa86abb6a3684879cb5ee93ae2967194c64da7482ebe5bbc0",
 		},
 		{
 			name:    "vector D2: cache read estimated",
-			event:   `{"source_event_id":"req-d2","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T12:00:00.500000Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"estimated"}},"status":"success","duration_ms":900}`,
-			version: normalizationVersion,
-			text:    `["2026-10-27T12:00:00.500000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"estimated"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",900]`,
-			hash:    "b488e38a6331fcb575c37af32bfbadcbbde4b6d7f037cb81ca4e5d3e5a6a61d4",
+			event:   `{"source_event_id":"req-d2","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T12:00:00.500000Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"estimated"}},"status":"success","duration_ms":900,"generation_duration_ms":null,"ttft_ms":null}`,
+			version: NormalizationVersionV2,
+			text:    `["2026-10-27T12:00:00.500000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":60,"quality":"estimated"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",900,null,null]`,
+			hash:    "e6f94cea9915c4d58fab6c8b46bc865781d91df9c00411320eb9ea3c05751acb",
 		},
 		{
 			name:    "vector E: explicit missing total matches omission",
-			event:   `{"source_event_id":"req-e2","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T09:15:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":null,"quality":"missing"}},"status":"success","duration_ms":640}`,
-			version: normalizationVersion,
-			text:    `["2026-10-27T09:15:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",640]`,
-			hash:    "2936ec89e70daa4df0d027f1944d9c887bb2b4a23e866799d0c2c51109b566b8",
+			event:   `{"source_event_id":"req-e2","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T09:15:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":null,"quality":"missing"}},"status":"success","duration_ms":640,"generation_duration_ms":null,"ttft_ms":null}`,
+			version: NormalizationVersionV2,
+			text:    `["2026-10-27T09:15:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",640,null,null]`,
+			hash:    "aa49f6708a6ba0702c82c34ab7d9004cfea991dc7df36d7ce75beaced77812a9",
 		},
 		{
 			name:    "vector V2-A: both client timings",
 			event:   `{"source_event_id":"req-v2a","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"status":"success","duration_ms":1250,"generation_duration_ms":1200,"ttft_ms":180}`,
-			version: normalizationVersionV2,
+			version: NormalizationVersionV2,
 			text:    `["2026-10-27T14:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",1250,1200,180]`,
 			hash:    "6dfe0008a26f246d55ce2fe198b10fc2d902d2f29f481e5c7ae830f2e2346a00",
 		},
 		{
 			name:    "vector V2-B: explicit null timings",
 			event:   `{"source_event_id":"req-v2b","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"status":"success","duration_ms":1250,"generation_duration_ms":null,"ttft_ms":null}`,
-			version: normalizationVersionV2,
+			version: NormalizationVersionV2,
 			text:    `["2026-10-27T14:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"},"total_tokens":{"value":120,"quality":"known"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},"success",1250,null,null]`,
 			hash:    "023170985f8fd1c54a0835b4da4ef56550d9ac7e5503f20ad9260f02908f6b30",
 		},
 		{
 			name:    "vector V2-C: only ttft with a real zero",
-			event:   `{"source_event_id":"req-v2c","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{},"ttft_ms":0}`,
-			version: normalizationVersionV2,
+			event:   `{"source_event_id":"req-v2c","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":0}`,
+			version: NormalizationVersionV2,
 			text:    `["2026-10-27T14:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":null,"quality":"missing"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,null,null,0]`,
 			hash:    "33677c8fe6a33b93b4b5490e941b63d3644513d6196fbfe9de1ca82562d49e2f",
 		},
 		{
 			name:    "vector V2-D: only generation duration with a real zero",
-			event:   `{"source_event_id":"req-v2d","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":0}`,
-			version: normalizationVersionV2,
+			event:   `{"source_event_id":"req-v2d","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":0,"ttft_ms":null}`,
+			version: NormalizationVersionV2,
 			text:    `["2026-10-27T14:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":null,"quality":"missing"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,null,0,null]`,
 			hash:    "5b5ea0d567b8ea3e8bde90333c3f1c748661cbe3bcff36b4ab5e56dbe4970e3a",
 		},
 		{
 			name:    "vector V2-E: both timings at the safe integer ceiling",
 			event:   `{"source_event_id":"req-v2e","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{},"generation_duration_ms":9007199254740991,"ttft_ms":9007199254740991}`,
-			version: normalizationVersionV2,
+			version: NormalizationVersionV2,
 			text:    `["2026-10-27T14:00:00.000000Z",null,"example-provider","example-model",{"input_tokens":{"value":null,"quality":"missing"},"output_tokens":{"value":null,"quality":"missing"},"total_tokens":{"value":null,"quality":"missing"},"cache_read_tokens":{"value":null,"quality":"missing"},"cache_write_tokens":{"value":null,"quality":"missing"},"reasoning_tokens":{"value":null,"quality":"missing"}},null,null,9007199254740991,9007199254740991]`,
 			hash:    "6ffe28e3f2ede9dcf856c4c6b73a9cd585fedcb79e7543d1b7cafc49ec58c1ee",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			decoded := mustDecodeEvent(t, tt.event)
-			if version := decoded.version(); version != tt.version {
-				t.Fatalf("version=%s want=%s", version, tt.version)
-			}
-			if text := string(decoded.normalizedText()); text != tt.text {
+			if text := string(normalizedTextV2(decoded.normalizationInput())); text != tt.text {
 				t.Fatalf("normalized text mismatch\ngot:  %s\nwant: %s", text, tt.text)
 			}
 			digest := sha256.Sum256([]byte(tt.text))
@@ -1384,64 +1384,68 @@ func TestNormalizationVectors(t *testing.T) {
 			if got := hex.EncodeToString(decoded.PayloadHash[:]); got != tt.hash {
 				t.Fatalf("payload hash=%s want=%s", got, tt.hash)
 			}
+			row := storedEventFor(credentials.Credential{WorkspaceID: syntheticWorkspace, SourceID: syntheticSource}, decoded, fixedNow)
+			if row.NormalizationVersion != tt.version {
+				t.Fatalf("stored version=%s want=%s", row.NormalizationVersion, tt.version)
+			}
 		})
 	}
 }
 
-// TestGenerationTimingFields pins the version switch: the seven v1 elements stay
-// byte identical unless a client actually sends one of the two timings, and an
-// explicit null still selects v2 so a client never looks like a v1 client by
-// sending an unknown timing.
-func TestGenerationTimingFields(t *testing.T) {
-	base := `{"source_event_id":"req-timing","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{}}`
-	t.Run("neither attribute keeps v1 and the v1 digest", func(t *testing.T) {
-		decoded := mustDecodeEvent(t, base)
-		if decoded.TimingFieldsPresent {
-			t.Fatal("timing fields reported as present")
-		}
-		if version := decoded.version(); version != normalizationVersion {
-			t.Fatalf("version=%s want=%s", version, normalizationVersion)
-		}
-		if decoded.GenerationDurationMS != nil || decoded.TTFTMS != nil {
-			t.Fatalf("timings=%v/%v want nil/nil", decoded.GenerationDurationMS, decoded.TTFTMS)
-		}
-	})
+// TestRequiredGenerationTimingAttributes pins the frozen request shape: both
+// timing attributes are mandatory, an unknown timing is an explicit null, and a
+// real zero stays a number.
+func TestRequiredGenerationTimingAttributes(t *testing.T) {
+	base := func(attributes string) string {
+		return `{"source_event_id":"req-timing","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":3,"quality":"known"}}` + attributes + `}`
+	}
 	for _, tt := range []struct {
 		name       string
 		attributes string
 		generation *int64
 		ttft       *int64
 	}{
-		{name: "generation duration only", attributes: `,"generation_duration_ms":1200`, generation: int64Ptr(1200)},
-		{name: "ttft only", attributes: `,"ttft_ms":180`, ttft: int64Ptr(180)},
-		{name: "explicit nulls still select v2", attributes: `,"generation_duration_ms":null,"ttft_ms":null`},
-		{name: "both", attributes: `,"generation_duration_ms":1200,"ttft_ms":180`, generation: int64Ptr(1200), ttft: int64Ptr(180)},
+		{name: "both explicit nulls", attributes: `,"generation_duration_ms":null,"ttft_ms":null`},
+		{name: "both real zeros", attributes: `,"generation_duration_ms":0,"ttft_ms":0`, generation: int64Ptr(0), ttft: int64Ptr(0)},
+		{name: "both at the safe ceiling", attributes: `,"generation_duration_ms":9007199254740991,"ttft_ms":9007199254740991`, generation: int64Ptr(9007199254740991), ttft: int64Ptr(9007199254740991)},
+		{name: "one value and one null", attributes: `,"generation_duration_ms":1200,"ttft_ms":null`, generation: int64Ptr(1200)},
+		{name: "field order does not matter", attributes: `,"ttft_ms":180,"generation_duration_ms":1200`, generation: int64Ptr(1200), ttft: int64Ptr(180)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			decoded := mustDecodeEvent(t, strings.TrimSuffix(base, "}")+tt.attributes+"}")
-			if !decoded.TimingFieldsPresent {
-				t.Fatal("timing fields reported as absent")
-			}
-			if version := decoded.version(); version != normalizationVersionV2 {
-				t.Fatalf("version=%s want=%s", version, normalizationVersionV2)
-			}
+			decoded := mustDecodeEvent(t, base(tt.attributes))
 			requireOptionalInteger(t, "generation_duration_ms", decoded.GenerationDurationMS, tt.generation)
 			requireOptionalInteger(t, "ttft_ms", decoded.TTFTMS, tt.ttft)
 		})
 	}
 	for _, tt := range []struct {
-		name      string
-		attribute string
-		reason    string
+		name       string
+		attributes string
 	}{
-		{name: "negative", attribute: `,"ttft_ms":-1`, reason: "must be a decimal integer within the safe range"},
-		{name: "above the safe ceiling", attribute: `,"generation_duration_ms":9007199254740992`, reason: "must be a decimal integer within the safe range"},
-		{name: "fraction", attribute: `,"ttft_ms":1.5`, reason: "must be a decimal integer within the safe range"},
-		{name: "string", attribute: `,"generation_duration_ms":"1200"`, reason: "must be a decimal integer or null"},
-		{name: "object", attribute: `,"ttft_ms":{}`, reason: "must be a decimal integer or null"},
+		{name: "the generation duration is missing", attributes: `,"ttft_ms":null`},
+		{name: "the ttft is missing", attributes: `,"generation_duration_ms":null`},
+		{name: "both are missing", attributes: ``},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rejection := mustRejectEvent(t, base(tt.attributes))
+			if rejection.code != codeInvalidArgument || rejection.message != "event must carry generation_duration_ms and ttft_ms" {
+				t.Fatalf("rejection=%+v", rejection)
+			}
+		})
+	}
+	for _, tt := range []struct {
+		name       string
+		attributes string
+		reason     string
+	}{
+		{name: "negative ttft", attributes: `,"generation_duration_ms":null,"ttft_ms":-1`, reason: "must be a decimal integer within the safe range"},
+		{name: "negative generation duration", attributes: `,"generation_duration_ms":-1,"ttft_ms":null`, reason: "must be a decimal integer within the safe range"},
+		{name: "generation duration above the safe ceiling", attributes: `,"generation_duration_ms":9007199254740992,"ttft_ms":null`, reason: "must be a decimal integer within the safe range"},
+		{name: "ttft fraction", attributes: `,"generation_duration_ms":null,"ttft_ms":1.5`, reason: "must be a decimal integer within the safe range"},
+		{name: "ttft string", attributes: `,"generation_duration_ms":null,"ttft_ms":"180"`, reason: "must be a decimal integer or null"},
+		{name: "generation duration object", attributes: `,"generation_duration_ms":{},"ttft_ms":null`, reason: "must be a decimal integer or null"},
 	} {
 		t.Run(tt.name+" is a permanent rejection", func(t *testing.T) {
-			rejection := mustRejectEvent(t, strings.TrimSuffix(base, "}")+tt.attribute+"}")
+			rejection := mustRejectEvent(t, base(tt.attributes))
 			if rejection.code != codeInvalidArgument {
 				t.Fatalf("code=%s want=%s", rejection.code, codeInvalidArgument)
 			}
@@ -1449,6 +1453,27 @@ func TestGenerationTimingFields(t *testing.T) {
 				t.Fatalf("message=%q want to contain %q", rejection.message, tt.reason)
 			}
 		})
+	}
+}
+
+// TestNullTimingAndRealZeroHashDiffer: the ninth element distinguishes a real
+// zero from an unknown timing, so a client that later reports 0 is a conflict
+// with the earlier null instead of a silent duplicate.
+func TestNullTimingAndRealZeroHashDiffer(t *testing.T) {
+	event := func(generation, ttft string) string {
+		return `{"source_event_id":"req-zero","provider":"example-provider","model":"example-model","occurred_at":"2026-10-27T14:00:00Z","usage":{}` +
+			`,"generation_duration_ms":` + generation + `,"ttft_ms":` + ttft + `}`
+	}
+	unknown := mustDecodeEvent(t, event("null", "null"))
+	zero := mustDecodeEvent(t, event("0", "0"))
+	if bytes.Equal(unknown.PayloadHash[:], zero.PayloadHash[:]) {
+		t.Fatal("a null timing and a real zero produced the same digest")
+	}
+	if text := string(normalizedTextV2(unknown.normalizationInput())); !strings.HasSuffix(text, ",null,null]") {
+		t.Fatalf("null text = %s", text)
+	}
+	if text := string(normalizedTextV2(zero.normalizationInput())); !strings.HasSuffix(text, ",0,0]") {
+		t.Fatalf("zero text = %s", text)
 	}
 }
 
@@ -1480,18 +1505,18 @@ func int64Ptr(value int64) *int64 {
 func TestNormalizationEquivalences(t *testing.T) {
 	// Different offsets and both total spellings must produce one digest, while a
 	// real zero, an estimated zero and a missing value must differ.
-	offsetZ := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`)
-	offsetLocal := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T07:00:00-07:00","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`)
-	micro := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00.000000Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`)
-	lowerT := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}}}`)
+	offsetZ := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`)
+	offsetLocal := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T07:00:00-07:00","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`)
+	micro := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00.000000Z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`)
+	lowerT := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T14:00:00z","usage":{"input_tokens":{"value":100,"quality":"known"},"output_tokens":{"value":20,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`)
 	for name, decoded := range map[string]*event{"offset": offsetLocal, "micro seconds": micro, "lower case z": lowerT} {
 		if decoded.PayloadHash != offsetZ.PayloadHash {
 			t.Fatalf("%s spelling produced a different digest", name)
 		}
 	}
-	zeroKnown := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T00:00:00Z","usage":{"input_tokens":{"value":0,"quality":"known"}}}`)
-	zeroEstimated := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T00:00:00Z","usage":{"input_tokens":{"value":0,"quality":"estimated"}}}`)
-	missingInput := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T00:00:00Z","usage":{}}`)
+	zeroKnown := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T00:00:00Z","usage":{"input_tokens":{"value":0,"quality":"known"}},"generation_duration_ms":null,"ttft_ms":null}`)
+	zeroEstimated := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T00:00:00Z","usage":{"input_tokens":{"value":0,"quality":"estimated"}},"generation_duration_ms":null,"ttft_ms":null}`)
+	missingInput := mustDecodeEvent(t, `{"source_event_id":"a","provider":"p","model":"m","occurred_at":"2026-10-27T00:00:00Z","usage":{},"generation_duration_ms":null,"ttft_ms":null}`)
 	seen := map[string]string{}
 	for name, decoded := range map[string]*event{"zero known": zeroKnown, "zero estimated": zeroEstimated, "missing": missingInput} {
 		digest := hex.EncodeToString(decoded.PayloadHash[:])
@@ -1561,7 +1586,7 @@ func TestUsageNormalizationRules(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			items, _, ok := decodeBatch([]byte(`{"events":[{"source_event_id":"req","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":` + tt.usage + `}]}`))
+			items, _, ok := decodeBatch([]byte(`{"events":[{"source_event_id":"req","provider":"p","model":"m","occurred_at":"2026-10-27T13:00:00Z","usage":` + tt.usage + `,"generation_duration_ms":null,"ttft_ms":null}]}`))
 			if !ok {
 				t.Fatal("batch decode failed")
 			}
@@ -1998,7 +2023,7 @@ func (t *contextRecordingTx) InsertEvent(ctx context.Context, event storedEvent)
 	return t.inner.InsertEvent(ctx, event)
 }
 
-func (t *contextRecordingTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (storedEvent, bool, error) {
+func (t *contextRecordingTx) ExistingEvent(ctx context.Context, workspaceID, sourceID credentials.ID, sourceEventID string) (existingEvent, bool, error) {
 	return t.inner.ExistingEvent(ctx, workspaceID, sourceID, sourceEventID)
 }
 
