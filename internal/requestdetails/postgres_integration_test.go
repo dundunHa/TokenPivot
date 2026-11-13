@@ -287,7 +287,11 @@ func (f *fixture) rate(t *testing.T, w pgtype.UUID, q url.Values) *RateResponse 
 	return r
 }
 
-func TestRateWindowBoundariesAndSums(t *testing.T) {
+// TestRateWindowBoundariesAndEventCount: the window reports how many events
+// occurred in [as_of-60s, as_of) and when the last one was received. Token
+// totals, quality counters and the legacy tokens/min unit are gone, so a token
+// value never stands in for the count.
+func TestRateWindowBoundariesAndEventCount(t *testing.T) {
 	f := newFixture(t)
 	start := asOf.Add(-time.Minute)
 	f.add(t, ev{at: start.Add(-time.Microsecond), total: n(1000)})
@@ -299,38 +303,42 @@ func TestRateWindowBoundariesAndSums(t *testing.T) {
 	f.add(t, ev{at: start.Add(-time.Hour), total: n(7), received: asOf.Add(20 * time.Second)})
 	f.add(t, ev{ws: otherWS, at: start.Add(time.Second), total: n(5)})
 	r := f.rate(t, ws, nil)
-	tt := r.TotalTokens
-	if tt.Value == nil || *tt.Value != "30" || tt.EventCount != 3 || tt.KnownCount != 1 || tt.EstimatedCount != 1 || tt.MissingCount != 1 {
-		t.Fatalf("rate = %+v", tt)
+	if r.EventCount != 3 {
+		t.Fatalf("event_count = %d want 3", r.EventCount)
 	}
 	if r.WindowLastReceived == nil || *r.WindowLastReceived != formatTime(asOf.Add(5*time.Second)) {
 		t.Fatalf("fresh = %v", r.WindowLastReceived)
 	}
-	if r.Start != formatTime(start) || r.End != formatTime(asOf) || r.WindowSeconds != 60 || r.Unit != "tokens/min" {
+	if r.Start != formatTime(start) || r.End != formatTime(asOf) || r.AsOf != formatTime(asOf) {
 		t.Fatalf("window = %+v", r)
 	}
 }
 
-func TestRateNullsZerosAndOverflow(t *testing.T) {
+// TestRateEventCountWithoutTokenAggregates: a zero token total, an explicit
+// missing total and a total above the safe integer range all count as events and
+// none of them feeds a token sum, because the response carries no token sum at
+// all. Both metric objects stay present with a null value.
+func TestRateEventCountWithoutTokenAggregates(t *testing.T) {
 	f := newFixture(t)
 	r := f.rate(t, ws, nil)
-	if r.TotalTokens.Value != nil || r.TotalTokens.EventCount != 0 || r.WindowLastReceived != nil {
+	if r.EventCount != 0 || r.WindowLastReceived != nil || r.GenerationSpeed.Value != nil || r.TTFT.Value != nil {
 		t.Fatalf("empty = %+v", r)
 	}
 	f.add(t, ev{at: asOf.Add(-time.Second), total: nil, quality: "missing"})
 	r = f.rate(t, ws, nil)
-	if r.TotalTokens.Value != nil || r.TotalTokens.EventCount != 1 || r.TotalTokens.MissingCount != 1 || r.WindowLastReceived == nil {
+	if r.EventCount != 1 || r.WindowLastReceived == nil {
 		t.Fatalf("missing only = %+v", r)
 	}
 	f.add(t, ev{at: asOf.Add(-2 * time.Second), total: n(0)})
-	if v := f.rate(t, ws, nil).TotalTokens.Value; v == nil || *v != "0" {
-		t.Fatalf("zero = %v", v)
+	if got := f.rate(t, ws, nil).EventCount; got != 2 {
+		t.Fatalf("zero total count = %d", got)
 	}
 	const big = 1<<53 - 1
 	f.add(t, ev{at: asOf.Add(-3 * time.Second), total: n(big)})
 	f.add(t, ev{at: asOf.Add(-4 * time.Second), total: n(big)})
-	if v := f.rate(t, ws, nil).TotalTokens.Value; v == nil || *v != "18014398509481982" {
-		t.Fatalf("big = %v", v)
+	r = f.rate(t, ws, nil)
+	if r.EventCount != 4 || r.GenerationSpeed.SampleCount != 0 || r.TTFT.SampleCount != 0 {
+		t.Fatalf("big total = %+v", r)
 	}
 }
 
@@ -342,36 +350,26 @@ func TestFiltersAndForeignProject(t *testing.T) {
 	f.add(t, ev{at: at.Add(-2 * time.Millisecond), provider: "p1", model: "m2", total: n(4)})
 	cases := []struct {
 		q    url.Values
-		want string
+		want int64
 	}{
-		{nil, "7"},
-		{url.Values{"provider": {"p1"}}, "5"},
-		{url.Values{"provider": {"p1", "p2"}, "model": {"m1"}}, "3"},
-		{url.Values{"project": {"unattributed"}}, "4"},
-		{url.Values{"project": {projA.String(), "unattributed"}}, "5"},
-		{url.Values{"project": {projB.String()}, "provider": {"p1"}}, ""},
+		{nil, 3},
+		{url.Values{"provider": {"p1"}}, 2},
+		{url.Values{"provider": {"p1", "p2"}, "model": {"m1"}}, 2},
+		{url.Values{"project": {"unattributed"}}, 1},
+		{url.Values{"project": {projA.String(), "unattributed"}}, 2},
+		{url.Values{"project": {projB.String()}, "provider": {"p1"}}, 0},
 	}
 	for _, c := range cases {
 		r := f.rate(t, ws, c.q)
-		if c.want == "" {
-			if r.TotalTokens.EventCount != 0 {
-				t.Fatalf("%v = %+v", c.q, r)
-			}
-			continue
-		}
-		if r.TotalTokens.Value == nil || *r.TotalTokens.Value != c.want {
-			t.Fatalf("%v = %v want %s", c.q, r.TotalTokens.Value, c.want)
+		if r.EventCount != c.want {
+			t.Fatalf("%v event_count = %d want %d", c.q, r.EventCount, c.want)
 		}
 		list, err := f.svc.Events(f.ctx, ws, withRange(c.q))
 		if err != nil {
 			t.Fatal(err)
 		}
-		var sum int64
-		for _, item := range list.Items {
-			sum += *item.TotalTokens.Value
-		}
-		if fmt.Sprint(sum) != c.want {
-			t.Fatalf("events %v sum %d want %s", c.q, sum, c.want)
+		if int64(len(list.Items)) != c.want {
+			t.Fatalf("events %v count %d want %d", c.q, len(list.Items), c.want)
 		}
 	}
 	if _, err := f.svc.RateAt(f.ctx, ws, url.Values{"project": {projX.String()}}, asOf); !errors.Is(err, ErrInvalidArgument) {
@@ -709,9 +707,9 @@ func TestRateGenerationMetricsAverages(t *testing.T) {
 	if r.TTFT.Unit != "ms" || r.TTFT.SampleCount != 3 || r.TTFT.Value == nil || *r.TTFT.Value != "1466.666667" {
 		t.Fatalf("ttft = %+v", r.TTFT)
 	}
-	// The legacy tokens/min fields survive unchanged next to the new objects.
-	if r.Unit != "tokens/min" || r.TotalTokens.Value == nil || *r.TotalTokens.Value != "132" {
-		t.Fatalf("legacy = %+v %+v", r.Unit, r.TotalTokens)
+	// The window counts the four events; it reports no token total next to them.
+	if r.EventCount != 4 {
+		t.Fatalf("event_count = %d want 4", r.EventCount)
 	}
 	// Averages over non terminating per request values round only once.
 	f2 := newFixture(t)
@@ -778,11 +776,11 @@ func TestRateGenerationMetricsSamplesAndWindow(t *testing.T) {
 	}
 }
 
-// TestRateGenerationMetricsAllSamplesInvalid: the window holds events, so the
-// legacy counters stay non zero, yet none of them is a valid sample of either
-// new metric. Both objects must then be value null with sample count zero,
-// never a zero average, and the single LEFT JOIN row of an empty window must not
-// be miscounted as an event.
+// TestRateGenerationMetricsAllSamplesInvalid: the window holds events, so
+// event_count stays non zero, yet none of them is a valid sample of either
+// metric. Both objects must then be value null with sample count zero, never a
+// zero average, and the single LEFT JOIN row of an empty window must not be
+// miscounted as an event.
 func TestRateGenerationMetricsAllSamplesInvalid(t *testing.T) {
 	f := newFixture(t)
 	at := asOf.Add(-time.Second)
@@ -798,9 +796,9 @@ func TestRateGenerationMetricsAllSamplesInvalid(t *testing.T) {
 	f.add(t, ev{at: at, total: n(2), out: n(2)})
 	// No row carries a TTFT, so that sample set is empty for a second reason.
 	r := f.rate(t, ws, nil)
-	// The missing row still counts as an event but contributes no total.
-	if r.TotalTokens.EventCount != 5 || r.TotalTokens.Value == nil || *r.TotalTokens.Value != "21" {
-		t.Fatalf("legacy = %+v", r.TotalTokens)
+	// Every row counts as an event, yet none of them is a valid sample.
+	if r.EventCount != 5 {
+		t.Fatalf("event_count = %d want 5", r.EventCount)
 	}
 	if r.GenerationSpeed.Unit != "tokens/s" || r.GenerationSpeed.Value != nil || r.GenerationSpeed.SampleCount != 0 {
 		t.Fatalf("speed = %+v", r.GenerationSpeed)
@@ -820,7 +818,7 @@ func TestRateGenerationMetricsAllSamplesInvalid(t *testing.T) {
 }
 
 // TestRateGenerationMetricsFilters: provider, model and project narrowing apply
-// the same way to both new objects and to the legacy total.
+// the same way to both objects and to the event count.
 func TestRateGenerationMetricsFilters(t *testing.T) {
 	f := newFixture(t)
 	at := asOf.Add(-time.Second)

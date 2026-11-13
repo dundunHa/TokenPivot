@@ -92,9 +92,9 @@ CREATE UNIQUE INDEX uk_workspaces_created_by_user_id_name ON workspaces (created
 
 权限与不可变：服务角色 `tokenpivot_app` 在本表上只有 SELECT、INSERT，不授予 UPDATE、DELETE、TRUNCATE、REFERENCES、TRIGGER。因此 `UPDATE`、`ON CONFLICT DO UPDATE`、`SELECT … FOR SHARE` 对服务角色都因权限不足失败，即使 SQL 写错也无法覆盖内容或续期 received_at；清理所需的 DELETE 由保留清理任务在自己的迁移里另行授权。无 RLS 时租户隔离靠每条 SQL 都带认证得到的 workspace_id，由写入与读查询任务各自实现并测试。
 
-比较依据与校验边界：持久化 normalization_version、payload_hash 和比较集合的每个字段（按冻结精度成列）；跨版本比较须基于实际留存信息，类型化列不保证能按新规则无损重建。数据库不校验摘要与列是否一致、不校验非负与取值范围、不建外键与 CHECK；这些都由入口校验一次，存储层不重复。
+比较依据与校验边界：持久化 normalization_version、payload_hash 和比较集合的每个字段（按冻结精度成列）；查重只比较同一版本的存储摘要，不对不同版本做投影，类型化列也不保证能按新规则重建摘要，所以版本升级只能经一次性转换命令重算并写回。数据库不校验摘要与列是否一致、不校验非负与取值范围、不建外键与 CHECK；这些都由入口校验一次，存储层不重复。
 
-规范化版本与新增计时列：`normalization_version` 目前有两个已知值，`tokenpivot-usage-event/v1`（比较集合 7 个元素）与 `tokenpivot-usage-event/v2`（在 v1 之后追加 `generation_duration_ms`、`ttft_ms`，共 9 个元素）。请求里两个计时属性都未出现时按 v1 落库，出现任一个时按 v2 落库（显式 `null` 也算出现）。已知 v1 与 v2 的共同比较版本固定为 v1：v2 是纯追加，v1 的每列都保留，因此 v2 旧行能用留存列重建 v1 摘要，v1 请求也能投影到 v1。两端任一是未知版本时返回 `NORMALIZATION_INCOMPATIBLE`。两列不参与分钟聚合，也不改动事件身份与既有用量。
+规范化版本与计时列：`normalization_version` 只有唯一取值 `tokenpivot-usage-event/v2`（比较集合 9 个元素：v1 的 7 个之后追加 `generation_duration_ms`、`ttft_ms`）。两个计时属性是请求的必填键，值可为显式 `null`：缺键返回 `INVALID_ARGUMENT`，显式 `null` 合法且与真实 `0` 的摘要不同。落库一律写 v2；查重只比对该行已存的 v2 摘要，同一摘要为 duplicate、不同为 conflict，版本不是 v2 的行一律返回 `NORMALIZATION_INCOMPATIBLE`，不投影、不重建旧摘要、也不提供 `/api/v2`。本地开发不承担旧版本运行时兼容：存量 v1 行只经 `tokenpivot-convert-generation-v2` 一次性转换（默认只读 check，`--apply` 在单事务内重算摘要并只写 `normalization_version`、`payload_hash`）升级，该命令使用 `TOKENPIVOT_MIGRATION_DATABASE_URL` 指向的迁移角色，因为服务角色 `tokenpivot_app` 在本表上没有 UPDATE 权限。两列不参与分钟聚合，也不改动事件身份、`received_at`、分钟桶与既有用量。
 
 保留按首次 received_at 180 天。时间有效性校验先于查重：过期返回 expired，不要求继续识别 duplicate/conflict。清理与有效写入边界使用一致服务端截点；未来事件不进入表。修改 occurred_at 是修改业务内容，不是合法重试；超出防重期限后不承诺识别被篡改身份。
 

@@ -88,36 +88,19 @@ test('accepted and duplicate dequeue; bearer token sent; body is {events}', asyn
   await s.close()
 })
 
-test('an older server that refuses project_key: the key is dropped and the event is resent unattributed', async () => {
+test('INVALID_ARGUMENT is terminal even when the event carries project_key: no stripped resend', async () => {
   const keyed = { ...ev(1), project_key: 'TokenPivot' }
-  const s = await server((body) => ({
-    status: 200,
-    json: {
-      request_id: 'r',
-      results: body.events.map((e, index) => 'project_key' in e
-        ? { index, status: 'rejected', error: { code: 'INVALID_ARGUMENT', message: 'event contains an unknown field' } }
-        : { index, status: 'accepted' }),
-    },
-  }))
-  const { queue, up, logger } = await uploader(s.endpoint, [keyed, ev(2)])
-  assert.equal((await up.flush()).state, 'idle')
-  assert.equal(queue.size, 0)
-  assert.equal(s.calls.length, 2)
-  assert.ok(!('project_key' in s.calls[1].body.events[0]))
-  assert.equal(s.calls[1].body.events[0].source_event_id, 'dsh:msg:1')
-  assert.ok(logger.lines.some((l) => l.includes('refused project_key')))
-  await s.close()
-})
-
-test('INVALID_ARGUMENT on an event without project_key is still a terminal rejection', async () => {
   const s = await server((body) => ({
     status: 200,
     json: { request_id: 'r', results: body.events.map((_, index) => ({ index, status: 'rejected', error: { code: 'INVALID_ARGUMENT', message: 'x' } })) },
   }))
-  const { queue, up } = await uploader(s.endpoint, [ev(1)])
-  await up.flush()
-  assert.equal(queue.size, 0)
+  const { dir, queue, up } = await uploader(s.endpoint, [keyed])
+  assert.equal((await up.flush()).state, 'idle')
+  // One request only: the item goes to the dead letter instead of being rewritten and resent.
   assert.equal(s.calls.length, 1)
+  assert.equal(queue.size, 0)
+  const death = await readFile(path.join(dir, 'dead-letter.jsonl'), "utf8")
+  assert.equal(JSON.parse(death.trim()).code, 'INVALID_ARGUMENT')
   await s.close()
 })
 
@@ -449,17 +432,16 @@ test('collector: session events → queue → upload; restart replays leftovers'
 
 // ---- generation timing in the uploaded body (T-061 D) ----
 
-test('v1 shape when no timing was observed: neither timing key is sent', async () => {
+test('the uploader never rewrites the queued event body', async () => {
   const s = await server(allAs('accepted'))
-  const { up } = await uploader(s.endpoint, [ev(1)])
+  const queued = { ...ev(1), generation_duration_ms: null, ttft_ms: null }
+  const { up } = await uploader(s.endpoint, [queued])
   assert.equal((await up.flush()).state, 'idle')
-  const body = s.calls[0].body.events[0]
-  assert.ok(!('generation_duration_ms' in body) && !('ttft_ms' in body))
-  assert.deepEqual(Object.keys(body).sort(), ['duration_ms', 'model', 'occurred_at', 'project_id', 'provider', 'source_event_id', 'status', 'usage'])
+  assert.deepEqual(s.calls[0].body.events[0], queued)
   await s.close()
 })
 
-test('v2 shape sends both keys with real values, and null for an unknown one', async () => {
+test('both keys keep real values, and null for an unknown one', async () => {
   const s = await server(allAs('accepted'))
   const timed = [
     { ...ev(1), generation_duration_ms: 2000, ttft_ms: 8000 },
@@ -521,7 +503,7 @@ test('mapper → collector → upload keeps TTFT for a usage-less request and a 
   await s.close()
 })
 
-test('old host through the collector: unchanged v1 body end to end', async () => {
+test('old host through the collector: both timing keys travel as null', async () => {
   const s = await server(allAs('accepted'))
   const dir = await tmp()
   const tasks = []
@@ -539,7 +521,8 @@ test('old host through the collector: unchanged v1 body end to end', async () =>
   await done
   assert.equal((await c.flush()).state, 'idle')
   const body = s.calls[0].body.events[0]
-  assert.ok(!('generation_duration_ms' in body) && !('ttft_ms' in body))
+  assert.equal(body.generation_duration_ms, null)
+  assert.equal(body.ttft_ms, null)
   assert.deepEqual(body.usage.output_tokens, { value: 1, quality: 'known' })
   await c.stop()
   await s.close()

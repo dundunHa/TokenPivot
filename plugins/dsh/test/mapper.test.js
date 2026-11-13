@@ -43,6 +43,8 @@ test('assistant/message maps to a UsageEvent; DSH input excludes cache so it is 
       cache_write_tokens: { value: 5, quality: 'known' },
       reasoning_tokens: { value: null, quality: 'missing' },
     },
+    generation_duration_ms: null,
+    ttft_ms: null,
     status: null,
     duration_ms: null,
   })
@@ -197,7 +199,7 @@ test('same millisecond first output: TTFT 0 is kept, not dropped', () => {
   assert.equal(e.generation_duration_ms, 1000)
 })
 
-test('clock going backwards: each invalid difference is null; both invalid omits both keys', () => {
+test('clock going backwards: each invalid difference is null; both invalid still sends two nulls', () => {
   // last before first → duration null, TTFT still valid
   const partial = mapSessionEvent(session, TIMED, {}, timingOf(0, 8000, 7000))
   assert.equal(partial.generation_duration_ms, null)
@@ -206,32 +208,32 @@ test('clock going backwards: each invalid difference is null; both invalid omits
   const other = mapSessionEvent(session, TIMED, {}, timingOf(9000, 8000, 10000))
   assert.equal(other.generation_duration_ms, 2000)
   assert.equal(other.ttft_ms, null)
-  // both broken → the event is reported exactly as before: neither key present
+  // both broken → the pair is still reported, as two explicit nulls
   const none = mapSessionEvent(session, TIMED, {}, timingOf(9000, 8000, 7000))
-  assert.deepEqual(Object.keys(none).sort(), ['duration_ms', 'model', 'occurred_at', 'project_id', 'provider', 'source_event_id', 'status', 'usage'])
-  assert.ok(!('generation_duration_ms' in none) && !('ttft_ms' in none))
+  assert.equal(none.generation_duration_ms, null)
+  assert.equal(none.ttft_ms, null)
 })
 
 test('missing boundaries: null value, absent field, non-integer and out-of-range are unknown', () => {
-  assert.deepEqual(mapGenerationTiming(timingOf(0, null, 1000)), {})
+  assert.deepEqual(mapGenerationTiming(timingOf(0, null, 1000)), { generation_duration_ms: null, ttft_ms: null })
   // last boundary unknown: duration null, TTFT is independent and still valid
   assert.deepEqual(mapGenerationTiming(timingOf(0, 1000, null)), { generation_duration_ms: null, ttft_ms: 1000 })
   assert.deepEqual(mapGenerationTiming(timingOf(0, 1000, undefined)), { generation_duration_ms: null, ttft_ms: 1000 })
-  assert.deepEqual(mapGenerationTiming({ requestStartedAt: 0 }), {})
-  assert.deepEqual(mapGenerationTiming(undefined), {})
-  assert.deepEqual(mapGenerationTiming(null), {})
-  assert.deepEqual(mapGenerationTiming('nope'), {})
+  assert.deepEqual(mapGenerationTiming({ requestStartedAt: 0 }), { generation_duration_ms: null, ttft_ms: null })
+  assert.deepEqual(mapGenerationTiming(undefined), { generation_duration_ms: null, ttft_ms: null })
+  assert.deepEqual(mapGenerationTiming(null), { generation_duration_ms: null, ttft_ms: null })
+  assert.deepEqual(mapGenerationTiming('nope'), { generation_duration_ms: null, ttft_ms: null })
   // negative start → TTFT unknown, duration unaffected
   assert.deepEqual(mapGenerationTiming(timingOf(-1, 1000, 2000)), { generation_duration_ms: 1000, ttft_ms: null })
   // fractional and beyond 2^53-1 boundaries are not observations
   assert.deepEqual(mapGenerationTiming(timingOf(0.5, 1000, 2000)), { generation_duration_ms: 1000, ttft_ms: null })
-  assert.deepEqual(mapGenerationTiming(timingOf(0, 1000.5, 2000)), {})
-  assert.deepEqual(mapGenerationTiming({ requestStartedAt: 0, firstOutputAt: 2 ** 53, lastOutputAt: 2 ** 53 }), {})
+  assert.deepEqual(mapGenerationTiming(timingOf(0, 1000.5, 2000)), { generation_duration_ms: null, ttft_ms: null })
+  assert.deepEqual(mapGenerationTiming({ requestStartedAt: 0, firstOutputAt: 2 ** 53, lastOutputAt: 2 ** 53 }), { generation_duration_ms: null, ttft_ms: null })
   assert.deepEqual(mapGenerationTiming({ requestStartedAt: 0, firstOutputAt: 0, lastOutputAt: 2 ** 53 }), { generation_duration_ms: null, ttft_ms: 0 })
   assert.deepEqual(mapGenerationTiming({ requestStartedAt: 0, firstOutputAt: 9007199254740991, lastOutputAt: 9007199254740991 }), { generation_duration_ms: 0, ttft_ms: 9007199254740991 })
 })
 
-test('old host: no timing argument keeps the exact previous event shape (v1)', () => {
+test('old host: no timing argument still reports both timing keys as null', () => {
   const e = mapSessionEvent(session, msg({ inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
   assert.deepEqual(e, {
     source_event_id: 'dsh:msg:7a1c9a52-0b7e-4e0b-9a3f-2f7c1b1d0e11',
@@ -247,6 +249,8 @@ test('old host: no timing argument keeps the exact previous event shape (v1)', (
       cache_write_tokens: { value: null, quality: 'missing' },
       reasoning_tokens: { value: null, quality: 'missing' },
     },
+    generation_duration_ms: null,
+    ttft_ms: null,
     status: null,
     duration_ms: null,
   })

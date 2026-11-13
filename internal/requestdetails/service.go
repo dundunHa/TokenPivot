@@ -1,5 +1,6 @@
-// Package requestdetails serves the read-only request detail list and the exact
-// 60 second token rate from the raw usage_events rows.
+// Package requestdetails serves the read-only request detail list, the rolling 60
+// second rate window and the generation speed series from the raw usage_events
+// rows.
 package requestdetails
 
 import (
@@ -89,14 +90,12 @@ type EventRow struct {
 	TTFTMS             *int64
 }
 
-// RateRow is the window aggregate. Sum is an exact decimal string, nil when no
-// known or estimated total exists.
+// RateRow is the window aggregate. EventCount is the raw number of events that
+// occurred in the window; it is not a token count and not a sample count.
 type RateRow struct {
-	AsOf                     time.Time
-	Sum                      *string
-	Events, Known, Estimated int64
-	Missing                  int64
-	LastReceived             *time.Time
+	AsOf         time.Time
+	EventCount   int64
+	LastReceived *time.Time
 	// SpeedAvg and TTFTAvg are decimal strings rounded to six places, nil when
 	// their own sample count is zero. The two sample sets are independent: each
 	// request counts once in the metric it has, never weighted by tokens or time.
@@ -203,15 +202,6 @@ type EventsResponse struct {
 	RetentionCutoff string  `json:"retention_cutoff"`
 }
 
-// RateTotal is the total token aggregate of the window.
-type RateTotal struct {
-	Value          *string `json:"value"`
-	EventCount     int64   `json:"event_count"`
-	KnownCount     int64   `json:"known_count"`
-	EstimatedCount int64   `json:"estimated_count"`
-	MissingCount   int64   `json:"missing_count"`
-}
-
 // RateMetric is one average over the window with its own unit and valid sample
 // count. Value is a decimal string, nil when no valid sample exists; a zero
 // sample count never becomes a zero average.
@@ -223,12 +213,12 @@ type RateMetric struct {
 
 // RateResponse is the body of the rate endpoint.
 type RateResponse struct {
-	Start              string     `json:"start"`
-	End                string     `json:"end"`
-	AsOf               string     `json:"as_of"`
-	WindowSeconds      int        `json:"window_seconds"`
-	Unit               string     `json:"unit"`
-	TotalTokens        RateTotal  `json:"total_tokens"`
+	Start      string `json:"start"`
+	End        string `json:"end"`
+	AsOf       string `json:"as_of"`
+	EventCount int64  `json:"event_count"`
+	// Both metrics are always present: an absent sample is a null value with a
+	// zero sample count, never an omitted object.
 	GenerationSpeed    RateMetric `json:"generation_speed"`
 	TTFT               RateMetric `json:"ttft"`
 	WindowLastReceived *string    `json:"window_last_received_at"`
@@ -379,7 +369,8 @@ func (s *Service) Events(ctx context.Context, workspaceID pgtype.UUID, values ur
 	return response, nil
 }
 
-// Rate returns the exact tokens/min of the rolling [as_of-60s, as_of) window.
+// Rate returns the rolling [as_of-60s, as_of) window aggregate: the raw event
+// count, the last received stamp and the two independent averages.
 func (s *Service) Rate(ctx context.Context, workspaceID pgtype.UUID, values url.Values) (*RateResponse, error) {
 	return s.rateAt(ctx, workspaceID, values, nil)
 }
@@ -405,8 +396,7 @@ func (s *Service) rateAt(ctx context.Context, workspaceID pgtype.UUID, values ur
 	end := row.AsOf.UTC()
 	response := &RateResponse{
 		Start: formatTime(end.Add(-RateWindow)), End: formatTime(end), AsOf: formatTime(end),
-		WindowSeconds: int(RateWindow / time.Second), Unit: "tokens/min",
-		TotalTokens:     RateTotal{Value: row.Sum, EventCount: row.Events, KnownCount: row.Known, EstimatedCount: row.Estimated, MissingCount: row.Missing},
+		EventCount:      row.EventCount,
 		GenerationSpeed: RateMetric{Unit: "tokens/s", Value: row.SpeedAvg, SampleCount: row.SpeedSamples},
 		TTFT:            RateMetric{Unit: "ms", Value: row.TTFTAvg, SampleCount: row.TTFTSamples},
 	}

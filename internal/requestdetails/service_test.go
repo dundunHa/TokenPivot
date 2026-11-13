@@ -101,21 +101,22 @@ func TestEventGenerationMetricsShape(t *testing.T) {
 }
 
 // TestRateGenerationMetricsShape: the two objects carry their own unit and
-// sample count; no valid sample yields value=null with count 0, never "0".
+// sample count; no valid sample yields value=null with count 0, never "0". The
+// window no longer reports a tokens/min total, only the raw event count.
 func TestRateGenerationMetricsShape(t *testing.T) {
 	speed, ttft := "29.750000", "4200.000000"
-	store := &fakeStore{rate: RateRow{AsOf: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC), SpeedAvg: &speed, SpeedSamples: 2, TTFTAvg: &ttft, TTFTSamples: 3}}
+	store := &fakeStore{rate: RateRow{AsOf: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC), EventCount: 7, SpeedAvg: &speed, SpeedSamples: 2, TTFTAvg: &ttft, TTFTSamples: 3}}
 	svc := New(store)
 	r, err := svc.Rate(context.Background(), pgtype.UUID{}, url.Values{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Unit != "tokens/min" || r.GenerationSpeed != (RateMetric{Unit: "tokens/s", Value: &speed, SampleCount: 2}) || r.TTFT != (RateMetric{Unit: "ms", Value: &ttft, SampleCount: 3}) {
+	if r.EventCount != 7 || r.GenerationSpeed != (RateMetric{Unit: "tokens/s", Value: &speed, SampleCount: 2}) || r.TTFT != (RateMetric{Unit: "ms", Value: &ttft, SampleCount: 3}) {
 		t.Fatalf("rate = %+v", r)
 	}
 	empty := New(&fakeStore{rate: RateRow{AsOf: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}})
 	e, err := empty.Rate(context.Background(), pgtype.UUID{}, url.Values{})
-	if err != nil || e.GenerationSpeed.Value != nil || e.GenerationSpeed.SampleCount != 0 || e.TTFT.Value != nil || e.TTFT.SampleCount != 0 {
+	if err != nil || e.EventCount != 0 || e.GenerationSpeed.Value != nil || e.GenerationSpeed.SampleCount != 0 || e.TTFT.Value != nil || e.TTFT.SampleCount != 0 {
 		t.Fatalf("empty = %+v %v", e, err)
 	}
 	body, err := json.Marshal(e)
@@ -123,8 +124,12 @@ func TestRateGenerationMetricsShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(body), `"generation_speed":{"unit":"tokens/s","value":null,"sample_count":0}`) ||
-		!strings.Contains(string(body), `"ttft":{"unit":"ms","value":null,"sample_count":0}`) {
+		!strings.Contains(string(body), `"ttft":{"unit":"ms","value":null,"sample_count":0}`) ||
+		!strings.Contains(string(body), `"event_count":0`) {
 		t.Fatalf("empty body = %s", body)
+	}
+	if strings.Contains(string(body), `"total_tokens"`) || strings.Contains(string(body), `"window_seconds"`) || strings.Contains(string(body), `"tokens/min"`) {
+		t.Fatalf("removed legacy fields still present: %s", body)
 	}
 }
 

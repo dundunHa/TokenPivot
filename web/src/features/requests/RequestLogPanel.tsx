@@ -300,8 +300,8 @@ function RateView({
   return (
     <div className="flex flex-col gap-1" data-testid="generation-rate">
       <p className="text-subtle text-xs">
-        近 60 秒平均：单请求 decode 速度的算术平均与 TTFT 的算术平均（与上方
-        tokens/min 口径不同）
+        近 60 秒平均：单请求 decode 速度与 TTFT 各自的算术平均；无有效样本的
+        一项显示“无样本”，不当成 0
       </p>
       <div className="flex flex-wrap gap-6">
         <div className="flex flex-col gap-0.5">

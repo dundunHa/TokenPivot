@@ -453,7 +453,8 @@ test('隐私：真实采集事件分别落 pending/dead/overflow，DB 字节与�
   ])
   for (const row of rows) {
     assert.deepEqual(Object.keys(JSON.parse(row.payload)).sort(), [
-      'duration_ms', 'model', 'occurred_at', 'project_id', 'provider', 'source_event_id', 'status', 'usage',
+      'duration_ms', 'generation_duration_ms', 'model', 'occurred_at', 'project_id', 'provider',
+      'source_event_id', 'status', 'ttft_ms', 'usage',
     ])
   }
 })
