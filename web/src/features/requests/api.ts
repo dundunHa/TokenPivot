@@ -141,18 +141,17 @@ function metricDecimal(value: unknown): string {
   return value;
 }
 
-/** 分钟点的样本数：必须是正的安全整数。 */
-function positiveCount(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
-    throw badResponse();
-  }
-  return value;
-}
-
 /** 必填的非负安全整数：指标对象必带样本数，null 与缺失都是畸形响应。 */
 function safeCount(value: unknown): number {
   const parsed = nullableSafeInteger(value);
   if (parsed === null) throw badResponse();
+  return parsed;
+}
+
+/** 分钟点的样本数：必须是正的安全整数。 */
+function positiveCount(value: unknown): number {
+  const parsed = safeCount(value);
+  if (parsed === 0) throw badResponse();
   return parsed;
 }
 

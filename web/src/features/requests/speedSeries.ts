@@ -50,10 +50,10 @@ export function buildSpeedRows(
   const startMs =
     Math.floor(Date.parse(ref.seriesStart) / MINUTE_MS) * MINUTE_MS;
   const endMs = Math.floor(Date.parse(ref.asOf) / MINUTE_MS) * MINUTE_MS;
-  const bySeries = new Map<string, Map<number, number | null>>();
+  const bySeries = new Map<string, Map<number, number>>();
   for (const input of inputs) {
     if (!input.data) continue;
-    const m = new Map<number, number | null>();
+    const m = new Map<number, number>();
     for (const p of input.data.points) {
       m.set(Date.parse(p.bucketStart), Number(p.generationSpeedTps));
     }
