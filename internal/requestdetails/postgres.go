@@ -123,19 +123,24 @@ LEFT JOIN usage_events e
  ` + filterSQL("$3", "$4", "$5", "$6") + `
 GROUP BY p.as_of`
 
-// speedQuery measures generation speed from the events that can be measured: a known
-// or estimated output_tokens and a positive duration_ms. As in rateQuery the database
+// speedQuery returns two independent speed measures. As in rateQuery the database
 // statement start is sampled once as as_of.
 //
-// It returns one row per UTC minute (grouping(bucket)=0) from the minute that contains
-// as_of-60min up to as_of, so the first bucket is whole, and one overall row
-// (grouping(bucket)=1). The overall row's win_* columns cover only the rolling 60 seconds
-// [as_of-60s, as_of); the per-minute rows' sums are the minute series. Empty minutes have
-// no row. $1 workspace, $2 optional fixed as_of, $3..$6 filter.
+// The current window (the overall row, grouping(bucket)=1) sums output_tokens and
+// duration_ms over events with a known or estimated output and a positive duration_ms,
+// and covers only the rolling 60 seconds [as_of-60s, as_of).
+//
+// The minute series has one row per UTC minute (grouping(bucket)=0) from the minute that
+// contains as_of-60min up to as_of, so the first bucket is whole. Each minute is the
+// arithmetic mean of the unrounded per request speedExpr over the requests that satisfy
+// speedValid (first to last valid output, the same measure as the request details and
+// rateQuery), rounded once at the end, with that sample count. Minutes without a valid
+// sample have no row. $1 workspace, $2 optional fixed as_of, $3..$6 filter.
 var speedQuery = `WITH p AS (SELECT COALESCE($2::timestamptz, statement_timestamp()) AS as_of),
 m AS (
   SELECT p.as_of, e.occurred_at, e.output_tokens_quality, e.output_tokens, e.duration_ms,
-    (e.output_tokens_quality IN ('known','estimated') AND e.duration_ms IS NOT NULL AND e.duration_ms > 0) AS usable
+    (e.output_tokens_quality IN ('known','estimated') AND e.duration_ms IS NOT NULL AND e.duration_ms > 0) AS usable,
+    CASE WHEN ` + speedValid + ` THEN ` + speedExpr + ` END AS speed
   FROM p
   LEFT JOIN usage_events e
     ON e.workspace_id = $1
@@ -146,10 +151,8 @@ m AS (
 SELECT as_of,
   date_bin('1 minute', occurred_at, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket,
   grouping(date_bin('1 minute', occurred_at, TIMESTAMPTZ '2000-01-01 00:00:00+00')) AS is_total,
-  (sum(output_tokens::numeric) FILTER (WHERE usable))::text,
-  (sum(duration_ms::numeric) FILTER (WHERE usable))::text,
-  count(occurred_at), count(*) FILTER (WHERE usable),
-  count(*) FILTER (WHERE usable AND output_tokens_quality = 'estimated'),
+  round(avg(speed), 6)::text,
+  count(speed),
   (sum(output_tokens::numeric) FILTER (WHERE usable AND occurred_at >= as_of - interval '60 seconds'))::text,
   (sum(duration_ms::numeric) FILTER (WHERE usable AND occurred_at >= as_of - interval '60 seconds'))::text,
   count(*) FILTER (WHERE occurred_at >= as_of - interval '60 seconds'),
@@ -177,12 +180,12 @@ func (s *Postgres) Speed(ctx context.Context, params SpeedParams) (SpeedRow, err
 			at                  time.Time
 			bucket              *time.Time
 			isTotal             int32
-			allOut, allDur      *string
-			events, meas, estim int64
+			minuteSpeed         *string
+			samples             int64
 			winOut, winDur      *string
 			wEvents, wMeas, wEs int64
 		)
-		if err := rows.Scan(&at, &bucket, &isTotal, &allOut, &allDur, &events, &meas, &estim, &winOut, &winDur, &wEvents, &wMeas, &wEs); err != nil {
+		if err := rows.Scan(&at, &bucket, &isTotal, &minuteSpeed, &samples, &winOut, &winDur, &wEvents, &wMeas, &wEs); err != nil {
 			return SpeedRow{}, database.SafeStoreError("scan request speed", err)
 		}
 		out.AsOf = at
@@ -190,8 +193,8 @@ func (s *Postgres) Speed(ctx context.Context, params SpeedParams) (SpeedRow, err
 			out.Current = SpeedSums{OutputTokens: winOut, DurationMS: winDur, Events: wEvents, Measured: wMeas, Estimated: wEs}
 			continue
 		}
-		if bucket != nil && meas > 0 {
-			out.Points = append(out.Points, SpeedPoint{BucketStart: *bucket, SpeedSums: SpeedSums{OutputTokens: allOut, DurationMS: allDur, Events: events, Measured: meas, Estimated: estim}})
+		if bucket != nil && samples > 0 && minuteSpeed != nil {
+			out.Points = append(out.Points, SpeedPoint{BucketStart: *bucket, SpeedTPS: *minuteSpeed, Samples: samples})
 		}
 	}
 	if err := rows.Err(); err != nil {

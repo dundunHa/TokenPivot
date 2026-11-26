@@ -874,27 +874,37 @@ func sp(out, dur int64, quality string) ev {
 	return ev{out: n(out), outputQuality: quality, duration: n(dur), total: n(out), quality: "known"}
 }
 
-// Only events with a usable output and a positive duration are measured, the rolling
-// window is exactly [as_of-60s, as_of), and the series groups by UTC minute.
+// spg is sp with the client observed generation span (first to last valid output),
+// which is what the minute series measures; duration stays the request span the
+// rolling window sums use.
+func spg(out, dur, gen int64, quality string) ev {
+	e := sp(out, dur, quality)
+	e.gen = n(gen)
+	return e
+}
+
+// Only events with a usable output and a positive duration are measured by the rolling
+// window, which is exactly [as_of-60s, as_of). The minute series is separate: it groups
+// by UTC minute and averages the per request speed of requests with a valid generation span.
 func TestSpeedWindowMeasuredEventsAndSeries(t *testing.T) {
 	f := newFixture(t)
 	at := func(d time.Duration, e ev) ev { e.at = asOf.Add(d); return e }
 	// In the 60 second window: 100 tokens/2s known, 50 tokens/1s estimated.
-	f.add(t, at(-10*time.Second, sp(100, 2000, "known")))
-	f.add(t, at(-20*time.Second, sp(50, 1000, "estimated")))
+	f.add(t, at(-10*time.Second, spg(100, 2000, 1000, "known")))
+	f.add(t, at(-20*time.Second, spg(50, 1000, 500, "estimated")))
 	// In the window but not measurable: unknown duration, zero duration, missing output.
 	f.add(t, at(-30*time.Second, ev{out: n(500), outputQuality: "known", total: n(500)}))
 	f.add(t, at(-31*time.Second, ev{out: n(500), outputQuality: "known", duration: n(0), total: n(500)}))
 	f.add(t, at(-32*time.Second, ev{duration: n(900), total: n(900)}))
 	// Window boundaries: start is included, as_of and just before start are not.
-	f.add(t, at(-time.Minute, sp(7, 700, "known")))
-	f.add(t, at(-time.Minute-time.Microsecond, sp(1000, 1000, "known")))
-	f.add(t, at(0, sp(1000, 1000, "known")))
+	f.add(t, at(-time.Minute, spg(7, 700, 600, "known")))
+	f.add(t, at(-time.Minute-time.Microsecond, spg(1000, 1000, 1000, "known")))
+	f.add(t, at(0, spg(1000, 1000, 1000, "known")))
 	// The first series minute is whole: 11:00:10 is before as_of-60min (11:00:30) but in the 11:00 bucket.
-	f.add(t, at(-60*time.Minute-20*time.Second, sp(40, 400, "known")))
-	// Earlier in the hour, and outside the hour.
+	f.add(t, at(-60*time.Minute-20*time.Second, spg(40, 400, 390, "known")))
+	// Earlier in the hour: measurable by the rolling sums but no generation span, so no point.
 	f.add(t, at(-10*time.Minute, sp(300, 3000, "known")))
-	f.add(t, at(-61*time.Minute, sp(9000, 9000, "known")))
+	f.add(t, at(-61*time.Minute, spg(9000, 9000, 9000, "known")))
 	// Another workspace must not leak in.
 	f.add(t, ev{ws: otherWS, at: asOf.Add(-5 * time.Second), out: n(9999), outputQuality: "known", duration: n(1), total: n(9999)})
 
@@ -915,43 +925,99 @@ func TestSpeedWindowMeasuredEventsAndSeries(t *testing.T) {
 		t.Fatalf("series start = %s", r.SeriesStart)
 	}
 	// The series groups by UTC calendar minute over the last 60 minutes, so unlike the rolling
-	// window it keeps the event at as_of-60s-1µs (11:59:29.999999): 11:59 = 7 + 1000 tokens.
-	// 12:00 holds the two measurable events at -10s and -20s; the event at as_of is excluded.
+	// window it keeps the event at as_of-60s-1µs (11:59:29.999999): 11:59 averages the speeds
+	// 6*1000/600=10 and 999*1000/1000=999. 12:00 holds only the known event at -10s (99); the
+	// estimated one at -20s is not a valid speed sample, and the event at as_of is excluded.
+	// 11:50 only has an event without a generation span, so that minute is left empty.
 	got := map[string]SpeedMinute{}
 	for _, p := range r.Points {
 		got[p.BucketStart] = p
 	}
 	m := func(h, min int) string { return formatTime(time.Date(2026, 10, 28, h, min, 0, 0, time.UTC)) }
-	val := func(p *string) string {
-		if p == nil {
-			return "<nil>"
-		}
-		return *p
-	}
 	for _, want := range []struct {
-		at             string
-		out, dur       string
-		measured, estd int64
+		at      string
+		speed   string
+		samples int64
 	}{
-		{m(11, 0), "40", "400", 1, 0},
-		{m(11, 50), "300", "3000", 1, 0},
-		{m(11, 59), "1007", "1700", 2, 0},
-		{m(12, 0), "150", "3000", 2, 1},
+		{m(11, 0), "100.000000", 1},
+		{m(11, 59), "504.500000", 2},
+		{m(12, 0), "99.000000", 1},
 	} {
 		p, ok := got[want.at]
-		if !ok || val(p.OutputTokens) != want.out || val(p.DurationMS) != want.dur || p.MeasuredCount != want.measured || p.EstimatedCount != want.estd {
-			t.Fatalf("%s = out %s dur %s measured %d estimated %d (present=%v), want %s/%s/%d/%d",
-				want.at, val(p.OutputTokens), val(p.DurationMS), p.MeasuredCount, p.EstimatedCount, ok, want.out, want.dur, want.measured, want.estd)
+		if !ok || p.GenerationSpeedTPS != want.speed || p.SampleCount != want.samples {
+			t.Fatalf("%s = speed %s samples %d (present=%v), want %s/%d",
+				want.at, p.GenerationSpeedTPS, p.SampleCount, ok, want.speed, want.samples)
 		}
 	}
-	if len(got) != 4 {
-		t.Fatalf("expected exactly the 11:00, 11:50, 11:59 and 12:00 minutes, got %d: %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("expected exactly the 11:00, 11:59 and 12:00 minutes, got %d: %+v", len(got), got)
 	}
-	// Minutes with no measurable event are absent, never zero rows.
+	// Minutes with no valid sample are absent, never zero rows.
 	for _, p := range r.Points {
-		if p.MeasuredCount == 0 {
+		if p.SampleCount <= 0 || p.GenerationSpeedTPS == "" {
 			t.Fatalf("empty minute returned: %+v", p)
 		}
+	}
+}
+
+// TestSpeedSeriesMinuteIsMeanOfRequestSpeeds: a minute point is the plain mean of the
+// per request speeds, so one slow-to-finish request cannot weight it. The two requests run
+// at 50 and 10 tokens/s; the second one waited 100 s in total, which would pull a
+// total-duration or token-weighted formula far from 30. Invalid timing never counts, a
+// backfill is placed by occurred_at, and the same requests agree with the rolling mean.
+func TestSpeedSeriesMinuteIsMeanOfRequestSpeeds(t *testing.T) {
+	f := newFixture(t)
+	at := asOf.Add(-10 * time.Second)
+	slow := spg(11, 100000, 1000, "known")
+	slow.at = at
+	fast := spg(101, 2000, 2000, "known")
+	fast.at = at.Add(-time.Second)
+	f.add(t, slow)
+	f.add(t, fast)
+	// Not valid speed samples: no timing, zero span, a single output token, estimated and
+	// missing output. They sit in the same minute and must change neither value nor count.
+	f.add(t, ev{at: at, out: n(500), duration: n(500)})
+	f.add(t, ev{at: at, out: n(500), gen: n(0), duration: n(500)})
+	f.add(t, ev{at: at, out: n(1), gen: n(500), duration: n(500)})
+	f.add(t, ev{at: at, out: n(500), outputQuality: "estimated", gen: n(500), duration: n(500)})
+	f.add(t, ev{at: at, gen: n(500), duration: n(500)})
+	// Backfilled: received long after it occurred, it stays in its own earlier minute.
+	late := spg(21, 1000, 1000, "known")
+	late.at, late.received = asOf.Add(-30*time.Minute), asOf.Add(-time.Second)
+	f.add(t, late)
+
+	r := f.speed(t, ws, nil)
+	if len(r.Points) != 2 {
+		t.Fatalf("points = %+v", r.Points)
+	}
+	backfill, now := r.Points[0], r.Points[1]
+	if backfill.BucketStart != formatTime(time.Date(2026, 10, 28, 11, 30, 0, 0, time.UTC)) || backfill.GenerationSpeedTPS != "20.000000" || backfill.SampleCount != 1 {
+		t.Fatalf("backfill point = %+v", backfill)
+	}
+	if now.BucketStart != formatTime(time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)) || now.GenerationSpeedTPS != "30.000000" || now.SampleCount != 2 {
+		t.Fatalf("minute point = %+v", now)
+	}
+	// The rolling request mean is over the same valid requests and gives the same number.
+	rate := f.rate(t, ws, nil)
+	if rate.GenerationSpeed.Value == nil || *rate.GenerationSpeed.Value != now.GenerationSpeedTPS || rate.GenerationSpeed.SampleCount != now.SampleCount {
+		t.Fatalf("rolling mean = %+v, minute = %+v", rate.GenerationSpeed, now)
+	}
+	// The rolling sums of the current window keep their own legacy basis.
+	if r.Current.OutputTokens == nil || *r.Current.OutputTokens != "1613" || r.Current.DurationMS == nil || *r.Current.DurationMS != "104000" {
+		t.Fatalf("current sums = %+v", r.Current)
+	}
+}
+
+// TestSpeedSeriesRoundsOnce: the mean of the unrounded speeds 0.9999996 and 1.0000011 is
+// 1.00000035 and rounds to 1.000000; averaging the rounded values would give 1.000001.
+func TestSpeedSeriesRoundsOnce(t *testing.T) {
+	f := newFixture(t)
+	at := asOf.Add(-10 * time.Second)
+	f.add(t, ev{at: at, out: n(2500000), gen: n(2500000000)})
+	f.add(t, ev{at: at, out: n(10000012), gen: n(10000000000)})
+	r := f.speed(t, ws, nil)
+	if len(r.Points) != 1 || r.Points[0].GenerationSpeedTPS != "1.000000" || r.Points[0].SampleCount != 2 {
+		t.Fatalf("points = %+v", r.Points)
 	}
 }
 
@@ -962,26 +1028,33 @@ func TestSpeedEmptyAndFilters(t *testing.T) {
 		t.Fatalf("empty = %+v", r)
 	}
 	at := asOf.Add(-5 * time.Second)
-	a := sp(100, 1000, "known")
+	a := spg(100, 1000, 1000, "known")
 	a.at, a.model, a.provider, a.project = at, "m1", "p1", projA
-	b := sp(200, 4000, "known")
+	b := spg(200, 4000, 4000, "known")
 	b.at, b.model, b.provider = at.Add(-time.Second), "m2", "p2"
 	f.add(t, a)
 	f.add(t, b)
+	// Speeds are 99 (a) and 199*1000/4000=49.75 (b).
 	cases := []struct {
 		q        url.Values
 		out, dur string
+		speed    string
+		samples  int64
 	}{
-		{nil, "300", "5000"},
-		{url.Values{"model": {"m1"}}, "100", "1000"},
-		{url.Values{"provider": {"p2"}}, "200", "4000"},
-		{url.Values{"project": {"unattributed"}}, "200", "4000"},
-		{url.Values{"project": {projA.String()}}, "100", "1000"},
+		{nil, "300", "5000", "74.375000", 2},
+		{url.Values{"model": {"m1"}}, "100", "1000", "99.000000", 1},
+		{url.Values{"provider": {"p2"}}, "200", "4000", "49.750000", 1},
+		{url.Values{"project": {"unattributed"}}, "200", "4000", "49.750000", 1},
+		{url.Values{"project": {projA.String()}}, "100", "1000", "99.000000", 1},
 	}
 	for _, c := range cases {
-		got := f.speed(t, ws, c.q).Current
+		resp := f.speed(t, ws, c.q)
+		got := resp.Current
 		if got.OutputTokens == nil || *got.OutputTokens != c.out || *got.DurationMS != c.dur {
 			t.Fatalf("%v: %+v, want %s/%s", c.q, got, c.out, c.dur)
+		}
+		if len(resp.Points) != 1 || resp.Points[0].GenerationSpeedTPS != c.speed || resp.Points[0].SampleCount != c.samples {
+			t.Fatalf("%v: points %+v, want %s/%d", c.q, resp.Points, c.speed, c.samples)
 		}
 	}
 	if _, err := f.svc.SpeedAt(f.ctx, ws, url.Values{"project": {projX.String()}}, asOf); !errors.Is(err, ErrInvalidArgument) {

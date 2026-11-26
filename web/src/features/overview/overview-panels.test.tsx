@@ -89,9 +89,15 @@ function useBackend(
     http.get(`${BASE}/usage-speed`, ({ request }) => {
       const model = new URL(request.url).searchParams.get("model");
       speedModels.push(model);
-      // 100 s 请求耗时内的输出 token：m1 = 100 tok/s，m2 = 50 tok/s，总体 = 90 tok/s。
+      // 当前窗口合计保持原样；分钟点是服务端算好的均值：m1 = 100，m2 = 50，总体 = 90 tok/s。
       const output =
         model === "m1" ? "10000" : model === "m2" ? "5000" : "9000";
+      const minuteSpeed =
+        model === "m1"
+          ? "100.000000"
+          : model === "m2"
+            ? "50.000000"
+            : "90.000000";
       return HttpResponse.json({
         as_of: "2026-10-28T02:00:30Z",
         series_start: "2026-10-28T01:00:00Z",
@@ -107,10 +113,8 @@ function useBackend(
         points: [
           {
             bucket_start: "2026-10-28T01:58:00Z",
-            output_tokens: output,
-            duration_ms: "100000",
-            measured_count: 3,
-            estimated_count: 0,
+            generation_speed_tps: minuteSpeed,
+            sample_count: 3,
           },
         ],
       });
@@ -198,13 +202,14 @@ describe("overview panels", () => {
     ).toBe(true);
   });
 
-  it("draws the per-minute generation speed trend from output ÷ request time, for the total and each model", async () => {
+  it("draws the per-minute generation speed trend from the server minute means, for the total and each model", async () => {
     const seen = useBackend();
     renderApp("/?tz=UTC");
     const card = await screen.findByRole("region", { name: "生成速度趋势" });
     expect(within(card).getByText(/近 60 分钟/)).toBeTruthy();
-    expect(within(card).getByText(/输出 ÷ 请求耗时/)).toBeTruthy();
-    // 总体 + 两个模型各取一条速度序列（来自 usage-speed，分钟聚合表没有请求耗时）。
+    expect(within(card).getByText(/首末有效输出计时/)).toBeTruthy();
+    expect(within(card).queryByText(/请求耗时/)).toBeNull();
+    // 总体 + 两个模型各取一条速度序列（来自 usage-speed，分钟聚合表没有首末有效输出计时）。
     await waitFor(() =>
       expect(seen.speedModels).toEqual(
         expect.arrayContaining([null, "m1", "m2"]),
