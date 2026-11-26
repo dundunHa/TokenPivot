@@ -1,6 +1,6 @@
 # TODO
 
-<!-- todo-meta: next-id=71 -->
+<!-- todo-meta: next-id=72 -->
 
 ## 里程碑一：采集打通
 
@@ -38,6 +38,11 @@
 
 - [ ] T-062 {running} {P1} **dashboard 正式前端：J 极客重奏方案落地 web/** 用户返修确认：按 J 原型复刻全部区块；无真实接口的数据标记不可用，不用演示数据；修正默认 braille、直角面板、窗口切换、字符直方图、排名、日志与响应式。
   - plan: docs/plans/2026-11-02-overview-j-geek-redesign.md
+- [ ] T-071 {running} {P2} **概览生成速度趋势改用首末有效输出计时** 仅修改概览「生成速度趋势」：与请求明细采用同一单请求速度算法，不计最后有效输出后的等待，其他指标不变。BF 已部署 32b0659，待登录验收。
+  - 规格: openspec/changes/generation-speed-and-ttft/specs/request-generation-metrics/spec.md
+  - 接口: docs/openapi/openapi.yaml
+  - plan: docs/plans/2026-11-26-overview-generation-speed-trend.md
+  - 发布验证: /root/.tokenpivot-bf/releases/t071-overview-speed-20261126T035730Z-32b0659/final-acceptance.json
 
 ## 部署
 
