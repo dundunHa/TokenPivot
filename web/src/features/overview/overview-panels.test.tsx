@@ -189,17 +189,13 @@ describe("overview panels", () => {
         expect.stringMatching(/m2.*50/),
       ]),
     );
-    const texts = screen.getAllByTestId("model-rate").map((r) => r.textContent);
-    expect(texts[0]).toContain("100");
-    expect(texts[1]).toContain("50");
     expect(seen.speedModels).toEqual(expect.arrayContaining(["m1", "m2"]));
-    // 分模型明细在顶部“生成速度”指标卡内，总体速度仍在。
-    const rate = screen.getByTestId("rate");
-    expect(
-      rate
-        .closest(".geek-kpi")
-        ?.contains(screen.getAllByTestId("model-rate")[0] ?? null),
-    ).toBe(true);
+    // 顶部“生成速度”卡只含分模型速率，不再显示总体平均速度。
+    const card = screen.getAllByTestId("model-rate")[0]?.closest(".geek-kpi");
+    if (!(card instanceof HTMLElement)) throw new Error("缺少生成速度卡");
+    expect(within(card).getByText("生成速度（tokens/s）")).toBeTruthy();
+    expect(within(card).getAllByTestId("model-rate")).toHaveLength(2);
+    expect(screen.queryByTestId("rate")).toBeNull();
   });
 
   it("draws the per-minute generation speed trend from the server minute means, for the total and each model", async () => {
