@@ -8,11 +8,10 @@ import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
 import { GeekComposition } from "./geek/GeekComposition";
 import { GeekHeatmap } from "./geek/GeekHeatmap";
-import { GeekKpis } from "./geek/GeekKpis";
+import { GeekKpiShell, GeekKpis } from "./geek/GeekKpis";
 import { GeekTrend } from "./geek/GeekTrend";
 import { ModelSpeedList } from "@/features/requests/ModelSpeedList";
 import { SpeedTrend } from "@/features/requests/SpeedTrend";
-import { SpeedKpi } from "@/features/requests/SpeedKpi";
 import {
   browserTimezone,
   DEFAULT_OVERVIEW_FILTERS,
@@ -220,14 +219,14 @@ function OverviewContent({
           data={data}
           previous={previous.data?.totals}
           rate={
-            <SpeedKpi scope={scope} filters={filters} intervalMs={refreshMs}>
+            <GeekKpiShell label="生成速度（tokens/s）">
               <ModelSpeedList
                 scope={scope}
                 filters={filters}
                 range={range}
                 intervalMs={refreshMs}
               />
-            </SpeedKpi>
+            </GeekKpiShell>
           }
         />
       ) : null}
