@@ -4,8 +4,10 @@ import { http, HttpResponse, server } from "@/test/server";
 import {
   fetchRate,
   fetchRequests,
+  fetchSpeed,
   type RateData,
   type RequestPage,
+  type SpeedData,
 } from "./api";
 
 const WS = "0198f2b0-0000-7000-8000-0000000000aa";
@@ -82,6 +84,35 @@ async function failure(pending: Promise<unknown>) {
   const error = await pending.catch((e: unknown) => e);
   expect(error).toBeInstanceOf(ApiError);
   expect((error as ApiError).code).toBe("BAD_RESPONSE");
+}
+
+const speedPoint = (over: Record<string, unknown> = {}) => ({
+  bucket_start: "2026-10-28T11:59:00Z",
+  generation_speed_tps: "30.000000",
+  sample_count: 2,
+  ...over,
+});
+
+const speedBody = (points: unknown[]) => ({
+  as_of: "2026-10-28T12:00:00Z",
+  series_start: "2026-10-28T11:00:00Z",
+  window_seconds: 60,
+  unit: "tokens/s",
+  current: {
+    output_tokens: "100",
+    duration_ms: "2000",
+    event_count: 3,
+    measured_count: 2,
+    estimated_count: 1,
+  },
+  points,
+});
+
+async function speed(points: unknown[]): Promise<SpeedData> {
+  server.use(
+    http.get(`${BASE}/usage-speed`, () => HttpResponse.json(speedBody(points))),
+  );
+  return fetchSpeed(WS, "", new AbortController().signal);
 }
 
 describe("request detail generation metrics", () => {
@@ -232,5 +263,90 @@ describe("current usage rate generation metrics", () => {
     );
     expect(body.generationSpeed.sampleCount).toBe(Number.MAX_SAFE_INTEGER);
     expect(body.ttft.sampleCount).toBe(0);
+  });
+});
+
+describe("usage speed minute points", () => {
+  it("parses the minute mean and sample count and keeps the current sums", async () => {
+    const body = await speed([
+      speedPoint(),
+      speedPoint({
+        bucket_start: "2026-10-28T12:00:00Z",
+        generation_speed_tps: "0",
+        sample_count: 1,
+      }),
+    ]);
+    expect(body.points).toEqual([
+      {
+        bucketStart: "2026-10-28T11:59:00Z",
+        generationSpeedTps: "30.000000",
+        sampleCount: 2,
+      },
+      {
+        bucketStart: "2026-10-28T12:00:00Z",
+        generationSpeedTps: "0",
+        sampleCount: 1,
+      },
+    ]);
+    expect(body.current).toEqual({
+      outputTokens: "100",
+      durationMs: "2000",
+      eventCount: 3,
+      measuredCount: 2,
+      estimatedCount: 1,
+    });
+  });
+
+  it("accepts an empty series", async () => {
+    expect((await speed([])).points).toEqual([]);
+  });
+
+  it("rejects the old point format", async () => {
+    await failure(
+      speed([
+        {
+          bucket_start: "2026-10-28T11:59:00Z",
+          output_tokens: "100",
+          duration_ms: "2000",
+          measured_count: 2,
+          estimated_count: 0,
+        },
+      ]),
+    );
+  });
+
+  it("rejects a missing, null or malformed speed", async () => {
+    const withoutSpeed: Record<string, unknown> = speedPoint();
+    delete withoutSpeed.generation_speed_tps;
+    await failure(speed([withoutSpeed]));
+    for (const bad of [
+      null,
+      30,
+      "-1",
+      "1e3",
+      "30.1234567",
+      "30.",
+      ".5",
+      "01",
+      "",
+    ]) {
+      await failure(speed([speedPoint({ generation_speed_tps: bad })]));
+    }
+  });
+
+  it("rejects a sample count that is not a positive safe integer", async () => {
+    const withoutCount: Record<string, unknown> = speedPoint();
+    delete withoutCount.sample_count;
+    await failure(speed([withoutCount]));
+    for (const bad of [0, -1, 1.5, 2 ** 53, "2", null, true]) {
+      await failure(speed([speedPoint({ sample_count: bad })]));
+    }
+  });
+
+  it("keeps the largest safe sample count", async () => {
+    const body = await speed([
+      speedPoint({ sample_count: Number.MAX_SAFE_INTEGER }),
+    ]);
+    expect(body.points[0]?.sampleCount).toBe(Number.MAX_SAFE_INTEGER);
   });
 });

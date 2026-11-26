@@ -2,16 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { SpeedData, SpeedMinute } from "./api";
 import { buildSpeedRows } from "./speedSeries";
 
-const minute = (
-  at: string,
-  output: string | null,
-  duration: string | null,
-): SpeedMinute => ({
+const minute = (at: string, speed: string, samples = 1): SpeedMinute => ({
   bucketStart: at,
-  outputTokens: output,
-  durationMs: duration,
-  measuredCount: output === null ? 0 : 1,
-  estimatedCount: 0,
+  generationSpeedTps: speed,
+  sampleCount: samples,
 });
 const data = (points: SpeedMinute[]): SpeedData => ({
   asOf: "2026-11-04T11:00:30Z",
@@ -33,13 +27,13 @@ const total = (d: SpeedData | undefined) => ({
 });
 
 describe("buildSpeedRows", () => {
-  it("turns minute sums into output ÷ request time and leaves silent minutes empty, not zero", () => {
+  it("plots the server minute mean as is and leaves silent minutes empty, not zero", () => {
     const { rows, hasData } = buildSpeedRows(
       [
         total(
           data([
-            minute("2026-11-04T10:58:00Z", "6000", "20000"), // 300 tok/s
-            minute("2026-11-04T11:00:00Z", "500", "2000"), // 250 tok/s
+            minute("2026-11-04T10:58:00Z", "300.000000", 2),
+            minute("2026-11-04T11:00:00Z", "250.123457"),
           ]),
         ),
       ],
@@ -55,7 +49,7 @@ describe("buildSpeedRows", () => {
     expect(by["10:57"]).toBeNull();
     expect(by["10:58"]).toBe(300);
     expect(by["10:59"]).toBeNull();
-    expect(by["11:00"]).toBe(250);
+    expect(by["11:00"]).toBe(250.123457);
     expect(hasData).toBe(true);
   });
 
@@ -71,13 +65,23 @@ describe("buildSpeedRows", () => {
     expect(hasData).toBe(false);
   });
 
-  it("ignores a minute whose request time is zero instead of dividing by it", () => {
+  it("keeps a real zero speed as zero while an absent minute stays empty", () => {
     const { rows, hasData } = buildSpeedRows(
-      [total(data([minute("2026-11-04T10:58:00Z", "10", "0")]))],
+      [total(data([minute("2026-11-04T10:58:00Z", "0")]))],
       "UTC",
     );
-    expect(rows.find((r) => r.label === "10:58")?.total).toBeNull();
-    expect(hasData).toBe(false);
+    expect(rows.find((r) => r.label === "10:58")?.total).toBe(0);
+    expect(rows.find((r) => r.label === "10:59")?.total).toBeNull();
+    expect(hasData).toBe(true);
+  });
+
+  it("does not recompute speed from request time: the point value is all it uses", () => {
+    // 点里没有输出/耗时合计；总耗时再长也不会改变服务端给出的分钟均值。
+    const { rows } = buildSpeedRows(
+      [total(data([minute("2026-11-04T10:58:00Z", "30.000000", 2)]))],
+      "UTC",
+    );
+    expect(rows.find((r) => r.label === "10:58")?.total).toBe(30);
   });
 
   it("returns nothing before any series has loaded", () => {
@@ -89,7 +93,7 @@ describe("buildSpeedRows", () => {
 
   it("labels minutes in the requested time zone", () => {
     const { rows } = buildSpeedRows(
-      [total(data([minute("2026-11-04T11:00:00Z", "60", "1000")]))],
+      [total(data([minute("2026-11-04T11:00:00Z", "60.000000")]))],
       "Asia/Shanghai",
     );
     expect(rows.at(-1)?.label).toBe("19:00");

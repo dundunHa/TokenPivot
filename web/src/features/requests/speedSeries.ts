@@ -3,7 +3,6 @@ import type {
   ChartSeries,
 } from "@/features/overview/geek/GeekLineChart";
 import type { SpeedData } from "./api";
-import { speedOf } from "./model";
 
 const MINUTE_MS = 60_000;
 
@@ -31,8 +30,8 @@ function hhmm(ms: number, timezone: string): string {
 }
 
 /**
- * 把每分钟的“输出 ÷ 耗时”变成 tokens/s 折线数据，横轴是 UTC 分钟（按所选时区显示时:分）。
- * 没有可测量请求的分钟留空（不是 0）：模型没在跑时没有“速度”，图上连线跨过空档。
+ * 把服务端每分钟的生成速度均值（首个到最后一个有效输出）变成 tokens/s 折线数据，横轴是 UTC 分钟（按所选时区显示时:分）。
+ * 没有有效样本的分钟留空（不是 0）：模型没在跑时没有“速度”，图上连线跨过空档。
  * 尚在加载的序列整条留空。
  */
 export function buildSpeedRows(
@@ -56,7 +55,7 @@ export function buildSpeedRows(
     if (!input.data) continue;
     const m = new Map<number, number | null>();
     for (const p of input.data.points) {
-      m.set(Date.parse(p.bucketStart), speedOf(p));
+      m.set(Date.parse(p.bucketStart), Number(p.generationSpeedTps));
     }
     bySeries.set(input.key, m);
   }

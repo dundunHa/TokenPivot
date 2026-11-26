@@ -2387,13 +2387,15 @@ paths:
       tags:
         - usage
       operationId: getUsageSpeed
-      summary: 查询生成速度：输出 Token ÷ 请求耗时（近 60 秒 + 最近 60 分钟逐分钟）
+      summary: 查询生成速度：近 60 秒的输出与耗时之和 + 最近 60 分钟逐分钟的请求速度均值
       description: |
-        生成速度 = 可测量请求的 `output_tokens` 之和 ÷ 这些请求的 `duration_ms` 之和（tokens/s）。分母是模型实际在处理请求的时间，空闲时间不计入；分子只含输出，不含输入与缓存读取。接口返回两个和而不是商：客户端用精确整数相除（`output_tokens / duration_ms * 1000`）。
+        本接口有两个互相独立的口径。`current` 是近 60 秒的生成速度输入：可测量请求的 `output_tokens` 之和 ÷ 这些请求的 `duration_ms` 之和（tokens/s）。分母是模型实际在处理请求的时间，空闲时间不计入；分子只含输出，不含输入与缓存读取。接口返回两个和而不是商：客户端用精确整数相除（`output_tokens / duration_ms * 1000`）。`points` 是逐分钟趋势，口径见下文「分钟点」，与 `current` 的和无关。
 
-        **可测量请求**：`output_tokens_quality` 为 `known` 或 `estimated`，且 `duration_ms` 非空且大于 0。其余请求（旧数据没有耗时、输出缺失、耗时为 0）不进入两个和，但计入 `event_count`，`event_count - measured_count` 就是未覆盖的条数，调用方必须标出部分覆盖。`duration_ms` 由数据源上报；DSH 插件上报模型调用开始（`step/start`）到最终消息提交的时间，包含首 token 之前的等待。已入库的旧事件没有耗时，不会被补算。
+        **可测量请求**（只用于 `current`）：`output_tokens_quality` 为 `known` 或 `estimated`，且 `duration_ms` 非空且大于 0。其余请求（旧数据没有耗时、输出缺失、耗时为 0）不进入两个和，但计入 `event_count`，`event_count - measured_count` 就是未覆盖的条数，调用方必须标出部分覆盖。`duration_ms` 由数据源上报；DSH 插件上报模型调用开始（`step/start`）到最终消息提交的时间，包含首 token 之前的等待。已入库的旧事件没有耗时，不会被补算。
 
-        **窗口**：`current` 是精确滚动窗口 `[as_of-60s,as_of)`，按 `occurred_at`（请求完成时间）归入；`points` 是 `[series_start, as_of)` 内按 UTC 自然分钟分组的和，只返回有可测量请求的分钟（没有数据的分钟不出现，不是 0），升序。`as_of` 是数据库单条语句的开始时间，客户端不能指定。只接受 `provider`/`model`/`project` 筛选，其他参数返回 `400`。
+        **窗口**：`current` 是精确滚动窗口 `[as_of-60s,as_of)`，按 `occurred_at`（请求完成时间）归入；`points` 是 `[series_start, as_of)` 内按 UTC 自然分钟分组的请求速度均值，只返回有有效速度样本的分钟（没有样本的分钟不出现，不是 0），升序；窗口、`occurred_at` 归属与筛选同 `current`。`as_of` 是数据库单条语句的开始时间，客户端不能指定。只接受 `provider`/`model`/`project` 筛选，其他参数返回 `400`。
+
+        **分钟点**：每个点是该分钟内有效请求的单请求速度的算术平均。单请求速度与请求明细、`usage-rate` 完全相同：`output_tokens.quality=known`、`output_tokens>1`、`generation_duration_ms>0`（首个到最后一个有效输出的时间，不含等待完成信号），值为未舍入的 `(output_tokens-1)*1000/generation_duration_ms`。先对未舍入的单请求速度求平均，最后舍入到 6 位小数；不按 token 或时长加权，也不用 `duration_ms` 推算。`generation_speed_tps` 非空，`sample_count` 为参与平均的有效请求数（至少 1）。没有有效样本的分钟不返回，不画成 0。同一组请求的分钟点与 `usage-rate` 滚动均值使用同一单请求速度。不兼容旧点格式（`output_tokens`、`duration_ms`、`measured_count`、`estimated_count`）。
 
         **授权**与筛选规则同 `usage-events`。
       security:
@@ -2404,7 +2406,7 @@ paths:
         - $ref: '#/components/parameters/RequestProject'
       responses:
         '200':
-          description: '当前 60 秒窗口与最近 60 分钟的生成速度输入。'
+          description: '当前 60 秒窗口的生成速度输入与最近 60 分钟逐分钟的请求速度均值。'
           headers:
             Cache-Control:
               $ref: '#/components/headers/NoStore'
@@ -2419,8 +2421,8 @@ paths:
                 unit: tokens/s
                 current: {output_tokens: '150', duration_ms: '3000', event_count: 6, measured_count: 3, estimated_count: 1}
                 points:
-                  - {bucket_start: '2026-10-28T11:50:00Z', output_tokens: '300', duration_ms: '3000', measured_count: 1, estimated_count: 0}
-                  - {bucket_start: '2026-10-28T12:00:00Z', output_tokens: '150', duration_ms: '3000', measured_count: 2, estimated_count: 1}
+                  - {bucket_start: '2026-10-28T11:50:00Z', generation_speed_tps: '99.000000', sample_count: 1}
+                  - {bucket_start: '2026-10-28T12:00:00Z', generation_speed_tps: '30.000000', sample_count: 2}
         '400':
           description: '`INVALID_ARGUMENT`：路径 UUID、参数非法，或 Project UUID 不属于该 workspace。'
           headers:
@@ -3926,13 +3928,11 @@ components:
           items:
             type: object
             additionalProperties: false
-            required: [bucket_start, output_tokens, duration_ms, measured_count, estimated_count]
+            required: [bucket_start, generation_speed_tps, sample_count]
             properties:
               bucket_start: {type: string, format: date-time, description: 'UTC 分钟起点。'}
-              output_tokens: {type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$'}
-              duration_ms: {type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$'}
-              measured_count: {type: integer, minimum: 1}
-              estimated_count: {type: integer, minimum: 0}
+              generation_speed_tps: {type: string, pattern: '^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$', description: '该分钟有效请求各自速度（首个到最后一个有效输出）的算术平均，先平均后舍入到 6 位小数的非空十进制字符串。'}
+              sample_count: {type: integer, minimum: 1, description: '参与平均的有效请求数。'}
 
     ProjectList:
       type: array

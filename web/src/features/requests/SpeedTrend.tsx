@@ -12,7 +12,7 @@ import { useModelSpeeds, useSpeed } from "./useRequestLogs";
 
 const TOTAL_COLOR = "#f4f1ea";
 
-/** 生成速度趋势：最近 60 分钟，每分钟的“输出 token ÷ 请求耗时”（tokens/s）；总体 + 用量最高的几个模型各一条线。 */
+/** 生成速度趋势：最近 60 分钟，每分钟内各请求“首个到最后一个有效输出”速度的平均（tokens/s）；总体 + 用量最高的几个模型各一条线。 */
 export function SpeedTrend({
   scope,
   filters,
@@ -59,7 +59,7 @@ export function SpeedTrend({
         <h2 className="geek-card-title">
           生成速度
           <span className="geek-card-sub">
-            近 60 分钟 · tokens/s · 输出 ÷ 请求耗时
+            近 60 分钟 · tokens/s · 首末有效输出计时
           </span>
         </h2>
       </div>
@@ -75,7 +75,7 @@ export function SpeedTrend({
         </p>
       ) : !built.hasData ? (
         <p className="geek-empty geek-dim">
-          暂无可测量的请求（需要上报了请求耗时的新数据）
+          暂无可测量的请求（需要上报了首末有效输出计时的数据）
         </p>
       ) : (
         <>

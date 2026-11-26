@@ -52,13 +52,14 @@ export interface SpeedSums {
   estimatedCount: number;
 }
 
+/** 一个 UTC 分钟的生成速度：该分钟内有效请求各自速度（首个到最后一个有效输出）的算术平均。 */
 export interface SpeedMinute {
   /** 该 UTC 分钟的起点。 */
   bucketStart: string;
-  outputTokens: string | null;
-  durationMs: string | null;
-  measuredCount: number;
-  estimatedCount: number;
+  /** tokens/s，最多 6 位小数的十进制字符串，服务端已先平均后舍入。 */
+  generationSpeedTps: string;
+  /** 参与平均的有效请求数，至少为 1。 */
+  sampleCount: number;
 }
 
 export interface SpeedData {
@@ -66,7 +67,7 @@ export interface SpeedData {
   seriesStart: string;
   /** 滚动 60 秒窗口。 */
   current: SpeedSums;
-  /** 最近 60 分钟，只含有可测量请求的分钟。 */
+  /** 最近 60 分钟，只含有有效速度样本的分钟。 */
   points: SpeedMinute[];
 }
 
@@ -135,6 +136,14 @@ const METRIC_DECIMAL = /^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$/;
 
 function metricDecimal(value: unknown): string {
   if (typeof value !== "string" || !METRIC_DECIMAL.test(value)) {
+    throw badResponse();
+  }
+  return value;
+}
+
+/** 分钟点的样本数：必须是正的安全整数。 */
+function positiveCount(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
     throw badResponse();
   }
   return value;
@@ -250,10 +259,8 @@ function parseSpeed(body: unknown): SpeedData {
       const p = record(item);
       return {
         bucketStart: text(p.bucket_start),
-        outputTokens: decimalOrNull(p.output_tokens),
-        durationMs: decimalOrNull(p.duration_ms),
-        measuredCount: count(p.measured_count),
-        estimatedCount: count(p.estimated_count),
+        generationSpeedTps: metricDecimal(p.generation_speed_tps),
+        sampleCount: positiveCount(p.sample_count),
       };
     }),
   };

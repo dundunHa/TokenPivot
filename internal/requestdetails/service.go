@@ -118,10 +118,12 @@ type SpeedSums struct {
 	Estimated                int64
 }
 
-// SpeedPoint is one UTC minute of the series.
+// SpeedPoint is one UTC minute of the series: the mean unrounded per request
+// speed, rounded to six places, over Samples valid requests (always positive).
 type SpeedPoint struct {
 	BucketStart time.Time
-	SpeedSums
+	SpeedTPS    string
+	Samples     int64
 }
 
 // SpeedRow is the current 60 second window plus the minute series ending at AsOf.
@@ -233,13 +235,13 @@ type SpeedCurrent struct {
 	EstimatedCount int64   `json:"estimated_count"`
 }
 
-// SpeedMinute is one minute of the speed series.
+// SpeedMinute is one minute of the speed series: the arithmetic mean of the
+// per request generation speed (first to last valid output) over SampleCount
+// requests. Minutes without a valid request are not returned.
 type SpeedMinute struct {
-	BucketStart    string  `json:"bucket_start"`
-	OutputTokens   *string `json:"output_tokens"`
-	DurationMS     *string `json:"duration_ms"`
-	MeasuredCount  int64   `json:"measured_count"`
-	EstimatedCount int64   `json:"estimated_count"`
+	BucketStart        string `json:"bucket_start"`
+	GenerationSpeedTPS string `json:"generation_speed_tps"`
+	SampleCount        int64  `json:"sample_count"`
 }
 
 // SpeedResponse is the body of the speed endpoint.
@@ -445,8 +447,7 @@ func (s *Service) speedAt(ctx context.Context, workspaceID pgtype.UUID, values u
 	}
 	for _, p := range row.Points {
 		response.Points = append(response.Points, SpeedMinute{
-			BucketStart: formatTime(p.BucketStart.UTC()), OutputTokens: p.OutputTokens, DurationMS: p.DurationMS,
-			MeasuredCount: p.Measured, EstimatedCount: p.Estimated,
+			BucketStart: formatTime(p.BucketStart.UTC()), GenerationSpeedTPS: p.SpeedTPS, SampleCount: p.Samples,
 		})
 	}
 	return response, nil
