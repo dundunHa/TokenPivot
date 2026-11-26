@@ -6,12 +6,13 @@ import { useUsageOptions } from "@/features/workspace/queries";
 import { OverviewFilterBar } from "./OverviewFilterBar";
 import { OverviewRanking } from "./OverviewRanking";
 import { Section } from "./OverviewSection";
-import { GeekComposition } from "./geek/GeekComposition";
 import { GeekHeatmap } from "./geek/GeekHeatmap";
-import { GeekKpiShell, GeekKpis } from "./geek/GeekKpis";
+import { GeekKpis, type FastestModelInfo } from "./geek/GeekKpis";
 import { GeekTrend } from "./geek/GeekTrend";
-import { ModelSpeedList } from "@/features/requests/ModelSpeedList";
+import { useTopModels } from "@/features/requests/modelRates";
+import { formatSpeed, speedOf } from "@/features/requests/model";
 import { SpeedTrend } from "@/features/requests/SpeedTrend";
+import { useModelSpeeds, useRate } from "@/features/requests/useRequestLogs";
 import {
   browserTimezone,
   DEFAULT_OVERVIEW_FILTERS,
@@ -30,11 +31,10 @@ import {
   type QueryScope,
 } from "./overviewQueries";
 import { useRefreshMs } from "./refreshInterval";
-import { buildTrend } from "./overviewView";
+import { buildTrend, formatInstant } from "./overviewView";
 
 const TICK_MS = 10_000;
 
-/** 当前时刻（分钟对齐）；页面隐藏时不推进，重新可见时立即更新。 */
 function useMinuteNow(): number {
   const [now, setNow] = useState(() => floorMinute(Date.now()));
   useEffect(() => {
@@ -59,7 +59,6 @@ function toggle(list: string[], value: string): string[] {
     : [...list, value];
 }
 
-/** 当前空间由工作区容器决定；本页只消费明确的 userId/workspaceId，不再查询 /current。 */
 export function OverviewPage({
   userId,
   workspaceId,
@@ -70,10 +69,6 @@ export function OverviewPage({
   return <OverviewBody scope={{ userId, workspaceId }} />;
 }
 
-/**
- * 解析 URL 筛选：缺时区时写回、非法时给出重置入口；合法时把筛选和更新函数交给子树。
- * 总览与请求明细页共用，保证两页的筛选语义一致。
- */
 export function FiltersGate({
   children,
 }: {
@@ -91,7 +86,6 @@ export function FiltersGate({
   const filters = parsed.ok ? parsed.filters : null;
   const implied = parsed.ok && parsed.timezoneImplied;
 
-  // 首次进入缺时区时，以 replace 语义把解析出的时区写回 URL。
   useEffect(() => {
     if (filters && implied) {
       setParams((prev) => toSearchParams(filters, prev), { replace: true });
@@ -141,6 +135,7 @@ function OverviewBody({ scope }: { scope: QueryScope }) {
 function defaults(timezone: string): OverviewFilters {
   return { ...DEFAULT_OVERVIEW_FILTERS, timezone };
 }
+
 function stripOwn(base: URLSearchParams): URLSearchParams {
   const next = new URLSearchParams(base);
   for (const key of [
@@ -173,6 +168,14 @@ function OverviewContent({
   const aggregate = useAggregate(scope, filters, range);
   const options = useUsageOptions(scope.userId, scope.workspaceId);
   const projects = useProjects(scope, refreshMs);
+  const rate = useRate(scope, filters);
+  const { models: topModels } = useTopModels(scope, filters, range);
+  const modelSpeedQueries = useModelSpeeds(
+    scope,
+    filters,
+    topModels,
+    refreshMs,
+  );
 
   const projectNames = useMemo(
     () => new Map((projects.data ?? []).map((p) => [p.projectId, p.name])),
@@ -198,6 +201,46 @@ function OverviewContent({
   const previous = usePreviousTotals(scope, filters, range, now);
   const week = useWeekActivity(scope, filters, now);
 
+  const { modelSpeeds, fastestModel } = useMemo(() => {
+    const map = new Map<string, string>();
+    let best: { model: string; speed: number; text: string } | null = null;
+    topModels.forEach((model, i) => {
+      const current = modelSpeedQueries[i]?.data?.current;
+      const v = current ? speedOf(current) : null;
+      if (v === null) return;
+      const estimated = (current?.estimatedCount ?? 0) > 0;
+      const text = `${formatSpeed(v)}${estimated ? " ≈" : ""}`;
+      map.set(model, text);
+      if (!best || v > best.speed) {
+        best = { model, speed: v, text };
+      }
+    });
+    const fastest: FastestModelInfo | null = best
+      ? {
+          model: (best as { model: string; text: string }).model,
+          speedText: (best as { model: string; text: string }).text,
+        }
+      : null;
+    return { modelSpeeds: map, fastestModel: fastest };
+  }, [topModels, modelSpeedQueries]);
+
+  const rangeText = data
+    ? `统计范围 ${formatInstant(data.range.start, tz)} → ${formatInstant(data.range.end, tz)} · ${tz}`
+    : null;
+
+  const qualityText = useMemo(() => {
+    if (!data) return null;
+    const known = Number(data.totals.total.known);
+    const est = Number(data.totals.total.estimated);
+    const miss = Number(data.totals.total.missing);
+    const total = known + est + miss;
+    if (total <= 0) return null;
+    const knownPct = ((known / total) * 100).toFixed(1);
+    const estPct =
+      est > 0 ? ` · ${((est / total) * 100).toFixed(1)}% 估算` : "";
+    return `✓ ${knownPct}% 已知${estPct}`;
+  }, [data]);
+
   return (
     <div className="geek-main">
       <OverviewFilterBar
@@ -211,6 +254,8 @@ function OverviewContent({
         projectsError={
           projects.isError ? "项目列表加载失败，暂时无法编辑项目。" : null
         }
+        rangeText={rangeText}
+        qualityText={qualityText}
         onChange={update}
       />
 
@@ -218,57 +263,47 @@ function OverviewContent({
         <GeekKpis
           data={data}
           previous={previous.data?.totals}
-          rate={
-            <GeekKpiShell label="生成速度（tokens/s）">
-              <ModelSpeedList
-                scope={scope}
-                filters={filters}
-                range={range}
-                intervalMs={refreshMs}
-              />
-            </GeekKpiShell>
-          }
+          rate={rate.data}
+          fastestModel={fastestModel}
         />
       ) : null}
 
-      <div className="geek-split">
-        <Section title="趋势" query={aggregate} timezone={tz}>
-          {data && trend ? (
-            <GeekTrend
-              scope={scope}
-              filters={filters}
-              range={range}
-              data={data}
-              trend={trend}
-              timezone={tz}
-            />
-          ) : null}
-        </Section>
+      <Section title="趋势" query={aggregate} timezone={tz}>
+        {data && trend ? (
+          <GeekTrend
+            scope={scope}
+            filters={filters}
+            range={range}
+            data={data}
+            trend={trend}
+            timezone={tz}
+          />
+        ) : null}
+      </Section>
 
-        {/* 排名 — 复用现有 OverviewRanking 保持查询/交互逻辑 */}
-        <OverviewRanking
-          identity={identity}
-          scope={scope}
-          filters={filters}
-          range={range}
-          projectNames={projectNames}
-          onToggle={(dim, val) => {
-            if (dim === "provider") {
-              update({
-                ...filters,
-                providers: toggle(filters.providers, val),
-              });
-            } else if (dim === "model") {
-              update({ ...filters, models: toggle(filters.models, val) });
-            } else if (dim === "project") {
-              update({
-                ...filters,
-                projects: toggle(filters.projects, val),
-              });
-            }
-          }}
-        />
-      </div>
+      <OverviewRanking
+        identity={identity}
+        scope={scope}
+        filters={filters}
+        range={range}
+        projectNames={projectNames}
+        modelSpeeds={modelSpeeds}
+        onToggle={(dim, val) => {
+          if (dim === "provider") {
+            update({
+              ...filters,
+              providers: toggle(filters.providers, val),
+            });
+          } else if (dim === "model") {
+            update({ ...filters, models: toggle(filters.models, val) });
+          } else if (dim === "project") {
+            update({
+              ...filters,
+              projects: toggle(filters.projects, val),
+            });
+          }
+        }}
+      />
 
       <div className="geek-split">
         <SpeedTrend
@@ -277,17 +312,8 @@ function OverviewContent({
           range={range}
           intervalMs={refreshMs}
         />
-        {data ? (
-          <GeekComposition
-            data={data}
-            scope={scope}
-            filters={filters}
-            range={range}
-          />
-        ) : null}
+        {week.data ? <GeekHeatmap data={week.data} timezone={tz} /> : null}
       </div>
-
-      {week.data ? <GeekHeatmap data={week.data} timezone={tz} /> : null}
     </div>
   );
 }

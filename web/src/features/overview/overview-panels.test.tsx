@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { renderApp } from "@/test/render";
 import { http, HttpResponse, server, sessionBody } from "@/test/server";
 
@@ -86,6 +87,21 @@ function useBackend(
         retention_cutoff: "2026-04-01T00:00:00Z",
       }),
     ),
+    http.get(`${BASE}/usage-rate`, () =>
+      HttpResponse.json({
+        start: "2026-10-28T01:59:00Z",
+        end: "2026-10-28T02:00:00Z",
+        as_of: "2026-10-28T02:00:00Z",
+        event_count: 5,
+        window_last_received_at: "2026-10-28T01:59:59Z",
+        generation_speed: {
+          unit: "tokens/s",
+          value: "90.000000",
+          sample_count: 3,
+        },
+        ttft: { unit: "ms", value: "420.000000", sample_count: 4 },
+      }),
+    ),
     http.get(`${BASE}/usage-speed`, ({ request }) => {
       const model = new URL(request.url).searchParams.get("model");
       speedModels.push(model);
@@ -126,8 +142,8 @@ function useBackend(
         overall: stats(extra),
         groups: ["m1", "m2"].map((model, i) => ({
           key:
-            by === "model"
-              ? { provider: "anthropic", model }
+            by === "project"
+              ? { project_id: `proj-${model}` }
               : { provider: "anthropic", model },
           share: i === 0 ? 0.6 : 0.4,
           stats: stats(byModel?.[model] ?? extra),
@@ -141,70 +157,73 @@ function useBackend(
 }
 
 describe("overview panels", () => {
-  it("shows cache read / write hit rate per model and the cache / reasoning subsets", async () => {
-    useBackend(
+  it("shows cache hit rate in the KPI strip and per-model cache hit / 60s speed in the matrix", async () => {
+    const seen = useBackend(
       { cacheRead: "600", cacheWrite: "100", reasoning: "50" },
       {
         m1: { cacheRead: "600", cacheWrite: "100" },
         m2: { cacheRead: "200", cacheWrite: "250" },
       },
     );
+    const user = userEvent.setup();
     renderApp("/?tz=UTC");
+
+    const cacheKpi = await screen.findByTestId("metric-cache-hit");
+    expect(cacheKpi.textContent).toContain("60.0%");
+    expect(cacheKpi.textContent).toContain("读 600");
+    expect(cacheKpi.textContent).toContain("写 100");
+
+    await user.click(screen.getByRole("tab", { name: "模型" }));
+    const ranking = await screen.findByRole("region", { name: "排名" });
     await waitFor(() =>
       expect(
-        screen.getAllByTestId("cache-hit").map((r) => r.textContent),
-      ).toEqual([
-        expect.stringMatching(/m1.*读取 60%.*写入 10%/),
-        expect.stringMatching(/m2.*读取 20%.*写入 25%/),
-      ]),
+        within(ranking)
+          .getAllByTestId("ranking-cache-hit")
+          .map((c) => c.textContent),
+      ).toEqual(["60%", "20%"]),
     );
-    // 缓存读取 / 写入只留总量，不再展示总体平均命中率。
-    expect(screen.getByTestId("comp-cache-read").textContent).not.toContain(
-      "占输入",
-    );
-    expect(screen.getByTestId("comp-cache-write").textContent).not.toContain(
-      "占输入",
-    );
-    expect(screen.getByTestId("comp-reasoning").textContent).toContain(
-      "占输出 10%",
-    );
-  });
-
-  it("says there is no data when no source reports cache or reasoning", async () => {
-    useBackend();
-    renderApp("/?tz=UTC");
-    const card = await screen.findByRole("region", { name: "缓存与推理" });
-    expect(within(card).getByText("暂无数据")).toBeTruthy();
-    expect(screen.queryByTestId("cache-hit")).toBeNull();
-  });
-
-  it("lists the top models by generation speed in the speed card, in tokens/s, highest first", async () => {
-    const seen = useBackend();
-    renderApp("/?tz=UTC");
     await waitFor(() =>
       expect(
-        screen.getAllByTestId("model-rate").map((r) => r.textContent),
-      ).toEqual([
-        expect.stringMatching(/m1.*100/),
-        expect.stringMatching(/m2.*50/),
-      ]),
+        within(ranking)
+          .getAllByTestId("ranking-speed")
+          .map((c) => c.textContent?.trim()),
+      ).toEqual(["100 tok/s", "50 tok/s"]),
     );
     expect(seen.speedModels).toEqual(expect.arrayContaining(["m1", "m2"]));
-    // 顶部“生成速度”卡只含分模型速率，不再显示总体平均速度。
-    const card = screen.getAllByTestId("model-rate")[0]?.closest(".geek-kpi");
-    if (!(card instanceof HTMLElement)) throw new Error("缺少生成速度卡");
-    expect(within(card).getByText("生成速度（tokens/s）")).toBeTruthy();
-    expect(within(card).getAllByTestId("model-rate")).toHaveLength(2);
-    expect(screen.queryByTestId("rate")).toBeNull();
+  });
+
+  it("shows placeholder dashes when no source reports cache or reasoning", async () => {
+    useBackend();
+    renderApp("/?tz=UTC");
+    const cacheKpi = await screen.findByTestId("metric-cache-hit");
+    expect(cacheKpi.textContent).toContain("—");
+    const ranking = await screen.findByRole("region", { name: "排名" });
+    await waitFor(() =>
+      expect(
+        within(ranking)
+          .getAllByTestId("ranking-cache-hit")
+          .every((c) => c.textContent === "—"),
+      ).toBe(true),
+    );
+  });
+
+  it("shows overall generation speed, fastest model and TTFT in the KPI strip", async () => {
+    const seen = useBackend();
+    renderApp("/?tz=UTC");
+    const speedKpi = await screen.findByTestId("metric-speed");
+    await waitFor(() => {
+      expect(speedKpi.textContent).toContain("90");
+      expect(speedKpi.textContent).toContain("最快 m1 100 tok/s");
+    });
+    const ttftKpi = screen.getByTestId("metric-ttft");
+    expect(ttftKpi.textContent).toContain("420");
+    expect(seen.speedModels).toEqual(expect.arrayContaining(["m1", "m2"]));
   });
 
   it("draws the per-minute generation speed trend from the server minute means, for the total and each model", async () => {
     const seen = useBackend();
     renderApp("/?tz=UTC");
     const card = await screen.findByRole("region", { name: "生成速度趋势" });
-    expect(within(card).getByText(/近 60 分钟/)).toBeTruthy();
-    expect(within(card).getByText(/首末有效输出计时/)).toBeTruthy();
-    expect(within(card).queryByText(/请求耗时/)).toBeNull();
     // 总体 + 两个模型各取一条速度序列（来自 usage-speed，分钟聚合表没有首末有效输出计时）。
     await waitFor(() =>
       expect(seen.speedModels).toEqual(

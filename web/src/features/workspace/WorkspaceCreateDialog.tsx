@@ -117,7 +117,7 @@ export function WorkspaceCreateDialog({
 
   return (
     <div
-      className="bg-background/80 fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="bg-background/80 fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-[2px]"
       onMouseDown={(event) => {
         if (
           !required &&

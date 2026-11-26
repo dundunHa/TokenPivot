@@ -181,6 +181,22 @@ function search() {
   return new URLSearchParams(text.includes("?") ? text.split("?")[1] : "");
 }
 
+async function openWorkspaceMenu(user: ReturnType<typeof userEvent.setup>) {
+  const trigger = screen.getByRole("button", { name: /切换工作区/ });
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    await user.click(trigger);
+  }
+  return screen.getByRole("menu", { name: "工作区列表" });
+}
+
+async function pickWorkspaceMenuItem(
+  user: ReturnType<typeof userEvent.setup>,
+  name: string | RegExp,
+) {
+  const menu = await openWorkspaceMenu(user);
+  await user.click(within(menu).getByRole("button", { name }));
+}
+
 interface Backend {
   state: { workspaces: Workspace[] };
   calls: {
@@ -272,6 +288,17 @@ function useBackend(initial: Workspace[]): Backend {
           estimated_count: 0,
         },
         points: [],
+      }),
+    ),
+    http.get(`${base}/:id/usage-rate`, () =>
+      HttpResponse.json({
+        start: "2026-10-28T01:59:00Z",
+        end: "2026-10-28T02:00:00Z",
+        as_of: "2026-10-28T02:00:00Z",
+        event_count: 0,
+        window_last_received_at: null,
+        generation_speed: { unit: "tokens/s", value: null, sample_count: 0 },
+        ttft: { unit: "ms", value: null, sample_count: 0 },
       }),
     ),
   );
@@ -477,11 +504,11 @@ describe("workspace home", () => {
     const user = userEvent.setup();
     renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
     await screen.findByTestId("metric-total");
-    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    await pickWorkspaceMenuItem(user, "创建工作区");
     expect(screen.getByRole("dialog")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "取消" }));
     expect(screen.queryByRole("dialog")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    await pickWorkspaceMenuItem(user, "创建工作区");
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).toBeNull();
   });
@@ -502,10 +529,13 @@ describe("workspace home", () => {
     const user = userEvent.setup();
     renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
     await screen.findByTestId("metric-total");
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     expect(search().get("workspace")).toBe(WS_A);
+    const menu = await openWorkspaceMenu(user);
     expect(
-      screen.getByRole("button", { name: /Beta/ }).hasAttribute("disabled"),
+      within(menu)
+        .getByRole("button", { name: /Beta/ })
+        .hasAttribute("disabled"),
     ).toBe(true);
     gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
     await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
@@ -527,7 +557,7 @@ describe("workspace home", () => {
     );
     await screen.findByTestId("metric-total");
     const listBefore = client.getQueryData(["workspace", "list", USER]);
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await screen.findByText(/无法切换到「Beta」/);
     expect(search().get("workspace")).toBe(WS_A);
     expect(screen.getByTestId("metric-total")).toBeTruthy();
@@ -557,17 +587,17 @@ describe("workspace home", () => {
     await screen.findByTestId("metric-total");
 
     // 第一次成功切换，让 B 的详情进入缓存。
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
     expect(client.getQueryData(["workspace", "detail", USER, WS_B])).toEqual(
       workspace(WS_B, "Beta"),
     );
-    await user.click(screen.getByRole("button", { name: "Alpha" }));
+    await pickWorkspaceMenuItem(user, "Alpha");
     await waitFor(() => expect(search().get("workspace")).toBe(WS_A));
     await screen.findByTestId("metric-total");
 
     status.conflict = true;
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await screen.findByText(/无法切换到「Beta」/);
     expect(search().get("workspace")).toBe(WS_A);
     expect(screen.getByTestId("metric-total")).toBeTruthy();
@@ -596,9 +626,9 @@ describe("workspace home", () => {
     const user = userEvent.setup();
     renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
     await screen.findByTestId("metric-total");
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
-    await user.click(screen.getByRole("button", { name: "Gamma" }));
+    await pickWorkspaceMenuItem(user, "Gamma");
     await waitFor(() => expect(backend.calls.detail).toContain(WS_C));
     expect(signals.get(WS_B)?.aborted).toBe(true);
     gates.get(WS_C)?.resolve(HttpResponse.json(body(workspace(WS_C, "Gamma"))));
@@ -625,13 +655,14 @@ describe("workspace home", () => {
     const user = userEvent.setup();
     renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
     await screen.findByTestId("metric-total");
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(signalB).toBeInstanceOf(AbortSignal));
 
     // 当前空间按钮可点：选它就是最新选择，先前的 B 随之作废。
-    await user.click(screen.getByRole("button", { name: "Alpha" }));
+    await pickWorkspaceMenuItem(user, "Alpha");
     await waitFor(() => expect(signalB?.aborted).toBe(true));
-    expect(screen.getByRole("button", { name: "Beta" })).toBeTruthy();
+    const menu = await openWorkspaceMenu(user);
+    expect(within(menu).getByRole("button", { name: "Beta" })).toBeTruthy();
     expect(search().get("workspace")).toBe(WS_A);
 
     gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
@@ -660,7 +691,7 @@ describe("workspace home", () => {
       <NavigateTo to={`/?workspace=${WS_C}&tz=UTC`} />,
     );
     await screen.findByTestId("metric-total");
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
 
     // 浏览器/路由在切换途中把 URL 改到 C。
@@ -670,7 +701,8 @@ describe("workspace home", () => {
     gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
     await new Promise((r) => setTimeout(r, 50));
     expect(search().get("workspace")).toBe(WS_C);
-    expect(screen.getByRole("button", { name: "Beta" })).toBeTruthy();
+    const menu = await openWorkspaceMenu(user);
+    expect(within(menu).getByRole("button", { name: "Beta" })).toBeTruthy();
   });
 
   it("a late switch success cannot navigate after the container unmounts", async () => {
@@ -698,11 +730,11 @@ describe("workspace home", () => {
     );
     await screen.findByTestId("metric-total");
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
 
     view.rerender(homeTree(client, `/?workspace=${WS_A}&tz=UTC`, null));
-    expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /切换工作区/ })).toBeNull();
     // 卸载即取消本容器发起的详情验证：请求被 abort，晚到的成功不写详情缓存。
     await waitFor(() => expect(signalB?.aborted).toBe(true));
 
@@ -739,7 +771,7 @@ describe("workspace home", () => {
     );
     await screen.findByTestId("metric-total");
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
 
     client.setQueryData(sessionKey, SESSION_B);
@@ -753,8 +785,12 @@ describe("workspace home", () => {
     // 换号后旧身份的详情验证被取消，pending 也不再保留。
     await waitFor(() => expect(signalB?.aborted).toBe(true));
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Beta" })).toBeTruthy(),
+      expect(
+        screen.getByRole("button", { name: /切换工作区：Alpha/ }),
+      ).toBeTruthy(),
     );
+    const menu = await openWorkspaceMenu(user);
+    expect(within(menu).getByRole("button", { name: "Beta" })).toBeTruthy();
 
     gate.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
     await new Promise((r) => setTimeout(r, 50));
@@ -797,7 +833,7 @@ describe("workspace home", () => {
     expect(signals.get(WS_A)).toBeInstanceOf(AbortSignal);
 
     // A 的业务响应仍未返回就切到 B。
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
     await waitFor(() => expect(backend.calls.aggregate).toContain(WS_B));
 
@@ -843,7 +879,7 @@ describe("workspace home", () => {
       `/?workspace=${WS_A}&tz=UTC&granularity=auto`,
     );
     await screen.findByTestId("metric-total");
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(search().get("workspace")).toBe(WS_B));
     // 旧空间的数据不能作为新空间占位；新聚合未返回前没有指标。
     expect(screen.queryByTestId("metric-total")).toBeNull();
@@ -894,7 +930,7 @@ describe("workspace home", () => {
     );
     await screen.findByTestId("metric-total");
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    await pickWorkspaceMenuItem(user, "创建工作区");
     const dialog = await screen.findByRole("dialog");
     await user.type(within(dialog).getByLabelText("名称"), "Gamma");
     await user.click(within(dialog).getByRole("button", { name: "创建" }));
@@ -960,24 +996,29 @@ describe("workspace home", () => {
     renderHome(client, `/?workspace=${WS_A}&tz=UTC`);
     await screen.findByTestId("metric-total");
 
-    await user.click(screen.getByRole("button", { name: "Beta" }));
+    await pickWorkspaceMenuItem(user, "Beta");
     await waitFor(() => expect(backend.calls.detail).toContain(WS_B));
     gateB.resolve(HttpResponse.json(body(workspace(WS_B, "Beta"))));
     // B 的详情已成功，正卡在取消 A 业务请求的等待窗口里。
     await waitFor(() => expect(held).toHaveLength(1));
 
     // 窗口里用户选择 C：C 成为最新的 pending 选择。
-    await user.click(screen.getByRole("button", { name: "Gamma" }));
+    await pickWorkspaceMenuItem(user, "Gamma");
     await waitFor(() => expect(backend.calls.detail).toContain(WS_C));
+    const menuBefore = await openWorkspaceMenu(user);
     expect(
-      screen.getByRole("button", { name: /Gamma/ }).hasAttribute("disabled"),
+      within(menuBefore)
+        .getByRole("button", { name: /Gamma/ })
+        .hasAttribute("disabled"),
     ).toBe(true);
 
     // B 恢复：它已不是最新选择，只能返回；C 的 pending 与 ticket 保持有效。
     gateCancel.resolve();
     await new Promise((r) => setTimeout(r, 30));
     expect(
-      screen.getByRole("button", { name: /Gamma/ }).hasAttribute("disabled"),
+      within(menuBefore)
+        .getByRole("button", { name: /Gamma/ })
+        .hasAttribute("disabled"),
     ).toBe(true);
     expect(search().get("workspace")).toBe(WS_A);
 
@@ -1018,7 +1059,7 @@ describe("workspace home", () => {
     );
     await screen.findByTestId("metric-total");
 
-    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    await pickWorkspaceMenuItem(user, "创建工作区");
     const dialog = await screen.findByRole("dialog");
     await user.type(within(dialog).getByLabelText("名称"), "Delta");
     await user.click(within(dialog).getByRole("button", { name: "创建" }));
@@ -1077,14 +1118,14 @@ describe("workspace home", () => {
     renderHome(createAppQueryClient(), `/?workspace=${WS_A}&tz=UTC`);
     await screen.findByTestId("metric-total");
 
-    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    await pickWorkspaceMenuItem(user, "创建工作区");
     const dialog = await screen.findByRole("dialog");
     await user.type(within(dialog).getByLabelText("名称"), "Delta");
     await user.click(within(dialog).getByRole("button", { name: "创建" }));
     await waitFor(() => expect(listCalls).toBe(2));
 
     // 同一个重查窗口里用户选择 C：最新选择必须赢。
-    await user.click(screen.getByRole("button", { name: "Gamma" }));
+    await pickWorkspaceMenuItem(user, "Gamma");
     await waitFor(() => expect(search().get("workspace")).toBe(WS_C));
 
     backend.state.workspaces = [
@@ -1138,7 +1179,7 @@ describe("workspace home", () => {
       expect(screen.getByTestId("metric-total").textContent).toContain("4.4K"),
     );
 
-    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    await pickWorkspaceMenuItem(user, "创建工作区");
     const dialog = await screen.findByRole("dialog");
     await user.type(within(dialog).getByLabelText("名称"), "Delta");
     await user.click(within(dialog).getByRole("button", { name: "创建" }));
@@ -1254,7 +1295,7 @@ describe("workspace home", () => {
         ),
       );
 
-      await user.click(screen.getByRole("button", { name: "创建工作区" }));
+      await pickWorkspaceMenuItem(user, "创建工作区");
       const dialog = await screen.findByRole("dialog");
       await user.type(within(dialog).getByLabelText("名称"), "Delta");
       await user.click(within(dialog).getByRole("button", { name: "创建" }));
@@ -1297,10 +1338,13 @@ describe("workspace home", () => {
       }
 
       // 窗口里用户选择 C：C 的详情成功，也在等它自己的旧业务取消窗口。
-      await user.click(screen.getByRole("button", { name: "Gamma" }));
+      await pickWorkspaceMenuItem(user, "Gamma");
       await waitFor(() => expect(gates).toHaveLength(2));
+      const menuC = await openWorkspaceMenu(user);
       expect(
-        screen.getByRole("button", { name: /Gamma/ }).hasAttribute("disabled"),
+        within(menuC)
+          .getByRole("button", { name: /Gamma/ })
+          .hasAttribute("disabled"),
       ).toBe(true);
 
       // 先放行旧创建：它只能返回，不能清掉 C 的 pending、错误或 modal，也不能改 URL。
@@ -1308,7 +1352,9 @@ describe("workspace home", () => {
       await new Promise((r) => setTimeout(r, 30));
       expect(search().get("workspace")).toBe(WS_A);
       expect(
-        screen.getByRole("button", { name: /Gamma/ }).hasAttribute("disabled"),
+        within(menuC)
+          .getByRole("button", { name: /Gamma/ })
+          .hasAttribute("disabled"),
       ).toBe(true);
       expect(screen.getByRole("dialog")).toBeTruthy();
       expect(screen.queryByText(/切换失败/)).toBeNull();
@@ -1367,7 +1413,7 @@ describe("workspace home", () => {
       expect(screen.getByTestId("metric-total").textContent).toContain("4.4K"),
     );
 
-    await user.click(screen.getByRole("button", { name: "创建工作区" }));
+    await pickWorkspaceMenuItem(user, "创建工作区");
     const dialog = await screen.findByRole("dialog");
     await user.type(within(dialog).getByLabelText("名称"), "Delta");
     await user.click(within(dialog).getByRole("button", { name: "创建" }));

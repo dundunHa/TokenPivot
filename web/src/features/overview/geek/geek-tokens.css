@@ -1,80 +1,55 @@
-/* J 极客重奏 F++ — 专属设计 token */
-/* 琥珀暖黑 · 等宽字体 · 终端气质 */
+/* 兼容别名：全部设计变量已收敛到 src/index.css 双主题体系。 */
 
 :root {
-  /* 背景层级 */
-  --geek-bg: #0b0a08;
-  --geek-bg-panel: #0e0e10;
-  --geek-bg-raised: #14120f;
-  --geek-bg-hover: rgba(224, 166, 75, 0.06);
-  --geek-bg-active: rgba(224, 166, 75, 0.1);
-
-  /* 文字 */
-  --geek-text: #f4f1ea;
-  --geek-text-dim: #a09a8c;
-  --geek-text-muted: #857f70;
-  --geek-text-faint: #6a655a;
-
-  /* 琥珀 */
-  --geek-amber: #e0a64b;
-  --geek-amber-dim: #b8853a;
-  --geek-amber-faint: #8a6a2e;
-  --geek-amber-glow: rgba(224, 166, 75, 0.15);
-
-  /* 语义色 */
-  --geek-success: #7fb069;
-  --geek-warning: #d4a574;
-  --geek-error: #c17c5b;
-  --geek-info: #7aa2ff;
-
-  /* 边线 */
-  --geek-border: #26231e;
-  --geek-border-light: #34302a;
-
-  /* 字体 */
-  --geek-mono:
-    ui-monospace, "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
-
-  /* 间距 */
+  --geek-bg: var(--bg);
+  --geek-bg-panel: var(--surface);
+  --geek-bg-raised: var(--surface-subtle);
+  --geek-bg-hover: var(--surface-hover);
+  --geek-bg-active: var(--accent-brand-soft);
+  --geek-text: var(--text);
+  --geek-text-dim: var(--text-secondary);
+  --geek-text-muted: var(--text-muted);
+  --geek-text-faint: var(--text-faint);
+  --geek-amber: var(--accent-brand);
+  --geek-amber-dim: var(--accent-brand-hover);
+  --geek-amber-faint: var(--accent-brand-border);
+  --geek-amber-glow: var(--accent-brand-soft);
+  --geek-success: var(--ok);
+  --geek-warning: var(--warn);
+  --geek-error: var(--err);
+  --geek-info: var(--c-input);
+  --geek-border: var(--border);
+  --geek-border-light: var(--border-strong);
+  --geek-mono: var(--font-terminal);
   --geek-gap: 16px;
-  --geek-pad: 16px;
-  --geek-radius: 6px;
+  --geek-pad: 18px;
+  --geek-radius: var(--r-lg);
 }
 
-/* 等宽数字 */
 .geek-num {
+  font-family: var(--font-terminal);
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
 }
 
-/* 琥珀文字 */
 .geek-amber {
-  color: var(--geek-amber);
+  color: var(--accent-brand);
 }
 .geek-dim {
-  color: var(--geek-text-dim);
+  color: var(--text-secondary);
 }
 .geek-muted {
-  color: var(--geek-text-muted);
+  color: var(--text-muted);
 }
 .geek-faint {
-  color: var(--geek-text-faint);
+  color: var(--text-faint);
 }
-
-/* 状态色 */
 .geek-ok {
-  color: var(--geek-success);
+  color: var(--ok);
 }
 .geek-warn {
-  color: var(--geek-warning);
+  color: var(--warn);
 }
 .geek-err {
-  color: var(--geek-error);
-}
-
-/* 减少动效 */
-@media (prefers-reduced-motion: reduce) {
-  .geek-skeleton {
-    animation: none;
-  }
+  color: var(--err);
 }

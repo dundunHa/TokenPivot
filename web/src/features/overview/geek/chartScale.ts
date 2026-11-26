@@ -1,4 +1,4 @@
-/** 折线图的纵轴刻度：把最大值向上取整到“好读”的步长（1/2/2.5/5 × 10^n），从 0 起。 */
+/** 折线图与柱状图的纵轴刻度：把最大值向上取整到“好读”的步长（1/2/2.5/5 × 10^n），从 0 起。 */
 export function niceTicks(
   max: number,
   intervals = 4,
@@ -33,11 +33,11 @@ export function fmtRate(n: number): string {
   return String(Number(n.toFixed(1)));
 }
 
-/** 分组调色：与琥珀主色相邻但可区分，深色背景下对比度足够；趋势与速率共用。 */
+/** 主题感知分组调色：随 data-theme 自动适配暖白与石墨暗。 */
 export const SERIES_PALETTE = [
-  "#e0a64b",
-  "#7aa2ff",
-  "#7fd1a8",
-  "#c792ea",
-  "#f07f6f",
+  "var(--c-s1)",
+  "var(--c-s2)",
+  "var(--c-s3)",
+  "var(--c-s4)",
+  "var(--c-s5)",
 ] as const;

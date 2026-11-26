@@ -205,53 +205,40 @@ describe("request log panel", () => {
     expect(screen.getByTestId("rate-ttft-samples").textContent).toBe(
       "3 个有效样本",
     );
-    expect(screen.getByTestId("rate-events").textContent).toBe(
-      "窗口内 5 条事件",
-    );
-    expect(screen.getByTestId("rate-estimate-note").textContent).toContain(
-      "chunk 估算",
-    );
-    expect(screen.getByTestId("rate-estimate-note").textContent).toContain(
-      "非逐 token 精确测量",
-    );
-    expect(screen.getByTestId("generation-rate-fresh").textContent).toContain(
-      "窗口截至",
-    );
+    expect(screen.getByTestId("rate-events").textContent).toBe("5 条");
+  });
 
-    // usage-speed：tokens/min 口径保持不变，与上面的 decode 平均值并存。
-    expect((await screen.findByTestId("rate-value")).textContent).toBe("200");
-    expect(screen.getByTestId("rate-notes").textContent).toContain(
-      "含估算 1 条",
-    );
-    expect(screen.getByTestId("rate-notes").textContent).toContain(
-      "部分覆盖：2 条无耗时",
-    );
-    expect(screen.getByTestId("rate-fresh").textContent).toContain(
-      "近 60 秒，截至",
-    );
+  it("opens and closes the slide-over request detail drawer on row click", async () => {
+    useBackend({
+      events: () =>
+        HttpResponse.json(
+          page([
+            item("evt-backfill", {
+              occurred_at: "2026-10-28T11:30:00Z",
+              received_at: "2026-10-28T11:42:50Z",
+              status: "ok",
+              duration_ms: 2150,
+            }),
+          ]),
+        ),
+    });
+    const user = userEvent.setup();
+    renderApp("/requests?tz=UTC");
+    const row = await screen.findByTestId("request-row");
+    expect(within(row).getByText("补报")).toBeTruthy();
+
+    await user.click(row);
+    const drawer = await screen.findByRole("dialog", { name: "请求详情" });
+    expect(within(drawer).getByText("evt-backfill")).toBeTruthy();
+    expect(within(drawer).getAllByText(/补报 \(\+12m 50s\)/)).toHaveLength(2);
+    expect(within(drawer).getByText("2150 ms")).toBeTruthy();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "请求详情" })).toBeNull();
   });
 
   it("distinguishes no events and a window without valid samples", async () => {
     useBackend({
-      speed: () =>
-        HttpResponse.json(
-          speedBody({
-            current: {
-              output_tokens: null,
-              duration_ms: null,
-              event_count: 0,
-              measured_count: 0,
-              estimated_count: 0,
-            },
-            window_last_received_at: null,
-            generation_speed: {
-              unit: "tokens/s",
-              value: null,
-              sample_count: 0,
-            },
-            ttft: { unit: "ms", value: null, sample_count: 0 },
-          }),
-        ),
       rate: () =>
         HttpResponse.json(
           rateBody({
@@ -276,13 +263,7 @@ describe("request log panel", () => {
       "0 个有效样本",
     );
     expect(screen.getByTestId("rate-ttft").textContent).toBe("不可用");
-    expect(screen.getByTestId("rate-events").textContent).toBe("窗口内无事件");
-    expect(screen.getByTestId("generation-rate-fresh").textContent).toContain(
-      "接收新鲜度未知",
-    );
-    // usage-speed：同一窗口的 tokens/min 口径也显示无数据。
-    expect(screen.getByTestId("rate-value").textContent).toBe("—");
-    expect(screen.getByTestId("rate-notes").textContent).toContain("暂无数据");
+    expect(screen.getByTestId("rate-events").textContent).toBe("0");
     await screen.findByText("当前保留明细中没有匹配的请求。");
   });
 
@@ -361,10 +342,6 @@ describe("request log panel", () => {
     expect(first?.searchParams.getAll("project")).toEqual(["unattributed"]);
     expect(first?.searchParams.has("start")).toBe(false);
     expect(first?.searchParams.get("limit")).toBe("50");
-    expect(seen.speeds[0]?.searchParams.getAll("project")).toEqual([
-      "unattributed",
-    ]);
-    expect(seen.speeds[0]?.searchParams.has("limit")).toBe(false);
     expect(seen.rates[0]?.searchParams.getAll("project")).toEqual([
       "unattributed",
     ]);
@@ -408,7 +385,6 @@ describe("request log panel", () => {
     const last = seen.events.at(-1);
     expect(last?.searchParams.has("cursor")).toBe(false);
     expect(last?.searchParams.has("model")).toBe(false);
-    expect(seen.speeds.at(-1)?.searchParams.has("model")).toBe(false);
     expect(seen.rates.at(-1)?.searchParams.has("model")).toBe(false);
   });
 
@@ -419,8 +395,6 @@ describe("request log panel", () => {
         fail
           ? errorResponse(500, "INTERNAL")
           : HttpResponse.json(page([item("e1")])),
-      speed: () =>
-        fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(speedBody()),
       rate: () =>
         fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(rateBody()),
     });
@@ -428,15 +402,12 @@ describe("request log panel", () => {
     renderApp("/requests?tz=UTC");
     const list = await screen.findByRole("region", { name: "明细列表" });
     await within(list).findByText(/服务暂不可用/);
-    await screen.findByText(/速度：服务暂不可用/);
     await screen.findByText(/速率：服务暂不可用/);
     fail = false;
     await user.click(within(list).getByRole("button", { name: "重试" }));
     await screen.findByTestId("request-row");
     await user.click(screen.getByRole("button", { name: "重试速率" }));
     await screen.findByTestId("rate-speed");
-    await user.click(screen.getByRole("button", { name: "重试速度" }));
-    await screen.findByTestId("rate-value");
   });
 
   it("keeps the previous rows and says so when a poll fails", async () => {
@@ -447,8 +418,6 @@ describe("request log panel", () => {
         fail
           ? errorResponse(500, "INTERNAL")
           : HttpResponse.json(page([item("e1")])),
-      speed: () =>
-        fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(speedBody()),
       rate: () =>
         fail ? errorResponse(500, "INTERNAL") : HttpResponse.json(rateBody()),
     });
@@ -460,11 +429,9 @@ describe("request log panel", () => {
     await tick(5_000);
     expect(seen.events.length).toBeGreaterThan(before);
     await screen.findByText(/^更新失败，展示截至/);
-    await screen.findByText(/速度更新失败，展示截至/);
     await screen.findByText(/速率更新失败，展示截至/);
     expect(screen.getByTestId("request-row")).toBeTruthy();
     expect(screen.getByTestId("rate-speed").textContent).toBe("49.5 tokens/s");
-    expect(screen.getByTestId("rate-value").textContent).toBe("200");
   });
 
   it("polls both every 5 seconds on the latest page and only the rate on an older page", async () => {
@@ -531,13 +498,16 @@ describe("request log panel", () => {
     await user.click(
       await screen.findByRole("button", { name: "移除 供应商 anthropic" }),
     );
-    await screen.findByText(/anthropic \/ fresh-model/);
+    const freshRow = await screen.findByTestId("request-row");
+    await waitFor(() =>
+      expect(within(freshRow).getByText("fresh-model")).toBeTruthy(),
+    );
     await act(async () => {
       slow.resolve();
       await Promise.resolve();
     });
     expect(screen.getAllByTestId("request-row")).toHaveLength(1);
-    expect(screen.getByText(/fresh-model/)).toBeTruthy();
+    expect(screen.getByText("fresh-model")).toBeTruthy();
   });
 
   it("drops the request cache for the signed-out identity", async () => {
@@ -796,7 +766,6 @@ describe("request log panel", () => {
     const e = seen.events.length;
     offline = true;
     await tick(5_000);
-    await screen.findByText(/速度更新失败，展示截至/);
     await screen.findByText(/速率更新失败，展示截至/);
     offline = false;
     act(() => {
@@ -805,8 +774,6 @@ describe("request log panel", () => {
     await tick(5_000);
     await waitFor(() => expect(screen.queryByText(/速率更新失败/)).toBeNull());
     expect(screen.getByTestId("rate-speed").textContent).toBe("49.5 tokens/s");
-    await waitFor(() => expect(screen.queryByText(/速度更新失败/)).toBeNull());
-    expect(screen.getByTestId("rate-value").textContent).toBe("200");
     expect(screen.getAllByTestId("request-row")).toHaveLength(1);
     expect(seen.events.length).toBe(e);
   });

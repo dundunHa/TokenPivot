@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { GeekLineChart } from "@/features/overview/geek/GeekLineChart";
 import { fmtRate, SERIES_PALETTE } from "@/features/overview/geek/chartScale";
 import type {
@@ -10,9 +10,9 @@ import { useTopModels } from "./modelRates";
 import { buildSpeedRows, type SpeedInput } from "./speedSeries";
 import { useModelSpeeds, useSpeed } from "./useRequestLogs";
 
-const TOTAL_COLOR = "#f4f1ea";
+const TOTAL_COLOR = "var(--c-total-line)";
 
-/** 生成速度趋势：最近 60 分钟，每分钟内各请求“首个到最后一个有效输出”速度的平均（tokens/s）；总体 + 用量最高的几个模型各一条线。 */
+/** 生成速度趋势：最近 60 分钟，纯净单调折线，支持点击图例聚焦单系列。 */
 export function SpeedTrend({
   scope,
   filters,
@@ -22,9 +22,9 @@ export function SpeedTrend({
   scope: QueryScope;
   filters: OverviewFilters;
   range: ResolvedRange;
-  /** 轮询间隔（毫秒）；缺省沿用请求页的 5 秒。 */
   intervalMs?: number;
 }) {
+  const [isolated, setIsolated] = useState<string | null>(null);
   const { models } = useTopModels(scope, filters, range);
   const total = useSpeed(scope, filters, intervalMs);
   const perModel = useModelSpeeds(scope, filters, models, intervalMs);
@@ -40,11 +40,10 @@ export function SpeedTrend({
     ...models.map((model, i) => ({
       key: `m:${model}`,
       name: model,
-      color: SERIES_PALETTE[i % SERIES_PALETTE.length] ?? "#e0a64b",
+      color: SERIES_PALETTE[i % SERIES_PALETTE.length] ?? "var(--c-s1)",
       data: perModel[i]?.data,
     })),
   ];
-  // 数据真正更新（含模型清单变化）时才重算；inputs 每次渲染都是新数组，不能直接作依赖。
   const signature = `${total.dataUpdatedAt},${perModel.map((r) => r.dataUpdatedAt).join(",")}|${models.join("|")}`;
   const timezone = filters.timezone;
   const built = useMemo(
@@ -53,15 +52,15 @@ export function SpeedTrend({
     [signature, timezone],
   );
 
+  const visibleSeries =
+    isolated && built.series.some((s) => s.key === isolated)
+      ? built.series.filter((s) => s.key === isolated)
+      : built.series;
+
   return (
     <div className="geek-card" role="region" aria-label="生成速度趋势">
       <div className="geek-card-head">
-        <h2 className="geek-card-title">
-          生成速度
-          <span className="geek-card-sub">
-            近 60 分钟 · tokens/s · 首末有效输出计时
-          </span>
-        </h2>
+        <h2 className="geek-card-title">生成速度趋势</h2>
       </div>
       {total.isPending ? (
         <div
@@ -74,31 +73,65 @@ export function SpeedTrend({
           速度趋势加载失败，请稍后重试。
         </p>
       ) : !built.hasData ? (
-        <p className="geek-empty geek-dim">
-          暂无可测量的请求（需要上报了首末有效输出计时的数据）
-        </p>
+        <p className="geek-empty geek-dim">暂无数据</p>
       ) : (
         <>
           <ul className="geek-legend" aria-label="图例">
             {built.series
               .filter((s) => !s.dashed)
-              .map((s) => (
-                <li key={s.key}>
-                  <i style={{ background: s.color }} />
-                  {s.name}
-                </li>
-              ))}
+              .map((s) => {
+                const state = isolated
+                  ? isolated === s.key
+                    ? "focused"
+                    : "dimmed"
+                  : undefined;
+                return (
+                  <li key={s.key}>
+                    <button
+                      type="button"
+                      className="tp-legend-btn"
+                      data-state={state}
+                      aria-pressed={isolated === s.key}
+                      onClick={() =>
+                        setIsolated((cur) => (cur === s.key ? null : s.key))
+                      }
+                    >
+                      <span
+                        className="tp-swatch"
+                        style={{ background: s.color }}
+                      />
+                      <span>{s.name}</span>
+                    </button>
+                  </li>
+                );
+              })}
             <li>
-              <i style={{ background: TOTAL_COLOR }} />
-              总体（虚线）
+              <button
+                type="button"
+                className="tp-legend-btn"
+                data-state={
+                  isolated
+                    ? isolated === "total"
+                      ? "focused"
+                      : "dimmed"
+                    : undefined
+                }
+                aria-pressed={isolated === "total"}
+                onClick={() =>
+                  setIsolated((cur) => (cur === "total" ? null : "total"))
+                }
+              >
+                <span className="tp-swatch tp-swatch-dash" />
+                <span>总体（虚线）</span>
+              </button>
             </li>
           </ul>
           <GeekLineChart
             rows={built.rows}
-            series={built.series}
+            series={visibleSeries}
             timezone={timezone}
             format={fmtRate}
-            height={260}
+            height={222}
             connectNulls
           />
         </>

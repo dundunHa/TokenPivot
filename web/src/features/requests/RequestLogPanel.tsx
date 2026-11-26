@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,7 +9,7 @@ import {
   type OverviewFilters,
 } from "@/features/overview/overviewFilters";
 import type { QueryScope } from "@/features/overview/overviewQueries";
-import { formatInstant } from "@/features/overview/overviewView";
+import { formatExact, formatInstant } from "@/features/overview/overviewView";
 import type { RateData, RequestRange, RequestRow } from "./api";
 import {
   describeGenerationMetrics,
@@ -19,10 +19,12 @@ import {
   formatStatus,
   formatTokenField,
   parseRequestRange,
+  trimDecimal,
+  UNAVAILABLE,
 } from "./model";
 import { eventsQuery, useRate, useRequestEvents } from "./useRequestLogs";
 
-/** 请求明细面板：筛选来自总览（单一来源）；筛选变化时以 key 重置游标。 */
+/** 请求明细面板：4 卡汇总条 + 流水表 + 右侧滑出详情抽屉。筛选变化时以 key 重置游标。 */
 export function RequestLogPanel({
   scope,
   filters,
@@ -31,16 +33,11 @@ export function RequestLogPanel({
   filters: OverviewFilters;
 }) {
   return (
-    <section aria-label="请求明细" className="flex flex-col gap-4">
-      <div className="geek-card-head">
-        <h2 className="geek-card-title">请求明细</h2>
-      </div>
-      <PanelBody
-        key={`${scope.workspaceId}|${filterIdentity(filters)}`}
-        scope={scope}
-        filters={filters}
-      />
-    </section>
+    <PanelBody
+      key={`${scope.workspaceId}|${filterIdentity(filters)}`}
+      scope={scope}
+      filters={filters}
+    />
   );
 }
 
@@ -57,6 +54,7 @@ function PanelBody({
   const [draftStart, setDraftStart] = useState("");
   const [draftEnd, setDraftEnd] = useState("");
   const [rangeError, setRangeError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<RequestRow | null>(null);
   const cursor = cursors.at(-1) ?? null;
   const events = useRequestEvents(scope, filters, cursor, range);
   const rate = useRate(scope, filters);
@@ -87,133 +85,338 @@ function PanelBody({
     setRange(null);
   };
 
+  const countText = events.data ? `${events.data.items.length} 条` : null;
+
   return (
-    <div className="flex flex-col gap-4">
-      <RateBlock rate={rate} timezone={tz} />
-      <details className="geek-ms-inline">
-        <summary>历史范围查询</summary>
-        <div
-          className="flex flex-col gap-2 pt-2"
-          aria-label="明细时间范围"
-          role="group"
-        >
-          <div className="flex flex-wrap items-end gap-2">
-            <label className="text-muted-foreground flex flex-col gap-1 text-xs">
-              明细起点
-              <Input
-                className="h-8 w-64 text-xs"
-                value={draftStart}
-                placeholder="2026-10-28T09:00:00+08:00"
-                onChange={(e) => setDraftStart(e.target.value)}
-              />
-            </label>
-            <label className="text-muted-foreground flex flex-col gap-1 text-xs">
-              明细终点
-              <Input
-                className="h-8 w-64 text-xs"
-                value={draftEnd}
-                placeholder="2026-10-28T18:00:00+08:00"
-                onChange={(e) => setDraftEnd(e.target.value)}
-              />
-            </label>
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-8"
-              onClick={applyRange}
-            >
-              查询范围
-            </Button>
-            {range ? (
+    <section aria-label="请求明细" className="geek-main">
+      <RateKpiStrip rate={rate} range={range} timezone={tz} />
+
+      <article className="geek-card">
+        <div className="geek-card-head">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h2 className="geek-card-title">请求流水</h2>
+            {events.data ? (
+              <span
+                className="tp-quality-pill"
+                title={`范围 ${formatInstant(events.data.start, tz, true)} → ${formatInstant(events.data.end, tz, true)}`}
+              >
+                {cursor === null ? "● 最新页每 5 秒刷新" : "更早页，不自动刷新"}
+                {Date.parse(events.data.start) <
+                Date.parse(events.data.retentionCutoff)
+                  ? " · 旧时段可能不完整"
+                  : ""}
+              </span>
+            ) : null}
+          </div>
+          {countText ? (
+            <span className="geek-num text-muted-foreground text-xs">
+              {countText}
+            </span>
+          ) : null}
+        </div>
+
+        <details className="geek-ms-inline">
+          <summary>历史范围查询</summary>
+          <div
+            className="flex flex-col gap-2 pt-3"
+            aria-label="明细时间范围"
+            role="group"
+          >
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="text-muted-foreground flex flex-col gap-1 text-xs">
+                明细起点
+                <Input
+                  className="h-8 w-64 text-xs"
+                  value={draftStart}
+                  placeholder="2026-10-28T09:00:00+08:00"
+                  onChange={(e) => setDraftStart(e.target.value)}
+                />
+              </label>
+              <label className="text-muted-foreground flex flex-col gap-1 text-xs">
+                明细终点
+                <Input
+                  className="h-8 w-64 text-xs"
+                  value={draftEnd}
+                  placeholder="2026-10-28T18:00:00+08:00"
+                  onChange={(e) => setDraftEnd(e.target.value)}
+                />
+              </label>
               <Button
                 variant="outline"
                 size="sm"
                 className="h-8"
-                onClick={resetRange}
+                onClick={applyRange}
               >
-                最近 1 小时
+                查询范围
               </Button>
-            ) : null}
-          </div>
-          <p className="text-subtle text-xs">
-            {range ? "固定范围（历史补报可在此查询）" : "默认最近 1 小时"}
-          </p>
-          {rangeError ? (
-            <p role="alert" className="text-destructive text-xs">
-              {rangeError}
-            </p>
-          ) : null}
-        </div>
-      </details>
-      <div aria-label="明细列表" role="region" className="flex flex-col gap-2">
-        {events.isPending ? (
-          <div
-            role="status"
-            aria-label="明细加载中"
-            className="bg-accent h-24 animate-pulse rounded-md"
-          />
-        ) : events.data === undefined && events.isError ? (
-          <ErrorBlock
-            error={events.error}
-            onRetry={() => void events.refetch()}
-            onLatest={cursor !== null ? goLatest : null}
-          />
-        ) : events.data ? (
-          <>
-            {events.isError ? (
-              <p role="alert" className="text-destructive text-xs">
-                更新失败，展示截至 {formatInstant(events.data.asOf, tz, true)}{" "}
-                的旧结果
-              </p>
-            ) : null}
-            <p
-              className="text-subtle text-xs"
-              title={`范围 ${formatInstant(events.data.start, tz, true)} → ${formatInstant(events.data.end, tz, true)} · 截点 ${formatInstant(events.data.asOf, tz, true)} · 分页不是某一时刻的完整快照`}
-            >
-              {cursor === null ? "最新页每 5 秒刷新" : "更早页，不自动刷新"}
-              {Date.parse(events.data.start) <
-              Date.parse(events.data.retentionCutoff)
-                ? " · 旧时段可能不完整"
-                : ""}
-            </p>
-            {events.data.items.length === 0 ? (
-              <p className="text-muted-foreground text-sm">
-                当前保留明细中没有匹配的请求。
-              </p>
-            ) : (
-              <RequestTable rows={events.data.items} timezone={tz} />
-            )}
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={cursors.length === 0}
-                onClick={() => setCursors((c) => c.slice(0, -1))}
-              >
-                上一页
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={
-                  !events.data.hasMore || events.data.nextCursor === null
-                }
-                onClick={() => {
-                  const next = events.data?.nextCursor;
-                  if (next) setCursors((c) => [...c, next]);
-                }}
-              >
-                下一页
-              </Button>
-              {cursor !== null ? (
-                <Button variant="outline" size="sm" onClick={goLatest}>
-                  返回最新页
+              {range ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                  onClick={resetRange}
+                >
+                  最近 1 小时
                 </Button>
               ) : null}
             </div>
-          </>
-        ) : null}
+            <p className="text-subtle text-xs">
+              {range ? "固定范围" : "默认最近 1 小时"}
+            </p>
+            {rangeError ? (
+              <p role="alert" className="text-destructive text-xs">
+                {rangeError}
+              </p>
+            ) : null}
+          </div>
+        </details>
+
+        <div
+          aria-label="明细列表"
+          role="region"
+          className="flex flex-col gap-3"
+        >
+          {events.isPending ? (
+            <div
+              role="status"
+              aria-label="明细加载中"
+              className="geek-skeleton geek-skeleton-md"
+            />
+          ) : events.data === undefined && events.isError ? (
+            <ErrorBlock
+              error={events.error}
+              onRetry={() => void events.refetch()}
+              onLatest={cursor !== null ? goLatest : null}
+            />
+          ) : events.data ? (
+            <>
+              {events.isError ? (
+                <p role="alert" className="text-destructive text-xs">
+                  更新失败，展示截至 {formatInstant(events.data.asOf, tz, true)}{" "}
+                  的旧结果
+                </p>
+              ) : null}
+              {events.data.items.length === 0 ? (
+                <p className="geek-empty text-muted-foreground">
+                  当前保留明细中没有匹配的请求。
+                </p>
+              ) : (
+                <RequestTable
+                  rows={events.data.items}
+                  timezone={tz}
+                  selectedId={selected?.id ?? null}
+                  onSelect={setSelected}
+                />
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={cursors.length === 0}
+                  onClick={() => setCursors((c) => c.slice(0, -1))}
+                >
+                  上一页
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={
+                    !events.data.hasMore || events.data.nextCursor === null
+                  }
+                  onClick={() => {
+                    const next = events.data?.nextCursor;
+                    if (next) setCursors((c) => [...c, next]);
+                  }}
+                >
+                  下一页
+                </Button>
+                {cursor !== null ? (
+                  <Button variant="outline" size="sm" onClick={goLatest}>
+                    返回最新页
+                  </Button>
+                ) : null}
+              </div>
+            </>
+          ) : null}
+        </div>
+      </article>
+
+      {selected ? (
+        <RequestDetailDrawer
+          row={selected}
+          timezone={tz}
+          onClose={() => setSelected(null)}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+function RateKpiStrip({
+  rate,
+  range,
+  timezone,
+}: {
+  rate: ReturnType<typeof useRate>;
+  range: RequestRange | null;
+  timezone: string;
+}) {
+  if (rate.isPending) {
+    return (
+      <section
+        className="geek-kpis geek-kpis-4"
+        role="status"
+        aria-label="速率加载中"
+      >
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i} className="geek-kpi">
+            <div className="geek-skeleton geek-skeleton-sm" />
+          </div>
+        ))}
+      </section>
+    );
+  }
+  if (rate.data === undefined) {
+    const { kind, message } = describeError(rate.error);
+    return (
+      <div className="geek-card">
+        <Alert variant="destructive">
+          <AlertDescription>速率：{message}</AlertDescription>
+        </Alert>
+        {kind === "forbidden" ? null : (
+          <Button
+            variant="outline"
+            size="sm"
+            className="self-start"
+            onClick={() => void rate.refetch()}
+          >
+            重试速率
+          </Button>
+        )}
       </div>
+    );
+  }
+  return (
+    <RateKpiCards
+      data={rate.data}
+      stale={rate.isError}
+      range={range}
+      timezone={timezone}
+    />
+  );
+}
+
+function RateKpiCards({
+  data,
+  stale,
+  range,
+  timezone,
+}: {
+  data: RateData;
+  stale: boolean;
+  range: RequestRange | null;
+  timezone: string;
+}) {
+  const view = describeGenerationMetrics(data);
+  const speedNum =
+    data.generationSpeed.value !== null && data.generationSpeed.sampleCount > 0
+      ? trimDecimal(data.generationSpeed.value)
+      : null;
+  const ttftNum =
+    data.ttft.value !== null && data.ttft.sampleCount > 0
+      ? trimDecimal(data.ttft.value)
+      : null;
+
+  return (
+    <div className="flex flex-col gap-2" data-testid="generation-rate">
+      <section className="geek-kpis geek-kpis-4" aria-label="实时速率指标">
+        <article className="geek-kpi">
+          <div className="geek-kpi-top">
+            <span className="geek-kpi-label">生成速度</span>
+            <span
+              className="geek-num text-[11px]"
+              data-testid="rate-speed-samples"
+            >
+              {view.speed.samples}
+            </span>
+          </div>
+          <div className="geek-kpi-row">
+            <div className="geek-kpi-number geek-num" data-testid="rate-speed">
+              {speedNum !== null ? (
+                <>
+                  {speedNum} <span className="geek-kpi-unit">tokens/s</span>
+                </>
+              ) : (
+                UNAVAILABLE
+              )}
+            </div>
+          </div>
+        </article>
+
+        <article className="geek-kpi">
+          <div className="geek-kpi-top">
+            <span className="geek-kpi-label">首 Token 延迟 TTFT</span>
+            <span
+              className="geek-num text-[11px]"
+              data-testid="rate-ttft-samples"
+            >
+              {view.ttft.samples}
+            </span>
+          </div>
+          <div className="geek-kpi-row">
+            <div className="geek-kpi-number geek-num" data-testid="rate-ttft">
+              {ttftNum !== null ? (
+                <>
+                  {ttftNum} <span className="geek-kpi-unit">ms</span>
+                </>
+              ) : (
+                UNAVAILABLE
+              )}
+            </div>
+          </div>
+        </article>
+
+        <article className="geek-kpi">
+          <div className="geek-kpi-top">
+            <span className="geek-kpi-label">窗口请求</span>
+            <span className="geek-num text-[11px]">60s</span>
+          </div>
+          <div className="geek-kpi-row">
+            <div className="geek-kpi-number geek-num" data-testid="rate-events">
+              {data.eventCount === 0 ? (
+                "0"
+              ) : (
+                <>
+                  {formatExact(String(data.eventCount))}{" "}
+                  <span className="geek-kpi-unit">条</span>
+                </>
+              )}
+            </div>
+          </div>
+        </article>
+
+        <article className="geek-kpi">
+          <div className="geek-kpi-top">
+            <span className="geek-kpi-label">明细窗口</span>
+            <span className="geek-num text-[11px]">180d</span>
+          </div>
+          <div className="geek-kpi-row">
+            <div
+              className="geek-kpi-number geek-num"
+              style={{ fontSize: 20, lineHeight: 1.45 }}
+            >
+              {range ? "固定范围" : "最近 1 小时"}
+            </div>
+          </div>
+        </article>
+      </section>
+
+      {stale ? (
+        <p role="alert" className="text-destructive text-xs">
+          速率更新失败，展示截至 {formatInstant(data.asOf, timezone, true)}{" "}
+          的旧结果
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -235,12 +438,12 @@ function ErrorBlock({
       </Alert>
       <div className="flex gap-2">
         {kind === "forbidden" ? null : (
-          <Button variant="outline" onClick={onRetry}>
+          <Button variant="outline" size="sm" onClick={onRetry}>
             重试
           </Button>
         )}
         {onLatest && kind === "filter" ? (
-          <Button variant="outline" onClick={onLatest}>
+          <Button variant="outline" size="sm" onClick={onLatest}>
             返回最新页
           </Button>
         ) : null}
@@ -249,115 +452,59 @@ function ErrorBlock({
   );
 }
 
-function RateBlock({
-  rate,
-  timezone,
-}: {
-  rate: ReturnType<typeof useRate>;
-  timezone: string;
-}) {
-  if (rate.isPending) {
-    return (
-      <div
-        role="status"
-        aria-label="速率加载中"
-        className="bg-accent h-16 animate-pulse rounded-md"
-      />
-    );
+function lagInfo(row: RequestRow): { isBackfill: boolean; label: string } {
+  const diffMs = Date.parse(row.receivedAt) - Date.parse(row.occurredAt);
+  if (!Number.isFinite(diffMs) || diffMs < 0) {
+    return { isBackfill: false, label: "实时" };
   }
-  if (rate.data === undefined) {
-    const { kind, message } = describeError(rate.error);
-    return (
-      <div className="flex flex-col gap-2">
-        <Alert variant="destructive">
-          <AlertDescription>速率：{message}</AlertDescription>
-        </Alert>
-        {kind === "forbidden" ? null : (
-          <Button
-            variant="outline"
-            className="self-start"
-            onClick={() => void rate.refetch()}
-          >
-            重试速率
-          </Button>
-        )}
-      </div>
-    );
+  const sec = Math.round(diffMs / 1000);
+  if (sec > 60) {
+    const mins = Math.floor(sec / 60);
+    const rem = sec % 60;
+    return {
+      isBackfill: true,
+      label: rem > 0 ? `补报 (+${mins}m ${rem}s)` : `补报 (+${mins}m)`,
+    };
   }
-  return <RateView data={rate.data} stale={rate.isError} timezone={timezone} />;
+  const frac = (diffMs / 1000).toFixed(diffMs < 10_000 ? 1 : 0);
+  return { isBackfill: false, label: `实时 (+${frac}s)` };
 }
 
-function RateView({
-  data,
-  stale,
-  timezone,
-}: {
-  data: RateData;
-  stale: boolean;
-  timezone: string;
-}) {
-  const view = describeGenerationMetrics(data);
-  return (
-    <div className="flex flex-col gap-1" data-testid="generation-rate">
-      <p className="text-subtle text-xs">
-        近 60 秒平均：单请求 decode 速度与 TTFT 各自的算术平均；无有效样本的
-        一项显示“无样本”，不当成 0
-      </p>
-      <div className="flex flex-wrap gap-6">
-        <div className="flex flex-col gap-0.5">
-          <p className="text-subtle text-xs">生成速度</p>
-          <p className="text-2xl font-semibold" data-testid="rate-speed">
-            {view.speed.headline}
-          </p>
-          <p
-            className="text-muted-foreground text-xs"
-            data-testid="rate-speed-samples"
-          >
-            {view.speed.samples}
-          </p>
-        </div>
-        <div className="flex flex-col gap-0.5">
-          <p className="text-subtle text-xs">首 token 延迟（TTFT）</p>
-          <p className="text-2xl font-semibold" data-testid="rate-ttft">
-            {view.ttft.headline}
-          </p>
-          <p
-            className="text-muted-foreground text-xs"
-            data-testid="rate-ttft-samples"
-          >
-            {view.ttft.samples}
-          </p>
-        </div>
-      </div>
-      <p className="text-muted-foreground text-xs" data-testid="rate-events">
-        {view.eventCount}
-      </p>
-      <p className="text-subtle text-xs" data-testid="rate-estimate-note">
-        客户端观测的 chunk 估算，非逐 token
-        精确测量；两项各自只统计有效样本，样本集合独立。
-      </p>
-      <p className="text-subtle text-xs" data-testid="generation-rate-fresh">
-        窗口截至 {formatInstant(data.end, timezone, true)} ·{" "}
-        {data.windowLastReceivedAt
-          ? `窗口内最后接收 ${formatInstant(data.windowLastReceivedAt, timezone, true)}`
-          : "窗口内无事件，接收新鲜度未知"}
-      </p>
-      {stale ? (
-        <p role="alert" className="text-destructive text-xs">
-          速率更新失败，展示截至 {formatInstant(data.asOf, timezone, true)}{" "}
-          的旧结果
-        </p>
-      ) : null}
-    </div>
-  );
+function statusPillClass(status: string | null): string {
+  if (status === null) return "tp-status-pill tp-st-na";
+  const lower = status.toLowerCase();
+  if (
+    lower === "ok" ||
+    lower === "success" ||
+    lower === "succeeded" ||
+    lower === "completed" ||
+    lower === "200"
+  ) {
+    return "tp-status-pill tp-st-ok";
+  }
+  if (
+    lower.includes("err") ||
+    lower.includes("fail") ||
+    lower === "timeout" ||
+    lower === "cancelled" ||
+    lower === "canceled" ||
+    /^[45]\d\d$/.test(lower)
+  ) {
+    return "tp-status-pill tp-st-err";
+  }
+  return "tp-status-pill tp-st-na";
 }
 
 function RequestTable({
   rows,
   timezone,
+  selectedId,
+  onSelect,
 }: {
   rows: RequestRow[];
   timezone: string;
+  selectedId: string | null;
+  onSelect: (row: RequestRow) => void;
 }) {
   return (
     <div className="geek-table-wrap">
@@ -365,7 +512,7 @@ function RequestTable({
         <thead>
           <tr>
             <th scope="col">发生时间</th>
-            <th scope="col">Provider / Model</th>
+            <th scope="col">模型 / 供应商</th>
             <th scope="col">项目</th>
             <th scope="col">来源</th>
             <th scope="col" className="geek-th-num">
@@ -378,10 +525,10 @@ function RequestTable({
               总计
             </th>
             <th scope="col" className="geek-th-num">
-              生成速度 (tokens/s)
+              生成速度
             </th>
             <th scope="col" className="geek-th-num">
-              TTFT (ms)
+              TTFT
             </th>
             <th scope="col">状态</th>
             <th scope="col" className="geek-th-num">
@@ -390,31 +537,219 @@ function RequestTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => (
-            <tr key={r.id} data-testid="request-row">
-              <td className="geek-num">
-                {formatInstant(r.occurredAt, timezone, true)}
-              </td>
-              <td>
-                {r.provider} / {r.model}
-              </td>
-              <td>{r.project ? r.project.name : "未归属"}</td>
-              <td className="text-muted-foreground">
-                {r.source.platform} · {r.source.instanceKey}
-              </td>
-              <td className="geek-td-num">{formatTokenField(r.input)}</td>
-              <td className="geek-td-num">{formatTokenField(r.output)}</td>
-              <td className="geek-td-num">{formatTokenField(r.total)}</td>
-              <td className="geek-td-num">
-                {formatSpeedTps(r.generationSpeedTps)}
-              </td>
-              <td className="geek-td-num">{formatMilliseconds(r.ttftMs)}</td>
-              <td>{formatStatus(r.status)}</td>
-              <td className="geek-td-num">{formatDuration(r.durationMs)}</td>
-            </tr>
-          ))}
+          {rows.map((r) => {
+            const lag = lagInfo(r);
+            return (
+              <tr
+                key={r.id}
+                data-testid="request-row"
+                data-selected={selectedId === r.id ? "true" : undefined}
+                onClick={() => onSelect(r)}
+              >
+                <td className="geek-num text-muted-foreground">
+                  {formatInstant(r.occurredAt, timezone, true)}
+                  {lag.isBackfill ? (
+                    <>
+                      {" "}
+                      <span className="tp-status-pill tp-st-warn">补报</span>
+                    </>
+                  ) : null}
+                </td>
+                <td>
+                  <strong className="geek-num font-semibold">{r.model}</strong>{" "}
+                  <span className="tp-prov-tag">{r.provider}</span>
+                </td>
+                <td className={r.project ? undefined : "text-muted-foreground"}>
+                  {r.project ? r.project.name : "未归属"}
+                </td>
+                <td className="geek-num text-muted-foreground text-xs">
+                  {r.source.platform} · {r.source.instanceKey}
+                </td>
+                <td className="geek-td-num">{formatTokenField(r.input)}</td>
+                <td
+                  className="geek-td-num"
+                  style={
+                    r.output.quality !== "missing" && r.output.value !== null
+                      ? { color: "var(--c-output)" }
+                      : undefined
+                  }
+                >
+                  {formatTokenField(r.output)}
+                </td>
+                <td className="geek-td-num font-semibold">
+                  {formatTokenField(r.total)}
+                </td>
+                <td className="geek-td-num">
+                  {formatSpeedTps(r.generationSpeedTps)}
+                </td>
+                <td className="geek-td-num text-muted-foreground">
+                  {formatMilliseconds(r.ttftMs)}
+                </td>
+                <td>
+                  <span className={statusPillClass(r.status)}>
+                    {formatStatus(r.status)}
+                  </span>
+                </td>
+                <td className="geek-td-num text-muted-foreground">
+                  {formatDuration(r.durationMs)}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function qualitySummary(row: RequestRow): string {
+  const qs = new Set([
+    row.input.quality,
+    row.output.quality,
+    row.total.quality,
+  ]);
+  if (qs.size === 1) return row.total.quality;
+  return `in:${row.input.quality} / out:${row.output.quality} / total:${row.total.quality}`;
+}
+
+function RequestDetailDrawer({
+  row,
+  timezone,
+  onClose,
+}: {
+  row: RequestRow;
+  timezone: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const lag = lagInfo(row);
+
+  return (
+    <div
+      className="tp-drawer-mask"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <aside className="tp-drawer" role="dialog" aria-label="请求详情">
+        <div className="tp-drawer-head">
+          <div>
+            <div className="geek-num text-muted-foreground text-[11px]">
+              REQUEST DETAIL
+            </div>
+            <h3 className="geek-num mt-1 text-base font-semibold">
+              {row.model}
+            </h3>
+          </div>
+          <Button variant="outline" size="sm" onClick={onClose}>
+            关闭
+          </Button>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <span className="tp-prov-tag">{row.provider}</span>
+          <span className={statusPillClass(row.status)}>
+            {formatStatus(row.status)}
+          </span>
+          <span
+            className={
+              lag.isBackfill
+                ? "tp-status-pill tp-st-warn"
+                : "tp-status-pill tp-st-na"
+            }
+          >
+            {lag.label}
+          </span>
+        </div>
+
+        <div
+          className="geek-card"
+          style={{
+            padding: "12px 14px",
+            gap: 10,
+            background: "var(--surface-subtle)",
+          }}
+        >
+          <div className="text-xs font-semibold">时间与上报延迟</div>
+          <div className="tp-kv-grid">
+            <span className="tp-kv-k">发生时间</span>
+            <span className="tp-kv-v geek-num">
+              {formatInstant(row.occurredAt, timezone, true)}
+            </span>
+            <span className="tp-kv-k">服务端接收</span>
+            <span className="tp-kv-v geek-num">
+              {formatInstant(row.receivedAt, timezone, true)}
+            </span>
+            <span className="tp-kv-k">上报延迟</span>
+            <span className="tp-kv-v geek-num">{lag.label}</span>
+          </div>
+        </div>
+
+        <div
+          className="geek-card"
+          style={{
+            padding: "12px 14px",
+            gap: 10,
+            background: "var(--surface-subtle)",
+          }}
+        >
+          <div className="text-xs font-semibold">Token 与性能指标</div>
+          <div className="tp-kv-grid">
+            <span className="tp-kv-k">输入 / 输出</span>
+            <span className="tp-kv-v geek-num">
+              {formatTokenField(row.input)} / {formatTokenField(row.output)}
+            </span>
+            <span className="tp-kv-k">总计 Token</span>
+            <span className="tp-kv-v geek-num font-semibold">
+              {formatTokenField(row.total)}
+            </span>
+            <span className="tp-kv-k">口径质量</span>
+            <span className="tp-kv-v geek-num">{qualitySummary(row)}</span>
+            <span className="tp-kv-k">生成速度</span>
+            <span className="tp-kv-v geek-num">
+              {formatSpeedTps(row.generationSpeedTps)}
+            </span>
+            <span className="tp-kv-k">首字延迟 TTFT</span>
+            <span className="tp-kv-v geek-num">
+              {formatMilliseconds(row.ttftMs)}
+            </span>
+            <span className="tp-kv-k">总耗时</span>
+            <span className="tp-kv-v geek-num">
+              {formatDuration(row.durationMs)}
+            </span>
+          </div>
+        </div>
+
+        <div
+          className="geek-card"
+          style={{
+            padding: "12px 14px",
+            gap: 10,
+            background: "var(--surface-subtle)",
+          }}
+        >
+          <div className="text-xs font-semibold">归属与事件标识</div>
+          <div className="tp-kv-grid">
+            <span className="tp-kv-k">事件 ID</span>
+            <span className="tp-kv-v geek-num">{row.id}</span>
+            <span className="tp-kv-k">归属项目</span>
+            <span className="tp-kv-v geek-num">
+              {row.project ? row.project.name : "未归属 (null)"}
+            </span>
+            <span className="tp-kv-k">来源实例</span>
+            <span className="tp-kv-v geek-num">
+              {row.source.platform} · {row.source.instanceKey}
+            </span>
+          </div>
+        </div>
+      </aside>
     </div>
   );
 }

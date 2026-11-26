@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -48,16 +48,40 @@ function MultiSelect({
   disabledHint: string | null;
   onChange: (next: string[]) => void;
 }) {
+  const detailsRef = useRef<HTMLDetailsElement>(null);
   const known = new Set(options.map((o) => o.value));
-  // URL 中有效但选项里不存在的标识不丢弃，原样列出。
   const all = [
     ...options,
     ...selected
       .filter((v) => !known.has(v))
       .map((v) => ({ value: v, label: v })),
   ];
+
+  useEffect(() => {
+    const onMouseDown = (event: MouseEvent) => {
+      const el = detailsRef.current;
+      if (el?.open && !el.contains(event.target as Node)) {
+        el.open = false;
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      const el = detailsRef.current;
+      if (event.key === "Escape" && el?.open) el.open = false;
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
   return (
-    <details className="geek-ms">
+    <details
+      ref={detailsRef}
+      className="geek-ms"
+      data-active={selected.length > 0 ? "true" : undefined}
+    >
       <summary>
         {label}
         {selected.length > 0 ? `（${selected.length}）` : "（全部）"}
@@ -72,7 +96,7 @@ function MultiSelect({
           <p className="text-muted-foreground text-xs">暂无选项</p>
         ) : null}
         {all.map((o) => (
-          <label key={o.value} className="flex items-center gap-2 text-sm">
+          <label key={o.value} className="flex items-center gap-2 text-xs">
             <input
               type="checkbox"
               checked={selected.includes(o.value)}
@@ -85,7 +109,7 @@ function MultiSelect({
                 )
               }
             />
-            {o.label}
+            <span className="geek-num">{o.label}</span>
           </label>
         ))}
       </div>
@@ -101,6 +125,8 @@ export function OverviewFilterBar({
   optionsError,
   projectsError,
   dimensionsOnly = false,
+  rangeText,
+  qualityText,
   onChange,
 }: {
   /** 只显示供应商/模型/项目（请求明细页不使用时间范围与粒度）。 */
@@ -111,6 +137,8 @@ export function OverviewFilterBar({
   projectOptions: Option[];
   optionsError: string | null;
   projectsError: string | null;
+  rangeText?: string | null;
+  qualityText?: string | null;
   onChange: (next: OverviewFilters) => void;
 }) {
   const [customOpen, setCustomOpen] = useState(filters.range === "custom");
@@ -247,6 +275,14 @@ export function OverviewFilterBar({
           />
         </div>
       </div>
+      {rangeText || qualityText ? (
+        <div className="tp-meta-inline">
+          <span className="geek-num">{rangeText ?? ""}</span>
+          {qualityText ? (
+            <span className="tp-quality-pill">{qualityText}</span>
+          ) : null}
+        </div>
+      ) : null}
       {chips.length > 0 ? (
         <ul aria-label="已选筛选" className="geek-chips">
           {chips.map((c) => (
@@ -268,7 +304,7 @@ export function OverviewFilterBar({
             <label className="text-muted-foreground flex flex-col gap-1 text-xs">
               起点
               <Input
-                className="h-8 w-64 text-xs"
+                className="h-8 w-64 font-mono text-xs"
                 value={draftStart}
                 placeholder="2026-10-28T09:00:00+08:00"
                 onChange={(e) => setDraftStart(e.target.value)}
@@ -277,7 +313,7 @@ export function OverviewFilterBar({
             <label className="text-muted-foreground flex flex-col gap-1 text-xs">
               终点
               <Input
-                className="h-8 w-64 text-xs"
+                className="h-8 w-64 font-mono text-xs"
                 value={draftEnd}
                 placeholder="2026-10-28T18:00:00+08:00"
                 onChange={(e) => setDraftEnd(e.target.value)}

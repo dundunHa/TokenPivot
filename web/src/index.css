@@ -2,24 +2,170 @@
 @import "./features/overview/geek/geek-tokens.css";
 @import "./features/overview/geek/geek-layout.css";
 
-/* F 极客终端原型（docs/prototypes/dashboard-f.html）的单一深色主题。 */
-:root {
-  --background: #0a0a0b;
-  --card: #0e0e10;
-  --foreground: #f4f1ea;
-  --muted-foreground: #a9a49a;
-  --subtle: #847f74;
-  --border: rgba(244, 241, 234, 0.11);
-  --divider: rgba(244, 241, 234, 0.055);
-  --primary: #e0a64b;
-  --primary-foreground: #0a0a0b;
-  --success: #8fbf7f;
-  --destructive: #d97b6b;
-  --accent: rgba(244, 241, 234, 0.07);
-  --accent-foreground: #f4f1ea;
+/*
+ * TokenPivot 统一设计变量（单一事实来源）：
+ * - editorial-light：暖白编辑风（默认）
+ * - graphite-dark：现代石墨暗
+ */
+:root,
+[data-theme="editorial-light"] {
+  --bg: #f6f5f1;
+  --topbar-bg: rgba(246, 245, 241, 0.86);
+  --surface: #ffffff;
+  --surface-subtle: #faf9f6;
+  --surface-hover: #f2f0ea;
+  --control-bg: #eeece5;
+  --control-active: #ffffff;
+
+  --border: #e5e1d8;
+  --border-strong: #d3cdc0;
+  --border-subtle: #efece4;
+  --divider: #e5e1d8;
+
+  --text: #191815;
+  --text-secondary: #4a463e;
+  --text-muted: #767066;
+  --text-faint: #a19a8e;
+
+  --accent-brand: #c85a28;
+  --accent-brand-hover: #b34d1f;
+  --accent-brand-soft: rgba(200, 90, 40, 0.09);
+  --accent-brand-border: rgba(200, 90, 40, 0.3);
+  --accent-brand-fg: #ffffff;
+
+  /* 暖白数据色板 */
+  --c-s1: #c85a28;
+  --c-s2: #3b6998;
+  --c-s3: #3d8b74;
+  --c-s4: #9a7446;
+  --c-s5: #7459a8;
+  --c-input: #3b6998;
+  --c-output: #c85a28;
+  --c-cache: #c58225;
+  --c-reason: #7459a8;
+  --c-total-line: #2e2b26;
+  --c-other: #a19a8e;
+
+  --ok: #1f7a43;
+  --ok-bg: #eef9f2;
+  --ok-border: #bfe8ce;
+  --err: #b83227;
+  --err-bg: #fef2f1;
+  --err-border: #f8cbc7;
+  --warn: #b46016;
+  --warn-bg: #fdf6ec;
+  --warn-border: #f3d7ad;
+
+  --heat-0: #eeece5;
+  --heat-1: #f4d9c9;
+  --heat-2: #e7a785;
+  --heat-3: #d67647;
+  --heat-4: #b54518;
+
+  --shadow-card:
+    0 1px 2px rgba(25, 24, 21, 0.035), 0 1px 1px rgba(25, 24, 21, 0.02);
+  --shadow-pop:
+    0 14px 36px rgba(25, 24, 21, 0.12), 0 2px 6px rgba(25, 24, 21, 0.05);
+  --tt-bg: #1c1a17;
+  --tt-text: #f7f5f0;
+  --tt-muted: #a6a095;
+  --tt-border: #33302a;
+  --grid-line: #edeae2;
+  --zero-line: #d6d1c6;
+  --bar-gap-stroke: #ffffff;
+
+  /* shadcn / Tailwind 语义映射 */
+  --background: var(--bg);
+  --card: var(--surface);
+  --foreground: var(--text);
+  --muted-foreground: var(--text-muted);
+  --subtle: var(--text-muted);
+  --primary: var(--accent-brand);
+  --primary-foreground: var(--accent-brand-fg);
+  --success: var(--ok);
+  --destructive: var(--err);
+  --accent: var(--surface-hover);
+  --accent-foreground: var(--text);
+
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  --font-ui:
+    "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
   --font-terminal:
-    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono",
-    monospace;
+    ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  color-scheme: light;
+}
+
+[data-theme="graphite-dark"] {
+  --bg: #09090b;
+  --topbar-bg: rgba(9, 9, 11, 0.84);
+  --surface: #111114;
+  --surface-subtle: #15151a;
+  --surface-hover: #1a1a21;
+  --control-bg: #16161b;
+  --control-active: #25252e;
+
+  --border: #222229;
+  --border-strong: #32323d;
+  --border-subtle: #191920;
+  --divider: #222229;
+
+  --text: #f4f4f6;
+  --text-secondary: #c9c9d4;
+  --text-muted: #8b8b9a;
+  --text-faint: #5e5e6d;
+
+  --accent-brand: #60a5fa;
+  --accent-brand-hover: #93c5fd;
+  --accent-brand-soft: rgba(96, 165, 250, 0.13);
+  --accent-brand-border: rgba(96, 165, 250, 0.34);
+  --accent-brand-fg: #09090b;
+
+  /* 石墨暗数据色板 */
+  --c-s1: #60a5fa;
+  --c-s2: #34d399;
+  --c-s3: #a78bfa;
+  --c-s4: #f59e0b;
+  --c-s5: #f472b6;
+  --c-input: #60a5fa;
+  --c-output: #34d399;
+  --c-cache: #f59e0b;
+  --c-reason: #a78bfa;
+  --c-total-line: #e4e4eb;
+  --c-other: #5e5e6d;
+
+  --ok: #34d399;
+  --ok-bg: rgba(52, 211, 153, 0.11);
+  --ok-border: rgba(52, 211, 153, 0.28);
+  --err: #f87171;
+  --err-bg: rgba(248, 113, 113, 0.12);
+  --err-border: rgba(248, 113, 113, 0.3);
+  --warn: #fbbf24;
+  --warn-bg: rgba(251, 191, 36, 0.11);
+  --warn-border: rgba(251, 191, 36, 0.28);
+
+  --heat-0: #18181f;
+  --heat-1: rgba(96, 165, 250, 0.2);
+  --heat-2: rgba(96, 165, 250, 0.42);
+  --heat-3: rgba(96, 165, 250, 0.68);
+  --heat-4: #60a5fa;
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-pop: 0 16px 42px rgba(0, 0, 0, 0.65);
+  --tt-bg: #18181e;
+  --tt-text: #f4f4f6;
+  --tt-muted: #9898a8;
+  --tt-border: #323240;
+  --grid-line: #1c1c23;
+  --zero-line: #32323d;
+  --bar-gap-stroke: #111114;
+
+  color-scheme: dark;
 }
 
 @theme inline {
@@ -29,7 +175,7 @@
   --color-muted-foreground: var(--muted-foreground);
   --color-subtle: var(--subtle);
   --color-border: var(--border);
-  --color-input: var(--border);
+  --color-input: var(--border-strong);
   --color-divider: var(--divider);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
@@ -38,18 +184,37 @@
   --color-destructive: var(--destructive);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
-  --font-sans: var(--font-terminal);
+  --font-sans: var(--font-ui);
   --font-mono: var(--font-terminal);
-  --radius-sm: 2px;
-  --radius-md: 3px;
-  --radius-lg: 3px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
 }
 
 @layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 7px;
+    height: 7px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 999px;
+  }
+
   body {
-    @apply bg-background text-foreground font-mono antialiased;
-    font-variant-numeric: tabular-nums;
-    color-scheme: dark;
+    @apply bg-background text-foreground font-sans antialiased;
+    font-size: 13px;
+    line-height: 1.5;
   }
 
   :focus-visible {

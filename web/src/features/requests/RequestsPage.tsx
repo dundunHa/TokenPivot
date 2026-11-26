@@ -6,7 +6,6 @@ import {
   type QueryScope,
 } from "@/features/overview/overviewQueries";
 import { useUsageOptions } from "@/features/workspace/queries";
-import { SpeedKpi } from "./SpeedKpi";
 import { RequestLogPanel } from "./RequestLogPanel";
 
 /** 请求明细独立页：筛选与总览共用同一组 URL 参数，这里只开放供应商/模型/项目。 */
@@ -65,12 +64,7 @@ function RequestsContent({
         }
         onChange={update}
       />
-      <div className="geek-kpis geek-kpis-single">
-        <SpeedKpi scope={scope} filters={filters} />
-      </div>
-      <div className="geek-card">
-        <RequestLogPanel scope={scope} filters={filters} />
-      </div>
+      <RequestLogPanel scope={scope} filters={filters} />
     </div>
   );
 }

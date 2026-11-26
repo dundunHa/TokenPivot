@@ -1,9 +1,19 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="editorial-light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TokenPivot</title>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("tokenpivot.theme");
+          if (t === "editorial-light" || t === "graphite-dark") {
+            document.documentElement.setAttribute("data-theme", t);
+          }
+        } catch (_) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

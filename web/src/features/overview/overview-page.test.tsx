@@ -105,6 +105,17 @@ function useBackend(opts?: { aggregate?: () => Response | Promise<Response> }) {
         points: [],
       }),
     ),
+    http.get(`${BASE}/usage-rate`, () =>
+      HttpResponse.json({
+        start: "2026-10-28T01:59:00Z",
+        end: "2026-10-28T02:00:00Z",
+        as_of: "2026-10-28T02:00:00Z",
+        event_count: 0,
+        window_last_received_at: null,
+        generation_speed: { unit: "tokens/s", value: null, sample_count: 0 },
+        ttft: { unit: "ms", value: null, sample_count: 0 },
+      }),
+    ),
     http.get(`${BASE}/usage/rankings`, ({ request }) => {
       const by = new URL(request.url).searchParams.get("group_by");
       return HttpResponse.json({
@@ -189,7 +200,10 @@ describe("overview page", () => {
     renderApp("/?tz=UTC");
     await screen.findByTestId("metric-total");
     await user.click(screen.getByRole("tab", { name: "模型" }));
-    await user.click(await screen.findByRole("button", { name: /m1/ }));
+    const ranking = await screen.findByRole("region", { name: "排名" });
+    await user.click(
+      await within(ranking).findByRole("button", { name: /m1/ }),
+    );
     await waitFor(() => {
       const last = calls[calls.length - 1];
       expect(last?.searchParams.getAll("model")).toEqual(["m1"]);
@@ -226,21 +240,37 @@ describe("overview page", () => {
     renderApp("/?tz=UTC");
     await screen.findByTestId("metric-total");
     await user.click(screen.getByRole("tab", { name: "模型" }));
-    await user.click(await screen.findByRole("button", { name: /其他/ }));
-    await screen.findByRole("button", { name: /tail-model/ });
-    await user.click(screen.getByRole("button", { name: /^m1/ }));
+    const ranking = await screen.findByRole("region", { name: "排名" });
+    await user.click(
+      await within(ranking).findByRole("button", { name: /其他/ }),
+    );
+    await within(ranking).findByRole("button", { name: /tail-model/ });
+    await user.click(within(ranking).getByRole("button", { name: /^m1/ }));
     await screen.findByRole("button", { name: "移除 模型 m1" });
     expect(
       screen.getByRole("tab", { name: "模型", selected: true }),
     ).toBeTruthy();
     // 等新筛选的排名加载完成（m1 行变为已筛选），再确认长尾已收起。
-    await screen.findByRole("button", { name: /^m1/, pressed: true });
-    expect(screen.queryByRole("button", { name: /tail-model/ })).toBeNull();
+    await within(ranking).findByRole("button", { name: /^m1/, pressed: true });
     expect(
-      screen
+      within(ranking).queryByRole("button", { name: /tail-model/ }),
+    ).toBeNull();
+    expect(
+      within(ranking)
         .getByRole("button", { name: /其他/ })
         .getAttribute("aria-expanded"),
     ).toBe("false");
+  });
+
+  it("switches between editorial-light and graphite-dark themes from the topbar", async () => {
+    useBackend();
+    const user = userEvent.setup();
+    renderApp("/?tz=UTC");
+    await screen.findByTestId("metric-total");
+    await user.click(screen.getByRole("button", { name: /石墨暗/ }));
+    expect(document.documentElement.dataset.theme).toBe("graphite-dark");
+    await user.click(screen.getByRole("button", { name: /暖白/ }));
+    expect(document.documentElement.dataset.theme).toBe("editorial-light");
   });
 
   it("keeps the request log off the overview and opens it from the nav with filters kept", async () => {
